@@ -32,6 +32,9 @@ set(LLAMA_ALL_WARNINGS              OFF CACHE BOOL   "" FORCE)
 
 add_subdirectory(${LLAMA_CPP_DIR} llama.cpp EXCLUDE_FROM_ALL)
 
+# The JNI layer reads the OpenCL device properties itself.
+find_package(OpenCL REQUIRED)
+
 add_library(qwenmobile SHARED
     llama_jni.cpp
     perf_hint.cpp)
@@ -42,5 +45,6 @@ target_include_directories(qwenmobile PRIVATE
 target_link_libraries(qwenmobile PRIVATE
     llama
     llama-common
+    OpenCL::OpenCL
     android
     log)

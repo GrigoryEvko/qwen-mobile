@@ -19,6 +19,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        LlamaNative.setWorkingDirectory(filesDir.absolutePath)
 
         if (savedInstanceState == null) {
             supportFragmentManager.beginTransaction()

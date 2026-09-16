@@ -13,7 +13,10 @@ object LlamaNative {
     /** Initialize the llama.cpp backends and route the log to logcat. */
     @JvmStatic external fun init()
 
-    /** One line per ggml backend device: name, description, type, memory. */
+    /** Make the directory current, thus a profiling build writes its CSV there. */
+    @JvmStatic external fun setWorkingDirectory(path: String)
+
+    /** The OpenCL device properties, then one line per ggml backend device. */
     @JvmStatic external fun devices(): String
 
     /**

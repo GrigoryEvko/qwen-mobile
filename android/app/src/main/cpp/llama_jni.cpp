@@ -21,6 +21,9 @@
 #include <string>
 #include <vector>
 
+#define CL_TARGET_OPENCL_VERSION 300
+#include <CL/cl.h>
+
 #include "chat.h"
 #include "common.h"
 #include "ggml-backend.h"
@@ -213,9 +216,50 @@ Java_ai_airi_qwenmobile_LlamaNative_init(JNIEnv *, jclass) {
     LOGI("llama.cpp initialized, %zu backend devices", ggml_backend_dev_count());
 }
 
+/**
+ * Make the directory the current one. The OpenCL profiling build writes
+ * cl_profiling.csv into the current directory when the backend closes.
+ */
+JNIEXPORT void JNICALL
+Java_ai_airi_qwenmobile_LlamaNative_setWorkingDirectory(JNIEnv * env, jclass, jstring jpath) {
+    const std::string path = jstring_to_std(env, jpath);
+    if (chdir(path.c_str()) != 0) {
+        LOGE("chdir to %s failed", path.c_str());
+    }
+}
+
+/** The driver version and the extensions of the first OpenCL GPU, or an empty string. */
+static std::string opencl_device_info() {
+    cl_platform_id platform = nullptr;
+    cl_device_id   dev      = nullptr;
+    if (clGetPlatformIDs(1, &platform, nullptr) != CL_SUCCESS ||
+        clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &dev, nullptr) != CL_SUCCESS) {
+        return {};
+    }
+    auto str = [&](cl_device_info what) {
+        size_t size = 0;
+        clGetDeviceInfo(dev, what, 0, nullptr, &size);
+        std::string s(size, '\0');
+        clGetDeviceInfo(dev, what, size, s.data(), nullptr);
+        while (!s.empty() && (s.back() == '\0' || s.back() == ' ')) s.pop_back();
+        return s;
+    };
+    cl_uint  cu = 0, clk = 0;
+    cl_ulong lmem = 0, cache = 0;
+    clGetDeviceInfo(dev, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cu), &cu, nullptr);
+    clGetDeviceInfo(dev, CL_DEVICE_MAX_CLOCK_FREQUENCY, sizeof(clk), &clk, nullptr);
+    clGetDeviceInfo(dev, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(lmem), &lmem, nullptr);
+    clGetDeviceInfo(dev, CL_DEVICE_GLOBAL_MEM_CACHE_SIZE, sizeof(cache), &cache, nullptr);
+    std::string out = "opencl: " + str(CL_DEVICE_VERSION) + ", driver " + str(CL_DRIVER_VERSION) +
+                      ", " + std::to_string(cu) + " CU, " + std::to_string(clk) + " MHz, local " +
+                      std::to_string(lmem >> 10) + " KB, cache " + std::to_string(cache >> 10) + " KB\n";
+    out += "extensions: " + str(CL_DEVICE_EXTENSIONS) + "\n";
+    return out;
+}
+
 JNIEXPORT jstring JNICALL
 Java_ai_airi_qwenmobile_LlamaNative_devices(JNIEnv * env, jclass) {
-    std::string out;
+    std::string out = opencl_device_info();
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         size_t mem_free = 0, mem_total = 0;
@@ -232,6 +276,13 @@ Java_ai_airi_qwenmobile_LlamaNative_devices(JNIEnv * env, jclass) {
                  ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), type,
                  mem_free >> 20, mem_total >> 20);
         out += line;
+    }
+    // One log line per item, because logcat cuts a line at 4 KB.
+    for (size_t pos = 0; pos < out.size();) {
+        size_t end = out.find_first_of(" \n", pos);
+        if (end == std::string::npos) end = out.size();
+        if (end > pos) LOGI("%s", out.substr(pos, end - pos).c_str());
+        pos = end + 1;
     }
     return env->NewStringUTF(out.c_str());
 }

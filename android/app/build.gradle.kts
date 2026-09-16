@@ -37,6 +37,11 @@ android {
                     "-DCMAKE_BUILD_TYPE=Release",
                     "-DLLAMA_CPP_DIR=$llamaDir",
                 )
+                // ./gradlew assembleRelease -Pprofiling=true records each OpenCL kernel
+                // and writes cl_profiling.csv into the app files directory on unload.
+                if (project.findProperty("profiling") == "true") {
+                    arguments += "-DGGML_OPENCL_PROFILING=ON"
+                }
             }
         }
     }
@@ -51,6 +56,8 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
+            // Debuggable, thus simpleperf and run-as reach the process. The native code stays -O3.
+            isDebuggable = true
             // The debug key lets adb install the release build without a keystore.
             signingConfig = signingConfigs.getByName("debug")
         }
