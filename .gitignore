@@ -1,0 +1,4 @@
+weights/
+*.gguf
+*.safetensors
+.DS_Store
