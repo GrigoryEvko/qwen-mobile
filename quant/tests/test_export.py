@@ -11,7 +11,7 @@ import torch
 
 from quant.blockopt import weighted_low_rank
 from quant.export import LinearAttentionLayout, _f32_of, block_permutation, export, write_adapter
-from quant.grid import dequantize, pack_nibbles, quantize
+from quant.grid import dequantize, pack_nibbles, q8_0_dequantize, q8_0_quantize, quantize
 from quant.grids import Q4_0Grid
 from quant.plan import Plan
 
@@ -147,13 +147,25 @@ def test_gguf_keeps_the_numpy_row_order_of_a_2d_tensor(tmp_path: Path) -> None:
     assert np.array_equal(_f32_of(t), a)
 
 
-def write_toy_f16(gguf, path: Path, vocab: int, d: int, gen: np.random.Generator) -> dict[str, np.ndarray]:
-    """A small F16 GGUF with the head tensors of the converter: token_embd, output_norm, output."""
+def write_toy_f16(gguf, path: Path, vocab: int, d: int, gen: np.random.Generator, tied: bool = False,
+                  layer: bool = False) -> dict[str, np.ndarray]:
+    """A small F16 GGUF with the head tensors of the converter: token_embd, output_norm, output.
+
+    ``tied`` gives no ``output.weight``, as the converter does for a tied
+    checkpoint. ``layer`` adds one decoder block: two F16 matrices, the F16
+    GDN control ``ssm_alpha`` and an F32 norm.
+    """
     tensors = {
         "token_embd.weight": gen.standard_normal((vocab, d)).astype(np.float16),
         "output_norm.weight": (0.5 + gen.random(d)).astype(np.float32),
-        "output.weight": gen.standard_normal((vocab, d)).astype(np.float16),
     }
+    if not tied:
+        tensors["output.weight"] = gen.standard_normal((vocab, d)).astype(np.float16)
+    if layer:
+        tensors["blk.0.ffn_gate.weight"] = gen.standard_normal((2 * d, d)).astype(np.float16)
+        tensors["blk.0.attn_gate.weight"] = gen.standard_normal((d, d)).astype(np.float16)
+        tensors["blk.0.ssm_alpha.weight"] = gen.standard_normal((2, d)).astype(np.float16)
+        tensors["blk.0.attn_norm.weight"] = (0.5 + gen.random(d)).astype(np.float32)
     writer = gguf.GGUFWriter(str(path), "qwen35")
     writer.add_uint32("qwen35.embedding_length", d)
     for name, a in tensors.items():
@@ -195,6 +207,37 @@ def test_tied_export_drops_the_head_and_writes_the_map(tmp_path: Path) -> None:
         export(out, tmp_path / "untied.gguf", packs, Plan(n_layers=0), LLAMA, torch.device("cpu"), only="^$")
     with pytest.raises(ValueError):
         export(src, tmp_path / "no-map.gguf", packs, Plan(n_layers=0), LLAMA, torch.device("cpu"), tie_head=True)
+
+
+def test_q8_0_export_of_a_plain_source_matches_gguf_py(tmp_path: Path) -> None:
+    """A plain tied F16 source with the bulk Q8_0: each 2-D weight of the plan is Q8_0 as gguf-py reads it.
+
+    The norms and the GDN control stay F32 with their values, the file type
+    is MOSTLY_Q8_0, and no pack directory is necessary.
+    """
+    gguf = gguf_module()
+    gen = np.random.default_rng(2)
+    vocab, d = 48, 64
+    src = tmp_path / "src.gguf"
+    tensors = write_toy_f16(gguf, src, vocab, d, gen, tied=True, layer=True)
+    out = tmp_path / "q8.gguf"
+    export(src, out, tmp_path / "no-packs", Plan(bulk="Q8_0", gdn_gate="Q8_0", n_layers=1), LLAMA, torch.device("cpu"))
+    reader = gguf.GGUFReader(str(out))
+    assert int(reader.fields["general.file_type"].contents()) == int(gguf.LlamaFileType.MOSTLY_Q8_0)
+    got = {t.name: t for t in reader.tensors}
+    assert set(got) == set(tensors)
+    for name in ("token_embd.weight", "blk.0.ffn_gate.weight", "blk.0.attn_gate.weight"):
+        assert got[name].tensor_type.name == "Q8_0", name
+        w = torch.from_numpy(tensors[name].astype(np.float32))
+        expected = q8_0_dequantize(*q8_0_quantize(w)).numpy()
+        packed = np.asarray(got[name].data).reshape(w.shape[0], -1)
+        reference = gguf.quants.dequantize(packed, gguf.GGMLQuantizationType.Q8_0)
+        np.testing.assert_allclose(reference, expected, rtol=0, atol=1e-7)
+        rel = np.linalg.norm(expected - w.numpy()) / np.linalg.norm(w.numpy())
+        assert rel < 0.01, f"{name}: the 8-bit round trip has the relative error {rel:.4f}"
+    for name in ("output_norm.weight", "blk.0.attn_norm.weight", "blk.0.ssm_alpha.weight"):
+        assert got[name].tensor_type.name == "F32", name
+        np.testing.assert_array_equal(_f32_of(got[name]), tensors[name].astype(np.float32))
 
 
 def test_tied_export_takes_the_head_pack_and_the_folds(tmp_path: Path) -> None:

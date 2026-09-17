@@ -7,7 +7,8 @@
     python -m quant.run quantize   --model Qwen3.5-2B --head-only --packs quant-out/<previous run> [--stream]
     python -m quant.run convert    --model Qwen3.5-2B --source tf
     python -m quant.run export     --model Qwen3.5-2B --source tf [--head Q8_0] [--only <regex>] [--invert] [--tie-head]
-    python -m quant.run eval       --model Qwen3.5-2B --gguf <file>
+    python -m quant.run export     --model Qwen3.5-2B --f16 weights/gguf/Qwen3.5-2B-F16.gguf --bulk Q8_0 --gdn-gate Q8_0 --tag Q8_0
+    python -m quant.run eval       --model Qwen3.5-2B --gguf <file> [--ngl 99]
     python -m quant.run drift      --model Qwen3.5-2B --source t --out analysis/<file>.drift.md
 
 Paths are relative to the project root: weights/<model> is the official
@@ -210,9 +211,10 @@ def cmd_drift(args: argparse.Namespace) -> None:
 
 
 def cmd_export(args: argparse.Namespace) -> None:
+    """Write the GGUF of the plan from the F16 GGUF of ``--source``, or from the file ``--f16``."""
     from .export import export
 
-    f16 = ROOT / "weights" / "gguf" / f"{args.model}-{args.source}-F16.gguf"
+    f16 = Path(args.f16) if args.f16 else ROOT / "weights" / "gguf" / f"{args.model}-{args.source}-F16.gguf"
     out = ROOT / "weights" / "gguf" / (args.out or f"{args.model}-{args.tag}.gguf")
     plan = _plan(args, num_layers(ROOT / "weights" / args.model), args.tie_head)
     export(f16, out, _packs(args), plan, ROOT / "llama.cpp", torch.device(args.device),
@@ -226,9 +228,9 @@ def _packs(args: argparse.Namespace) -> Path:
 
 
 def cmd_eval(args: argparse.Namespace) -> None:
-    """KL divergence of a GGUF against the F16 logits base on CUDA."""
+    """KL divergence of a GGUF against the F16 logits base, with ``--ngl`` layers on CUDA."""
     base = ROOT / "eval" / f"{args.model}-F16.wiki.c512x16.kld"
-    cmd = [str(ROOT / "llama.cpp" / "build-cuda" / "bin" / "llama-perplexity"), "-m", str(args.gguf), "-ngl", "99",
+    cmd = [str(ROOT / "llama.cpp" / "build-cuda" / "bin" / "llama-perplexity"), "-m", str(args.gguf), "-ngl", str(args.ngl),
            "-f", str(ROOT / "data" / "wiki.test.raw"), "-c", "512", "--chunks", "16",
            "--kl-divergence-base", str(base), "--kl-divergence"]
     lora = Path(args.gguf).with_name(Path(args.gguf).stem + "-lora.gguf")
@@ -318,6 +320,8 @@ def main() -> None:
     e.add_argument("--out", default=None)
     e.add_argument("--source", default="t", help="the F16 GGUF that supplies the unsolved tensors: t or tf "
                                                  "(tf is necessary with --only or a plan that differs from the calibration)")
+    e.add_argument("--f16", default=None, help="the source GGUF as a path, for example the F16 GGUF of the original "
+                                              "checkpoint; the default is weights/gguf/<model>-<source>-F16.gguf")
     e.add_argument("--packs", default=None, help="the directory of the solved blocks, default quant-out/<model>")
     e.add_argument("--only", default=None, help="regex: quantize the matching tensors only, the rest stays F16")
     e.add_argument("--invert", action="store_true", help="with --only: quantize everything except the matches")
@@ -328,6 +332,8 @@ def main() -> None:
 
     ev = sub.add_parser("eval", parents=[common])
     ev.add_argument("--gguf", required=True)
+    ev.add_argument("--ngl", type=int, default=99,
+                    help="the number of layers on the GPU; a model that does not fit in VRAM takes the split of its base")
 
     args = p.parse_args()
     {"transform": cmd_transform, "verify": cmd_verify, "convert": cmd_convert, "quantize": cmd_quantize,
@@ -335,7 +341,8 @@ def main() -> None:
 
 
 def _plan_args(sp: argparse.ArgumentParser) -> None:
-    sp.add_argument("--bulk", default="Q4_0", choices=("Q4_0", "IQ4_NL", "CB4"), help="the 4-bit grid of the bulk")
+    sp.add_argument("--bulk", default="Q4_0", choices=("Q4_0", "IQ4_NL", "CB4", "Q8_0"),
+                    help="the 4-bit grid of the bulk, or Q8_0 for a round-to-nearest 8-bit file")
     sp.add_argument("--head", default="Q4_0")
     sp.add_argument("--embedding", default="Q8_0")
     sp.add_argument("--kv-proj", default="Q8_0")

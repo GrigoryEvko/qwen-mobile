@@ -33,7 +33,7 @@ from .grids import make_grid
 from .plan import Plan
 
 GGUF_4BIT = {"Q4_0": "Q4_0", "IQ4_NL": "IQ4_NL"}
-FILE_TYPES = {"Q4_0": "MOSTLY_Q4_0", "IQ4_NL": "MOSTLY_IQ4_NL"}
+FILE_TYPES = {"Q4_0": "MOSTLY_Q4_0", "IQ4_NL": "MOSTLY_IQ4_NL", "Q8_0": "MOSTLY_Q8_0"}
 
 
 def _load_gguf_module(llama_dir: Path):
@@ -176,6 +176,10 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
     ``only`` is a regular expression on the GGUF tensor name. The tensors
     that match keep their plan type and every other tensor stays F16, thus
     the file isolates the error of one class. ``invert`` swaps the two sets.
+
+    A plan with the bulk Q8_0 and the F16 GGUF of the original checkpoint
+    gives a round-to-nearest Q8_0 file with no transform: each 2-D weight
+    of the plan goes through ``q8_0_quantize`` one tensor at a time.
 
     ``source_folded`` says that the F16 GGUF comes from the folded
     reference (``--source tf``). The calibration folds move the columns of
