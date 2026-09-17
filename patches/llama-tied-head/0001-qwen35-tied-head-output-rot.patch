@@ -1,0 +1,121 @@
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index 36b4c31..a309086 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -662,6 +662,7 @@ class MODEL_TENSOR(IntEnum):
+     TOKEN_TYPES          = auto()
+     POS_EMBD             = auto()
+     OUTPUT               = auto()
++    OUTPUT_ROT           = auto() # qwen35 tied head: a dense map between the output norm and the head
+     HRM_Z_L_INIT         = auto()
+     DENSE_2_OUT          = auto() # embeddinggemma 2_Dense
+     DENSE_3_OUT          = auto() # embeddinggemma 3_Dense
+@@ -1419,6 +1420,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
+     MODEL_TENSOR.POS_EMBD:                  "position_embd",
+     MODEL_TENSOR.OUTPUT_NORM:               "output_norm",
+     MODEL_TENSOR.OUTPUT:                    "output",
++    MODEL_TENSOR.OUTPUT_ROT:                "output_rot",
+     MODEL_TENSOR.HRM_Z_L_INIT:              "hrm.z_l_init",
+     MODEL_TENSOR.DENSE_2_OUT:               "dense_2", # embeddinggemma 2_Dense
+     MODEL_TENSOR.DENSE_3_OUT:               "dense_3", # embeddinggemma 2_Dense
+@@ -2859,6 +2861,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
+         MODEL_TENSOR.TOKEN_EMBD,
+         MODEL_TENSOR.OUTPUT_NORM,
+         MODEL_TENSOR.OUTPUT,
++        MODEL_TENSOR.OUTPUT_ROT,
+         MODEL_TENSOR.ATTN_NORM,
+         MODEL_TENSOR.ATTN_Q,
+         MODEL_TENSOR.ATTN_Q_NORM,
+diff --git a/gguf-py/gguf/tensor_mapping.py b/gguf-py/gguf/tensor_mapping.py
+index d2dfeec..2f1b761 100644
+--- a/gguf-py/gguf/tensor_mapping.py
++++ b/gguf-py/gguf/tensor_mapping.py
+@@ -93,6 +93,9 @@ class TensorNameMap:
+         MODEL_TENSOR.DENSE_3_OUT: (
+             "dense_3_out",  # embeddinggemma
+         ),
++        MODEL_TENSOR.OUTPUT_ROT: (
++            "model.output_rot",  # qwen35 tied head
++        ),
+         # Output norm
+         MODEL_TENSOR.OUTPUT_NORM: (
+             "gpt_neox.final_layer_norm",               # gptneox
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index 03b7951..9b9bedc 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -435,6 +435,7 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+     { LLM_TENSOR_OUTPUT_NORM,                            "output_norm" },
+     { LLM_TENSOR_OUTPUT_NORM_LFM2,                       "token_embd_norm" }, // fix for wrong tensor name
+     { LLM_TENSOR_OUTPUT,                                 "output" },
++    { LLM_TENSOR_OUTPUT_ROT,                             "output_rot" },
+     { LLM_TENSOR_ROPE_FREQS,                             "rope_freqs" },
+     { LLM_TENSOR_HRM_Z_L_INIT,                           "hrm.z_l_init" },
+     { LLM_TENSOR_ATTN_NORM,                              "blk.%d.attn_norm" },
+@@ -723,6 +724,7 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_HRM_Z_L_INIT,               {LLM_TENSOR_LAYER_INPUT,     GGML_OP_ADD}},
+     {LLM_TENSOR_TOKEN_EMBD_NORM,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},  // do the norms on the first layer (not the input layer)
+     {LLM_TENSOR_OUTPUT,                     {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_OUTPUT_ROT,                 {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_CLS,                        {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_CLS_OUT,                    {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_CLS_NORM,                   {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index af64f4e..c780783 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -443,6 +443,7 @@ enum llm_tensor {
+     LLM_TENSOR_DENSE_2_OUT,
+     LLM_TENSOR_DENSE_3_OUT,
+     LLM_TENSOR_OUTPUT,
++    LLM_TENSOR_OUTPUT_ROT, // a dense map between the output norm and a tied head
+     LLM_TENSOR_OUTPUT_NORM,
+     LLM_TENSOR_OUTPUT_NORM_LFM2, // fix for wrong tensor name
+     LLM_TENSOR_ROPE_FREQS,
+diff --git a/src/llama-model.h b/src/llama-model.h
+index d61afa2..d86a4a7 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -632,6 +632,7 @@ struct llama_model {
+     struct ggml_tensor * output_norm_b   = nullptr;
+     struct ggml_tensor * output          = nullptr;
+     struct ggml_tensor * output_b        = nullptr;
++    struct ggml_tensor * output_rot      = nullptr; // qwen35 tied head: logits = output · (output_rot · norm(h))
+     struct ggml_tensor * output_norm_enc = nullptr;
+ 
+ 
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index a1e2635..4a2febd 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -48,6 +48,10 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
+         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
+     }
+ 
++    // optional dense map between the output norm and the head: the quantization pipeline folds the
++    // final norm weight and the residual rotation into it, thus the head can stay tied to token_embd
++    output_rot = create_tensor(tn(LLM_TENSOR_OUTPUT_ROT, "weight"), { n_embd, n_embd }, TENSOR_NOT_REQUIRED);
++
+     auto load_block_trunk = [&](int il, int flags) {
+         auto & layer = layers[il];
+ 
+@@ -212,6 +216,11 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
+         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+     }
+ 
++    if (model.output_rot) {
++        // the tied head reads the normed hidden state through the dense map
++        cur = ggml_mul_mat(ctx0, model.output_rot, cur);
++    }
++
+     cb(cur, "result_norm", -1);
+     res->t_embd = cur;
+ 
+@@ -633,6 +642,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+     cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+     cb(cur, "mtp_shared_head_norm", -1);
+ 
++    // the MTP head does not apply model.output_rot: the transformed checkpoints do not keep the MTP block exact
+     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
