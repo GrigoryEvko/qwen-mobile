@@ -87,6 +87,13 @@ Phone speed of row 3 (the GPTQ Q4_0 file, llama-bench, thermal status 0, 2026-09
 the NPU): GPU OpenCL pp512 574 t/s, tg64 30.1 t/s. NPU HTP0 pp512 968 t/s, tg64 31.9 t/s. The F16
 file gives tg 13.6 (GPU) and 13.8 (NPU), thus Q4_0 more than doubles the decode speed.
 
+Phone speed on the NPU with op fusion on (llama-bench -p 512 -n 32, 2026-09-17 23:58 and 2026-09-18
+00:45): row 7 pp512 1017 t/s, tg32 32.05 t/s; row 11 (tied head, 0.53 GB less) pp512 1017 t/s, tg32
+32.2 t/s; the 2B Q8_0 pp512 1004 t/s, tg32 21.5 t/s (2.1 GB per token, 45 GB/s); the 4B Q8_0 pp512
+377 t/s, tg32 7.0 t/s (4.7 GB per token, the gate and up pairs stream at 56 GB/s, thus the floor). The
+fused matvec add of the Hexagon backend (patches/hexagon-fusion/0001) makes the fusion correct: the
+32-token greedy streams with fusion on and off are identical for the Q4_0 and the F16 file.
+
 Grid test on Gaussian weights (256 x 512, block-32 F16 scales with the scale search, 4.5 bits per
 weight, `python -m quant.trellis 12`): Q4_0 21.8 dB, IQ4_NL 22.5 dB, codebook per matrix 22.3 dB,
 trellis (bit-shift, L = 12) 22.1 dB with a Gaussian table and 21.8 dB with the Ungerboeck cosets.
