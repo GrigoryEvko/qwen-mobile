@@ -43,6 +43,7 @@ class SettingsFragment : Fragment() {
         viewLifecycleOwner.lifecycleScope.launch {
             LlamaEngine.state.collect { loaded ->
                 b.modelInfoText.text = loaded?.info ?: getString(R.string.settings_no_model_loaded)
+                applySpeculative(b, loaded)
             }
         }
         viewLifecycleOwner.lifecycleScope.launch {
@@ -174,6 +175,20 @@ class SettingsFragment : Fragment() {
         }
     }
 
+    /**
+     * The speculative switch is available only for a loaded model that holds
+     * the MTP tensors and runs on a compute unit that can draft with them.
+     * The hint tells the user which of the three conditions is missing.
+     */
+    private fun applySpeculative(b: FragmentSettingsBinding, loaded: LoadedModel?) {
+        b.speculativeSwitch.isEnabled = loaded?.hasMtp == true
+        b.speculativeHint.text = when {
+            loaded == null -> getString(R.string.settings_speculative_no_model)
+            !loaded.hasMtp -> getString(R.string.settings_speculative_absent)
+            else -> getString(R.string.settings_speculative_hint)
+        }
+    }
+
     /** The label of an image detail level. */
     private fun detailLabel(detail: ImageDetail): Int = when (detail) {
         ImageDetail.FAST -> R.string.settings_image_detail_fast
@@ -188,6 +203,11 @@ class SettingsFragment : Fragment() {
             if (applying) return@setOnCheckedChangeListener
             store.update { it.copy(thinking = checked) }
         }
+        b.speculativeSwitch.setOnCheckedChangeListener { _, checked ->
+            if (applying) return@setOnCheckedChangeListener
+            store.update { it.copy(speculative = checked) }
+        }
+        applySpeculative(b, LlamaEngine.state.value)
         b.temperatureSlider.valueFrom = 0f
         b.temperatureSlider.valueTo = SettingsStore.MAX_TEMPERATURE
         b.temperatureSlider.stepSize = 0.05f
@@ -248,6 +268,7 @@ class SettingsFragment : Fragment() {
                 }
             }
             b.thinkingSwitch.isChecked = s.thinking
+            b.speculativeSwitch.isChecked = s.speculative
             b.temperatureSlider.value = snap(s.temperature, 0f, 0.05f)
             b.temperatureValue.text = String.format(Locale.US, "%.2f", s.temperature)
             b.topPSlider.value = snap(s.topP, SettingsStore.MIN_TOP_P, 0.01f)

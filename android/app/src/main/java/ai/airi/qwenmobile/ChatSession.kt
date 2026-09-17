@@ -121,7 +121,8 @@ object ChatSession {
             SettingsStore.of(app).state.collect { s ->
                 val c = wantedConfig ?: LlamaEngine.state.value?.config ?: return@collect
                 if (s.modelPath != c.path || s.backend != c.backend || s.threads != c.threads || s.nCtx != c.nCtx ||
-                    s.visionOnGpu != c.visionOnGpu || s.imageDetail.tokens != c.imageMaxTokens
+                    s.visionOnGpu != c.visionOnGpu || s.imageDetail.tokens != c.imageMaxTokens ||
+                    s.speculative != c.speculative
                 ) {
                     scheduleReload()
                 }
@@ -199,7 +200,7 @@ object ChatSession {
             } else {
                 EngineConfig(
                     path, s.backend, s.threads, s.nCtx, ModelFiles.mmprojFor(file)?.absolutePath, s.visionOnGpu,
-                    s.imageDetail.tokens,
+                    s.imageDetail.tokens, s.speculative,
                 )
             }
         } ?: return app.getString(R.string.no_model_selected)
@@ -216,7 +217,7 @@ object ChatSession {
             } else {
                 app.getString(
                     R.string.load_no_memory,
-                    MemoryBudget.format(MemoryBudget.weightBytes(config)),
+                    MemoryBudget.format(MemoryBudget.loadBytes(config)),
                     MemoryBudget.format(MemoryBudget.availableBytes(app)),
                     config.backend.label,
                 )

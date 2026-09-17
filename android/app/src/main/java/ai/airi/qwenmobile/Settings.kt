@@ -39,6 +39,12 @@ data class AppSettings(
     val thinking: Boolean = false,
     val temperature: Float = 0.7f,
     val topP: Float = 0.8f,
+    /**
+     * Draft the answer with the MTP block of the model. A change loads the
+     * model again, because the MTP block loads with the weights and the
+     * context keeps the state snapshots of a draft.
+     */
+    val speculative: Boolean = false,
 )
 
 /**
@@ -86,6 +92,7 @@ class SettingsStore private constructor(context: Context) {
             thinking = prefs.getBoolean(KEY_THINKING, false),
             temperature = prefs.getFloat(KEY_TEMPERATURE, 0.7f),
             topP = prefs.getFloat(KEY_TOP_P, 0.8f),
+            speculative = prefs.getBoolean(KEY_SPECULATIVE, false),
         ),
     )
 
@@ -100,6 +107,7 @@ class SettingsStore private constructor(context: Context) {
             .putBoolean(KEY_THINKING, s.thinking)
             .putFloat(KEY_TEMPERATURE, s.temperature)
             .putFloat(KEY_TOP_P, s.topP)
+            .putBoolean(KEY_SPECULATIVE, s.speculative)
             .apply()
     }
 
@@ -114,6 +122,7 @@ class SettingsStore private constructor(context: Context) {
         private const val KEY_THINKING = "thinking"
         private const val KEY_TEMPERATURE = "temperature"
         private const val KEY_TOP_P = "top_p"
+        private const val KEY_SPECULATIVE = "speculative"
 
         /** The permitted context lengths, in tokens. */
         val CONTEXT_LENGTHS: List<Int> = listOf(2048, 4096, 8192, 16384)

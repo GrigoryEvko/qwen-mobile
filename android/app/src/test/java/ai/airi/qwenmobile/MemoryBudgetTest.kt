@@ -44,6 +44,34 @@ class MemoryBudgetTest {
     }
 
     @Test
+    fun speculativeDecodingCountsTheDraftContextAndTheStateSnapshots() {
+        val model = folder.newFile("mtp.gguf").also { it.writeBytes(ByteArray(1_000)) }
+        val plain = EngineConfig(model.absolutePath, Backend.GPU, 4, 8192)
+        val draft = plain.copy(speculative = true)
+        assertEquals(0L, MemoryBudget.speculativeBytes(plain))
+        assertEquals(1_000L, MemoryBudget.loadBytes(plain))
+        // 8192 positions of 4 KB, and the three recurrent state snapshots.
+        val expected = 8_192L * MemoryBudget.DRAFT_KV_BYTES_PER_POSITION + MemoryBudget.DRAFT_STATE_BYTES
+        assertEquals(expected, MemoryBudget.speculativeBytes(draft))
+        assertEquals(1_000L + expected, MemoryBudget.loadBytes(draft))
+        // A longer context needs a longer draft cache.
+        assertEquals(
+            expected + 8_192L * MemoryBudget.DRAFT_KV_BYTES_PER_POSITION,
+            MemoryBudget.speculativeBytes(draft.copy(nCtx = 16384)),
+        )
+    }
+
+    @Test
+    fun theHybridBackendDraftsNothing() {
+        val model = folder.newFile("hybrid.gguf").also { it.writeBytes(ByteArray(1_000)) }
+        // The prompt of the hybrid backend runs on a second model, thus the draft block cannot follow it.
+        val hybrid = EngineConfig(model.absolutePath, Backend.HYBRID, 4, 8192, speculative = true)
+        assertFalse(hybrid.speculativeReady)
+        assertEquals(0L, MemoryBudget.speculativeBytes(hybrid))
+        assertEquals(2_000L, MemoryBudget.loadBytes(hybrid))
+    }
+
+    @Test
     fun aMissingFileWeighsNothing() {
         val config = EngineConfig("/no/such/model.gguf", Backend.GPU, 4, 8192, "/no/such/projector.gguf")
         assertEquals(0L, MemoryBudget.weightBytes(config))

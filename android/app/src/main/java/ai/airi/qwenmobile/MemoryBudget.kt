@@ -16,6 +16,25 @@ object MemoryBudget {
     const val RUNTIME_BYTES = 1_200L shl 20
 
     /**
+     * The bytes of the KV cache of the MTP draft context for each position of
+     * the context. The MTP block is one attention layer: K and V of 4 heads
+     * of 256 values in F16 is 4 KB for each position of the 4B model, and
+     * 2 KB for the 2B model.
+     */
+    const val DRAFT_KV_BYTES_PER_POSITION = 4L shl 10
+
+    /**
+     * The bytes of the recurrent state snapshots that a draft needs. The
+     * context keeps one snapshot for each drafted position (3), next to the
+     * state itself. One recurrent layer of the 4B model holds a state of
+     * 128 x 128 x 32 values and a convolution state of 8192 x 3 values in
+     * F32, which is 2.1 MB, and the model has 24 recurrent layers: 151 MB
+     * for the three snapshots. The 2B model needs 54 MB, thus this value is
+     * the ceiling of the two models.
+     */
+    const val DRAFT_STATE_BYTES = 160L shl 20
+
+    /**
      * The bytes of the weights that the backend holds in memory. The hybrid
      * backend holds one copy for the NPU and one for the GPU.
      */
@@ -25,6 +44,17 @@ object MemoryBudget {
         val copies = if (config.backend.prefillDeviceName != null) 2 else 1
         return model * copies + projector
     }
+
+    /**
+     * The bytes that speculative decoding adds: the KV cache of the MTP draft
+     * context over the whole context length, and the recurrent state
+     * snapshots of the target context. Zero without it.
+     */
+    fun speculativeBytes(config: EngineConfig): Long =
+        if (config.speculativeReady) config.nCtx * DRAFT_KV_BYTES_PER_POSITION + DRAFT_STATE_BYTES else 0L
+
+    /** The bytes that the load needs next to [RUNTIME_BYTES]. */
+    fun loadBytes(config: EngineConfig): Long = weightBytes(config) + speculativeBytes(config)
 
     /**
      * The bytes the kernel can give without swapping: MemAvailable of
@@ -54,8 +84,8 @@ object MemoryBudget {
      * loaded at the moment is released first, thus its bytes count as free.
      */
     fun fits(context: Context, config: EngineConfig): Boolean {
-        val loaded = LlamaEngine.state.value?.config?.let { weightBytes(it) } ?: 0L
-        return fits(weightBytes(config), availableBytes(context), loaded)
+        val loaded = LlamaEngine.state.value?.config?.let { loadBytes(it) } ?: 0L
+        return fits(loadBytes(config), availableBytes(context), loaded)
     }
 
     /** True when [weights] plus [RUNTIME_BYTES] fit in [available] plus the [loaded] bytes that a release frees. */
