@@ -21,14 +21,18 @@
 #include <string>
 #include <vector>
 
+#ifndef QWEN_NO_OPENCL_INFO
 #define CL_TARGET_OPENCL_VERSION 300
 #include <CL/cl.h>
+#endif
 
 #include "chat.h"
 #include "common.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "llama.h"
+#include "mtmd-helper.h"
+#include "mtmd.h"
 #include "perf_hint.h"
 
 #define TAG "QwenMobile"
@@ -43,17 +47,25 @@ constexpr int64_t kHintTargetNs = 40'000'000;
 /** The number of tokens that the presence penalty looks back on. */
 constexpr int32_t kPenaltyLastN = 256;
 
+/** The maximum number of vision tokens of one image. 1024 tokens is a 1024 x 1024 image. */
+constexpr int32_t kImageMaxTokens = 1024;
+
 struct Engine {
     llama_model *     model = nullptr;
     llama_context *   ctx   = nullptr;
     llama_sampler *   smpl  = nullptr;
     ggml_threadpool * tp    = nullptr;
+    /** The vision projector. It loads on the first image. */
+    mtmd_context *    mctx  = nullptr;
+    std::string       mmproj;
     common_chat_templates_ptr tmpls;
     std::unique_ptr<PerfHintSession> hint;
     std::mutex mutex;
 
-    /** The tokens that the model memory holds, in order. */
+    /** The tokens that the model memory holds, in order. Empty when the memory holds images. */
     std::vector<llama_token> cache;
+    /** True when the memory holds image chunks. A token prefix cannot extend such a memory. */
+    bool memory_has_media = false;
     /** Bytes of an incomplete UTF-8 sequence from the last token. */
     std::string utf8_pending;
 
@@ -175,6 +187,107 @@ int decode_one(Engine & e, llama_token token) {
     return rc;
 }
 
+/** Empty the model memory and the record of what it holds. */
+void clear_memory(Engine & e) {
+    llama_memory_clear(llama_get_memory(e.ctx), true);
+    e.cache.clear();
+    e.memory_has_media = false;
+}
+
+/** Load the vision projector. Returns false when the model has none or it does not load. */
+bool ensure_vision(Engine & e) {
+    if (e.mctx != nullptr) {
+        return true;
+    }
+    if (e.mmproj.empty()) {
+        return false;
+    }
+    mtmd_context_params mp = mtmd_context_params_default();
+    mp.use_gpu          = e.gpu_layers > 0;
+    mp.n_threads        = e.n_threads;
+    mp.print_timings    = false;
+    mp.warmup           = false;
+    mp.image_max_tokens = kImageMaxTokens;
+    const int64_t t0 = now_us();
+    e.mctx = mtmd_init_from_file(e.mmproj.c_str(), e.model, mp);
+    if (e.mctx == nullptr) {
+        LOGE("the vision projector did not load: %s", e.mmproj.c_str());
+        return false;
+    }
+    LOGI("vision projector loaded in %.0f ms: %s", (now_us() - t0) / 1000.0, e.mmproj.c_str());
+    return true;
+}
+
+/**
+ * Decode a prompt that holds images into an empty memory. The prompt has
+ * one media marker per image, in order. Returns the number of prompt
+ * tokens, or -1 with the error text set.
+ */
+int64_t prefill_with_images(JNIEnv * env, Engine & e, const std::string & prompt,
+                            const std::vector<jbyteArray> & images, std::string & error) {
+    if (!ensure_vision(e)) {
+        error = "This model has no vision projector (mmproj) next to it";
+        return -1;
+    }
+    std::vector<mtmd_bitmap *> bitmaps;
+    auto free_bitmaps = [&bitmaps] {
+        for (mtmd_bitmap * b : bitmaps) mtmd_bitmap_free(b);
+        bitmaps.clear();
+    };
+    for (jbyteArray image : images) {
+        const jsize len = env->GetArrayLength(image);
+        jbyte * bytes = env->GetByteArrayElements(image, nullptr);
+        const mtmd_helper_bitmap_wrapper w = mtmd_helper_bitmap_init_from_buf(
+            e.mctx, reinterpret_cast<const unsigned char *>(bytes), (size_t) len, false,
+            mtmd_helper_init_opt_default());
+        env->ReleaseByteArrayElements(image, bytes, JNI_ABORT);
+        if (w.bitmap == nullptr) {
+            free_bitmaps();
+            error = "The image did not decode";
+            return -1;
+        }
+        bitmaps.push_back(w.bitmap);
+    }
+
+    mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+    mtmd_input_text text;
+    text.text          = prompt.c_str();
+    text.text_len      = prompt.size();
+    text.add_special   = true;
+    text.parse_special = true;
+    const int32_t tk = mtmd_tokenize(e.mctx, chunks, &text, bitmaps.data(), bitmaps.size());
+    free_bitmaps();
+    if (tk != 0) {
+        mtmd_input_chunks_free(chunks);
+        error = tk == 1 ? "The number of images differs from the number of markers in the prompt"
+                        : "The image preprocessing failed";
+        return -1;
+    }
+    const llama_pos n_pos = mtmd_helper_get_n_pos(chunks);
+    if ((uint32_t) n_pos + 8 >= llama_n_ctx(e.ctx)) {
+        mtmd_input_chunks_free(chunks);
+        error = "The conversation is longer than the context (" + std::to_string(n_pos) + " positions)";
+        return -1;
+    }
+
+    clear_memory(e);
+    e.memory_has_media = true;
+    llama_pos new_n_past = 0;
+    const int64_t t0 = now_us();
+    const int32_t rc = mtmd_helper_eval_chunks(e.mctx, e.ctx, chunks, 0, 0, e.n_batch, true, &new_n_past);
+    if (e.hint) {
+        e.hint->report((now_us() - t0) * 1000);
+    }
+    const size_t n_tokens = mtmd_helper_get_n_tokens(chunks);
+    mtmd_input_chunks_free(chunks);
+    if (rc != 0) {
+        clear_memory(e);
+        error = "The prompt with images did not decode, code " + std::to_string(rc);
+        return -1;
+    }
+    return (int64_t) n_tokens;
+}
+
 /** Mean and sample standard deviation of the values. */
 std::pair<double, double> mean_std(const std::vector<double> & v) {
     if (v.empty()) {
@@ -209,11 +322,21 @@ std::string jstring_to_std(JNIEnv * env, jstring s) {
 
 extern "C" {
 
+/**
+ * Initialize the backends. With a library directory, the dynamic backends
+ * load from it, and the Hexagon backend finds the DSP library there through
+ * ADSP_LIBRARY_PATH.
+ */
 JNIEXPORT void JNICALL
-Java_ai_airi_qwenmobile_LlamaNative_init(JNIEnv *, jclass) {
+Java_ai_airi_qwenmobile_LlamaNative_init(JNIEnv * env, jclass, jstring jlibdir) {
     llama_log_set(log_to_logcat, nullptr);
+    const std::string libdir = jstring_to_std(env, jlibdir);
+    if (!libdir.empty()) {
+        setenv("ADSP_LIBRARY_PATH", libdir.c_str(), 1);
+        ggml_backend_load_all_from_path(libdir.c_str());
+    }
     llama_backend_init();
-    LOGI("llama.cpp initialized, %zu backend devices", ggml_backend_dev_count());
+    LOGI("llama.cpp initialized, %zu backend devices, libdir %s", ggml_backend_dev_count(), libdir.c_str());
 }
 
 /**
@@ -230,6 +353,9 @@ Java_ai_airi_qwenmobile_LlamaNative_setWorkingDirectory(JNIEnv * env, jclass, js
 
 /** The driver version and the extensions of the first OpenCL GPU, or an empty string. */
 static std::string opencl_device_info() {
+#ifdef QWEN_NO_OPENCL_INFO
+    return {};
+#else
     cl_platform_id platform = nullptr;
     cl_device_id   dev      = nullptr;
     if (clGetPlatformIDs(1, &platform, nullptr) != CL_SUCCESS ||
@@ -255,6 +381,7 @@ static std::string opencl_device_info() {
                       std::to_string(lmem >> 10) + " KB, cache " + std::to_string(cache >> 10) + " KB\n";
     out += "extensions: " + str(CL_DEVICE_EXTENSIONS) + "\n";
     return out;
+#endif
 }
 
 JNIEXPORT jstring JNICALL
@@ -288,15 +415,28 @@ Java_ai_airi_qwenmobile_LlamaNative_devices(JNIEnv * env, jclass) {
 }
 
 JNIEXPORT jlong JNICALL
-Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath,
-                                          jint gpu_layers, jint n_threads, jint n_ctx) {
-    const std::string path = jstring_to_std(env, jpath);
+Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, jstring jmmproj,
+                                          jstring jdevice, jint gpu_layers, jint n_threads, jint n_ctx) {
+    const std::string path   = jstring_to_std(env, jpath);
+    const std::string device = jstring_to_std(env, jdevice);
     auto e = std::make_unique<Engine>();
     e->n_threads  = std::max(1, (int) n_threads);
     e->gpu_layers = gpu_layers;
+    e->mmproj     = jstring_to_std(env, jmmproj);
 
+    // The device by its ggml name: GPUOpenCL for the Adreno, HTP0 for the Hexagon NPU.
+    std::vector<ggml_backend_dev_t> devices;
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = gpu_layers;
+    if (!device.empty()) {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_name(device.c_str());
+        if (dev == nullptr) {
+            throw_java(env, "The device is not available: " + device);
+            return 0;
+        }
+        devices = {dev, nullptr};
+        mp.devices = devices.data();
+    }
     e->model = llama_model_load_from_file(path.c_str(), mp);
     if (e->model == nullptr) {
         throw_java(env, "The model did not load: " + path);
@@ -335,8 +475,9 @@ Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath,
     e->tmpls = common_chat_templates_init(e->model, "");
     rebuild_sampler(*e, false);
 
-    LOGI("model loaded: %s, gpu_layers=%d, threads=%d, n_ctx=%u",
-         path.c_str(), gpu_layers, e->n_threads, llama_n_ctx(e->ctx));
+    LOGI("model loaded: %s, device=%s, gpu_layers=%d, threads=%d, n_ctx=%u, mmproj=%s",
+         path.c_str(), device.empty() ? "cpu" : device.c_str(), gpu_layers, e->n_threads, llama_n_ctx(e->ctx),
+         e->mmproj.empty() ? "none" : e->mmproj.c_str());
     return reinterpret_cast<jlong>(e.release());
 }
 
@@ -350,6 +491,7 @@ Java_ai_airi_qwenmobile_LlamaNative_free(JNIEnv *, jclass, jlong handle) {
         std::lock_guard<std::mutex> lock(e->mutex);
         e->hint.reset();
         if (e->smpl) llama_sampler_free(e->smpl);
+        if (e->mctx) mtmd_free(e->mctx);
         if (e->ctx) {
             llama_detach_threadpool(e->ctx);
             llama_free(e->ctx);
@@ -366,41 +508,45 @@ Java_ai_airi_qwenmobile_LlamaNative_modelInfo(JNIEnv * env, jclass, jlong handle
     char desc[256];
     llama_model_desc(e->model, desc, sizeof(desc));
     char line[512];
-    snprintf(line, sizeof(line), "%s, %.2f GiB, %.2f B params, n_ctx %u, gpu layers %d, threads %d, ADPF %s",
+    snprintf(line, sizeof(line), "%s, %.2f GiB, %.2f B params, n_ctx %u, gpu layers %d, threads %d, ADPF %s, vision %s",
              desc, llama_model_size(e->model) / 1073741824.0, llama_model_n_params(e->model) / 1e9,
-             llama_n_ctx(e->ctx), e->gpu_layers, e->n_threads, e->hint && e->hint->ok() ? "on" : "off");
+             llama_n_ctx(e->ctx), e->gpu_layers, e->n_threads, e->hint && e->hint->ok() ? "on" : "off",
+             e->mmproj.empty() ? "none" : (e->mctx ? "loaded" : "ready"));
     return env->NewStringUTF(line);
 }
 
 JNIEXPORT jint JNICALL
 Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass, jlong handle,
                                                jobjectArray roles, jobjectArray contents,
-                                               jboolean thinking) {
+                                               jobjectArray images, jboolean thinking) {
     Engine * e = engine_of(handle);
     std::lock_guard<std::mutex> lock(e->mutex);
 
+    // A message with an image starts with the media marker. mtmd replaces
+    // the marker with the vision tokens of that image, in message order.
     common_chat_templates_inputs inputs;
+    std::vector<jbyteArray> image_refs;
     const jsize n = env->GetArrayLength(roles);
     for (jsize i = 0; i < n; ++i) {
         common_chat_msg msg;
         msg.role    = jstring_to_std(env, (jstring) env->GetObjectArrayElement(roles, i));
         msg.content = jstring_to_std(env, (jstring) env->GetObjectArrayElement(contents, i));
+        jbyteArray image = images ? (jbyteArray) env->GetObjectArrayElement(images, i) : nullptr;
+        if (image != nullptr) {
+            msg.content = std::string(mtmd_default_marker()) + "\n" + msg.content;
+            image_refs.push_back(image);
+        }
         inputs.messages.push_back(std::move(msg));
     }
     inputs.add_generation_prompt = true;
     inputs.use_jinja             = true;
     inputs.enable_thinking       = thinking;
 
-    std::vector<llama_token> tokens;
+    std::string prompt;
     try {
-        const common_chat_params params = common_chat_templates_apply(e->tmpls.get(), inputs);
-        tokens = common_tokenize(llama_model_get_vocab(e->model), params.prompt, true, true);
+        prompt = common_chat_templates_apply(e->tmpls.get(), inputs).prompt;
     } catch (const std::exception & ex) {
         throw_java(env, std::string("The chat template failed: ") + ex.what());
-        return -1;
-    }
-    if (tokens.size() + 8 >= llama_n_ctx(e->ctx)) {
-        throw_java(env, "The conversation is longer than the context (" + std::to_string(tokens.size()) + " tokens)");
         return -1;
     }
 
@@ -409,8 +555,30 @@ Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass, jlong handle
     e->gen_tokens = 0;
     e->gen_us     = 0;
 
+    if (!image_refs.empty()) {
+        std::string error;
+        const int64_t t0 = now_us();
+        const int64_t n_tokens = prefill_with_images(env, *e, prompt, image_refs, error);
+        if (n_tokens < 0) {
+            throw_java(env, error);
+            return -1;
+        }
+        e->prefill_us     = now_us() - t0;
+        e->prefill_tokens = n_tokens;
+        return (jint) n_tokens;
+    }
+
+    const std::vector<llama_token> tokens = common_tokenize(llama_model_get_vocab(e->model), prompt, true, true);
+    if (tokens.size() + 8 >= llama_n_ctx(e->ctx)) {
+        throw_java(env, "The conversation is longer than the context (" + std::to_string(tokens.size()) + " tokens)");
+        return -1;
+    }
+
     // The memory keeps the previous turns when the new prompt extends them.
     // A recurrent state cannot roll back, thus any other case starts again.
+    if (e->memory_has_media) {
+        clear_memory(*e);
+    }
     size_t common = 0;
     while (common < e->cache.size() && common < tokens.size() && e->cache[common] == tokens[common]) {
         ++common;
@@ -419,15 +587,13 @@ Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass, jlong handle
     if (common == e->cache.size() && common < tokens.size()) {
         start = common;
     } else {
-        llama_memory_clear(llama_get_memory(e->ctx), true);
-        e->cache.clear();
+        clear_memory(*e);
     }
 
     const int64_t t0 = now_us();
     const int rc = decode_tokens(*e, tokens.data() + start, (int) (tokens.size() - start));
     if (rc != 0) {
-        llama_memory_clear(llama_get_memory(e->ctx), true);
-        e->cache.clear();
+        clear_memory(*e);
         throw_java(env, "llama_decode failed on the prompt with code " + std::to_string(rc));
         return -1;
     }
@@ -472,9 +638,10 @@ Java_ai_airi_qwenmobile_LlamaNative_stats(JNIEnv * env, jclass, jlong handle) {
     char line[256];
     const double pp = e->prefill_us > 0 ? e->prefill_tokens * 1e6 / e->prefill_us : 0.0;
     const double tg = e->gen_us > 0 ? e->gen_tokens * 1e6 / e->gen_us : 0.0;
-    snprintf(line, sizeof(line), "prefill %lld tok in %.0f ms (%.1f t/s), generate %lld tok (%.1f t/s), memory %zu tok",
+    const llama_pos n_past = llama_memory_seq_pos_max(llama_get_memory(e->ctx), 0) + 1;
+    snprintf(line, sizeof(line), "prefill %lld tok in %.0f ms (%.1f t/s), generate %lld tok (%.1f t/s), memory %d pos",
              (long long) e->prefill_tokens, e->prefill_us / 1000.0, pp,
-             (long long) e->gen_tokens, tg, e->cache.size());
+             (long long) e->gen_tokens, tg, (int) n_past);
     return env->NewStringUTF(line);
 }
 
@@ -482,8 +649,7 @@ JNIEXPORT void JNICALL
 Java_ai_airi_qwenmobile_LlamaNative_resetChat(JNIEnv *, jclass, jlong handle) {
     Engine * e = engine_of(handle);
     std::lock_guard<std::mutex> lock(e->mutex);
-    llama_memory_clear(llama_get_memory(e->ctx), true);
-    e->cache.clear();
+    clear_memory(*e);
     e->utf8_pending.clear();
     e->prefill_tokens = e->prefill_us = e->gen_tokens = e->gen_us = 0;
 }
@@ -537,8 +703,7 @@ Java_ai_airi_qwenmobile_LlamaNative_bench(JNIEnv * env, jclass, jlong handle,
             tg_tps.push_back(tg * 1e6 / dt);
         }
     }
-    llama_memory_clear(mem, true);
-    e->cache.clear();
+    clear_memory(*e);
 
     char desc[128];
     llama_model_desc(e->model, desc, sizeof(desc));

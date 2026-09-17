@@ -56,10 +56,16 @@ class STELinear(nn.Module):
         super().__init__()
         self.rows, self.cols = weight.shape
         self.weight = nn.Parameter(weight.detach().clone().to(torch.float32))
-        self.log_d = nn.Parameter(d.detach().to(torch.float32).clamp_min(1e-12).log())
+        # A Q4_0 scale carries the sign of the signed maximum. The sign stays, the magnitude learns.
+        d = d.detach().to(torch.float32)
+        self.sign = torch.where(d < 0, -torch.ones_like(d), torch.ones_like(d))
+        self.log_d = nn.Parameter(d.abs().clamp_min(1e-12).log())
         levels = grid.levels.detach().clone()
         self.levels = nn.Parameter(levels) if learn_levels else levels
         self.grid = grid
+
+    def scale(self) -> torch.Tensor:
+        return self.sign * self.log_d.exp()
 
     def current_grid(self) -> Grid:
         """The grid with the current levels, integer for a codebook."""
@@ -69,7 +75,7 @@ class STELinear(nn.Module):
         return _grid_like(self.grid, levels)
 
     def quantized_weight(self) -> torch.Tensor:
-        d = self.log_d.exp()
+        d = self.scale()
         blocks = self.weight.view(self.rows, -1, BLOCK)
         idx = _grid_like(self.grid, self.levels.detach()).round(blocks.detach() / d.detach()[..., None])
         w_q = d[..., None] * self.levels[idx]
@@ -83,7 +89,7 @@ class STELinear(nn.Module):
     def finalize(self) -> tuple[Grid, torch.Tensor, torch.Tensor]:
         """The final grid, indices and F16 scales, with integer levels for a codebook."""
         grid = self.current_grid()
-        d = self.log_d.exp().to(torch.float16).to(torch.float32)
+        d = self.scale().to(torch.float16).to(torch.float32)
         idx = grid.round(self.weight.view(self.rows, -1, BLOCK) / d[..., None]).view(self.rows, self.cols)
         return grid, idx.to(torch.int8), d.to(torch.float16)
 

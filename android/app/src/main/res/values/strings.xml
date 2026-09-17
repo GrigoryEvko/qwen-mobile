@@ -9,11 +9,15 @@
     <string name="stop">Stop</string>
     <string name="cpu">CPU</string>
     <string name="gpu">GPU</string>
+    <string name="npu">NPU</string>
     <string name="threads">Threads</string>
     <string name="thinking">Thinking</string>
     <string name="message_hint">Message</string>
     <string name="run_benchmark">Run benchmark</string>
     <string name="clear">Clear</string>
     <string name="grant_storage">Grant all-files access</string>
+    <string name="attach">📷</string>
+    <string name="attached_image">Attached image</string>
+    <string name="describe_image">Describe this image.</string>
     <string name="no_model">No model. Put a .gguf file in /sdcard/qwen/models and select Load.</string>
 </resources>

@@ -1,21 +1,27 @@
 package ai.airi.qwenmobile
 
+import android.graphics.BitmapFactory
+import android.net.Uri
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.ArrayAdapter
 import android.widget.Toast
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import ai.airi.qwenmobile.databinding.FragmentChatBinding
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 
-/** The chat screen: model selection, backend, and the conversation. */
+/** The chat screen: model selection, backend, the conversation, and the image attachment. */
 class ChatFragment : Fragment() {
     private var binding: FragmentChatBinding? = null
     private val messages = ArrayList<ChatMessage>()
@@ -23,19 +29,42 @@ class ChatFragment : Fragment() {
     private var models: List<File> = emptyList()
     private var generation: Job? = null
 
+    /** The encoded image that goes with the next message. */
+    private var pendingImage: ByteArray? = null
+
+    /** An image shared to the app. The fragment reads it when it resumes. */
+    var sharedUri: Uri? = null
+
+    private val pickImage = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        if (uri != null) {
+            attachImage(uri)
+        }
+    }
+
     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
         val b = FragmentChatBinding.inflate(inflater, container, false)
         binding = b
         b.messages.layoutManager = LinearLayoutManager(requireContext()).apply { stackFromEnd = true }
         b.messages.adapter = adapter
-        b.backendGroup.check(if (LlamaEngine.hasGpu) b.gpuButton.id else b.cpuButton.id)
-        b.gpuButton.isEnabled = LlamaEngine.hasGpu
+        b.gpuButton.isEnabled = LlamaEngine.has(Backend.GPU)
+        b.npuButton.isEnabled = LlamaEngine.has(Backend.NPU)
+        b.backendGroup.check(
+            when {
+                LlamaEngine.has(Backend.NPU) -> b.npuButton.id
+                LlamaEngine.has(Backend.GPU) -> b.gpuButton.id
+                else -> b.cpuButton.id
+            },
+        )
 
         b.loadButton.setOnClickListener { onLoadOrUnload() }
         b.sendButton.setOnClickListener { onSend() }
         b.stopButton.setOnClickListener { generation?.cancel() }
         b.grantButton.setOnClickListener { startActivity(ModelFiles.allFilesAccessIntent(requireContext())) }
         b.clearButton.setOnClickListener { onClearChat() }
+        b.attachButton.setOnClickListener {
+            pickImage.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+        }
+        b.attachPreview.setOnClickListener { setPendingImage(null) }
 
         viewLifecycleOwner.lifecycleScope.launch {
             LlamaEngine.state.collect { loaded ->
@@ -50,6 +79,34 @@ class ChatFragment : Fragment() {
     override fun onResume() {
         super.onResume()
         refreshModels()
+        sharedUri?.let { uri ->
+            sharedUri = null
+            attachImage(uri)
+        }
+    }
+
+    /** Read the image behind the URI and hold it for the next message. */
+    fun attachImage(uri: Uri) {
+        viewLifecycleOwner.lifecycleScope.launch {
+            try {
+                val resolver = requireContext().contentResolver
+                setPendingImage(withContext(Dispatchers.IO) { ImageBytes.load(resolver, uri) })
+            } catch (e: Exception) {
+                toast("The image did not open: ${e.message}")
+            }
+        }
+    }
+
+    private fun setPendingImage(bytes: ByteArray?) {
+        val b = binding ?: return
+        pendingImage = bytes
+        if (bytes == null) {
+            b.attachPreview.setImageDrawable(null)
+            b.attachPreview.visibility = View.GONE
+        } else {
+            b.attachPreview.setImageBitmap(BitmapFactory.decodeByteArray(bytes, 0, bytes.size))
+            b.attachPreview.visibility = View.VISIBLE
+        }
     }
 
     override fun onDestroyView() {
@@ -78,13 +135,19 @@ class ChatFragment : Fragment() {
             toast(getString(R.string.no_model))
             return
         }
+        val backend = when (b.backendGroup.checkedButtonId) {
+            b.npuButton.id -> Backend.NPU
+            b.gpuButton.id -> Backend.GPU
+            else -> Backend.CPU
+        }
         val config = EngineConfig(
             path = file.absolutePath,
-            gpu = b.backendGroup.checkedButtonId == b.gpuButton.id,
+            backend = backend,
             threads = b.threadsInput.text.toString().toIntOrNull()?.coerceIn(1, 16) ?: 4,
+            mmproj = ModelFiles.mmprojFor(file)?.absolutePath,
         )
         b.loadButton.isEnabled = false
-        b.statusText.text = "Loading ${file.name} on ${if (config.gpu) "GPU" else "CPU"}..."
+        b.statusText.text = "Loading ${file.name} on ${backend.label}..."
         viewLifecycleOwner.lifecycleScope.launch {
             try {
                 LlamaEngine.load(config)
@@ -101,12 +164,15 @@ class ChatFragment : Fragment() {
 
     private fun onSend() {
         val b = binding ?: return
-        val text = b.input.text.toString().trim()
-        if (text.isEmpty() || generation?.isActive == true) {
+        val typed = b.input.text.toString().trim()
+        val image = pendingImage
+        if ((typed.isEmpty() && image == null) || generation?.isActive == true) {
             return
         }
+        val text = typed.ifEmpty { getString(R.string.describe_image) }
         b.input.text?.clear()
-        messages += ChatMessage("user", text)
+        setPendingImage(null)
+        messages += ChatMessage("user", text, image)
         val history = messages.toList()
         val answer = ChatMessage("assistant", "")
         messages += answer

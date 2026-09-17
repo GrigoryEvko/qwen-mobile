@@ -1,5 +1,7 @@
 package ai.airi.qwenmobile
 
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -9,15 +11,29 @@ import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
 import java.util.concurrent.Executors
 
-/** One message of the conversation. The role is "user", "assistant", or "system". */
-data class ChatMessage(val role: String, var content: String)
+/**
+ * One message of the conversation. The role is "user", "assistant", or "system".
+ * An image is the encoded file (JPEG) that goes to the vision projector.
+ */
+class ChatMessage(val role: String, var content: String, val image: ByteArray? = null) {
+    /** The decoded image for the message list, decoded one time. */
+    val bitmap: Bitmap? by lazy { image?.let { BitmapFactory.decodeByteArray(it, 0, it.size) } }
+}
+
+/** The compute unit of the model. The ggml device name is null for the CPU. */
+enum class Backend(val deviceName: String?, val label: String) {
+    CPU(null, "CPU"),
+    GPU("GPUOpenCL", "GPU"),
+    NPU("HTP0", "NPU"),
+}
 
 /** The settings of one loaded model. */
 data class EngineConfig(
     val path: String,
-    val gpu: Boolean,
+    val backend: Backend,
     val threads: Int,
     val nCtx: Int = 8192,
+    val mmproj: String? = null,
 )
 
 /** A loaded model with the description line from the native side. */
@@ -45,15 +61,18 @@ object LlamaEngine {
     /** The ggml backend devices, one per line. */
     val devices: String by lazy { LlamaNative.devices() }
 
-    /** Tell if a GPU backend is compiled in and visible. */
-    val hasGpu: Boolean by lazy { devices.contains("(GPU)") }
+    /** Tell if the device of a backend is visible. */
+    fun has(backend: Backend): Boolean =
+        backend.deviceName == null || devices.lines().any { it.startsWith(backend.deviceName + ":") }
 
     /** Load a model. A model that is loaded already is released first. */
     suspend fun load(config: EngineConfig): LoadedModel = withContext(dispatcher) {
         releaseLocked()
         handle = LlamaNative.load(
             config.path,
-            if (config.gpu) 999 else 0,
+            config.mmproj,
+            config.backend.deviceName,
+            if (config.backend == Backend.CPU) 0 else 999,
             config.threads,
             config.nCtx,
         )
@@ -78,6 +97,7 @@ object LlamaEngine {
             h,
             messages.map { it.role }.toTypedArray(),
             messages.map { it.content }.toTypedArray(),
+            messages.map { it.image }.toTypedArray(),
             thinking,
         )
         var count = 0

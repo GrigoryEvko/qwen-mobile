@@ -29,6 +29,9 @@ set(LLAMA_BUILD_SERVER              OFF CACHE BOOL   "" FORCE)
 set(LLAMA_BUILD_APP                 OFF CACHE BOOL   "" FORCE)
 set(LLAMA_OPENSSL                   OFF CACHE BOOL   "" FORCE)
 set(LLAMA_ALL_WARNINGS              OFF CACHE BOOL   "" FORCE)
+# The vision projector runs through libmtmd. Video needs ffmpeg, thus it is off.
+set(LLAMA_BUILD_MTMD                ON  CACHE BOOL   "" FORCE)
+set(MTMD_VIDEO                      OFF CACHE BOOL   "" FORCE)
 
 add_subdirectory(${LLAMA_CPP_DIR} llama.cpp EXCLUDE_FROM_ALL)
 
@@ -40,11 +43,13 @@ add_library(qwenmobile SHARED
     perf_hint.cpp)
 
 target_include_directories(qwenmobile PRIVATE
-    ${LLAMA_CPP_DIR}/common)
+    ${LLAMA_CPP_DIR}/common
+    ${LLAMA_CPP_DIR}/tools/mtmd)
 
 target_link_libraries(qwenmobile PRIVATE
     llama
     llama-common
+    mtmd
     OpenCL::OpenCL
     android
     log)

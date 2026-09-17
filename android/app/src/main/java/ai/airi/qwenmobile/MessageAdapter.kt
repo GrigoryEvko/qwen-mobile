@@ -2,6 +2,7 @@ package ai.airi.qwenmobile
 
 import android.view.Gravity
 import android.view.LayoutInflater
+import android.view.View
 import android.view.ViewGroup
 import android.widget.LinearLayout
 import androidx.recyclerview.widget.RecyclerView
@@ -25,6 +26,9 @@ class MessageAdapter(private val messages: List<ChatMessage>) :
         val b = holder.binding
         b.roleText.text = message.role
         b.contentText.text = message.content
+        val bitmap = message.bitmap
+        b.imageView.setImageBitmap(bitmap)
+        b.imageView.visibility = if (bitmap == null) View.GONE else View.VISIBLE
         b.row.gravity = if (isUser) Gravity.END else Gravity.START
         val params = b.card.layoutParams as LinearLayout.LayoutParams
         params.gravity = if (isUser) Gravity.END else Gravity.START

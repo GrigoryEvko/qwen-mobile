@@ -5,13 +5,27 @@ package ai.airi.qwenmobile
  * must come from one thread. [LlamaEngine] gives that thread.
  */
 object LlamaNative {
+    private var initialized = false
+
     init {
         System.loadLibrary("qwenmobile")
-        init()
     }
 
-    /** Initialize the llama.cpp backends and route the log to logcat. */
-    @JvmStatic external fun init()
+    /**
+     * Initialize the backends one time. [libDir] is the native library
+     * directory of the app: the dynamic backends load from it and the DSP
+     * library of the NPU is found there.
+     */
+    @Synchronized
+    fun initialize(libDir: String) {
+        if (!initialized) {
+            init(libDir)
+            initialized = true
+        }
+    }
+
+    /** Initialize the llama.cpp backends from the library directory and route the log to logcat. */
+    @JvmStatic private external fun init(libDir: String)
 
     /** Make the directory current, thus a profiling build writes its CSV there. */
     @JvmStatic external fun setWorkingDirectory(path: String)
@@ -23,13 +37,22 @@ object LlamaNative {
      * Load a GGUF model and make its context.
      *
      * @param path       The GGUF file
-     * @param gpuLayers  The number of layers on the GPU, 0 for the CPU only
+     * @param mmproj     The vision projector GGUF, or null for a text-only engine
+     * @param device     The ggml device name (GPUOpenCL, HTP0), or null for the CPU
+     * @param gpuLayers  The number of layers on the device, 0 for the CPU only
      * @param threads    The number of CPU threads
      * @param nCtx       The context length in tokens
      * @return The engine handle
-     * @throws RuntimeException If the model or the context does not load
+     * @throws RuntimeException If the device, the model or the context does not load
      */
-    @JvmStatic external fun load(path: String, gpuLayers: Int, threads: Int, nCtx: Int): Long
+    @JvmStatic external fun load(
+        path: String,
+        mmproj: String?,
+        device: String?,
+        gpuLayers: Int,
+        threads: Int,
+        nCtx: Int,
+    ): Long
 
     /** Release the engine. The handle is not valid after this call. */
     @JvmStatic external fun free(handle: Long)
@@ -40,13 +63,15 @@ object LlamaNative {
     /**
      * Apply the chat template and decode the prompt.
      *
+     * @param images  One entry per message: the encoded image bytes (JPEG, PNG) or null
      * @return The number of prompt tokens that this call decoded
-     * @throws RuntimeException If the template or the decode fails
+     * @throws RuntimeException If the template, an image, or the decode fails
      */
     @JvmStatic external fun chatStart(
         handle: Long,
         roles: Array<String>,
         contents: Array<String>,
+        images: Array<ByteArray?>,
         thinking: Boolean,
     ): Int
 

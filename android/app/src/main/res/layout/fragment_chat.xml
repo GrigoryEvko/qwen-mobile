@@ -52,6 +52,13 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="@string/gpu" />
+
+            <Button
+                android:id="@+id/npuButton"
+                style="?attr/materialButtonOutlinedStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/npu" />
         </com.google.android.material.button.MaterialButtonToggleGroup>
 
         <TextView
@@ -105,6 +112,23 @@
         android:layout_height="wrap_content"
         android:gravity="bottom"
         android:orientation="horizontal">
+
+        <ImageView
+            android:id="@+id/attachPreview"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_marginEnd="4dp"
+            android:contentDescription="@string/attached_image"
+            android:scaleType="centerCrop"
+            android:visibility="gone" />
+
+        <Button
+            android:id="@+id/attachButton"
+            style="@style/Widget.Material3.Button.TextButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:minWidth="0dp"
+            android:text="@string/attach" />
 
         <EditText
             android:id="@+id/input"
