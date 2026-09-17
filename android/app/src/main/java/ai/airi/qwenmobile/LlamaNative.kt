@@ -63,7 +63,10 @@ object LlamaNative {
     /**
      * Apply the chat template and decode the prompt.
      *
-     * @param images  One entry per message: the encoded image bytes (JPEG, PNG) or null
+     * @param images       One entry per message: the encoded image bytes (JPEG, PNG) or null
+     * @param thinking     Enable the thinking mode of the chat template
+     * @param temperature  The sampling temperature, 0 for greedy
+     * @param topP         The nucleus probability mass
      * @return The number of prompt tokens that this call decoded
      * @throws RuntimeException If the template, an image, or the decode fails
      */
@@ -73,6 +76,8 @@ object LlamaNative {
         contents: Array<String>,
         images: Array<ByteArray?>,
         thinking: Boolean,
+        temperature: Float,
+        topP: Float,
     ): Int
 
     /**

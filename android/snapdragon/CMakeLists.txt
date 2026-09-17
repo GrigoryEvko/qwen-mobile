@@ -14,7 +14,8 @@ if(NOT EXISTS "${LLAMA_BUILD_DIR}/bin/libllama.so")
     message(FATAL_ERROR "LLAMA_BUILD_DIR has no bin/libllama.so: '${LLAMA_BUILD_DIR}'")
 endif()
 
-foreach(lib llama ggml ggml-base mtmd llama-common)
+# The thread pool functions live in the CPU backend library.
+foreach(lib llama ggml ggml-base ggml-cpu mtmd llama-common)
     add_library(${lib} SHARED IMPORTED)
     set_target_properties(${lib} PROPERTIES IMPORTED_LOCATION "${LLAMA_BUILD_DIR}/bin/lib${lib}.so")
 endforeach()
@@ -40,5 +41,6 @@ target_link_libraries(qwenmobile PRIVATE
     mtmd
     ggml
     ggml-base
+    ggml-cpu
     android
     log)

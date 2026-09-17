@@ -9,3 +9,6 @@ quant-out/
 data/
 eval/
 __pycache__/
+android/snapdragon/jniLibs/
+android/snapdragon/build/
+android/snapdragon/*.apk

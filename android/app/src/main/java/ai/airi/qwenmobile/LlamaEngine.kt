@@ -20,11 +20,19 @@ class ChatMessage(val role: String, var content: String, val image: ByteArray? =
     val bitmap: Bitmap? by lazy { image?.let { BitmapFactory.decodeByteArray(it, 0, it.size) } }
 }
 
-/** The compute unit of the model. The ggml device name is null for the CPU. */
+/**
+ * The compute unit of the model. The ggml device name is null for the CPU.
+ * The GPU is the default, the NPU is opt-in: its single-token decode is experimental.
+ */
 enum class Backend(val deviceName: String?, val label: String) {
     CPU(null, "CPU"),
     GPU("GPUOpenCL", "GPU"),
-    NPU("HTP0", "NPU"),
+    NPU("HTP0", "NPU");
+
+    companion object {
+        /** The backend of a fresh install. */
+        val DEFAULT = GPU
+    }
 }
 
 /** The settings of one loaded model. */
@@ -48,7 +56,11 @@ object LlamaEngine {
     private const val MAX_ANSWER_TOKENS = 4096
 
     private val dispatcher = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "llama-engine")
+        // The engine thread runs at the background priority, thus the display thread stays smooth.
+        Thread({
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+            runnable.run()
+        }, "llama-engine")
     }.asCoroutineDispatcher()
 
     private var handle = 0L
@@ -65,15 +77,23 @@ object LlamaEngine {
     fun has(backend: Backend): Boolean =
         backend.deviceName == null || devices.lines().any { it.startsWith(backend.deviceName + ":") }
 
-    /** Load a model. A model that is loaded already is released first. */
+    /**
+     * Load a model. A model that is loaded already is released first. With an
+     * accelerator the CPU only feeds it, thus the threads stay at half the cores.
+     */
     suspend fun load(config: EngineConfig): LoadedModel = withContext(dispatcher) {
         releaseLocked()
+        val threads = if (config.backend == Backend.CPU) {
+            config.threads
+        } else {
+            config.threads.coerceAtMost(maxOf(1, Runtime.getRuntime().availableProcessors() / 2))
+        }
         handle = LlamaNative.load(
             config.path,
             config.mmproj,
             config.backend.deviceName,
             if (config.backend == Backend.CPU) 0 else 999,
-            config.threads,
+            threads,
             config.nCtx,
         )
         val loaded = LoadedModel(config, LlamaNative.modelInfo(handle))
@@ -91,7 +111,12 @@ object LlamaEngine {
      * piece of the answer. The flow stops at the end token, at the token
      * limit, or when the collector cancels.
      */
-    fun generate(messages: List<ChatMessage>, thinking: Boolean): Flow<String> = flow {
+    fun generate(
+        messages: List<ChatMessage>,
+        thinking: Boolean,
+        temperature: Float = 0.7f,
+        topP: Float = 0.8f,
+    ): Flow<String> = flow {
         val h = requireHandle()
         LlamaNative.chatStart(
             h,
@@ -99,6 +124,8 @@ object LlamaEngine {
             messages.map { it.content }.toTypedArray(),
             messages.map { it.image }.toTypedArray(),
             thinking,
+            temperature,
+            topP,
         )
         var count = 0
         while (count < MAX_ANSWER_TOKENS) {

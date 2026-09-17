@@ -9,6 +9,7 @@
 #include <android/log.h>
 #include <dirent.h>
 #include <jni.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -50,14 +51,25 @@ constexpr int32_t kPenaltyLastN = 256;
 /** The maximum number of vision tokens of one image. 1024 tokens is a 1024 x 1024 image. */
 constexpr int32_t kImageMaxTokens = 1024;
 
+/** The nice value of the compute threads. The display thread keeps its priority. */
+constexpr int kComputeNice = 10;
+
+/** Give a thread the compute priority. tid 0 is the calling thread. */
+void lower_priority(int32_t tid) {
+    if (setpriority(PRIO_PROCESS, tid, kComputeNice) != 0) {
+        LOGE("setpriority for thread %d failed", tid);
+    }
+}
+
 struct Engine {
     llama_model *     model = nullptr;
     llama_context *   ctx   = nullptr;
     llama_sampler *   smpl  = nullptr;
     ggml_threadpool * tp    = nullptr;
-    /** The vision projector. It loads on the first image. */
+    /** The vision projector. It loads on the first image, on the device of the model. */
     mtmd_context *    mctx  = nullptr;
     std::string       mmproj;
+    ggml_backend_dev_t device = nullptr;
     common_chat_templates_ptr tmpls;
     std::unique_ptr<PerfHintSession> hint;
     std::mutex mutex;
@@ -139,22 +151,27 @@ size_t utf8_complete_prefix(const std::string & s) {
     return i;
 }
 
-/** Build the sampler chain with the Qwen3.5 settings for the mode. */
-void rebuild_sampler(Engine & e, bool thinking) {
+/**
+ * Build the sampler chain. Qwen3.5 recommends temperature 1.0 and top-p 0.95
+ * with thinking, 0.7 and 0.8 without. A temperature of 0 is greedy.
+ */
+void rebuild_sampler(Engine & e, bool thinking, float temp, float top_p) {
     if (e.smpl != nullptr) {
         llama_sampler_free(e.smpl);
     }
     auto params = llama_sampler_chain_default_params();
     params.no_perf = true;
     e.smpl = llama_sampler_chain_init(params);
-    const float temp  = thinking ? 1.0f  : 0.7f;
-    const float top_p = thinking ? 0.95f : 0.8f;
     const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(e.model));
     llama_sampler_chain_add(e.smpl, llama_sampler_init_penalties(n_vocab, kPenaltyLastN, 1.0f, 0.0f, 1.5f));
-    llama_sampler_chain_add(e.smpl, llama_sampler_init_top_k(20));
-    llama_sampler_chain_add(e.smpl, llama_sampler_init_top_p(top_p, 1));
-    llama_sampler_chain_add(e.smpl, llama_sampler_init_temp(temp));
-    llama_sampler_chain_add(e.smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+    if (temp <= 0.0f) {
+        llama_sampler_chain_add(e.smpl, llama_sampler_init_greedy());
+    } else {
+        llama_sampler_chain_add(e.smpl, llama_sampler_init_top_k(20));
+        llama_sampler_chain_add(e.smpl, llama_sampler_init_top_p(std::min(std::max(top_p, 0.05f), 1.0f), 1));
+        llama_sampler_chain_add(e.smpl, llama_sampler_init_temp(temp));
+        llama_sampler_chain_add(e.smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+    }
     e.thinking = thinking;
 }
 
@@ -203,7 +220,8 @@ bool ensure_vision(Engine & e) {
         return false;
     }
     mtmd_context_params mp = mtmd_context_params_default();
-    mp.use_gpu          = e.gpu_layers > 0;
+    mp.use_gpu          = e.device != nullptr;
+    mp.device           = e.device;
     mp.n_threads        = e.n_threads;
     mp.print_timings    = false;
     mp.warmup           = false;
@@ -285,6 +303,8 @@ int64_t prefill_with_images(JNIEnv * env, Engine & e, const std::string & prompt
         error = "The prompt with images did not decode, code " + std::to_string(rc);
         return -1;
     }
+    LOGI("image prefill: %zu images, %zu tokens, %d positions, %.0f ms on %s", images.size(), n_tokens, (int) new_n_past,
+         (now_us() - t0) / 1000.0, e.device ? ggml_backend_dev_name(e.device) : "CPU");
     return (int64_t) n_tokens;
 }
 
@@ -330,6 +350,9 @@ extern "C" {
 JNIEXPORT void JNICALL
 Java_ai_airi_qwenmobile_LlamaNative_init(JNIEnv * env, jclass, jstring jlibdir) {
     llama_log_set(log_to_logcat, nullptr);
+    // The op fusion of the Hexagon backend breaks the single-token decode
+    // (correct prefill, garbage after the first tokens). It stays off.
+    setenv("GGML_HEXAGON_OPFUSION", "0", 0);
     const std::string libdir = jstring_to_std(env, jlibdir);
     if (!libdir.empty()) {
         setenv("ADSP_LIBRARY_PATH", libdir.c_str(), 1);
@@ -436,6 +459,7 @@ Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, js
         }
         devices = {dev, nullptr};
         mp.devices = devices.data();
+        e->device  = dev;
     }
     e->model = llama_model_load_from_file(path.c_str(), mp);
     if (e->model == nullptr) {
@@ -459,21 +483,28 @@ Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, js
 
     // The thread pool exists before the first decode, thus its thread ids are
     // known and go into the ADPF session together with the caller thread.
+    // The workers block between graphs and run at the compute priority, thus
+    // the display thread keeps the cores it needs.
     const std::set<int32_t> before = list_tids();
     ggml_threadpool_params tpp = ggml_threadpool_params_default(e->n_threads);
+    tpp.prio       = GGML_SCHED_PRIO_LOW;
+    tpp.poll       = 0;
+    tpp.strict_cpu = false;
     e->tp = ggml_threadpool_new(&tpp);
     llama_attach_threadpool(e->ctx, e->tp, e->tp);
     std::vector<int32_t> tids;
     for (int32_t tid : list_tids()) {
         if (before.count(tid) == 0) {
             tids.push_back(tid);
+            lower_priority(tid);
         }
     }
+    lower_priority(0);
     tids.push_back(gettid());
     e->hint = std::make_unique<PerfHintSession>(tids, kHintTargetNs);
 
     e->tmpls = common_chat_templates_init(e->model, "");
-    rebuild_sampler(*e, false);
+    rebuild_sampler(*e, false, 0.7f, 0.8f);
 
     LOGI("model loaded: %s, device=%s, gpu_layers=%d, threads=%d, n_ctx=%u, mmproj=%s",
          path.c_str(), device.empty() ? "cpu" : device.c_str(), gpu_layers, e->n_threads, llama_n_ctx(e->ctx),
@@ -518,7 +549,8 @@ Java_ai_airi_qwenmobile_LlamaNative_modelInfo(JNIEnv * env, jclass, jlong handle
 JNIEXPORT jint JNICALL
 Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass, jlong handle,
                                                jobjectArray roles, jobjectArray contents,
-                                               jobjectArray images, jboolean thinking) {
+                                               jobjectArray images, jboolean thinking,
+                                               jfloat temperature, jfloat top_p) {
     Engine * e = engine_of(handle);
     std::lock_guard<std::mutex> lock(e->mutex);
 
@@ -550,7 +582,7 @@ Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass, jlong handle
         return -1;
     }
 
-    rebuild_sampler(*e, thinking);
+    rebuild_sampler(*e, thinking, temperature, top_p);
     e->utf8_pending.clear();
     e->gen_tokens = 0;
     e->gen_us     = 0;

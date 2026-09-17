@@ -16,7 +16,7 @@ DSP=v79
 podman run --rm --userns=keep-id --security-opt label=disable \
     -v "$LLAMA:/llama" -v "$HERE/..:/android" -w /android/snapdragon "$IMAGE" bash -c '
 set -e
-cmake -S . -B build \
+cmake -S . -B build -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DANDROID_ABI=arm64-v8a \
     -DANDROID_PLATFORM=android-34 \
