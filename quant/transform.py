@@ -98,11 +98,13 @@ def transform(tensors: "OrderedDict[str, torch.Tensor]", n_layers: int, layer_ty
 
     zero = torch.zeros(d, dtype=torch.float32)
 
-    # The embedding and the untied head. logits = E · diag(γ_f) · Q · norm(h').
+    # The embedding and the untied head. logits = H · diag(γ_f) · Q · norm(h'), with H the head of the
+    # checkpoint, or the embedding when the checkpoint ties them.
     emb = get(LM + "embed_tokens.weight").to(torch.float64)
+    head = get("lm_head.weight").to(torch.float64) if "lm_head.weight" in tensors else emb
     gamma_f = gamma(LM + "norm.weight")
     out[LM + "embed_tokens.weight"] = (emb @ q).to(torch.float32).cpu()
-    out["lm_head.weight"] = ((emb * gamma_f[None, :]) @ q).to(torch.float32).cpu()
+    out["lm_head.weight"] = ((head * gamma_f[None, :]) @ q).to(torch.float32).cpu()
     out[LM + "norm.weight"] = zero.clone()
 
     # The vision merger writes image features into the residual stream.
@@ -136,7 +138,10 @@ def transform(tensors: "OrderedDict[str, torch.Tensor]", n_layers: int, layer_ty
         out[p + "post_attention_layernorm.weight"] = zero.clone()
 
     # Everything not produced above passes through: the small GDN and attention
-    # tensors, the vision tower, and the MTP block.
+    # tensors, the vision tower, and the MTP block. The MTP block is not exact
+    # after the transform: it reads the final-norm output, and the fold of the
+    # final-norm weight into the head changes that vector. llama.cpp loads the
+    # MTP block only for the draft-mtp speculative mode.
     for name, tensor in tensors.items():
         if name not in out:
             out[name] = tensor.to(torch.float32) if not name.startswith("model.visual") else tensor

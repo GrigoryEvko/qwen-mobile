@@ -1,0 +1,173 @@
+"""The function-preserving transform on a toy model with the tensor names of the checkpoint."""
+
+from __future__ import annotations
+
+from collections import OrderedDict
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+from quant.checkpoint import LM
+from quant.transform import _rotate_output, hadamard, rotation_matrix, transform
+
+EPS = 1e-6
+
+
+def rmsnorm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """The zero-centered RMSNorm of Qwen3.5: norm(x) · (1 + w)."""
+    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + EPS) * (1.0 + w)
+
+
+def toy_tensors(d: int, vocab: int, layer_types: list[str], untied: bool, merger: bool,
+                gen: torch.Generator) -> "OrderedDict[str, torch.Tensor]":
+    """A checkpoint dictionary of a toy model: attention and GDN layers, an MLP, the head, the merger."""
+    inter, heads, dim, key_dim, value_dim, v_heads = 3 * d, 2, d // 2, d, 2 * d, 4
+
+    def rand(*shape: int) -> torch.Tensor:
+        return torch.randn(*shape, generator=gen, dtype=torch.float32) / shape[-1] ** 0.5
+
+    t: "OrderedDict[str, torch.Tensor]" = OrderedDict()
+    t[LM + "embed_tokens.weight"] = rand(vocab, d)
+    t[LM + "norm.weight"] = 0.3 * torch.randn(d, generator=gen)
+    if untied:
+        t["lm_head.weight"] = rand(vocab, d)
+    for i, kind in enumerate(layer_types):
+        p = f"{LM}layers.{i}."
+        t[p + "input_layernorm.weight"] = 0.3 * torch.randn(d, generator=gen)
+        t[p + "post_attention_layernorm.weight"] = 0.3 * torch.randn(d, generator=gen)
+        if kind == "full_attention":
+            t[p + "self_attn.q_proj.weight"] = rand(heads * dim * 2, d)
+            t[p + "self_attn.k_proj.weight"] = rand(heads * dim, d)
+            t[p + "self_attn.v_proj.weight"] = rand(heads * dim, d)
+            t[p + "self_attn.o_proj.weight"] = rand(d, heads * dim)
+        else:
+            t[p + "linear_attn.in_proj_qkv.weight"] = rand(2 * key_dim + value_dim, d)
+            t[p + "linear_attn.in_proj_z.weight"] = rand(value_dim, d)
+            t[p + "linear_attn.in_proj_a.weight"] = rand(v_heads, d)
+            t[p + "linear_attn.in_proj_b.weight"] = rand(v_heads, d)
+            t[p + "linear_attn.out_proj.weight"] = rand(d, value_dim)
+            t[p + "linear_attn.norm.weight"] = torch.ones(value_dim // v_heads)
+        t[p + "mlp.gate_proj.weight"] = rand(inter, d)
+        t[p + "mlp.up_proj.weight"] = rand(inter, d)
+        t[p + "mlp.down_proj.weight"] = rand(d, inter)
+    if merger:
+        t["model.visual.merger.linear_fc2.weight"] = rand(d, 2 * d)
+        t["model.visual.merger.linear_fc2.bias"] = 0.1 * torch.randn(d, generator=gen)
+    return t
+
+
+def toy_forward(t: dict[str, torch.Tensor], layer_types: list[str], ids: torch.Tensor,
+                image: torch.Tensor | None) -> torch.Tensor:
+    """The logits of the toy model. The mixers are nonlinear functions of their projections."""
+    f = {k: v.to(torch.float64) for k, v in t.items()}
+    h = f[LM + "embed_tokens.weight"][ids]
+    if image is not None:
+        w, b = f["model.visual.merger.linear_fc2.weight"], f["model.visual.merger.linear_fc2.bias"]
+        h = torch.cat([image.to(torch.float64) @ w.T + b, h], 0)
+    for i, kind in enumerate(layer_types):
+        p = f"{LM}layers.{i}."
+        n = rmsnorm(h, f[p + "input_layernorm.weight"])
+        if kind == "full_attention":
+            q = n @ f[p + "self_attn.q_proj.weight"].T
+            k = n @ f[p + "self_attn.k_proj.weight"].T
+            v = n @ f[p + "self_attn.v_proj.weight"].T
+            m = torch.tanh(q[:, : k.shape[1]]) * k + torch.sigmoid(q[:, k.shape[1]:]) * v
+            h = h + m @ f[p + "self_attn.o_proj.weight"].T
+        else:
+            qkv = n @ f[p + "linear_attn.in_proj_qkv.weight"].T
+            z = n @ f[p + "linear_attn.in_proj_z.weight"].T
+            a = n @ f[p + "linear_attn.in_proj_a.weight"].T
+            b = n @ f[p + "linear_attn.in_proj_b.weight"].T
+            value = qkv[:, -z.shape[1]:]
+            m = torch.tanh(value) * F.silu(z) * torch.sigmoid(a.sum(-1, keepdim=True)) * F.softplus(b.sum(-1, keepdim=True))
+            h = h + m @ f[p + "linear_attn.out_proj.weight"].T
+        n2 = rmsnorm(h, f[p + "post_attention_layernorm.weight"])
+        mlp = F.silu(n2 @ f[p + "mlp.gate_proj.weight"].T) * (n2 @ f[p + "mlp.up_proj.weight"].T)
+        h = h + mlp @ f[p + "mlp.down_proj.weight"].T
+    head = f["lm_head.weight"] if "lm_head.weight" in f else f[LM + "embed_tokens.weight"]
+    return rmsnorm(h, f[LM + "norm.weight"]) @ head.T
+
+
+@pytest.mark.parametrize("n", [1, 2, 32, 40, 2560])
+def test_hadamard_is_orthogonal(n: int) -> None:
+    """The Sylvester matrix, and the Kronecker product with the seeded odd factor, are orthogonal."""
+    h = hadamard(n, torch.device("cpu"))
+    assert h.shape == (n, n) and h.dtype == torch.float64
+    torch.testing.assert_close(h @ h.T, torch.eye(n, dtype=torch.float64), atol=1e-12, rtol=0)
+    if n > 1:
+        assert (h.abs() > 1e-9).all(), "every entry mixes every channel"
+
+
+def test_rotation_matrix_is_orthogonal_and_seeded() -> None:
+    q = rotation_matrix(64, 16, seed=3, device=torch.device("cpu"))
+    torch.testing.assert_close(q @ q.T, torch.eye(64, dtype=torch.float64), atol=1e-12, rtol=0)
+    assert torch.equal(q, rotation_matrix(64, 16, seed=3, device=torch.device("cpu")))
+    assert not torch.equal(q, rotation_matrix(64, 16, seed=4, device=torch.device("cpu")))
+    with pytest.raises(ValueError):
+        rotation_matrix(64, 24, seed=0, device=torch.device("cpu"))
+
+
+@pytest.mark.parametrize("d,block", [(32, None), (32, 8), (40, None), (40, 8)])
+@pytest.mark.parametrize("permute", [False, True])
+@pytest.mark.parametrize("untied", [False, True])
+def test_transform_keeps_the_function(d: int, block: int | None, permute: bool, untied: bool) -> None:
+    """The fold, the rotation (Sylvester or Kronecker), the permutation and the merger keep the logits."""
+    gen = torch.Generator().manual_seed(d + 7 * permute + 13 * untied)
+    layer_types = ["linear_attention", "full_attention"]
+    tensors = toy_tensors(d, vocab=50, layer_types=layer_types, untied=untied, merger=True, gen=gen)
+    ids = torch.randint(0, 50, (9,), generator=gen)
+    image = torch.randn(3, 2 * d, generator=gen)
+    before = toy_forward(tensors, layer_types, ids, image)
+    out = transform(tensors, 2, layer_types, rotate=True, block=block, seed=1, permute_mlp=permute,
+                    device=torch.device("cpu"))
+    after = toy_forward(out, layer_types, ids, image)
+    torch.testing.assert_close(after, before, atol=2e-4 * before.abs().max().item(), rtol=0)
+    for name in (LM + "norm.weight", f"{LM}layers.0.input_layernorm.weight", f"{LM}layers.1.post_attention_layernorm.weight"):
+        assert torch.equal(out[name], torch.zeros(d)), "a folded norm is the identity (zero-centered)"
+    assert out[f"{LM}layers.0.linear_attn.norm.weight"].dtype == torch.float32
+    q = rotation_matrix(d, block, 1, torch.device("cpu"))
+    emb = tensors[LM + "embed_tokens.weight"].to(torch.float64)
+    torch.testing.assert_close(out[LM + "embed_tokens.weight"], (emb @ q).to(torch.float32))
+    if untied:
+        assert not torch.allclose(out["lm_head.weight"], out[LM + "embed_tokens.weight"]), "the untied head stays its own"
+
+
+def test_vision_tensors_keep_their_dtype() -> None:
+    """The rotated merger goes back to the dtype of the vision tower, the text tensors become float32."""
+    gen = torch.Generator().manual_seed(5)
+    layer_types = ["full_attention"]
+    tensors = toy_tensors(32, vocab=20, layer_types=layer_types, untied=False, merger=True, gen=gen)
+    for name in ("model.visual.merger.linear_fc2.weight", "model.visual.merger.linear_fc2.bias"):
+        tensors[name] = tensors[name].to(torch.bfloat16)
+    tensors["model.visual.blocks.0.attn.qkv.weight"] = torch.randn(8, 8, generator=gen).to(torch.bfloat16)
+    tensors[LM + "layers.0.self_attn.q_norm.weight"] = torch.zeros(16, dtype=torch.bfloat16)
+    out = transform(tensors, 1, layer_types, rotate=True, block=None, seed=0, permute_mlp=False,
+                    device=torch.device("cpu"))
+    q = rotation_matrix(32, None, 0, torch.device("cpu"))
+    w = tensors["model.visual.merger.linear_fc2.weight"].to(torch.float64)
+    assert out["model.visual.merger.linear_fc2.weight"].dtype == torch.bfloat16
+    torch.testing.assert_close(out["model.visual.merger.linear_fc2.weight"].to(torch.float64), q.T @ w, atol=0, rtol=2**-7)
+    assert torch.equal(out["model.visual.blocks.0.attn.qkv.weight"], tensors["model.visual.blocks.0.attn.qkv.weight"])
+    assert out[LM + "layers.0.self_attn.q_norm.weight"].dtype == torch.float32
+
+
+def test_no_rotation_with_permutation_keeps_the_function() -> None:
+    gen = torch.Generator().manual_seed(11)
+    layer_types = ["full_attention"]
+    tensors = toy_tensors(32, vocab=20, layer_types=layer_types, untied=False, merger=False, gen=gen)
+    ids = torch.randint(0, 20, (5,), generator=gen)
+    before = toy_forward(tensors, layer_types, ids, None)
+    out = transform(tensors, 1, layer_types, rotate=False, block=None, seed=0, permute_mlp=True,
+                    device=torch.device("cpu"))
+    torch.testing.assert_close(toy_forward(out, layer_types, ids, None), before, atol=1e-5, rtol=0)
+    assert torch.equal(out[LM + "embed_tokens.weight"], tensors[LM + "embed_tokens.weight"])
+
+
+def test_mmproj_rotation_matches_the_checkpoint_transform() -> None:
+    """rotate_mmproj applies Qᵀ·W and Qᵀ·b, the same as _rotate_output in the transform."""
+    q = rotation_matrix(32, None, 0, torch.device("cpu"))
+    w = torch.randn(32, 48, dtype=torch.float64)
+    b = torch.randn(32, dtype=torch.float64)
+    torch.testing.assert_close(q.T @ w, _rotate_output(w, q))
+    torch.testing.assert_close(q.T @ b, (q.T @ b[:, None]).squeeze(1))

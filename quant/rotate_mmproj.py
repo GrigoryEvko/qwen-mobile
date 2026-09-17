@@ -55,9 +55,9 @@ def main() -> None:
             n = shape[0]
             if q is None:
                 q = rotation_matrix(n, args.block, args.seed, torch.device("cpu"))
+            # W' = Qᵀ·W for the weight [out, in] and b' = Qᵀ·b for the bias [out]: one matmul for the two.
             x = torch.from_numpy(data.astype(np.float32)).to(torch.float64)
-            rotated = (q.T @ x) if x.dim() == 2 else (q.T @ x)
-            data = rotated.to(torch.float32).numpy().astype(data.dtype)
+            data = (q.T @ x).to(torch.float32).numpy().astype(data.dtype)
             print(f"rotated {t.name} {shape}")
         writer.add_tensor(t.name, data)
     writer.write_header_to_file()

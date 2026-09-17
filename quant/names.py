@@ -53,13 +53,3 @@ def to_gguf(name: str) -> str | None:
     if m:
         return _TOP_TO_GGUF[m.group(1)]
     return None
-
-
-def is_big_linear(gguf_name: str) -> bool:
-    """A 2-D weight that the decode step reads in full for every token."""
-    tail = gguf_name.split(".", 2)[-1] if gguf_name.startswith("blk.") else gguf_name
-    return tail in {
-        "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight", "attn_qkv.weight", "attn_gate.weight",
-        "ssm_out.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
-        "output.weight", "token_embd.weight",
-    }
