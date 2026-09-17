@@ -99,3 +99,51 @@ The HF lockstep drift report (analysis/*.drift.md, 16 x 1024 WikiText tokens, fp
 the same ranking with its own numbers: row 3 mean KL 0.0291, row 4 0.0314. The KL attribution
 of row 3 is in analysis/quant-attribution.md: the round-to-nearest head alone is 0.011 of the
 0.037, MLP gate/up 0.009, MLP down 0.007, GDN out 0.005, GDN qkv 0.0025, layers 0-2 0.0075.
+
+## Q8_0 files of the original checkpoints, 2B and 4B (2026-09-18)
+
+The packer of the pipeline (`q8_0_quantize` and `pack_q8_0` in `quant/grid.py`) wrote these files
+from the F16 GGUF of the original checkpoint: no rotation, no folds, no calibration. Each 2-D weight
+of the 24 (32) decoder layers and `token_embd` is round-to-nearest Q8_0 (the head is tied, thus the
+lookup is the head). The norms, `ssm_a`, `ssm_dt.bias`, `ssm_conv1d`, `ssm_alpha` and `ssm_beta`
+are F32, as the plan of the export does today. The MTP block (`blk.24` of the 2B, `blk.32` of the
+4B: 8 F16 tensors and 7 F32 norms) stays F16, because llama.cpp does not load it ("unused tensor").
+The metadata is that of the F16 GGUF, with the file type Q8_0. The projectors are copies, byte for
+byte, of the original F16 projectors, next to the files as `<name>.mmproj.gguf`.
+
+| Model | File | Bytes | Mean KL | 99.9 % KL | 99.0 % KL | Max KL | Top-1 | PPL (Q / F16) |
+|---|---|---|---|---|---|---|---|---|
+| 2B | Qwen3.5-2B-Q8_0.gguf | 2,137,156,512 (1.99 GiB, 151 Q8_0 tensors) | 0.00115 | 0.0143 | 0.0057 | 0.0281 | 98.21 % | 14.00 / 14.00 |
+| 4B | Qwen3.5-4B-Q8_0.gguf | 4,735,180,608 (4.41 GiB, 201 Q8_0 tensors) | 0.00202 | 0.175 | 0.0085 | 1.56 | 97.21 % | 10.78 / 10.77 |
+
+The 2B ran against the F16 base of the box on the laptop CUDA build, with all layers on the GPU, as
+rows 7c to 11. The F16 4B does not fit in the 6 GB of the laptop GPU, thus its base comes from
+`llama-perplexity` with 15 decoder layers and the output on the GPU and 17 decoder layers on the
+CPU (`-ngl 16`). The Q8_0 4B ran against that base with the same 16 layers on the GPU. The location
+of the layers has no effect on this laptop. The F16 4B with all layers on the CPU gives a mean KL of
+−0.000014 against that base (the resolution of the base), a maximum of 0.000002 and a top-1 of
+100.000 %. The Q8_0 4B gives the same statistics with all layers on the GPU (`-ngl 99`), with 16
+layers on the GPU and with all layers on the CPU (`-ngl 0`).
+
+The 4B has a heavy tail. Through chunk 13 the mean KL is 0.0014 to 0.0018, and chunks 14 and 16
+hold the tokens of the tail: the 99.9 % point is 0.17, thus eight tokens have a KL of more than
+0.17, and the maximum is 1.56. The 2B has no such tail (maximum 0.028, 99.9 % point 0.014). The next
+step isolates the class that causes the tail, with `--only` on the 4B export: `token_embd`, the MLP,
+the GDN projections and the attention projections, one file each.
+
+The checks: `llama-completion` of build-host (temperature 0, 48 tokens) on each of the two files
+gives correct text about the laws of thermodynamics, and `llama-mtmd-cli` of build-host with the 2B
+file and its projector gives one correct sentence about a 1000 × 1000 JPEG. The build-host
+configuration has `LLAMA_BUILD_MTMD=ON` for `llama-mtmd-cli` (set for this check). The commands,
+from the project root:
+
+    .venv/bin/python -m quant.run export --model Qwen3.5-2B --device cpu --f16 weights/gguf/Qwen3.5-2B-F16.gguf --packs quant-out/empty --bulk Q8_0 --gdn-gate Q8_0 --tag Q8_0
+    .venv/bin/python -m quant.run export --model Qwen3.5-4B --device cpu --f16 weights/gguf/Qwen3.5-4B-F16.gguf --packs quant-out/empty --bulk Q8_0 --gdn-gate Q8_0 --tag Q8_0
+    cp weights/gguf/Qwen3.5-2B-mmproj-F16.gguf weights/gguf/Qwen3.5-2B-Q8_0.mmproj.gguf
+    cp weights/gguf/Qwen3.5-4B-mmproj-F16.gguf weights/gguf/Qwen3.5-4B-Q8_0.mmproj.gguf
+    .venv/bin/python -m quant.run eval --model Qwen3.5-2B --gguf weights/gguf/Qwen3.5-2B-Q8_0.gguf
+    llama.cpp/build-cuda/bin/llama-perplexity -m weights/gguf/Qwen3.5-4B-F16.gguf -ngl 16 -f data/wiki.test.raw -c 512 --chunks 16 --kl-divergence-base eval/Qwen3.5-4B-F16.wiki.c512x16.kld
+    .venv/bin/python -m quant.run eval --model Qwen3.5-4B --gguf weights/gguf/Qwen3.5-4B-Q8_0.gguf --ngl 16
+    llama.cpp/build-cuda/bin/llama-perplexity -m weights/gguf/Qwen3.5-4B-F16.gguf -ngl 0 -t 12 -f data/wiki.test.raw -c 512 --chunks 16 --kl-divergence-base eval/Qwen3.5-4B-F16.wiki.c512x16.kld --kl-divergence
+    llama.cpp/build-host/bin/llama-completion -m weights/gguf/Qwen3.5-2B-Q8_0.gguf -p "The three laws of thermodynamics are" -n 48 -no-cnv --temp 0 --simple-io
+    llama.cpp/build-host/bin/llama-mtmd-cli -m weights/gguf/Qwen3.5-2B-Q8_0.gguf --mmproj weights/gguf/Qwen3.5-2B-Q8_0.mmproj.gguf --image <file.jpg> -p "Describe this image in one sentence." -n 64 --temp 0
