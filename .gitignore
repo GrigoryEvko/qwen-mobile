@@ -1,4 +1,7 @@
 weights/
 *.gguf
 *.safetensors
+.venv/
+llama.cpp/
+*.pftrace
 .DS_Store
