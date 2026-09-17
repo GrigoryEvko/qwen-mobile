@@ -225,3 +225,11 @@ off, same top-1 (90.98 % against 90.78 %), maximum KLD 7.35 against 7.49: the fu
 floor of the unfused path. The decode batch on the DSP falls from 31.0 ms to 24.8 ms per token (513
 ops instead of 790). The 512-token prefill profile: GATED_DELTA_NET takes 235 ms of the 501 ms batch
 (44 %), the matmuls 152 ms, SSM_CONV plus CONCAT 54 ms; the prefill floor is about 160 ms.
+
+MTP on the phone (NPU, llama-server --spec-type draft-mtp, draft 3, one prompt, 96 tokens, temperature
+0, 2026-09-18): row 12 (tied Q4_0 with the rotated MTP block) 20.0 t/s with 51 of 131 drafts accepted
+(39 %), against 33.1 t/s plain; the untransformed 2B Q8_0 17.3 t/s with 49 of 135 accepted, against
+21.1 plain; the 4B Q8_0 18.6 t/s with 34 of 38 accepted (89 %), against 7 to 9.6 plain. The rotated
+block drafts as the original (the acceptance matches), but the 2B head is weak, and on the HVX matvec
+a 4-row verify step costs 1.9x a single row, thus MTP pays only where the acceptance is high (the 4B)
+or once the multi-row matvec streams the weights one time for 1 to 4 rows.
