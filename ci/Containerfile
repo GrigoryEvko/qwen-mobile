@@ -1,0 +1,44 @@
+# The container that builds the Android APK. scripts/build-apk.sh builds this
+# image and starts it with the repository at /workspace.
+#
+# The pins:
+#   - The base image is Eclipse Temurin JDK 21.0.12+8 on Ubuntu 24.04, by the
+#     digest of its amd64 manifest.
+#   - The command-line tools zip is pinned by SHA-256 (the value from
+#     developer.android.com/studio, revision 22.0).
+#   - The SDK components are the versions that android/app/build.gradle.kts
+#     names: platform 36 (compileSdk), build tools 36.0.0, NDK 30.0.16248370,
+#     CMake 4.1.2. sdkmanager does a check of each download against the
+#     checksum in the repository index of Google.
+#
+# The APK build with -Pprebuilt=true does not use the NDK or CMake. They are in
+# the image for the CMake path of the app (without -Pprebuilt).
+
+FROM docker.io/library/eclipse-temurin:21-jdk-noble@sha256:87f0a5e638d0bc739f2908adb4a0a697b585d8bee5e5a8de43c88e8d07b3786e
+
+ARG CMDLINE_TOOLS_ZIP=commandlinetools-linux-15859902_latest.zip
+ARG CMDLINE_TOOLS_SHA256=4e4c464f145a7512b57d088ac6c278c03c9eea610886b35a5e0804e74eedf583
+ARG ANDROID_PLATFORM=android-36
+ARG BUILD_TOOLS=36.0.0
+ARG NDK=30.0.16248370
+ARG CMAKE=4.1.2
+
+ENV ANDROID_HOME=/opt/android-sdk
+ENV ANDROID_SDK_ROOT=/opt/android-sdk
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl git unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL -o /tmp/cmdline-tools.zip "https://dl.google.com/android/repository/${CMDLINE_TOOLS_ZIP}" \
+    && echo "${CMDLINE_TOOLS_SHA256}  /tmp/cmdline-tools.zip" | sha256sum -c - \
+    && mkdir -p "${ANDROID_HOME}/cmdline-tools" \
+    && unzip -q /tmp/cmdline-tools.zip -d /tmp/cmdline-tools \
+    && mv /tmp/cmdline-tools/cmdline-tools "${ANDROID_HOME}/cmdline-tools/latest" \
+    && rm -rf /tmp/cmdline-tools.zip /tmp/cmdline-tools
+
+ENV PATH="${ANDROID_HOME}/cmdline-tools/latest/bin:${PATH}"
+
+RUN yes | sdkmanager --licenses > /dev/null \
+    && sdkmanager "platforms;${ANDROID_PLATFORM}" "build-tools;${BUILD_TOOLS}" "ndk;${NDK}" "cmake;${CMAKE}" \
+    && chmod -R a+rX "${ANDROID_HOME}"
