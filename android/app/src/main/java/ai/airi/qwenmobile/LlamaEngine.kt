@@ -22,12 +22,17 @@ class ChatMessage(val role: String, var content: String, val image: ByteArray? =
 
 /**
  * The compute unit of the model. The ggml device name is null for the CPU.
- * The GPU is the default, the NPU is opt-in: its single-token decode is experimental.
+ * The GPU is the default, the NPU is opt-in: its single-token decode is
+ * experimental. The hybrid one prefills on the NPU and decodes on the GPU.
  */
-enum class Backend(val deviceName: String?, val label: String) {
-    CPU(null, "CPU"),
-    GPU("GPUOpenCL", "GPU"),
-    NPU("HTP0", "NPU");
+enum class Backend(val deviceName: String?, val prefillDeviceName: String?, val label: String) {
+    CPU(null, null, "CPU"),
+    GPU("GPUOpenCL", null, "GPU"),
+    NPU("HTP0", null, "NPU"),
+    HYBRID("GPUOpenCL", "HTP0", "NPU+GPU");
+
+    /** The ggml devices the backend needs. */
+    val devices: List<String> get() = listOfNotNull(deviceName, prefillDeviceName)
 
     companion object {
         /** The backend of a fresh install. */
@@ -73,9 +78,9 @@ object LlamaEngine {
     /** The ggml backend devices, one per line. */
     val devices: String by lazy { LlamaNative.devices() }
 
-    /** Tell if the device of a backend is visible. */
+    /** Tell if every device of a backend is visible. */
     fun has(backend: Backend): Boolean =
-        backend.deviceName == null || devices.lines().any { it.startsWith(backend.deviceName + ":") }
+        backend.devices.all { name -> devices.lines().any { it.startsWith("$name:") } }
 
     /**
      * Load a model. A model that is loaded already is released first. With an
@@ -92,6 +97,7 @@ object LlamaEngine {
             config.path,
             config.mmproj,
             config.backend.deviceName,
+            config.backend.prefillDeviceName,
             if (config.backend == Backend.CPU) 0 else 999,
             threads,
             config.nCtx,

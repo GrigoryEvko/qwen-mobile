@@ -54,6 +54,12 @@ constexpr int32_t kImageMaxTokens = 1024;
 /** The nice value of the compute threads. The display thread keeps its priority. */
 constexpr int kComputeNice = 10;
 
+/** The number of new prompt tokens from which the hybrid backend uses the prefill context. */
+constexpr int kHybridMinTokens = 128;
+
+/** The batch of the prefill context. The Hexagon backend wants 512. */
+constexpr int kPrefillBatch = 512;
+
 /** Give a thread the compute priority. tid 0 is the calling thread. */
 void lower_priority(int32_t tid) {
     if (setpriority(PRIO_PROCESS, tid, kComputeNice) != 0) {
@@ -70,6 +76,19 @@ struct Engine {
     mtmd_context *    mctx  = nullptr;
     std::string       mmproj;
     ggml_backend_dev_t device = nullptr;
+
+    /**
+     * The hybrid backend: a second copy of the model on the prefill device
+     * (the NPU) with its own context. The prompt goes there, the state moves
+     * to the decode context, and the answer comes from the decode device.
+     */
+    llama_model *      model_pf  = nullptr;
+    llama_context *    ctx_pf    = nullptr;
+    ggml_backend_dev_t device_pf = nullptr;
+    /** True when the first answer token of the turn was an end token on the prefill context. */
+    bool first_eog = false;
+    /** The state copies of the current turn, in microseconds. */
+    int64_t transfer_us = 0;
     common_chat_templates_ptr tmpls;
     std::unique_ptr<PerfHintSession> hint;
     std::mutex mutex;
@@ -179,12 +198,13 @@ void rebuild_sampler(Engine & e, bool thinking, float temp, float top_p) {
  * Decode tokens in chunks of n_batch. Each chunk goes to the ADPF session
  * with its measured duration. Returns the llama_decode code, 0 on success.
  */
-int decode_tokens(Engine & e, const llama_token * tokens, int n) {
-    for (int i = 0; i < n; i += e.n_batch) {
-        const int count = std::min(e.n_batch, n - i);
+int decode_tokens(Engine & e, llama_context * ctx, const llama_token * tokens, int n) {
+    const int n_batch = ctx == e.ctx_pf ? kPrefillBatch : e.n_batch;
+    for (int i = 0; i < n; i += n_batch) {
+        const int count = std::min(n_batch, n - i);
         llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(tokens) + i, count);
         const int64_t t0 = now_us();
-        const int rc = llama_decode(e.ctx, batch);
+        const int rc = llama_decode(ctx, batch);
         if (e.hint) {
             e.hint->report((now_us() - t0) * 1000);
         }
@@ -195,20 +215,90 @@ int decode_tokens(Engine & e, const llama_token * tokens, int n) {
     return 0;
 }
 
-/** Decode one token and append it to the memory cache. */
+/** Decode one token on the decode context and append it to the memory cache. */
 int decode_one(Engine & e, llama_token token) {
-    const int rc = decode_tokens(e, &token, 1);
+    const int rc = decode_tokens(e, e.ctx, &token, 1);
     if (rc == 0) {
         e.cache.push_back(token);
     }
     return rc;
 }
 
-/** Empty the model memory and the record of what it holds. */
+/** Empty the model memory of both contexts and the record of what it holds. */
 void clear_memory(Engine & e) {
     llama_memory_clear(llama_get_memory(e.ctx), true);
+    if (e.ctx_pf != nullptr) {
+        llama_memory_clear(llama_get_memory(e.ctx_pf), true);
+    }
     e.cache.clear();
     e.memory_has_media = false;
+}
+
+/**
+ * Copy the sequence state (the KV cache of the attention layers and the
+ * recurrent states) from one context to the other. The destination loses
+ * its own state first. Returns false with the error text set.
+ */
+bool transfer_state(llama_context * src, llama_context * dst, std::string & error) {
+    const size_t size = llama_state_seq_get_size(src, 0);
+    std::vector<uint8_t> buffer(size);
+    const size_t got = llama_state_seq_get_data(src, buffer.data(), size, 0);
+    llama_memory_seq_rm(llama_get_memory(dst), 0, -1, -1);
+    if (got == 0 || llama_state_seq_set_data(dst, buffer.data(), got, 0) == 0) {
+        error = "The state transfer between the prefill and the decode context failed (" + std::to_string(size) + " bytes)";
+        return false;
+    }
+    return true;
+}
+
+/**
+ * The end of a hybrid prefill: sample the first answer token on the prefill
+ * context, move the state to the decode context, and decode that token
+ * there. Thus generateNext samples the second token from the decode context.
+ */
+bool hybrid_finish(Engine & e, std::string & error) {
+    const llama_token first = llama_sampler_sample(e.smpl, e.ctx_pf, -1);
+    const int64_t t0 = now_us();
+    if (!transfer_state(e.ctx_pf, e.ctx, error)) {
+        return false;
+    }
+    e.transfer_us += now_us() - t0;
+    if (llama_vocab_is_eog(llama_model_get_vocab(e.model), first)) {
+        e.first_eog = true;
+        return true;
+    }
+    e.utf8_pending += common_token_to_piece(e.ctx, first, true);
+    const int64_t t1 = now_us();
+    if (decode_one(e, first) != 0) {
+        error = "llama_decode failed on the first answer token";
+        return false;
+    }
+    e.gen_tokens = 1;
+    e.gen_us     = now_us() - t1;
+    return true;
+}
+
+/**
+ * Decode new prompt tokens on the prefill context. With ``extend`` the
+ * decode context holds the earlier turns, and its state moves to the
+ * prefill context first.
+ */
+bool hybrid_prefill_tokens(Engine & e, const llama_token * tokens, int n, bool extend, std::string & error) {
+    const int64_t t0 = now_us();
+    if (extend) {
+        if (!transfer_state(e.ctx, e.ctx_pf, error)) {
+            return false;
+        }
+    } else {
+        llama_memory_clear(llama_get_memory(e.ctx_pf), true);
+    }
+    e.transfer_us = now_us() - t0;
+    const int rc = decode_tokens(e, e.ctx_pf, tokens, n);
+    if (rc != 0) {
+        error = "llama_decode failed on the prompt on the prefill device with code " + std::to_string(rc);
+        return false;
+    }
+    return hybrid_finish(e, error);
 }
 
 /** Load the vision projector. Returns false when the model has none or it does not load. */
@@ -219,9 +309,11 @@ bool ensure_vision(Engine & e) {
     if (e.mmproj.empty()) {
         return false;
     }
+    // The encoder runs on the prefill device when there is one, else on the device of the model.
+    ggml_backend_dev_t dev = e.device_pf != nullptr ? e.device_pf : e.device;
     mtmd_context_params mp = mtmd_context_params_default();
-    mp.use_gpu          = e.device != nullptr;
-    mp.device           = e.device;
+    mp.use_gpu          = dev != nullptr;
+    mp.device           = dev;
     mp.n_threads        = e.n_threads;
     mp.print_timings    = false;
     mp.warmup           = false;
@@ -290,9 +382,12 @@ int64_t prefill_with_images(JNIEnv * env, Engine & e, const std::string & prompt
 
     clear_memory(e);
     e.memory_has_media = true;
+    const bool hybrid = e.ctx_pf != nullptr;
+    llama_context * lctx = hybrid ? e.ctx_pf : e.ctx;
     llama_pos new_n_past = 0;
     const int64_t t0 = now_us();
-    const int32_t rc = mtmd_helper_eval_chunks(e.mctx, e.ctx, chunks, 0, 0, e.n_batch, true, &new_n_past);
+    const int32_t rc = mtmd_helper_eval_chunks(e.mctx, lctx, chunks, 0, 0, hybrid ? kPrefillBatch : e.n_batch, true,
+                                               &new_n_past);
     if (e.hint) {
         e.hint->report((now_us() - t0) * 1000);
     }
@@ -303,8 +398,12 @@ int64_t prefill_with_images(JNIEnv * env, Engine & e, const std::string & prompt
         error = "The prompt with images did not decode, code " + std::to_string(rc);
         return -1;
     }
+    if (hybrid && !hybrid_finish(e, error)) {
+        clear_memory(e);
+        return -1;
+    }
     LOGI("image prefill: %zu images, %zu tokens, %d positions, %.0f ms on %s", images.size(), n_tokens, (int) new_n_past,
-         (now_us() - t0) / 1000.0, e.device ? ggml_backend_dev_name(e.device) : "CPU");
+         (now_us() - t0) / 1000.0, hybrid ? ggml_backend_dev_name(e.device_pf) : e.device ? ggml_backend_dev_name(e.device) : "CPU");
     return (int64_t) n_tokens;
 }
 
@@ -439,9 +538,11 @@ Java_ai_airi_qwenmobile_LlamaNative_devices(JNIEnv * env, jclass) {
 
 JNIEXPORT jlong JNICALL
 Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, jstring jmmproj,
-                                          jstring jdevice, jint gpu_layers, jint n_threads, jint n_ctx) {
-    const std::string path   = jstring_to_std(env, jpath);
-    const std::string device = jstring_to_std(env, jdevice);
+                                          jstring jdevice, jstring jprefill, jint gpu_layers, jint n_threads,
+                                          jint n_ctx) {
+    const std::string path    = jstring_to_std(env, jpath);
+    const std::string device  = jstring_to_std(env, jdevice);
+    const std::string prefill = jstring_to_std(env, jprefill);
     auto e = std::make_unique<Engine>();
     e->n_threads  = std::max(1, (int) n_threads);
     e->gpu_layers = gpu_layers;
@@ -481,6 +582,33 @@ Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, js
         return 0;
     }
 
+    // The hybrid backend: the same file again on the prefill device, with the prefill batch.
+    if (!prefill.empty()) {
+        e->device_pf = ggml_backend_dev_by_name(prefill.c_str());
+        if (e->device_pf == nullptr) {
+            llama_free(e->ctx);
+            llama_model_free(e->model);
+            throw_java(env, "The prefill device is not available: " + prefill);
+            return 0;
+        }
+        std::vector<ggml_backend_dev_t> devices_pf = {e->device_pf, nullptr};
+        llama_model_params mp_pf = llama_model_default_params();
+        mp_pf.n_gpu_layers = 999;
+        mp_pf.devices      = devices_pf.data();
+        e->model_pf = llama_model_load_from_file(path.c_str(), mp_pf);
+        llama_context_params cp_pf = cp;
+        cp_pf.n_batch  = kPrefillBatch;
+        cp_pf.n_ubatch = kPrefillBatch;
+        e->ctx_pf = e->model_pf ? llama_init_from_model(e->model_pf, cp_pf) : nullptr;
+        if (e->ctx_pf == nullptr) {
+            if (e->model_pf) llama_model_free(e->model_pf);
+            llama_free(e->ctx);
+            llama_model_free(e->model);
+            throw_java(env, "The prefill model did not load on " + prefill);
+            return 0;
+        }
+    }
+
     // The thread pool exists before the first decode, thus its thread ids are
     // known and go into the ADPF session together with the caller thread.
     // The workers block between graphs and run at the compute priority, thus
@@ -492,6 +620,9 @@ Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, js
     tpp.strict_cpu = false;
     e->tp = ggml_threadpool_new(&tpp);
     llama_attach_threadpool(e->ctx, e->tp, e->tp);
+    if (e->ctx_pf != nullptr) {
+        llama_attach_threadpool(e->ctx_pf, e->tp, e->tp);
+    }
     std::vector<int32_t> tids;
     for (int32_t tid : list_tids()) {
         if (before.count(tid) == 0) {
@@ -506,9 +637,9 @@ Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, js
     e->tmpls = common_chat_templates_init(e->model, "");
     rebuild_sampler(*e, false, 0.7f, 0.8f);
 
-    LOGI("model loaded: %s, device=%s, gpu_layers=%d, threads=%d, n_ctx=%u, mmproj=%s",
-         path.c_str(), device.empty() ? "cpu" : device.c_str(), gpu_layers, e->n_threads, llama_n_ctx(e->ctx),
-         e->mmproj.empty() ? "none" : e->mmproj.c_str());
+    LOGI("model loaded: %s, device=%s, prefill=%s, gpu_layers=%d, threads=%d, n_ctx=%u, mmproj=%s",
+         path.c_str(), device.empty() ? "cpu" : device.c_str(), prefill.empty() ? "same" : prefill.c_str(),
+         gpu_layers, e->n_threads, llama_n_ctx(e->ctx), e->mmproj.empty() ? "none" : e->mmproj.c_str());
     return reinterpret_cast<jlong>(e.release());
 }
 
@@ -523,6 +654,11 @@ Java_ai_airi_qwenmobile_LlamaNative_free(JNIEnv *, jclass, jlong handle) {
         e->hint.reset();
         if (e->smpl) llama_sampler_free(e->smpl);
         if (e->mctx) mtmd_free(e->mctx);
+        if (e->ctx_pf) {
+            llama_detach_threadpool(e->ctx_pf);
+            llama_free(e->ctx_pf);
+        }
+        if (e->model_pf) llama_model_free(e->model_pf);
         if (e->ctx) {
             llama_detach_threadpool(e->ctx);
             llama_free(e->ctx);
@@ -584,8 +720,10 @@ Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass, jlong handle
 
     rebuild_sampler(*e, thinking, temperature, top_p);
     e->utf8_pending.clear();
-    e->gen_tokens = 0;
-    e->gen_us     = 0;
+    e->gen_tokens  = 0;
+    e->gen_us      = 0;
+    e->first_eog   = false;
+    e->transfer_us = 0;
 
     if (!image_refs.empty()) {
         std::string error;
@@ -623,15 +761,28 @@ Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass, jlong handle
     }
 
     const int64_t t0 = now_us();
-    const int rc = decode_tokens(*e, tokens.data() + start, (int) (tokens.size() - start));
-    if (rc != 0) {
+    const int n_new = (int) (tokens.size() - start);
+    std::string error;
+    bool ok;
+    if (e->ctx_pf != nullptr && n_new >= kHybridMinTokens) {
+        // Both contexts hold these tokens after the prefill. The first answer token joins the cache.
+        e->cache = tokens;
+        ok = hybrid_prefill_tokens(*e, tokens.data() + start, n_new, start > 0, error);
+    } else {
+        const int rc = decode_tokens(*e, e->ctx, tokens.data() + start, n_new);
+        ok = rc == 0;
+        if (!ok) {
+            error = "llama_decode failed on the prompt with code " + std::to_string(rc);
+        }
+        e->cache = tokens;
+    }
+    if (!ok) {
         clear_memory(*e);
-        throw_java(env, "llama_decode failed on the prompt with code " + std::to_string(rc));
+        throw_java(env, error);
         return -1;
     }
     e->prefill_us     = now_us() - t0;
-    e->prefill_tokens = (int64_t) (tokens.size() - start);
-    e->cache          = tokens;
+    e->prefill_tokens = n_new;
     return (jint) e->prefill_tokens;
 }
 
@@ -640,6 +791,11 @@ Java_ai_airi_qwenmobile_LlamaNative_generateNext(JNIEnv * env, jclass, jlong han
     Engine * e = engine_of(handle);
     std::lock_guard<std::mutex> lock(e->mutex);
     const llama_vocab * vocab = llama_model_get_vocab(e->model);
+    if (e->first_eog) {
+        // The prefill context sampled the end token as the first answer token.
+        e->first_eog = false;
+        return nullptr;
+    }
 
     const int64_t t0 = now_us();
     const llama_token token = llama_sampler_sample(e->smpl, e->ctx, -1);
@@ -671,8 +827,10 @@ Java_ai_airi_qwenmobile_LlamaNative_stats(JNIEnv * env, jclass, jlong handle) {
     const double pp = e->prefill_us > 0 ? e->prefill_tokens * 1e6 / e->prefill_us : 0.0;
     const double tg = e->gen_us > 0 ? e->gen_tokens * 1e6 / e->gen_us : 0.0;
     const llama_pos n_past = llama_memory_seq_pos_max(llama_get_memory(e->ctx), 0) + 1;
-    snprintf(line, sizeof(line), "prefill %lld tok in %.0f ms (%.1f t/s), generate %lld tok (%.1f t/s), memory %d pos",
-             (long long) e->prefill_tokens, e->prefill_us / 1000.0, pp,
+    const char * pf_dev = e->device_pf ? ggml_backend_dev_name(e->device_pf) : e->device ? ggml_backend_dev_name(e->device) : "CPU";
+    snprintf(line, sizeof(line), "prefill %lld tok in %.0f ms (%.1f t/s on %s%s), generate %lld tok (%.1f t/s), memory %d pos",
+             (long long) e->prefill_tokens, e->prefill_us / 1000.0, pp, pf_dev,
+             e->device_pf ? (", transfer " + std::to_string(e->transfer_us / 1000) + " ms").c_str() : "",
              (long long) e->gen_tokens, tg, (int) n_past);
     return env->NewStringUTF(line);
 }
@@ -707,10 +865,12 @@ Java_ai_airi_qwenmobile_LlamaNative_bench(JNIEnv * env, jclass, jlong handle,
         if (pp > 0) {
             std::vector<llama_token> tokens(pp);
             for (auto & t : tokens) t = pick(rng);
-            llama_memory_clear(mem, true);
+            // The hybrid backend prefills on its prefill context.
+            llama_context * pctx = e->ctx_pf ? e->ctx_pf : e->ctx;
+            llama_memory_clear(llama_get_memory(pctx), true);
             const int64_t t0 = now_us();
-            const int rc = decode_tokens(*e, tokens.data(), pp);
-            llama_synchronize(e->ctx);
+            const int rc = decode_tokens(*e, pctx, tokens.data(), pp);
+            llama_synchronize(pctx);
             const int64_t dt = now_us() - t0;
             if (rc != 0) {
                 log += "pp decode failed with code " + std::to_string(rc) + "\n";
@@ -724,7 +884,7 @@ Java_ai_airi_qwenmobile_LlamaNative_bench(JNIEnv * env, jclass, jlong handle,
             int rc = 0;
             for (int i = 0; i < tg && rc == 0; ++i) {
                 llama_token t = pick(rng);
-                rc = decode_tokens(*e, &t, 1);
+                rc = decode_tokens(*e, e->ctx, &t, 1);
                 llama_synchronize(e->ctx);
             }
             const int64_t dt = now_us() - t0;

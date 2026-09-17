@@ -38,17 +38,19 @@ object LlamaNative {
      *
      * @param path       The GGUF file
      * @param mmproj     The vision projector GGUF, or null for a text-only engine
-     * @param device     The ggml device name (GPUOpenCL, HTP0), or null for the CPU
-     * @param gpuLayers  The number of layers on the device, 0 for the CPU only
-     * @param threads    The number of CPU threads
-     * @param nCtx       The context length in tokens
+     * @param device         The ggml device name (GPUOpenCL, HTP0), or null for the CPU
+     * @param prefillDevice  The device of a second model copy for the prompt (HTP0), or null
+     * @param gpuLayers      The number of layers on the device, 0 for the CPU only
+     * @param threads        The number of CPU threads
+     * @param nCtx           The context length in tokens
      * @return The engine handle
-     * @throws RuntimeException If the device, the model or the context does not load
+     * @throws RuntimeException If a device, the model or a context does not load
      */
     @JvmStatic external fun load(
         path: String,
         mmproj: String?,
         device: String?,
+        prefillDevice: String?,
         gpuLayers: Int,
         threads: Int,
         nCtx: Int,
