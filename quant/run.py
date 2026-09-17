@@ -1,62 +1,70 @@
 """Command line of the pipeline.
 
-    python -m quant.run transform  --model Qwen3.5-2B [--no-rotate] [--block 32] [--permute-mlp]
+    python -m quant.run transform  --model Qwen3.5-2B [--no-rotate] [--block 32] [--permute-mlp] [--tie-head] [--suffix t]
     python -m quant.run verify     --model Qwen3.5-2B
     python -m quant.run convert    --model Qwen3.5-2B
-    python -m quant.run quantize   --model Qwen3.5-2B [--solver qronos|gptq] [--no-scale] [--mismatch model|layer] [--drift]
+    python -m quant.run quantize   --model Qwen3.5-2B [--init qronos|gptq] [--no-scale] [--mismatch model|layer] [--drift]
+    python -m quant.run quantize   --model Qwen3.5-2B --head-only --packs quant-out/<previous run> [--stream]
     python -m quant.run convert    --model Qwen3.5-2B --source tf
-    python -m quant.run export     --model Qwen3.5-2B --source tf [--head Q8_0] [--only <regex>] [--invert]
+    python -m quant.run export     --model Qwen3.5-2B --source tf [--head Q8_0] [--only <regex>] [--invert] [--tie-head]
     python -m quant.run eval       --model Qwen3.5-2B --gguf <file>
     python -m quant.run drift      --model Qwen3.5-2B --source t --out analysis/<file>.drift.md
 
 Paths are relative to the project root: weights/<model> is the official
 checkpoint, weights/<model>-t is the transformed one, weights/gguf holds the
-GGUF files, quant-out/<model> holds the solved blocks.
+GGUF files, quant-out/<model> holds the solved blocks. A transformed
+checkpoint with the tensor ``output_rot`` (``transform --tie-head``) is a
+tied one: quantize and drift then wrap the heads with its dense map, and the
+head pack is ``token_embd.weight``.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import torch
 
-from .checkpoint import layer_types, load_checkpoint, num_layers, save_checkpoint
+from .checkpoint import OUTPUT_ROT, layer_types, load_checkpoint, load_tensor, num_layers, save_checkpoint
 from .plan import Plan
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
 def cmd_transform(args: argparse.Namespace) -> None:
+    """Write the transformed checkpoint weights/<model>-<suffix>, tied or untied."""
     src = ROOT / "weights" / args.model
-    dst = ROOT / "weights" / f"{args.model}-t"
+    dst = ROOT / "weights" / f"{args.model}-{args.suffix}"
     from .transform import transform
 
     tensors = load_checkpoint(src)
     out = transform(tensors, num_layers(src), layer_types(src), rotate=not args.no_rotate,
                     block=args.block, seed=args.seed, permute_mlp=args.permute_mlp,
-                    device=torch.device(args.device))
-    save_checkpoint(out, src, dst, tie_word_embeddings=False)
-    print(f"wrote {dst}: rotate={not args.no_rotate} block={args.block} permute_mlp={args.permute_mlp}")
+                    device=torch.device(args.device), tie_head=args.tie_head)
+    save_checkpoint(out, src, dst, tie_word_embeddings=args.tie_head)
+    print(f"wrote {dst}: rotate={not args.no_rotate} block={args.block} permute_mlp={args.permute_mlp} "
+          f"tie_head={args.tie_head}")
 
 
 @torch.no_grad()
 def cmd_verify(args: argparse.Namespace) -> None:
     """Compare the logits of the original and the transformed model on a prompt."""
-    from transformers import AutoTokenizer, Qwen3_5ForCausalLM
+    from transformers import AutoTokenizer
 
     src = ROOT / "weights" / args.model
-    dst = ROOT / "weights" / f"{args.model}-t"
+    dst = ROOT / "weights" / f"{args.model}-{args.suffix}"
     tok = AutoTokenizer.from_pretrained(src)
     ids = tok(args.prompt, return_tensors="pt").input_ids.to(args.device)
-    torch.backends.cuda.matmul.allow_tf32 = False
-    ref = Qwen3_5ForCausalLM.from_pretrained(src, dtype=torch.float32, device_map=args.device)
+    ref = _load_model(src, args.device)
     a = ref(ids).logits.float()
     del ref
     torch.cuda.empty_cache()
-    new = Qwen3_5ForCausalLM.from_pretrained(dst, dtype=torch.float32, device_map=args.device)
+    new = _load_model(dst, args.device)
+    _tie(dst, new)
     b = new(ids).logits.float()
     diff = (a - b).abs()
     print(f"logits: max abs diff {diff.max():.3e}, mean {diff.mean():.3e}, "
@@ -73,10 +81,24 @@ def cmd_convert(args: argparse.Namespace) -> None:
 
 
 def _load_model(directory: Path, device: str):
+    """The float32 model on ``device``. A CPU load takes no device map, thus it needs no accelerate."""
     from transformers import Qwen3_5ForCausalLM
 
     torch.backends.cuda.matmul.allow_tf32 = False
-    return Qwen3_5ForCausalLM.from_pretrained(directory, dtype=torch.float32, device_map=device).eval()
+    placement = {} if device == "cpu" else {"device_map": device}
+    return Qwen3_5ForCausalLM.from_pretrained(directory, dtype=torch.float32, **placement).eval()
+
+
+def _tie(directory: Path, *models) -> bool:
+    """Wrap the heads of the models with the dense map of a tied checkpoint. Returns True when it is tied."""
+    from .flow import tie_head
+
+    rot = load_tensor(directory, OUTPUT_ROT)
+    if rot is None:
+        return False
+    for model in models:
+        tie_head(model, rot)
+    return True
 
 
 def _wiki_ids(tokenizer, n_seq: int, seq_len: int) -> torch.Tensor:
@@ -85,38 +107,83 @@ def _wiki_ids(tokenizer, n_seq: int, seq_len: int) -> torch.Tensor:
     return load_text_ids(tokenizer, ROOT / "data" / "wiki.test.raw", n_seq, seq_len)
 
 
+def _link_packs(packs: Path, out: Path) -> int:
+    """Put the layer packs of ``packs`` into ``out`` as hard links (copies on another file system).
+
+    The stale packs of ``out`` go first, thus the export finds one
+    consistent set. Returns the number of linked packs.
+    """
+    out.mkdir(parents=True, exist_ok=True)
+    for stale in out.glob("*.npz"):
+        stale.unlink()
+    n = 0
+    for path in sorted(packs.glob("blk.*.npz")):
+        try:
+            os.link(path, out / path.name)
+        except OSError:
+            shutil.copy2(path, out / path.name)
+        n += 1
+    return n
+
+
 def cmd_quantize(args: argparse.Namespace) -> None:
-    """Solve the plan in the quantized flow, save the folded reference, report the drift."""
+    """Solve the plan in the quantized flow, save the folded reference, report the drift.
+
+    With ``--head-only`` the layers of the working copy take the packs and
+    the folds of a previous run (``--packs``), and only the head, and the
+    tied embedding, is solved and optimized. With ``--stream`` the copies
+    stay on the CPU and each layer moves to the device for its passes.
+    """
     from transformers import AutoTokenizer
 
     from .blockopt import OptOptions
     from .calib import build_calibration
-    from .drift import drift_report
+    from .drift import apply_folds, apply_packs, drift_report
     from .flow import Lockstep, Options, Quantizer, state_as_checkpoint
 
     src = ROOT / "weights" / f"{args.model}-t"
     out = ROOT / "quant-out" / args.model
     tok = AutoTokenizer.from_pretrained(src)
     ids = build_calibration(tok, args.n_seq, args.seq_len, args.seed, ROOT / "data" / f"calib-{args.n_seq}x{args.seq_len}.pt")
-    ref = _load_model(src, args.device)
-    work = _load_model(src, args.device)
-    plan = _plan(args, num_layers(ROOT / "weights" / args.model))
+    store = "cpu" if args.stream else args.device
+    ref = _load_model(src, store)
+    work = _load_model(src, store)
+    tied = _tie(src, ref, work)
+    plan = _plan(args, num_layers(ROOT / "weights" / args.model), tied)
     opts = Options(method=args.method, init=args.init, scale=not args.no_scale, permute_mlp=not args.no_permute,
                    mismatch=args.mismatch, damp=args.damp, refit_damp=args.refit_damp, batch=args.batch,
                    opt=OptOptions(epochs=args.epochs, batch=args.opt_batch, freeze_weights=args.freeze_weights,
                                   lr_weight=args.lr_weight,
                                   lr_scale=args.lr_scale, lr_other=args.lr_other, rank=args.rank,
-                                  head_rank=args.head_rank, head_steps=args.head_steps))
-    print(f"quantize {args.model}: {opts}", flush=True)
-    Quantizer(Lockstep(ref, work, ids, args.batch), plan, out, opts).run()
+                                  head_rank=args.head_rank, head_steps=args.head_steps, head_chunk=args.head_chunk))
+    if args.head_only:
+        packs = _packs(args)
+        if packs.resolve() == out.resolve():
+            raise SystemExit(f"--head-only writes to {out}: give the packs of the previous run with --packs "
+                             "from another directory")
+        n_packs, n_folds = len(apply_packs(work, packs)), apply_folds(work, packs)
+        if tied:
+            # The folds of an untied run hold the column scales of its head in the final norm. A tied
+            # head has no column scales, thus its final norm starts as the identity.
+            work.model.norm.weight.data.zero_()
+        print(f"applied {n_packs} packs and {n_folds} folded tensors from {packs}, "
+              f"linked {_link_packs(packs, out)} layer packs into {out}", flush=True)
+    print(f"quantize {args.model}: tied={tied} stream={args.stream} {opts}", flush=True)
+    step = Lockstep(ref, work, ids, args.batch, device=torch.device(args.device))
+    quantizer = Quantizer(step, plan, out, opts)
+    if args.head_only:
+        quantizer.run_head_only()
+    else:
+        quantizer.run()
     print(f"solved blocks in {out}", flush=True)
 
-    dst = ROOT / "weights" / f"{args.model}-tf"
-    save_checkpoint(state_as_checkpoint(ref, load_checkpoint(src)), src, dst, tie_word_embeddings=False)
-    print(f"wrote the folded reference {dst}", flush=True)
+    if not args.head_only:
+        dst = ROOT / "weights" / f"{args.model}-tf"
+        save_checkpoint(state_as_checkpoint(ref, load_checkpoint(src)), src, dst, tie_word_embeddings=tied)
+        print(f"wrote the folded reference {dst}", flush=True)
 
     if args.drift:
-        step = Lockstep(ref, work, _wiki_ids(tok, 16, 1024), 4)
+        step = Lockstep(ref, work, _wiki_ids(tok, 16, 1024), 4, device=torch.device(args.device))
         report = drift_report(step, f"{args.model} {args.tag}")
         path = ROOT / "analysis" / f"{args.model}-{args.tag}.drift.md"
         path.write_text(report)
@@ -134,6 +201,7 @@ def cmd_drift(args: argparse.Namespace) -> None:
     tok = AutoTokenizer.from_pretrained(src)
     ref = _load_model(src, args.device)
     work = _load_model(src, args.device)
+    _tie(src, ref, work)
     stats = apply_packs(work, _packs(args))
     print(f"applied {len(stats)} solved blocks and {apply_folds(work, _packs(args))} folded tensors", flush=True)
     step = Lockstep(ref, work, _wiki_ids(tok, 16, 1024), 4)
@@ -146,9 +214,10 @@ def cmd_export(args: argparse.Namespace) -> None:
 
     f16 = ROOT / "weights" / "gguf" / f"{args.model}-{args.source}-F16.gguf"
     out = ROOT / "weights" / "gguf" / (args.out or f"{args.model}-{args.tag}.gguf")
-    plan = _plan(args, num_layers(ROOT / "weights" / args.model))
+    plan = _plan(args, num_layers(ROOT / "weights" / args.model), args.tie_head)
     export(f16, out, _packs(args), plan, ROOT / "llama.cpp", torch.device(args.device),
-           only=args.only, invert=args.invert, source_folded=args.source == "tf")
+           only=args.only, invert=args.invert, source_folded=args.source == "tf",
+           tie_head=args.tie_head, rot=Path(args.rot) if args.rot else None)
 
 
 def _packs(args: argparse.Namespace) -> Path:
@@ -173,9 +242,10 @@ def cmd_eval(args: argparse.Namespace) -> None:
             print(line.split(" I ", 1)[-1])
 
 
-def _plan(args: argparse.Namespace, n_layers: int) -> Plan:
+def _plan(args: argparse.Namespace, n_layers: int, tied: bool = False) -> Plan:
+    """The plan of the flags. A tied head takes the type of the embedding, because it is the embedding."""
     edges = tuple(int(x) for x in args.edge_layers.split(",")) if args.edge_layers else ()
-    return Plan(bulk=args.bulk, head=args.head, embedding=args.embedding, kv_proj=args.kv_proj,
+    return Plan(bulk=args.bulk, head=args.embedding if tied else args.head, embedding=args.embedding, kv_proj=args.kv_proj,
                 gdn_gate=args.gdn_gate, edge_layers=edges, edge_type="Q8_0", n_layers=n_layers)
 
 
@@ -191,9 +261,13 @@ def main() -> None:
     t.add_argument("--block", type=int, default=None, help="Hadamard block size, default full")
     t.add_argument("--seed", type=int, default=0)
     t.add_argument("--permute-mlp", action="store_true")
+    t.add_argument("--tie-head", action="store_true",
+                   help="keep the head tied to the embedding and write the dense map output_rot after the final norm")
+    t.add_argument("--suffix", default="t", help="the suffix of the output checkpoint, weights/<model>-<suffix>")
 
     v = sub.add_parser("verify", parents=[common])
     v.add_argument("--prompt", default="The three laws of thermodynamics are")
+    v.add_argument("--suffix", default="t", help="the suffix of the transformed checkpoint")
 
     c = sub.add_parser("convert", parents=[common])
     c.add_argument("--source", default="t", help="the checkpoint suffix: t (transformed) or tf (transformed, folded)")
@@ -225,6 +299,12 @@ def main() -> None:
                    help="where the FP-flow reference restarts: never (model) or at each layer input")
     q.add_argument("--drift", action="store_true", help="write the drift report after the solve")
     q.add_argument("--tag", default="recipe", help="the label of the drift report")
+    q.add_argument("--head-only", action="store_true",
+                   help="reuse the layer packs and folds of --packs, solve and optimize only the head")
+    q.add_argument("--packs", default=None, help="with --head-only: the directory of the packs of the previous run")
+    q.add_argument("--stream", action="store_true",
+                   help="the copies stay on the CPU, each layer moves to --device for its passes")
+    q.add_argument("--head-chunk", type=int, default=16384, help="rows of the head per chunk of the logits")
     _plan_args(q)
 
     dr = sub.add_parser("drift", parents=[common])
@@ -241,6 +321,9 @@ def main() -> None:
     e.add_argument("--packs", default=None, help="the directory of the solved blocks, default quant-out/<model>")
     e.add_argument("--only", default=None, help="regex: quantize the matching tensors only, the rest stays F16")
     e.add_argument("--invert", action="store_true", help="with --only: quantize everything except the matches")
+    e.add_argument("--tie-head", action="store_true",
+                   help="no output.weight: the head is token_embd through the dense map output_rot (F16)")
+    e.add_argument("--rot", default=None, help="with --tie-head: a .npy file with the dense map M, [out, in] float32")
     _plan_args(e)
 
     ev = sub.add_parser("eval", parents=[common])
