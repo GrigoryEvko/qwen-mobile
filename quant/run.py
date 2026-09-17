@@ -3,9 +3,11 @@
     python -m quant.run transform  --model Qwen3.5-2B [--no-rotate] [--block 32] [--permute-mlp]
     python -m quant.run verify     --model Qwen3.5-2B
     python -m quant.run convert    --model Qwen3.5-2B
-    python -m quant.run quantize   --model Qwen3.5-2B [--n-seq 128] [--seq-len 2048]
-    python -m quant.run export     --model Qwen3.5-2B [--head Q8_0] [--gdn-gate Q8_0] [--edge-layers 0,23]
+    python -m quant.run quantize   --model Qwen3.5-2B [--solver qronos|gptq] [--no-scale] [--mismatch model|layer] [--drift]
+    python -m quant.run convert    --model Qwen3.5-2B --source tf
+    python -m quant.run export     --model Qwen3.5-2B --source tf [--head Q8_0] [--only <regex>] [--invert]
     python -m quant.run eval       --model Qwen3.5-2B --gguf <file>
+    python -m quant.run drift      --model Qwen3.5-2B --source t --out analysis/<file>.drift.md
 
 Paths are relative to the project root: weights/<model> is the official
 checkpoint, weights/<model>-t is the transformed one, weights/gguf holds the
@@ -62,38 +64,91 @@ def cmd_verify(args: argparse.Namespace) -> None:
 
 
 def cmd_convert(args: argparse.Namespace) -> None:
-    src = ROOT / "weights" / f"{args.model}-t"
-    out = ROOT / "weights" / "gguf" / f"{args.model}-t-F16.gguf"
+    src = ROOT / "weights" / f"{args.model}-{args.source}"
+    out = ROOT / "weights" / "gguf" / f"{args.model}-{args.source}-F16.gguf"
     cmd = [sys.executable, str(ROOT / "llama.cpp" / "convert_hf_to_gguf.py"), str(src),
            "--outtype", "f16", "--outfile", str(out)]
     subprocess.run(cmd, check=True)
     print(f"wrote {out}")
 
 
-def cmd_quantize(args: argparse.Namespace) -> None:
-    from transformers import AutoTokenizer, Qwen3_5ForCausalLM
+def _load_model(directory: Path, device: str):
+    from transformers import Qwen3_5ForCausalLM
 
-    from .calib import build_calibration, quantize_layers
+    torch.backends.cuda.matmul.allow_tf32 = False
+    return Qwen3_5ForCausalLM.from_pretrained(directory, dtype=torch.float32, device_map=device).eval()
+
+
+def _wiki_ids(tokenizer, n_seq: int, seq_len: int) -> torch.Tensor:
+    from .drift import load_text_ids
+
+    return load_text_ids(tokenizer, ROOT / "data" / "wiki.test.raw", n_seq, seq_len)
+
+
+def cmd_quantize(args: argparse.Namespace) -> None:
+    """Solve the plan in the quantized flow, save the folded reference, report the drift."""
+    from transformers import AutoTokenizer
+
+    from .calib import build_calibration
+    from .drift import drift_report
+    from .flow import Lockstep, Options, Quantizer, state_as_checkpoint
 
     src = ROOT / "weights" / f"{args.model}-t"
     out = ROOT / "quant-out" / args.model
     tok = AutoTokenizer.from_pretrained(src)
     ids = build_calibration(tok, args.n_seq, args.seq_len, args.seed, ROOT / "data" / f"calib-{args.n_seq}x{args.seq_len}.pt")
-    torch.backends.cuda.matmul.allow_tf32 = False
-    model = Qwen3_5ForCausalLM.from_pretrained(src, dtype=torch.float32, device_map=args.device)
-    model.eval()
+    ref = _load_model(src, args.device)
+    work = _load_model(src, args.device)
     plan = _plan(args, num_layers(ROOT / "weights" / args.model))
-    quantize_layers(model, ids, plan, out, batch=args.batch, damp=args.damp)
-    print(f"solved blocks in {out}")
+    opts = Options(solver=args.solver, scale=not args.no_scale, permute_mlp=not args.no_permute,
+                   mismatch=args.mismatch, damp=args.damp, refit_damp=args.refit_damp, batch=args.batch)
+    print(f"quantize {args.model}: {opts}", flush=True)
+    Quantizer(Lockstep(ref, work, ids, args.batch), plan, out, opts).run()
+    print(f"solved blocks in {out}", flush=True)
+
+    dst = ROOT / "weights" / f"{args.model}-tf"
+    save_checkpoint(state_as_checkpoint(ref, load_checkpoint(src)), src, dst, tie_word_embeddings=False)
+    print(f"wrote the folded reference {dst}", flush=True)
+
+    if args.drift:
+        step = Lockstep(ref, work, _wiki_ids(tok, 16, 1024), 4)
+        report = drift_report(step, f"{args.model} {args.tag}")
+        path = ROOT / "analysis" / f"{args.model}-{args.tag}.drift.md"
+        path.write_text(report)
+        print(f"wrote {path}")
+
+
+def cmd_drift(args: argparse.Namespace) -> None:
+    """The drift report of the solved blocks on a source checkpoint."""
+    from transformers import AutoTokenizer
+
+    from .drift import apply_packs, drift_report
+    from .flow import Lockstep
+
+    src = ROOT / "weights" / f"{args.model}-{args.source}"
+    tok = AutoTokenizer.from_pretrained(src)
+    ref = _load_model(src, args.device)
+    work = _load_model(src, args.device)
+    stats = apply_packs(work, _packs(args))
+    print(f"applied {len(stats)} solved blocks", flush=True)
+    step = Lockstep(ref, work, _wiki_ids(tok, 16, 1024), 4)
+    args.out.write_text(drift_report(step, f"{args.model} {args.tag}", stats))
+    print(f"wrote {args.out}")
 
 
 def cmd_export(args: argparse.Namespace) -> None:
     from .export import export
 
-    f16 = ROOT / "weights" / "gguf" / f"{args.model}-t-F16.gguf"
+    f16 = ROOT / "weights" / "gguf" / f"{args.model}-{args.source}-F16.gguf"
     out = ROOT / "weights" / "gguf" / (args.out or f"{args.model}-{args.tag}.gguf")
     plan = _plan(args, num_layers(ROOT / "weights" / args.model))
-    export(f16, out, ROOT / "quant-out" / args.model, plan, ROOT / "llama.cpp", torch.device(args.device))
+    export(f16, out, _packs(args), plan, ROOT / "llama.cpp", torch.device(args.device),
+           only=args.only, invert=args.invert)
+
+
+def _packs(args: argparse.Namespace) -> Path:
+    """The directory of the solved blocks: --packs, or quant-out/<model>."""
+    return Path(args.packs) if args.packs else ROOT / "quant-out" / args.model
 
 
 def cmd_eval(args: argparse.Namespace) -> None:
@@ -131,27 +186,46 @@ def main() -> None:
     v = sub.add_parser("verify", parents=[common])
     v.add_argument("--prompt", default="The three laws of thermodynamics are")
 
-    sub.add_parser("convert", parents=[common])
+    c = sub.add_parser("convert", parents=[common])
+    c.add_argument("--source", default="t", help="the checkpoint suffix: t (transformed) or tf (transformed, folded)")
 
     q = sub.add_parser("quantize", parents=[common])
     q.add_argument("--n-seq", type=int, default=128)
     q.add_argument("--seq-len", type=int, default=2048)
     q.add_argument("--seed", type=int, default=0)
     q.add_argument("--batch", type=int, default=8)
-    q.add_argument("--damp", type=float, default=0.01)
+    q.add_argument("--damp", type=float, default=0.01, help="rounding damping, relative to the mean diagonal")
+    q.add_argument("--refit-damp", type=float, default=1e-6, help="refit damping, relative to the largest eigenvalue")
+    q.add_argument("--solver", choices=("qronos", "gptq"), default="qronos")
+    q.add_argument("--no-scale", action="store_true", help="no folded column scales")
+    q.add_argument("--no-permute", action="store_true", help="no permutation of the MLP intermediate channels")
+    q.add_argument("--mismatch", choices=("model", "layer"), default="model",
+                   help="where the FP-flow reference restarts: never (model) or at each layer input")
+    q.add_argument("--drift", action="store_true", help="write the drift report after the solve")
+    q.add_argument("--tag", default="recipe", help="the label of the drift report")
     _plan_args(q)
+
+    dr = sub.add_parser("drift", parents=[common])
+    dr.add_argument("--source", default="t")
+    dr.add_argument("--packs", default=None)
+    dr.add_argument("--tag", default="gptq")
+    dr.add_argument("--out", type=Path, required=True)
 
     e = sub.add_parser("export", parents=[common])
     e.add_argument("--tag", default="Q4_0")
     e.add_argument("--out", default=None)
+    e.add_argument("--source", default="t", help="the F16 GGUF that supplies the unsolved tensors: t or tf")
+    e.add_argument("--packs", default=None, help="the directory of the solved blocks, default quant-out/<model>")
+    e.add_argument("--only", default=None, help="regex: quantize the matching tensors only, the rest stays F16")
+    e.add_argument("--invert", action="store_true", help="with --only: quantize everything except the matches")
     _plan_args(e)
 
     ev = sub.add_parser("eval", parents=[common])
     ev.add_argument("--gguf", required=True)
 
     args = p.parse_args()
-    {"transform": cmd_transform, "verify": cmd_verify, "convert": cmd_convert,
-     "quantize": cmd_quantize, "export": cmd_export, "eval": cmd_eval}[args.cmd](args)
+    {"transform": cmd_transform, "verify": cmd_verify, "convert": cmd_convert, "quantize": cmd_quantize,
+     "export": cmd_export, "eval": cmd_eval, "drift": cmd_drift}[args.cmd](args)
 
 
 def _plan_args(sp: argparse.ArgumentParser) -> None:

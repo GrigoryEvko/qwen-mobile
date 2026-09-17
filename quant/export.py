@@ -8,6 +8,7 @@ round-to-nearest Q4_0 or Q8_0 otherwise, F32 for the sensitive small tensors.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -33,9 +34,15 @@ def _f32_of(reader_tensor) -> np.ndarray:
 
 
 def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: Path,
-           device: torch.device) -> None:
-    """Write ``out_gguf``. Complexity is O(total bytes)."""
+           device: torch.device, only: str | None = None, invert: bool = False) -> None:
+    """Write ``out_gguf``. Complexity is O(total bytes).
+
+    ``only`` is a regular expression on the GGUF tensor name. The tensors
+    that match keep their plan type and every other tensor stays F16, thus
+    the file isolates the error of one class. ``invert`` swaps the two sets.
+    """
     gguf = _load_gguf_module(llama_dir)
+    selector = re.compile(only) if only else None
     reader = gguf.GGUFReader(str(f16_gguf))
     arch = bytes(reader.fields["general.architecture"].parts[-1]).decode()
     writer = gguf.GGUFWriter(str(out_gguf), arch)
@@ -53,6 +60,8 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
     for t in reader.tensors:
         name = t.name
         kind = plan.type_of(name)
+        if selector is not None and kind in ("Q4_0", "Q8_0") and (selector.search(name) is None) != invert:
+            kind = "keep"
         shape = [int(x) for x in reversed(t.shape)]
         pack = packs / f"{name}.npz"
         if kind == "Q4_0" and pack.exists():

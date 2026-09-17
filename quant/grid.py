@@ -38,16 +38,16 @@ def q4_0_round(blocks: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
 
 
 def q4_0_scale_search(blocks: torch.Tensor, weights: torch.Tensor | None = None,
-                      n_candidates: int = 24, span: float = 0.25) -> torch.Tensor:
+                      n_candidates: int = 40, lo: float = 0.55, hi: float = 1.05) -> torch.Tensor:
     """Pick the scale per block that minimizes the (weighted) squared error.
 
-    Candidates are the reference scale times factors in [1 - span, 1 + span],
-    plus the scales that map the extreme value to each level. ``weights``
-    [cols] weights the error per input column, for a diagonal Hessian.
+    Candidates are the reference scale times factors in [lo, hi]. This is the
+    diagonal-Hessian scale search of NeUQI for a grid without zero point.
+    ``weights`` [cols] weights the error per input column.
     Complexity is O(rows · cols · n_candidates).
     """
     d0 = q4_0_scale_rtn(blocks)
-    factors = torch.linspace(1.0 - span, 1.0 + span, n_candidates, device=blocks.device, dtype=blocks.dtype)
+    factors = torch.linspace(lo, hi, n_candidates, device=blocks.device, dtype=blocks.dtype)
     best_d = d0.clone()
     best_err = torch.full_like(d0, float("inf"))
     wgt = None
