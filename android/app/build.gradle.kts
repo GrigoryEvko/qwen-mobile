@@ -89,6 +89,11 @@ android {
         viewBinding = true
     }
 
+    testOptions {
+        // The unit tests run on the JVM: a stub of the Android SDK returns a default value, it does not throw.
+        unitTests.isReturnDefaultValues = true
+    }
+
     packaging {
         jniLibs {
             // The Hexagon backend hands the DSP library to FastRPC by file path, thus the
@@ -117,4 +122,6 @@ dependencies {
     implementation("io.noties.markwon:html:4.6.2")
     implementation("io.noties.markwon:linkify:4.6.2")
     testImplementation("junit:junit:4.13.2")
+    // The conversation store writes JSON. The Android SDK stub of org.json has no implementation.
+    testImplementation("org.json:json:20250107")
 }
