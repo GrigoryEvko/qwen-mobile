@@ -321,7 +321,7 @@ def main() -> None:
     e.add_argument("--source", default="t", help="the F16 GGUF that supplies the unsolved tensors: t or tf "
                                                  "(tf is necessary with --only or a plan that differs from the calibration)")
     e.add_argument("--f16", default=None, help="the source GGUF as a path, for example the F16 GGUF of the original "
-                                              "checkpoint; the default is weights/gguf/<model>-<source>-F16.gguf")
+                                              "checkpoint. The default is weights/gguf/<model>-<source>-F16.gguf")
     e.add_argument("--packs", default=None, help="the directory of the solved blocks, default quant-out/<model>")
     e.add_argument("--only", default=None, help="regex: quantize the matching tensors only, the rest stays F16")
     e.add_argument("--invert", action="store_true", help="with --only: quantize everything except the matches")
@@ -333,7 +333,7 @@ def main() -> None:
     ev = sub.add_parser("eval", parents=[common])
     ev.add_argument("--gguf", required=True)
     ev.add_argument("--ngl", type=int, default=99,
-                    help="the number of layers on the GPU; a model that does not fit in VRAM takes the split of its base")
+                    help="the number of layers on the GPU. A model that does not fit in VRAM takes the split of its base")
 
     args = p.parse_args()
     {"transform": cmd_transform, "verify": cmd_verify, "convert": cmd_convert, "quantize": cmd_quantize,

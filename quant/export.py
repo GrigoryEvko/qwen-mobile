@@ -178,8 +178,8 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
     the file isolates the error of one class. ``invert`` swaps the two sets.
 
     A plan with the bulk Q8_0 and the F16 GGUF of the original checkpoint
-    gives a round-to-nearest Q8_0 file with no transform: each 2-D weight
-    of the plan goes through ``q8_0_quantize`` one tensor at a time.
+    gives a round-to-nearest Q8_0 file with no transform: ``q8_0_quantize``
+    packs each 2-D weight of the plan, one tensor at a time.
 
     ``source_folded`` says that the F16 GGUF comes from the folded
     reference (``--source tf``). The calibration folds move the columns of
