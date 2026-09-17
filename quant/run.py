@@ -117,22 +117,23 @@ def _plan(args: argparse.Namespace, n_layers: int) -> Plan:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--model", default="Qwen3.5-2B")
-    p.add_argument("--device", default="cuda")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--model", default="Qwen3.5-2B")
+    common.add_argument("--device", default="cuda")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    t = sub.add_parser("transform")
+    t = sub.add_parser("transform", parents=[common])
     t.add_argument("--no-rotate", action="store_true")
     t.add_argument("--block", type=int, default=None, help="Hadamard block size, default full")
     t.add_argument("--seed", type=int, default=0)
     t.add_argument("--permute-mlp", action="store_true")
 
-    v = sub.add_parser("verify")
+    v = sub.add_parser("verify", parents=[common])
     v.add_argument("--prompt", default="The three laws of thermodynamics are")
 
-    sub.add_parser("convert")
+    sub.add_parser("convert", parents=[common])
 
-    q = sub.add_parser("quantize")
+    q = sub.add_parser("quantize", parents=[common])
     q.add_argument("--n-seq", type=int, default=128)
     q.add_argument("--seq-len", type=int, default=2048)
     q.add_argument("--seed", type=int, default=0)
@@ -140,12 +141,12 @@ def main() -> None:
     q.add_argument("--damp", type=float, default=0.01)
     _plan_args(q)
 
-    e = sub.add_parser("export")
+    e = sub.add_parser("export", parents=[common])
     e.add_argument("--tag", default="Q4_0")
     e.add_argument("--out", default=None)
     _plan_args(e)
 
-    ev = sub.add_parser("eval")
+    ev = sub.add_parser("eval", parents=[common])
     ev.add_argument("--gguf", required=True)
 
     args = p.parse_args()
