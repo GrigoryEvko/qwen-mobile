@@ -1019,10 +1019,10 @@ JNIEXPORT void JNICALL
 Java_ai_airi_qwenmobile_LlamaNative_init(JNIEnv * env, jclass, jstring jlibdir) {
     llama_log_set(log_to_logcat, nullptr);
     // Op fusion is correct with the patch of the fused matvec add (patches/hexagon-fusion/0001)
-    // and gives the F16 file a faster prefill. The fused recurrent state step stays off until
-    // its conv kernel is fast (patches/hexagon-fusion/0002).
+    // and gives the F16 file a faster prefill. The fused recurrent state step is verified: a
+    // one-token KL run is at the same floor as the unfused path (patches/hexagon-fusion/0002 to 0004).
     setenv("GGML_HEXAGON_OPFUSION", "1", 0);
-    setenv("GGML_HEXAGON_OPFUSION_STATE", "0", 0);
+    setenv("GGML_HEXAGON_OPFUSION_STATE", "1", 0);
     const std::string libdir = jstring_to_std(env, jlibdir);
     if (!libdir.empty()) {
         setenv("ADSP_LIBRARY_PATH", libdir.c_str(), 1);
