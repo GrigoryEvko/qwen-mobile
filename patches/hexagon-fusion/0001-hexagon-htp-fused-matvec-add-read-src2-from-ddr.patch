@@ -1,0 +1,106 @@
+Hexagon HTP: read the fused ADD input from DDR in the two matvec kernels
+
+Base: llama.cpp commit c6824a9. File: ggml/src/ggml-hexagon/htp/matmul-ops.c.
+
+How to apply, from the llama.cpp root:
+
+    git apply patches/hexagon-fusion/0001-hexagon-htp-fused-matvec-add-read-src2-from-ddr.patch
+    cmake --build build-snapdragon -j
+
+Only the DSP library changes. Push build-snapdragon/ggml/src/ggml-hexagon/libggml-htp-v79.so
+to /data/local/tmp/qwen/htp/lib/ on the phone. The host library libggml-hexagon.so stays as it is.
+
+Defect
+
+With op fusion on, the host fuses MUL_MAT and ADD when the activation has one row.
+The kernel for one row copies the ADD input (src2) with DMA into VTCM. The copy
+starts at the byte offset of the first row of the thread. Then the kernel adds
+the slice with hvx_add_f32_uaa, which loads src2 with aligned vector loads.
+
+The F16 and F32 matvec kernel (hvx_mv_2d) splits the rows per thread in even
+counts, not in multiples of 32. Thus, the slice of thread 1 and of each later
+thread starts at an offset that is not a multiple of 128 bytes. The aligned
+load ignores the low bits of the address, and the thread reads the wrong bias.
+
+The Qwen3.5 graph adds ssm_dt.bias to the output of the 16-row ssm_alpha
+matrix (src/models/qwen35.cpp, line 378). That matrix is F32 in the Q4_0 file
+and F16 in the F16 file, thus it always takes hvx_mv_2d. With 4 or 6 threads,
+rows 4 thru 15 get the bias of rows 0 thru 3. The decay gate of the gated
+delta net is wrong, and the text after the first token is not correct.
+
+Prefill is correct. The fusion at m > 1 needs the HMX path (ggml-hexagon.cpp,
+line 2632), and a 16-row matrix never takes the HMX path (line 4257).
+
+Fix
+
+The two matvec kernels read src2 from DDR with unaligned loads in the final
+add (hvx_add_f32_uau). The m > 1 kernel already does this in
+hvx_tensor_add_f32_grid. The DMA copy of src2 is removed, and with it the
+dma_queue_pop_nowait that never waited for the copy. The VTCM layout does not
+change, thus the host and the DSP stay in sync.
+
+diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
+index e16cfdc..1457a9a 100644
+--- a/ggml/src/ggml-hexagon/htp/matmul-ops.c
++++ b/ggml/src/ggml-hexagon/htp/matmul-ops.c
+@@ -476,16 +476,6 @@ static void hvx_mv_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
+                                                                                                                                   \
+     uint32_t push_ct = ct_start;                                                                                                  \
+     if (src0_start_row < src0_end_row) {                                                                                          \
+-        if (src2) {                                                                                                               \
+-            float * vtcm_src2_ptr = (float *) mmctx->vtcm_src2 + src0_start_row;                                                  \
+-            const float * src2_ptr = (const float *) src2->data + src0_start_row;                                                 \
+-            int slice_size = (int)MIN(src0_end_row, ne0) - (int)src0_start_row;                                                   \
+-            if (slice_size > 0) {                                                                                                 \
+-                dma_queue_push(dma_queue, dma_make_ptr(vtcm_src2_ptr, src2_ptr),                                                  \
+-                               slice_size * sizeof(float), slice_size * sizeof(float), slice_size * sizeof(float), 1);            \
+-                dma_queue_pop_nowait(dma_queue);                                                                                  \
+-            }                                                                                                                     \
+-        }                                                                                                                         \
+         for (uint32_t d = 0; d < n_prefetch && push_ct < ct_end; d++, push_ct++) {                                                \
+             dma_queue_push(dma_queue, dma_make_ptr(vtcm_src0_ptr + d * tile_row_transfer_size_aligned,                            \
+                            src0_row + push_ct * tile_row_stride), aligned_tile_size, tile_size, tile_size, n_k_tiles_a);          \
+@@ -520,9 +510,10 @@ static void hvx_mv_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
+     if (copy_cnt > 0) {                                                                                                           \
+         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct_end);                                                                \
+         if (src2) {                                                                                                               \
+-            hvx_add_f32_uaa((uint8_t *) &dst_col[src0_start_row],                                                                 \
++            /* The kernel reads src2 from DDR with unaligned loads. src2->data is not always aligned to 128 bytes. */             \
++            hvx_add_f32_uau((uint8_t *) &dst_col[src0_start_row],                                                                 \
+                             (const uint8_t *) tmp,                                                                                \
+-                            (const uint8_t *) ((const float *) mmctx->vtcm_src2 + src0_start_row),                                \
++                            (const uint8_t *) ((const float *) src2->data + src0_start_row),                                      \
+                             copy_cnt);                                                                                            \
+         } else {                                                                                                                  \
+             hvx_copy_f32_ua((uint8_t *) &dst_col[src0_start_row], (uint8_t *) tmp, copy_cnt);                                     \
+@@ -904,16 +895,6 @@ static void hvx_mv_2d(unsigned int nth, unsigned int ith, void * data) {
+ 
+     // Prefill vtcm with 2x src0 rows
+     if (src0_start_row < src0_end_row) {
+-        if (src2) {
+-            float * vtcm_src2_ptr = (float *) mmctx->vtcm_src2 + src0_start_row;
+-            const float * src2_ptr = (const float *) src2->data + src0_start_row;
+-            int slice_size = (int)src0_end_row - (int)src0_start_row;
+-            if (slice_size > 0) {
+-                dma_queue_push(dma_queue, dma_make_ptr(vtcm_src2_ptr, src2_ptr),
+-                               slice_size * sizeof(float), slice_size * sizeof(float), slice_size * sizeof(float), 1);
+-                dma_queue_pop_nowait(dma_queue);
+-            }
+-        }
+         for (uint32_t ir0 = src0_start_row; ir0 < src0_end_row_x2; ir0 += 2) {
+             const uint32_t is0 = (ir0 - src0_start_row);
+             if (is0 >= n_prefetch) {
+@@ -962,9 +943,11 @@ static void hvx_mv_2d(unsigned int nth, unsigned int ith, void * data) {
+     if (copy_cnt > 0) {
+         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, src0_end_row);
+         if (src2) {
+-            hvx_add_f32_uaa((uint8_t *) &dst_col[src0_start_row],
++            // The kernel reads src2 from DDR with unaligned loads. The per-thread row split is even,
++            // not a multiple of 32 rows. Thus, the slice offset is not aligned to 128 bytes.
++            hvx_add_f32_uau((uint8_t *) &dst_col[src0_start_row],
+                             (const uint8_t *) tmp,
+-                            (const uint8_t *) ((const float *) mmctx->vtcm_src2 + src0_start_row),
++                            (const uint8_t *) ((const float *) src2->data + src0_start_row),
+                             copy_cnt);
+         } else {
+             hvx_copy_f32_ua((uint8_t *) &dst_col[src0_start_row], (uint8_t *) tmp, copy_cnt);
