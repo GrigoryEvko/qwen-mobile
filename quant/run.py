@@ -7,6 +7,7 @@
     python -m quant.run quantize   --model Qwen3.5-2B --head-only --packs quant-out/<previous run> [--stream]
     python -m quant.run convert    --model Qwen3.5-2B --source tf
     python -m quant.run export     --model Qwen3.5-2B --source tf [--head Q8_0] [--mtp Q8_0] [--only <regex>] [--invert] [--tie-head]
+    python -m quant.run export     --model Qwen3.5-2B --source tu --packs <packs> --promote ssm_out [--promote-type F16]
     python -m quant.run export     --model Qwen3.5-2B --f16 weights/gguf/Qwen3.5-2B-F16.gguf --bulk Q8_0 --gdn-gate Q8_0 --tag Q8_0
     python -m quant.run eval       --model Qwen3.5-2B --gguf <file> [--ngl 99]
     python -m quant.run drift      --model Qwen3.5-2B --source t --out analysis/<file>.drift.md
@@ -219,7 +220,8 @@ def cmd_export(args: argparse.Namespace) -> None:
     plan = _plan(args, num_layers(ROOT / "weights" / args.model), args.tie_head)
     export(f16, out, _packs(args), plan, ROOT / "llama.cpp", torch.device(args.device),
            only=args.only, invert=args.invert, source_folded=args.source == "tf",
-           tie_head=args.tie_head, rot=Path(args.rot) if args.rot else None)
+           tie_head=args.tie_head, rot=Path(args.rot) if args.rot else None,
+           promote=args.promote, promote_type=args.promote_type)
 
 
 def _packs(args: argparse.Namespace) -> Path:
@@ -330,6 +332,10 @@ def main() -> None:
     e.add_argument("--tie-head", action="store_true",
                    help="no output.weight: the head is token_embd through the dense map output_rot (F16)")
     e.add_argument("--rot", default=None, help="with --tie-head: a .npy file with the dense map M, [out, in] float32")
+    e.add_argument("--promote", default=None,
+                   help="regex: the matching tensors of the 4-bit classes take --promote-type of their folded "
+                        "weight in place of their pack (round-to-nearest, no new calibration)")
+    e.add_argument("--promote-type", default="Q8_0", choices=("Q8_0", "F16"))
     _plan_args(e)
 
     ev = sub.add_parser("eval", parents=[common])

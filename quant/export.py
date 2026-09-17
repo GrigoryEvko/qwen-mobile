@@ -34,9 +34,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .grid import BLOCK, pack_nibbles, pack_q8_0, q8_0_quantize, quantize
+from .grid import block_permutation, dequantize_pack, pack_nibbles, pack_q8_0, q8_0_quantize, quantize
 from .grids import make_grid
 from .plan import MTP_MAPS, Plan
+from .refold import Geometry, Refold
 
 GGUF_4BIT = {"Q4_0": "Q4_0", "IQ4_NL": "IQ4_NL"}
 FILE_TYPES = {"Q4_0": "MOSTLY_Q4_0", "IQ4_NL": "MOSTLY_IQ4_NL", "Q8_0": "MOSTLY_Q8_0"}
@@ -139,14 +140,6 @@ class LinearAttentionLayout:
         return a, b
 
 
-def block_permutation(cols: torch.Tensor) -> torch.Tensor:
-    """The permutation of the blocks of 32 that a column permutation of whole blocks makes."""
-    runs = cols.view(-1, BLOCK)
-    if not torch.equal(runs, runs[:, :1] + torch.arange(BLOCK)) or int((runs[:, 0] % BLOCK).max()) != 0:
-        raise ValueError("the column permutation splits a block of 32, the packed scales cannot follow it")
-    return runs[:, 0] // BLOCK
-
-
 def plan_of(folds) -> dict | None:
     """The plan that the calibration used, from folds.npz, or None for an old file."""
     if folds is None or "plan" not in folds.files:
@@ -192,14 +185,43 @@ def mtp_map(name: str, a: np.ndarray, out_norm: np.ndarray) -> np.ndarray:
     raise ValueError(f"{name} is not a dense map of the MTP block")
 
 
+def make_refold(reader, folds, packs: Path, layout: LinearAttentionLayout | None, arch: str,
+                device: torch.device) -> Refold:
+    """The refold of the calibration ``folds`` and ``packs`` on the unfolded source ``reader``, in GGUF order."""
+    by_name = {t.name: t for t in reader.tensors}
+
+    def fold(name: str) -> np.ndarray:
+        a = folds[name].astype(np.float32).reshape([int(x) for x in reversed(by_name[name].shape)])
+        return layout.array(name, a) if layout is not None else a
+
+    def pack(name: str) -> torch.Tensor | None:
+        path = packs / f"{name}.npz"
+        if not path.exists():
+            return None
+        rows = layout.rows(name) if layout is not None else None
+        cols = layout.cols(name) if layout is not None else None
+        return dequantize_pack(np.load(path), device, rows, cols)
+
+    geometry = Geometry.from_gguf(reader, arch, layout.head_v_dim if layout is not None else 0)
+    return Refold(lambda name: _f32_of(by_name[name]), fold, pack, geometry, device)
+
+
 def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: Path,
            device: torch.device, only: str | None = None, invert: bool = False,
-           source_folded: bool = False, tie_head: bool = False, rot: Path | None = None) -> None:
+           source_folded: bool = False, tie_head: bool = False, rot: Path | None = None,
+           promote: str | None = None, promote_type: str = "Q8_0") -> None:
     """Write ``out_gguf``. Complexity is O(total bytes).
 
     ``only`` is a regular expression on the GGUF tensor name. The tensors
     that match keep their plan type and every other tensor stays F16, thus
     the file isolates the error of one class. ``invert`` swaps the two sets.
+
+    ``promote`` is a regular expression on the GGUF tensor name. The
+    tensors of the 4-bit classes that match take ``promote_type`` (Q8_0 by
+    round-to-nearest, or F16) of their folded weight in place of their
+    pack. The folded weight comes from the folded reference, or from the
+    unfolded source through ``Refold`` (refer to that module for the
+    approximation), thus a class moves to 8 bits with no new calibration.
 
     A plan with the bulk Q8_0 and the F16 GGUF of the original checkpoint
     gives a round-to-nearest Q8_0 file with no transform: ``q8_0_quantize``
@@ -225,6 +247,9 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
     """
     gguf = _load_gguf_module(llama_dir)
     selector = re.compile(only) if only else None
+    promoter = re.compile(promote) if promote else None
+    if promote_type not in ("Q8_0", "F16"):
+        raise ValueError(f"a promoted class takes Q8_0 or F16, not {promote_type}")
     # The small tensors that the calibration moved (norms, gates, Q8 matrices), in GGUF space.
     folds = np.load(packs / "folds.npz") if (packs / "folds.npz").exists() else None
     saved_plan = plan_of(folds)
@@ -241,12 +266,21 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
     arch = bytes(reader.fields["general.architecture"].parts[-1]).decode()
     layout = LinearAttentionLayout.from_gguf(reader, arch)
     rot_m = output_rot(rot, folds, reader) if tie_head else None
+    # A promoted tensor of an unfolded source with a calibration needs its folded coordinates.
+    refold = make_refold(reader, folds, packs, layout, arch, device) \
+        if promoter is not None and folds is not None and not source_folded else None
 
     def source(t) -> np.ndarray:
         if folds is not None and t.name in folds.files:
             a = folds[t.name].astype(np.float32).reshape([int(x) for x in reversed(t.shape)])
             return layout.array(t.name, a) if layout is not None else a
         return _f32_of(t)
+
+    def promoted(t) -> torch.Tensor:
+        """The folded weight of a promoted tensor on the device."""
+        if refold is None:
+            return torch.from_numpy(source(t)).to(device)
+        return refold.weight(t.name, _f32_of(t))
 
     # The exported output norm: the identity for a tied head without folds, else the source or the folds.
     t_norm = next((t for t in reader.tensors if t.name == "output_norm.weight"), None)
@@ -278,13 +312,23 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
             counts["dropped (tied)"] = counts.get("dropped (tied)", 0) + 1
             continue
         kind = plan.type_of(name)
+        promote_this = promoter is not None and kind in GGUF_4BIT and promoter.search(name) is not None
+        if promote_this:
+            kind = promote_type
         if selector is not None and kind in ("Q4_0", "Q8_0") and (selector.search(name) is None) != invert:
             kind = "keep"
         shape = [int(x) for x in reversed(t.shape)]
         pack = packs / f"{name}.npz"
         if kind in plan.solved_types() and kind not in GGUF_4BIT:
             raise ValueError(f"{name}: {kind} has no GGUF type, measure it with the drift report")
-        if kind in GGUF_4BIT and pack.exists():
+        if promote_this and kind == "Q8_0":
+            q, d = q8_0_quantize(promoted(t))
+            writer.add_tensor(name, pack_q8_0(q, d), raw_dtype=gguf.GGMLQuantizationType.Q8_0)
+            kind = "Q8_0 (promoted)"
+        elif promote_this and kind == "F16":
+            writer.add_tensor(name, promoted(t).to("cpu", torch.float16).numpy())
+            kind = "F16 (promoted)"
+        elif kind in GGUF_4BIT and pack.exists():
             z = np.load(pack)
             idx = torch.from_numpy(z["q"])
             if "levels" not in z:
@@ -330,6 +374,9 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file(progress=False)
     writer.close()
+    if refold is not None:
+        for note in refold.notes:
+            print(f"  refold {note}")
     for kind, n in sorted(counts.items()):
         print(f"  {kind:16s} {n:4d} tensors")
     print(f"wrote {out_gguf} ({out_gguf.stat().st_size / 2**30:.2f} GiB)")

@@ -117,10 +117,22 @@ def block_error(grid: Grid, w: torch.Tensor, col_weights: torch.Tensor,
     return total
 
 
-def dequantize_pack(z, device: torch.device) -> torch.Tensor:
+def block_permutation(cols: torch.Tensor) -> torch.Tensor:
+    """The permutation of the blocks of 32 that a column permutation of whole blocks makes."""
+    runs = cols.view(-1, BLOCK)
+    if not torch.equal(runs, runs[:, :1] + torch.arange(BLOCK)) or int((runs[:, 0] % BLOCK).max()) != 0:
+        raise ValueError("the column permutation splits a block of 32, the packed scales cannot follow it")
+    return runs[:, 0] // BLOCK
+
+
+def dequantize_pack(z, device: torch.device, rows: torch.Tensor | None = None,
+                    cols: torch.Tensor | None = None) -> torch.Tensor:
     """The values of a saved pack, the low-rank correction included.
 
-    A pack without ``levels`` holds Q4_0 levels as indices minus 8.
+    A pack without ``levels`` holds Q4_0 levels as indices minus 8. ``rows``
+    and ``cols`` are index permutations: the result holds pack row rows[i]
+    at row i, and pack column cols[j] at column j. The column permutation
+    must move whole blocks of 32.
     """
     from .grids import Grid, Q4_0Grid
 
@@ -131,9 +143,18 @@ def dequantize_pack(z, device: torch.device) -> torch.Tensor:
     else:
         grid = Q4_0Grid().to(device)
         idx = idx.to(torch.int16) + 8
+    if rows is not None:
+        idx, d = idx[rows.to(device)], d[rows.to(device)]
+    if cols is not None:
+        idx, d = idx[:, cols.to(device)], d[:, block_permutation(cols).to(device)]
     w = dequantize(grid, idx, d)
     if "lora_a" in z.files:
-        w = w + torch.from_numpy(z["lora_b"]).to(device) @ torch.from_numpy(z["lora_a"]).to(device)
+        a, b = torch.from_numpy(z["lora_a"]).to(device), torch.from_numpy(z["lora_b"]).to(device)
+        if rows is not None:
+            b = b[rows.to(device)]
+        if cols is not None:
+            a = a[:, cols.to(device)]
+        w = w + b @ a
     return w
 
 
