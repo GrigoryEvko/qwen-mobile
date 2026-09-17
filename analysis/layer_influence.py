@@ -30,20 +30,30 @@ def load_text_ids(tokenizer, path: Path, n_seq: int, seq_len: int) -> torch.Tens
 
 
 @torch.no_grad()
-def logits_of(model, ids: torch.Tensor, batch: int) -> torch.Tensor:
-    """Log-probabilities [n, T, V] in float32 on the CPU, batch by batch."""
+def logprobs_of(model, ids: torch.Tensor, batch: int) -> list[torch.Tensor]:
+    """Log-probabilities per batch, float16 on the CPU, thus 16 x 1024 tokens fit in RAM."""
     out = []
     for i in range(0, ids.shape[0], batch):
         lg = model(ids[i:i + batch].to(model.device)).logits.float()
-        out.append(F.log_softmax(lg, dim=-1).cpu())
-    return torch.cat(out)
+        out.append(F.log_softmax(lg, dim=-1).to(torch.float16).cpu())
+        del lg
+    return out
 
 
-def kl_and_top1(ref: torch.Tensor, other: torch.Tensor) -> tuple[float, float]:
-    """Mean KL(ref || other) per token and the top-1 agreement."""
-    kl = (ref.exp() * (ref - other)).sum(-1).mean().item()
-    top1 = (ref.argmax(-1) == other.argmax(-1)).float().mean().item()
-    return kl, top1
+@torch.no_grad()
+def kl_and_top1(model, ids: torch.Tensor, batch: int, ref: list[torch.Tensor]) -> tuple[float, float]:
+    """Mean KL(ref || model) per token and the top-1 agreement, batch by batch on the GPU."""
+    kl_sum = 0.0
+    agree = 0.0
+    n = 0
+    for bi, i in enumerate(range(0, ids.shape[0], batch)):
+        other = F.log_softmax(model(ids[i:i + batch].to(model.device)).logits.float(), dim=-1)
+        r = ref[bi].to(model.device).float()
+        kl_sum += (r.exp() * (r - other)).sum(-1).sum().item()
+        agree += (r.argmax(-1) == other.argmax(-1)).float().sum().item()
+        n += r.shape[0] * r.shape[1]
+        del other, r
+    return kl_sum / n, agree / n
 
 
 class Stats:
@@ -74,9 +84,9 @@ def main() -> None:
     p.add_argument("checkpoint", type=Path)
     p.add_argument("out", type=Path)
     p.add_argument("--text", type=Path, default=Path("data/wiki.test.raw"))
-    p.add_argument("--n-seq", type=int, default=32)
+    p.add_argument("--n-seq", type=int, default=16)
     p.add_argument("--seq-len", type=int, default=1024)
-    p.add_argument("--batch", type=int, default=8)
+    p.add_argument("--batch", type=int, default=2)
     args = p.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.checkpoint)
@@ -95,7 +105,7 @@ def main() -> None:
             stats[(i, name)] = st
             handles.append(mod.register_forward_pre_hook(st.pre, with_kwargs=True))
             handles.append(mod.register_forward_hook(st.post))
-    ref = logits_of(model, ids, args.batch)
+    ref = logprobs_of(model, ids, args.batch)
     for h in handles:
         h.remove()
 
@@ -109,7 +119,7 @@ def main() -> None:
         mixer = layer.linear_attn if types[i] == "linear_attention" else layer.self_attn
         for name, mod in (("mixer", mixer), ("mlp", layer.mlp)):
             h = mod.register_forward_hook(zero_output)
-            kl, top1 = kl_and_top1(ref, logits_of(model, ids, args.batch))
+            kl, top1 = kl_and_top1(model, ids, args.batch, ref)
             h.remove()
             st = stats[(i, name)]
             lines.append(f"{i:5d} {types[i]:18s} {name:6s} {st.cos / st.n:7.4f} {st.rel / st.n:7.4f} {kl:9.4f} {100 * top1:9.2f}%")
