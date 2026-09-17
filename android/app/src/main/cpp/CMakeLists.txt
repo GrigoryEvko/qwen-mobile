@@ -43,7 +43,8 @@ add_library(qwenmobile SHARED
     image_cache.cpp
     llama_jni.cpp
     perf_hint.cpp
-    state_cache.cpp)
+    state_cache.cpp
+    trace.cpp)
 
 target_include_directories(qwenmobile PRIVATE
     ${LLAMA_CPP_DIR}/common

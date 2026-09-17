@@ -39,6 +39,11 @@
             android:name="android.game_mode_config"
             android:resource="@xml/game_mode_config" />
 
+        <!-- Perfetto and simpleperf from the shell reach the process also in a build that is not debuggable. -->
+        <profileable
+            android:shell="true"
+            tools:targetApi="q" />
+
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|screenSize|keyboardHidden"

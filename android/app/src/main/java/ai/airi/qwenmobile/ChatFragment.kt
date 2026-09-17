@@ -8,6 +8,7 @@ import android.graphics.drawable.BitmapDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Trace
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -295,9 +296,14 @@ class ChatFragment : Fragment() {
         }
         // The decision comes before the update: the relayout of a grown row must not change it.
         val follow = atBottom
-        adapter.notifyItemChanged(session.messages.size - 1, MessageAdapter.PAYLOAD_TEXT)
-        if (follow) {
-            scrollToEnd()
+        Trace.beginSection("piece-render")
+        try {
+            adapter.notifyItemChanged(session.messages.size - 1, MessageAdapter.PAYLOAD_TEXT)
+            if (follow) {
+                scrollToEnd()
+            }
+        } finally {
+            Trace.endSection()
         }
     }
 

@@ -26,7 +26,8 @@ add_library(qwenmobile SHARED
     "${JNI_DIR}/image_cache.cpp"
     "${JNI_DIR}/llama_jni.cpp"
     "${JNI_DIR}/perf_hint.cpp"
-    "${JNI_DIR}/state_cache.cpp")
+    "${JNI_DIR}/state_cache.cpp"
+    "${JNI_DIR}/trace.cpp")
 
 target_include_directories(qwenmobile PRIVATE
     "${JNI_DIR}"

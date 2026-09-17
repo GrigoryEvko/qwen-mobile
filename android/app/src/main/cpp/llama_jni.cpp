@@ -58,6 +58,7 @@
 #include "mtmd.h"
 #include "perf_hint.h"
 #include "state_cache.h"
+#include "trace.h"
 
 #define TAG "QwenMobile"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -359,6 +360,7 @@ int decode_text(Engine & e, llama_context * lctx, const llama_token * tokens, in
 
 /** Decode one token of the answer on the decode context. Returns the llama_decode code. */
 int decode_one(Engine & e, llama_token token) {
+    TraceSection trace("decode-step");
     const int rc = decode_text(e, e.ctx, &token, 1, e.n_past, true);
     if (rc == 0) {
         e.cache.push_back(MemItem{token, {}});
@@ -510,7 +512,11 @@ const float * image_embd(Engine & e, const mtmd_input_chunk * chunk, std::string
         return nullptr;
     }
     const int64_t t0 = now_us();
-    const int32_t rc = mtmd_encode_chunk(e.mctx, chunk);
+    int32_t rc = 0;
+    {
+        TraceSection trace("image-encode");
+        rc = mtmd_encode_chunk(e.mctx, chunk);
+    }
     report_hint(e, t0);
     if (rc != 0) {
         error = "The vision encoder failed with code " + std::to_string(rc);
@@ -609,6 +615,7 @@ int64_t count_tokens(const std::vector<const mtmd_input_chunk *> & chunk_of, siz
  */
 bool prefill(Engine & e, const std::vector<MemItem> & items, const std::vector<const mtmd_input_chunk *> & chunk_of,
              size_t base_len, std::string & error) {
+    TraceSection trace("prefill");
     const bool hybrid = e.ctx_pf != nullptr;
     llama_context * pctx = hybrid ? e.ctx_pf : e.ctx;
     // What sequence kSeqMain of the prefill context holds at this time.
@@ -910,7 +917,8 @@ Java_ai_airi_qwenmobile_LlamaNative_init(JNIEnv * env, jclass, jstring jlibdir) 
         ggml_backend_load_all_from_path(libdir.c_str());
     }
     llama_backend_init();
-    LOGI("llama.cpp initialized, %zu backend devices, libdir %s", ggml_backend_dev_count(), libdir.c_str());
+    LOGI("llama.cpp initialized, %zu backend devices, libdir %s, trace sections %s", ggml_backend_dev_count(),
+         libdir.c_str(), TraceSection::available() ? "available" : "unavailable");
 }
 
 /**
@@ -1251,7 +1259,11 @@ Java_ai_airi_qwenmobile_LlamaNative_generateNext(JNIEnv * env, jclass, jlong han
     }
 
     const int64_t t0 = now_us();
-    const llama_token token = llama_sampler_sample(e->smpl, e->ctx, -1);
+    llama_token token = LLAMA_TOKEN_NULL;
+    {
+        TraceSection trace("sample");
+        token = llama_sampler_sample(e->smpl, e->ctx, -1);
+    }
     if (llama_vocab_is_eog(vocab, token)) {
         // The end token goes into the memory, thus a template that renders it lets the next turn extend this one.
         decode_one(*e, token);

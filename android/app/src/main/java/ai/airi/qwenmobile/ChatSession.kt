@@ -2,6 +2,7 @@ package ai.airi.qwenmobile
 
 import android.content.Context
 import android.os.SystemClock
+import android.os.Trace
 import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
@@ -298,8 +299,14 @@ object ChatSession {
                     stream.markStart()
                     var lastSave = SystemClock.elapsedRealtime()
                     LlamaEngine.generate(history, s.thinking, s.temperature, s.topP).collect { piece ->
-                        stream.accept(piece)
-                        revisionFlow.value += 1
+                        // The piece arrives on the main thread here: the section shows the hand-over in a system trace.
+                        Trace.beginSection("piece-post")
+                        try {
+                            stream.accept(piece)
+                            revisionFlow.value += 1
+                        } finally {
+                            Trace.endSection()
+                        }
                         val now = SystemClock.elapsedRealtime()
                         if (now - lastSave > SAVE_INTERVAL_MS) {
                             lastSave = now
