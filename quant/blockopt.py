@@ -284,7 +284,7 @@ def optimize_head(step, target: Target, opts: OptOptions) -> Solved:
     """
     work, ref = step.work, step.ref
     d_model = step.cfg.hidden_size
-    ref_h = ref.model.norm(step.ref_in.view(-1, d_model))
+    ref_flat = step.ref_in.view(-1, d_model)
     lin = work.lm_head
     ste = make_ste(lin, target, opts.head_rank)
     norm = work.model.norm
@@ -308,7 +308,7 @@ def optimize_head(step, target: Target, opts: OptOptions) -> Solved:
         with torch.enable_grad():
             logits_q = ste(norm(work_flat[rows]))
             with torch.no_grad():
-                log_p = F.log_softmax(ref.lm_head(ref_h[rows]), -1)
+                log_p = F.log_softmax(ref.lm_head(ref.model.norm(ref_flat[rows])), -1)
             log_q = F.log_softmax(logits_q, -1)
             loss = (log_p.exp() * (log_p - log_q)).sum(-1).mean()
             loss.backward()

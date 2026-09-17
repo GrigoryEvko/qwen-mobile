@@ -326,6 +326,9 @@ class Quantizer:
             if isinstance(lin, nn.Linear) and self.kind(li, rel) == "Q8_0":
                 q8_round_trip_(lin.weight.data)
         self.step.advance_work(li)
+        for key in [k for k in self.hess if k[0] == li]:
+            del self.hess[key]
+        torch.cuda.empty_cache()
 
     def save_folds(self) -> None:
         """The GGUF-space values of the small tensors of the working copy, for the export.
@@ -424,12 +427,19 @@ class Quantizer:
         kind = self.plan.type_of("output.weight")
         if kind not in self.plan.solved_types():
             return
-        ref_h, work_h = self.step.final_norm()
-        n = work_h.shape[0]
-        h = work_h.T @ work_h / n
-        g = work_h.T @ ref_h / n
-        del ref_h, work_h
-        heads = (self.step.ref.lm_head, self.step.work.lm_head)
+        step = self.step
+        d = self.cfg.hidden_size
+        h = torch.zeros(d, d, dtype=torch.float32, device=step.device)
+        g = torch.zeros(d, d, dtype=torch.float32, device=step.device)
+        for i, tok in step.batches():
+            n = tok.shape[0]
+            r = step.ref.model.norm(step.ref_in[i:i + n]).reshape(-1, d)
+            w = step.work.model.norm(step.work_in[i:i + n]).reshape(-1, d)
+            h.addmm_(w.T, w)
+            g.addmm_(w.T, r)
+        h /= step.n_seq * step.seq_len
+        g /= step.n_seq * step.seq_len
+        heads = (step.ref.lm_head, step.work.lm_head)
         if self.opts.scale:
             t = search_column_scales(self.search_grid(kind), [heads[1].weight.data], torch.diag(h))
             for lin in heads:
