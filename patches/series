@@ -1,0 +1,8 @@
+opencl-vision/0001-mtmd-qwen-patch-embedding-as-gemm.patch
+opencl-vision/0002-mtmd-clip-compute-warmup.patch
+opencl-vision/0003-mtmd-qwen3vl-zero-mask-test-aid.patch
+hexagon-fusion/0001-hexagon-htp-fused-matvec-add-read-src2-from-ddr.patch
+hexagon-fusion/0002-hexagon-htp-fused-gdn-state-step.patch
+hexagon-fusion/0003-hexagon-htp-gdn-state-step-hvx-conv-and-match-fix.patch
+hexagon-vit/0001-hexagon-gelu-tanh-form.patch
+llama-tied-head/0001-qwen35-tied-head-output-rot.patch

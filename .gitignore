@@ -2,7 +2,7 @@ weights/
 *.gguf
 *.safetensors
 .venv/
-llama.cpp/
+/llama.cpp/
 *.pftrace
 .DS_Store
 quant-out/
