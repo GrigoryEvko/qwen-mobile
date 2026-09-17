@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The camera writes the captured photo into the cache directory of the app. -->
+<paths>
+    <cache-path name="images" path="images/" />
+</paths>

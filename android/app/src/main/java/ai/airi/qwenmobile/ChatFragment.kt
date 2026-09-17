@@ -1,39 +1,55 @@
 package ai.airi.qwenmobile
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.drawable.BitmapDrawable
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import android.widget.ArrayAdapter
+import android.widget.PopupMenu
 import android.widget.Toast
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import ai.airi.qwenmobile.databinding.FragmentChatBinding
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 
-/** The chat screen: model selection, backend, the conversation, and the image attachment. */
+/**
+ * The conversation screen: a view over [ChatSession] with the message list,
+ * the composer and the attachment. The session owns the messages and the
+ * running answer, thus the screen can go and come back at any time.
+ */
 class ChatFragment : Fragment() {
     private var binding: FragmentChatBinding? = null
-    private val messages = ArrayList<ChatMessage>()
-    private val adapter = MessageAdapter(messages)
-    private var models: List<File> = emptyList()
-    private var generation: Job? = null
+    private val session = ChatSession
+    private val adapter = MessageAdapter(session.messages) { session.metaByMessage[it] }
 
     /** The encoded image that goes with the next message. */
     private var pendingImage: ByteArray? = null
 
-    /** An image shared to the app. The fragment reads it when it resumes. */
-    var sharedUri: Uri? = null
+    /** An image shared to the app before the view exists. */
+    private var sharedUri: Uri? = null
+
+    /** The file the camera writes to. */
+    private var captureUri: Uri? = null
+
+    /** True while a redraw of the last row waits. */
+    private var renderScheduled = false
+
+    private val settings by lazy { SettingsStore.of(requireContext()) }
 
     private val pickImage = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         if (uri != null) {
@@ -41,71 +57,62 @@ class ChatFragment : Fragment() {
         }
     }
 
+    private val takePicture = registerForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
+        val uri = captureUri
+        if (ok && uri != null) {
+            attachImage(uri)
+        }
+    }
+
+    private val askNotifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
+        session.init(requireContext())
         val b = FragmentChatBinding.inflate(inflater, container, false)
         binding = b
         b.messages.layoutManager = LinearLayoutManager(requireContext()).apply { stackFromEnd = true }
         b.messages.adapter = adapter
-        b.gpuButton.isEnabled = LlamaEngine.has(Backend.GPU)
-        b.npuButton.isEnabled = LlamaEngine.has(Backend.NPU)
-        b.backendGroup.check(
-            when {
-                LlamaEngine.has(Backend.NPU) -> b.npuButton.id
-                LlamaEngine.has(Backend.GPU) -> b.gpuButton.id
-                else -> b.cpuButton.id
-            },
-        )
+        b.messages.itemAnimator = null
 
-        b.loadButton.setOnClickListener { onLoadOrUnload() }
         b.sendButton.setOnClickListener { onSend() }
-        b.stopButton.setOnClickListener { generation?.cancel() }
+        b.stopButton.setOnClickListener { session.stop() }
+        b.attachButton.setOnClickListener { showAttachMenu(it) }
+        b.attachmentChip.setOnCloseIconClickListener { setPendingImage(null) }
         b.grantButton.setOnClickListener { startActivity(ModelFiles.allFilesAccessIntent(requireContext())) }
-        b.clearButton.setOnClickListener { onClearChat() }
-        b.attachButton.setOnClickListener {
-            pickImage.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
-        }
-        b.attachPreview.setOnClickListener { setPendingImage(null) }
 
-        viewLifecycleOwner.lifecycleScope.launch {
-            LlamaEngine.state.collect { loaded ->
-                b.loadButton.text = getString(if (loaded == null) R.string.load else R.string.unload)
-                b.statusText.text = loaded?.info ?: getString(R.string.no_model)
-                b.sendButton.isEnabled = loaded != null
+        val scope = viewLifecycleOwner.lifecycleScope
+        scope.launch {
+            session.structure.collect {
+                adapter.notifyDataSetChanged()
+                updateEmptyState()
+                if (session.messages.isNotEmpty()) {
+                    b.messages.scrollToPosition(session.messages.size - 1)
+                }
             }
         }
+        scope.launch { session.revision.collect { scheduleRender() } }
+        scope.launch {
+            session.generating.collect { active ->
+                b.sendButton.visibility = if (active) View.GONE else View.VISIBLE
+                b.stopButton.visibility = if (active) View.VISIBLE else View.GONE
+                publishStatus()
+            }
+        }
+        scope.launch { session.loading.collect { publishStatus() } }
+        scope.launch { LlamaEngine.state.collect { publishStatus() } }
+        scope.launch { settings.state.collect { publishStatus() } }
         return b.root
     }
 
     override fun onResume() {
         super.onResume()
-        refreshModels()
+        binding?.grantButton?.visibility = if (ModelFiles.hasAllFilesAccess()) View.GONE else View.VISIBLE
         sharedUri?.let { uri ->
             sharedUri = null
             attachImage(uri)
         }
-    }
-
-    /** Read the image behind the URI and hold it for the next message. */
-    fun attachImage(uri: Uri) {
         viewLifecycleOwner.lifecycleScope.launch {
-            try {
-                val resolver = requireContext().contentResolver
-                setPendingImage(withContext(Dispatchers.IO) { ImageBytes.load(resolver, uri) })
-            } catch (e: Exception) {
-                toast("The image did not open: ${e.message}")
-            }
-        }
-    }
-
-    private fun setPendingImage(bytes: ByteArray?) {
-        val b = binding ?: return
-        pendingImage = bytes
-        if (bytes == null) {
-            b.attachPreview.setImageDrawable(null)
-            b.attachPreview.visibility = View.GONE
-        } else {
-            b.attachPreview.setImageBitmap(BitmapFactory.decodeByteArray(bytes, 0, bytes.size))
-            b.attachPreview.visibility = View.VISIBLE
+            session.autoLoad()?.let { toast(it) }
         }
     }
 
@@ -114,103 +121,152 @@ class ChatFragment : Fragment() {
         binding = null
     }
 
-    /** Read the model directories again and fill the spinner. */
-    private fun refreshModels() {
-        val b = binding ?: return
-        b.grantButton.visibility = if (ModelFiles.hasAllFilesAccess()) View.GONE else View.VISIBLE
-        models = ModelFiles.list(requireContext())
-        val names = models.map { "${it.name} (${it.length() shr 20} MB)" }
-        b.modelSpinner.adapter = ArrayAdapter(requireContext(), android.R.layout.simple_spinner_dropdown_item, names)
+    // --- the model, from the app bar menu ---
+
+    fun loadModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            session.loadFromSettings()?.let { toast(it) }
+        }
     }
 
-    private fun onLoadOrUnload() {
-        val b = binding ?: return
-        if (LlamaEngine.state.value != null) {
-            generation?.cancel()
-            viewLifecycleOwner.lifecycleScope.launch { LlamaEngine.unload() }
-            return
+    fun unloadModel() {
+        session.unload()
+    }
+
+    fun newChat() {
+        session.clear()
+    }
+
+    /** The status chip and the title of the app bar. */
+    private fun publishStatus() {
+        val host = activity as? MainActivity ?: return
+        val loaded = LlamaEngine.state.value
+        when {
+            session.loading.value -> host.setStatus(getString(R.string.status_loading), MainActivity.Tone.BUSY)
+            loaded == null -> host.setStatus(getString(R.string.status_idle), MainActivity.Tone.IDLE)
+            else -> {
+                val id = if (session.generating.value) R.string.status_generating else R.string.status_ready
+                host.setStatus(getString(id, loaded.config.backend.label), MainActivity.Tone.READY)
+            }
         }
-        val file = models.getOrNull(b.modelSpinner.selectedItemPosition)
-        if (file == null) {
-            toast(getString(R.string.no_model))
-            return
+        val path = loaded?.config?.path ?: settings.state.value.modelPath
+        host.setTitle(path?.let { File(it).nameWithoutExtension } ?: getString(R.string.app_name))
+    }
+
+    // --- the attachment ---
+
+    private fun showAttachMenu(anchor: View) {
+        val menu = PopupMenu(requireContext(), anchor)
+        menu.menu.add(0, 1, 0, R.string.attach_photo_library).setIcon(R.drawable.ic_image)
+        menu.menu.add(0, 2, 1, R.string.attach_take_photo).setIcon(R.drawable.ic_camera)
+        menu.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                1 -> pickImage.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                2 -> capturePhoto()
+            }
+            true
         }
-        val backend = when (b.backendGroup.checkedButtonId) {
-            b.npuButton.id -> Backend.NPU
-            b.gpuButton.id -> Backend.GPU
-            else -> Backend.CPU
-        }
-        val config = EngineConfig(
-            path = file.absolutePath,
-            backend = backend,
-            threads = b.threadsInput.text.toString().toIntOrNull()?.coerceIn(1, 16) ?: 4,
-            mmproj = ModelFiles.mmprojFor(file)?.absolutePath,
+        menu.show()
+    }
+
+    private fun capturePhoto() {
+        val dir = File(requireContext().cacheDir, "images").apply { mkdirs() }
+        val uri = FileProvider.getUriForFile(
+            requireContext(),
+            "${requireContext().packageName}.fileprovider",
+            File(dir, "capture.jpg"),
         )
-        b.loadButton.isEnabled = false
-        b.statusText.text = "Loading ${file.name} on ${backend.label}..."
+        captureUri = uri
+        takePicture.launch(uri)
+    }
+
+    /** An image shared to the app: attach it now, or when the view exists. */
+    fun attachShared(uri: Uri) {
+        if (view == null) {
+            sharedUri = uri
+        } else {
+            attachImage(uri)
+        }
+    }
+
+    /** Read the image behind the URI and hold it for the next message. */
+    private fun attachImage(uri: Uri) {
         viewLifecycleOwner.lifecycleScope.launch {
             try {
-                LlamaEngine.load(config)
-                messages.clear()
-                adapter.notifyDataSetChanged()
+                val resolver = requireContext().contentResolver
+                setPendingImage(withContext(Dispatchers.IO) { ImageBytes.load(resolver, uri) })
             } catch (e: Exception) {
-                toast(e.message ?: "load failed")
-                b.statusText.text = "Load failed: ${e.message}"
-            } finally {
-                b.loadButton.isEnabled = true
+                toast(getString(R.string.image_failed, e.message ?: "?"))
             }
         }
     }
+
+    private fun setPendingImage(bytes: ByteArray?) {
+        val b = binding ?: return
+        pendingImage = bytes
+        if (bytes == null) {
+            b.attachmentRow.visibility = View.GONE
+            b.attachmentChip.chipIcon = null
+            return
+        }
+        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        val side = (28 * resources.displayMetrics.density).toInt()
+        b.attachmentChip.chipIcon = BitmapDrawable(resources, Bitmap.createScaledBitmap(bitmap, side, side, true))
+        b.attachmentRow.visibility = View.VISIBLE
+    }
+
+    // --- the turn ---
 
     private fun onSend() {
         val b = binding ?: return
         val typed = b.input.text.toString().trim()
         val image = pendingImage
-        if ((typed.isEmpty() && image == null) || generation?.isActive == true) {
+        if ((typed.isEmpty() && image == null) || session.generating.value) {
             return
         }
+        ensureNotificationPermission()
         val text = typed.ifEmpty { getString(R.string.describe_image) }
         b.input.text?.clear()
         setPendingImage(null)
-        messages += ChatMessage("user", text, image)
-        val history = messages.toList()
-        val answer = ChatMessage("assistant", "")
-        messages += answer
-        adapter.notifyItemRangeInserted(messages.size - 2, 2)
-        b.messages.scrollToPosition(messages.size - 1)
-        setGenerating(true)
+        session.send(text, image) { problem -> toast(problem) }
+    }
 
-        generation = viewLifecycleOwner.lifecycleScope.launch {
-            try {
-                LlamaEngine.generate(history, b.thinkingSwitch.isChecked).collect { piece ->
-                    answer.content += piece
-                    adapter.notifyItemChanged(messages.size - 1)
-                    b.messages.scrollToPosition(messages.size - 1)
-                }
-                b.statusText.text = LlamaEngine.stats()
-            } catch (e: Exception) {
-                if (e !is kotlinx.coroutines.CancellationException) {
-                    answer.content += "\n[error: ${e.message}]"
-                    adapter.notifyItemChanged(messages.size - 1)
-                }
-            } finally {
-                setGenerating(false)
-            }
+    /** The foreground service shows a notification, thus the app asks for the permission one time. */
+    private fun ensureNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            return
+        }
+        val granted = ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.POST_NOTIFICATIONS)
+        if (granted != PackageManager.PERMISSION_GRANTED) {
+            askNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
 
-    private fun onClearChat() {
-        generation?.cancel()
-        messages.clear()
-        adapter.notifyDataSetChanged()
-        viewLifecycleOwner.lifecycleScope.launch { LlamaEngine.resetChat() }
+    /** Redraw the last row at most every 80 ms while the answer streams. */
+    private fun scheduleRender() {
+        if (renderScheduled) {
+            return
+        }
+        renderScheduled = true
+        binding?.messages?.postDelayed({ renderLast() }, 80)
     }
 
-    private fun setGenerating(active: Boolean) {
+    private fun renderLast() {
+        renderScheduled = false
         val b = binding ?: return
-        b.sendButton.visibility = if (active) View.GONE else View.VISIBLE
-        b.stopButton.visibility = if (active) View.VISIBLE else View.GONE
-        b.loadButton.isEnabled = !active
+        if (session.messages.isEmpty()) {
+            return
+        }
+        val last = session.messages.size - 1
+        adapter.notifyItemChanged(last, MessageAdapter.PAYLOAD_TEXT)
+        val lm = b.messages.layoutManager as LinearLayoutManager
+        if (lm.findLastVisibleItemPosition() >= last - 1) {
+            b.messages.scrollToPosition(last)
+        }
+    }
+
+    private fun updateEmptyState() {
+        binding?.emptyText?.visibility = if (session.messages.isEmpty()) View.VISIBLE else View.GONE
     }
 
     private fun toast(message: String) {

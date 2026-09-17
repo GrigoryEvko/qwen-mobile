@@ -9,6 +9,10 @@
     <uses-permission
         android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
+    <!-- The answer streams in a foreground service with a notification. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:name=".QwenApplication"
@@ -24,6 +28,10 @@
         <!-- The Adreno OpenCL driver is a vendor public library, thus the app declares it. -->
         <uses-native-library
             android:name="libOpenCL.so"
+            android:required="false" />
+        <!-- The Hexagon backend opens the FastRPC driver of the compute DSP, a vendor public library. -->
+        <uses-native-library
+            android:name="libcdsprpc.so"
             android:required="false" />
 
         <!-- Game mode support, thus the OEM game policy applies to this app. -->
@@ -48,5 +56,26 @@
                 <data android:mimeType="image/*" />
             </intent-filter>
         </activity>
+
+        <!-- Holds the process alive while an answer streams. -->
+        <service
+            android:name=".GenerationService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="llm inference" />
+        </service>
+
+        <!-- The camera app writes the captured photo through this provider. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 </manifest>

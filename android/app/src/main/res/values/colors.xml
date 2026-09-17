@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A fixed light palette: white surfaces, near-black ink, warm grays, one green for "ready". -->
+<resources>
+    <color name="white">#FFFFFFFF</color>
+    <color name="ink">#FF0D0D0D</color>
+    <color name="muted">#FF6B6B6B</color>
+    <color name="faint">#FF9B9B9B</color>
+    <color name="surface_variant">#FFF4F4F4</color>
+    <color name="outline">#FFE3E3E3</color>
+    <color name="ready_green">#FF10A37F</color>
+    <color name="ready_green_bg">#FFE6F4EF</color>
+    <color name="error_red">#FFD03B3B</color>
+    <color name="error_red_bg">#FFFBE9E9</color>
+    <color name="avatar_user">#FF5436DA</color>
+    <color name="avatar_assistant">#FF10A37F</color>
+</resources>
