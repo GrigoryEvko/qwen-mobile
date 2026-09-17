@@ -1,0 +1,81 @@
+diff --git a/tools/mtmd/models/qwen2vl.cpp b/tools/mtmd/models/qwen2vl.cpp
+index 2220c26..c8c2ce8 100644
+--- a/tools/mtmd/models/qwen2vl.cpp
++++ b/tools/mtmd/models/qwen2vl.cpp
+@@ -9,11 +9,29 @@ ggml_tensor * clip_graph_qwen2vl::build_inp_with_temporal_merge() {
+     const size_t nb1 = ggml_row_size(inp_raw->type, img.nx());
+     const size_t nb2 = ggml_row_size(inp_raw->type, img.nx() * img.ny());
+ 
++    // The two temporal kernels as [IC*KH*KW, OC] matrices. The patch matmul
++    // then has the weight as src0 and the F32 patch columns as src1, thus
++    // every backend does it on its F16-weight GEMM path. The result is
++    // [OC, n_patches], which is the [c, w, h] order that the spatial merge
++    // wants. ggml_conv_2d gives a F16 x F16 product with the activation as
++    // src0, a [n_patches, OC] result, and a transposed copy of that result.
++    ggml_tensor * w0 = model.patch_embeddings_0;
++    ggml_tensor * w1 = model.patch_embeddings_1;
++    w0 = ggml_reshape_2d(ctx0, w0, w0->ne[0] * w0->ne[1] * w0->ne[2], w0->ne[3]);
++    w1 = ggml_reshape_2d(ctx0, w1, w1->ne[0] * w1->ne[1] * w1->ne[2], w1->ne[3]);
++
++    // The patch columns of one frame as [IC*KH*KW, n_patches] in F32.
++    auto patchify = [&](ggml_tensor * frame) {
++        ggml_tensor * cols = ggml_im2col(ctx0, model.patch_embeddings_0, frame,
++            patch_size, patch_size, 0, 0, 1, 1, true, GGML_TYPE_F32);
++        return ggml_reshape_2d(ctx0, cols, cols->ne[0], cols->ne[1] * cols->ne[2] * cols->ne[3]);
++    };
++
++    ggml_tensor * out = nullptr;
+     if (n_batch == 1) {
+-        // still image input
+-        return ggml_add(ctx0,
+-            ggml_conv_2d(ctx0, model.patch_embeddings_0, inp_raw, patch_size, patch_size, 0, 0, 1, 1),
+-            ggml_conv_2d(ctx0, model.patch_embeddings_1, inp_raw, patch_size, patch_size, 0, 0, 1, 1));
++        // still image input, the two temporal kernels read the same frame
++        ggml_tensor * cols = patchify(inp_raw);
++        out = ggml_add(ctx0, ggml_mul_mat(ctx0, w0, cols), ggml_mul_mat(ctx0, w1, cols));
+     } else if (n_batch == 2) {
+         // 2 frames input (video input)
+         ggml_tensor * inp_0 = ggml_view_3d(ctx0, inp_raw,
+@@ -21,12 +39,13 @@ ggml_tensor * clip_graph_qwen2vl::build_inp_with_temporal_merge() {
+         ggml_tensor * inp_1 = ggml_view_3d(ctx0, inp_raw,
+                                     img.nx(), img.ny(), 3, nb1, nb2,
+                                     nb2 * 3); // move to the second frame
+-        return ggml_add(ctx0,
+-            ggml_conv_2d(ctx0, model.patch_embeddings_0, inp_0, patch_size, patch_size, 0, 0, 1, 1),
+-            ggml_conv_2d(ctx0, model.patch_embeddings_1, inp_1, patch_size, patch_size, 0, 0, 1, 1));
++        out = ggml_add(ctx0, ggml_mul_mat(ctx0, w0, patchify(inp_0)), ggml_mul_mat(ctx0, w1, patchify(inp_1)));
+     } else {
+         GGML_ASSERT(false && "n_batch > 2 is not supported");
+     }
++
++    // [OC, n_patches] -> [c, w, h, 1], contiguous
++    return ggml_reshape_4d(ctx0, out, n_embd, n_patches_x, n_patches_y, 1);
+ }
+ 
+ ggml_cgraph * clip_graph_qwen2vl::build() {
+@@ -49,8 +68,8 @@ ggml_cgraph * clip_graph_qwen2vl::build() {
+ 
+     // second conv dimension
+     {
+-        inp = ggml_permute(ctx0, inp, 1, 2, 0, 3);  // [w, h, c, b] -> [c, w, h, b]
+-        inp = ggml_cont_4d(
++        // inp is [c, w, h, b] and contiguous, two adjacent w patches make one row
++        inp = ggml_reshape_4d(
+             ctx0, inp,
+             n_embd * 2, n_patches_x / 2, n_patches_y, batch_size);
+         inp = ggml_reshape_4d(
+diff --git a/tools/mtmd/models/qwen3vl.cpp b/tools/mtmd/models/qwen3vl.cpp
+index 48626b2..22e5a7f 100644
+--- a/tools/mtmd/models/qwen3vl.cpp
++++ b/tools/mtmd/models/qwen3vl.cpp
+@@ -17,8 +17,8 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
+ 
+     // spatial merge
+     {
+-        inp = ggml_permute(ctx0, inp, 1, 2, 0, 3);  // [w, h, c, b] -> [c, w, h, b]
+-        inp = ggml_cont_4d(
++        // inp is [c, w, h, b] and contiguous, two adjacent w patches make one row
++        inp = ggml_reshape_4d(
+             ctx0, inp,
+             n_embd * 2, n_patches_x / 2, n_patches_y, batch_size);
+         inp = ggml_reshape_4d(

@@ -1,0 +1,51 @@
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index cd6421d..f98b28d 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -3759,6 +3759,34 @@ struct clip_model_loader {
+         }
+     }
+ 
++    // Encode one image of the smallest permitted size. A GPU backend then
++    // builds the programs that it compiles on first use (the OpenCL
++    // flash-attention variants) at load time, not during the first image of
++    // the user. Only a model with a dynamic image size gives a small graph,
++    // thus the function returns for the other models.
++    static void warmup_compute(clip_ctx & ctx_clip) {
++        const auto & hparams = ctx_clip.model.hparams;
++        if (ctx_clip.model.modality != CLIP_MODALITY_VISION || hparams.image_min_pixels <= 0) {
++            return;
++        }
++        const int align = hparams.patch_size * std::max(1, hparams.n_merge);
++        const int side  = CLIP_ALIGN((int) std::ceil(std::sqrt((double) hparams.image_min_pixels)), align);
++
++        clip_image_f32_batch batch;
++        clip_image_f32 img;
++        img.set_size({side, side}, false, false);
++        batch.entries.push_back(img);
++
++        std::vector<float> out;
++        const int64_t t0 = ggml_time_us();
++        if (!clip_image_batch_encode(&ctx_clip, /* n_threads */ 4, &batch, out)) {
++            LOG_WRN("%s: the compute warmup with image size %d x %d did not complete\n", __func__, side, side);
++            return;
++        }
++        LOG_INF("%s: compute warmup with image size = %d x %d took %.1f ms\n",
++                __func__, side, side, (ggml_time_us() - t0) / 1000.0);
++    }
++
+     // only initialize backend buffers, but do not allocate them yet
+     static support_info_graph reserve_compute_meta(clip_ctx & ctx_clip, const clip_image_f32_batch & batch) {
+         ggml_cgraph * gf = clip_get_graph_builder(&ctx_clip, batch)->build();
+@@ -3974,6 +4002,11 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
+             if (ctx_params.warmup) {
+                 loader.warmup(*ctx_vision);
+             }
++            // CLIP_WARMUP_COMPUTE=1 moves the first-use program builds of the
++            // backend from the first image to the model load
++            if (std::getenv("CLIP_WARMUP_COMPUTE") != nullptr) {
++                loader.warmup_compute(*ctx_vision);
++            }
+ 
+             // TODO: we don't support audio for Gemma 3N, but GGUF contains audio tensors
+             // we can remove this check when we implement audio support for Gemma 3N

@@ -1,0 +1,55 @@
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index f98b28d..04b401e 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -4834,6 +4834,12 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+                 }
+ 
+                 set_input_i32("positions", positions);
++
++                // the optional all-zero attention mask of the Qwen3-VL graph
++                if (ggml_graph_get_tensor(gf, "vit_kq_mask") != nullptr) {
++                    std::vector<float> zero_mask((size_t) n_pos * n_pos, 0.0f);
++                    set_input_f32("vit_kq_mask", zero_mask);
++                }
+             } break;
+         case PROJECTOR_TYPE_STEP3VL:
+             {
+diff --git a/tools/mtmd/models/qwen3vl.cpp b/tools/mtmd/models/qwen3vl.cpp
+index 22e5a7f..db8040a 100644
+--- a/tools/mtmd/models/qwen3vl.cpp
++++ b/tools/mtmd/models/qwen3vl.cpp
+@@ -1,5 +1,7 @@
+ #include "models.h"
+ 
++#include <cstdlib>
++
+ ggml_cgraph * clip_graph_qwen3vl::build() {
+     GGML_ASSERT(model.patch_bias != nullptr);
+     GGML_ASSERT(model.position_embeddings != nullptr);
+@@ -57,6 +59,16 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
+     ggml_set_name(positions, "positions");
+     ggml_set_input(positions);
+ 
++    // MTMD_VIT_ZERO_MASK=1 gives the attention an all-zero mask. This is a
++    // test aid for a backend where the flash-attention kernel did not get a
++    // NULL mask before. The result does not change. It adds one F16 copy per layer.
++    ggml_tensor * kq_mask = nullptr;
++    if (std::getenv("MTMD_VIT_ZERO_MASK") != nullptr) {
++        kq_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_pos, n_pos);
++        ggml_set_name(kq_mask, "vit_kq_mask");
++        ggml_set_input(kq_mask);
++    }
++
+     // pre-layernorm
+     if (model.pre_ln_w) {
+         inpL = build_norm(inpL, model.pre_ln_w, model.pre_ln_b, norm_t, eps, -1);
+@@ -112,7 +124,7 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
+             cb(Kcur, "Kcur_rope", il);
+ 
+             cur = build_attn(layer.o_w, layer.o_b,
+-                Qcur, Kcur, Vcur, nullptr, kq_scale, il);
++                Qcur, Kcur, Vcur, kq_mask, kq_scale, il);
+             cb(cur, "attn_out", il);
+         }
+ 
