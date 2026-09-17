@@ -46,8 +46,8 @@ class OptOptions:
     lr_levels: float = 1e-2
     rank: int = 0
     head_rank: int = 0
-    head_tokens: int = 1024
-    head_steps: int = 300
+    head_tokens: int = 512
+    head_steps: int = 400
 
 
 def _grid_like(grid: Grid, levels: torch.Tensor) -> Grid:

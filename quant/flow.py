@@ -450,8 +450,16 @@ class Quantizer:
         key = (-1, "lm_head")
         self.solve(key, "output.weight", kind, heads[1], h, g, "head    ")
         if self.opts.method == "blockopt":
-            solved = optimize_head(self.step, Target(self.grids[key], self.hess[key], heads[0].weight.data), self.opts.opt)
+            # The head optimization needs only the norm and the head of the reference.
+            # The reference decoder and embedding wait on the CPU meanwhile.
+            ref = step.ref.model
+            ref.layers.to("cpu")
+            ref.embed_tokens.to("cpu")
+            torch.cuda.empty_cache()
+            solved = optimize_head(step, Target(self.grids[key], self.hess[key], heads[0].weight.data), self.opts.opt)
             self.save_solved("output.weight", kind, solved)
+            ref.layers.to(step.device)
+            ref.embed_tokens.to(step.device)
 
     # --- the run ---
 
