@@ -14,9 +14,8 @@ hexagon-host/0001-hexagon-host-timers-and-batch-cache.patch
 hexagon-host/0002-llama-host-timers-and-embd-lookup.patch
 hexagon-host/0003-llama-sampler-topset.patch
 # hexagon-fusion/0005-hexagon-htp-gdn-chunked-hmx.patch
-#   The chunked gated delta rule of a batch on the HMX. The patch is in the
-#   repository, and the line above stays a comment until the kernel runs on the
-#   phone. The kernel sits inside the plain GATED_DELTA_NET op, thus the switch
-#   GGML_HEXAGON_OPFUSION_STATE does not reach it. Its own switch is
-#   GGML_HEXAGON_GDN_CHUNK, which is on by default, and 0 keeps the sequential
-#   kernel for an A/B run of the same build.
+#   The chunked gated delta rule on the HMX. The patch applies as the last
+#   entry, and the kernel hangs the DSP on the first batch of 512 tokens
+#   (test-backend-ops stops in that case, and llama-bench never reaches its
+#   first token). Its switch GGML_HEXAGON_GDN_CHUNK is on by default, thus the
+#   line stays a comment until the hang is gone.
