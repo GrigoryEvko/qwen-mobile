@@ -14,13 +14,15 @@
 #
 # The steps:
 #   1. scripts/apply-patches.sh puts the series on the submodule.
-#   2. The tracked presets file android/snapdragon/CMakeUserPresets.json goes
+#   2. The submodule gets core.abbrev 7, thus the commit string of ggml has the
+#      same length on every machine.
+#   3. The tracked presets file android/snapdragon/CMakeUserPresets.json goes
 #      to the root of the submodule. llama.cpp does not track that file.
-#   3. In the container, CMake configures llama.cpp with the preset
+#   4. In the container, CMake configures llama.cpp with the preset
 #      arm64-android-snapdragon-release into build/native/llama, then the JNI
 #      library from android/snapdragon/CMakeLists.txt into build/native/jni,
 #      with the flags of android/snapdragon/build.sh.
-#   4. The script copies the libraries into android/snapdragon/jniLibs and
+#   5. The script copies the libraries into android/snapdragon/jniLibs and
 #      writes build/hashes-native.txt with the SHA-256 of each library.
 #
 # Determinism:
@@ -51,12 +53,20 @@ cd "$REPO_ROOT"
 # 1. The patches.
 scripts/apply-patches.sh
 
-# 2. The presets file. The exclude entry keeps the submodule status clean.
+# 2. The length of an abbreviated commit. The CMake files of ggml and of
+# llama.cpp read the commit with "git rev-parse --short HEAD" and write it into
+# the libraries. Git makes the abbreviation long enough to stay unambiguous in
+# the repository at hand, thus a full clone gives 7 characters and a shallow
+# clone of a runner gives 9, and the two libraries differ. The pin makes the
+# length the same everywhere.
+git -C "$LLAMA_SUBMODULE" config core.abbrev 7
+
+# 3. The presets file. The exclude entry keeps the submodule status clean.
 cp android/snapdragon/CMakeUserPresets.json "$LLAMA_SUBMODULE/CMakeUserPresets.json"
 exclude=$(git -C "$LLAMA_SUBMODULE" rev-parse --git-path info/exclude)
 grep -q -x 'CMakeUserPresets.json' "$exclude" 2> /dev/null || echo 'CMakeUserPresets.json' >> "$exclude"
 
-# 3. The build.
+# 4. The build.
 if [[ "${KEEP_BUILD:-0}" != 1 ]]; then
     rm -rf build/native
 fi
@@ -106,7 +116,7 @@ cmake -S android/snapdragon -B build/native/jni -G Ninja \
 cmake --build build/native/jni -j"$(nproc)"
 '
 
-# 4. The libraries and their hashes.
+# 5. The libraries and their hashes.
 out="android/snapdragon/jniLibs/arm64-v8a"
 rm -rf "$out"
 mkdir -p "$out"
