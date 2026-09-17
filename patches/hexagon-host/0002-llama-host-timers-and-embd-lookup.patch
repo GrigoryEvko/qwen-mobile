@@ -1,0 +1,436 @@
+llama: the per-decode host timers, and the token embedding rows from the host
+
+Base: llama.cpp commit c6824a9. The files of this patch are not touched by the other patches of this
+repository.
+
+Files:
+    src/llama-context.h              the hostprof data and the embedding lookup buffer
+    src/llama-context.cpp            the timers of process_ubatch and decode, the embedding lookup, the state timers
+    tools/completion/completion.cpp  the time of the sampler for each token
+    examples/simple/simple.cpp       the time of the sampler for each token
+
+How to apply, from the llama.cpp root:
+
+    git apply patches/hexagon-host/0002-llama-host-timers-and-embd-lookup.patch
+    cmake --build build-snapdragon -j
+
+Only libllama.so, llama-completion (libllama-completion-impl.so) and llama-simple change.
+
+Switches (environment variables):
+
+    LLAMA_HOSTPROF=1           print one line for each decode call, one line for each sampler call, and one
+                               line for each sequence state get or set
+    LLAMA_EMBD_LOOKUP_HOST=1   the token embedding rows come from the host
+
+The decode line
+
+    hostprof: decode #12 tokens 1 ubatches 1 reused 1 embd_host 0 | prologue 60 apply 20 reuse_check 15 build 0
+              alloc 0 inputs 40 compute 1100 logits_get 25300 loop_other 10 epilogue 15 total 26560 | since_last_return 2900 us
+
+The fields are microseconds. reused is the count of ubatches that reused the previous graph, build and
+alloc are 0 then. compute is the time of the scheduler compute call (the backends queue their work in
+it). logits_get is the copy of the logits to the host, and for the Hexagon backend the wait for the DSP is
+in it. since_last_return is the time from the return of the previous decode call, thus the time of the
+caller: the sampler and the loop. The sampler line is "hostprof: sample #N us T".
+
+The graph reuse of llama.cpp (llm_graph_result::can_reuse) fires for a decode of one token when the
+ubatch shape, the number of outputs, the KV length (n_kv, padded to 256) and the recurrent slot (head,
+rs_z) stay the same. The perf print at the end of a run gives the count: "graphs reused". With the reuse,
+the scheduler does not split the graph again, thus the split graphs keep their uid, and the Hexagon
+backend finds its op nodes and its packed batch by that uid.
+
+The token embedding rows from the host
+
+The token embedding table is on the CPU. Thus the GET_ROWS of the tokens is a split of one node on the
+CPU before the HTP0 split, and the scheduler copies its output to the device with the other inputs. With
+LLAMA_EMBD_LOOKUP_HOST=1, decode reads the rows of the tokens on the host with the same dequantization
+function that the CPU GET_ROWS op calls (ggml_get_type_traits(type)->to_float, and a memcpy for F32), and
+gives the batch the rows as embeddings (batch.embd) in place of the tokens. The graph then takes the
+inp_embd input, has no GET_ROWS node, and has one split. The rows are the same bytes, thus the graph
+computes the same values, and the token stream is the same.
+
+The lookup does not run, and the tokens stay, when the context is an MTP context, the model is DFLASH, a
+LoRA adapter is active (the token path applies the adapter on the rows), the table is not in a host
+buffer, or the type has no to_float function.
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index ef53728..ba48409 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -284,6 +284,18 @@ llama_context::llama_context(
+         }
+     }
+ 
++    {
++        const char * LLAMA_HOSTPROF = getenv("LLAMA_HOSTPROF");
++        hostprof = LLAMA_HOSTPROF ? (atoi(LLAMA_HOSTPROF) != 0) : hostprof;
++
++        const char * LLAMA_EMBD_LOOKUP_HOST = getenv("LLAMA_EMBD_LOOKUP_HOST");
++        embd_lookup_host = LLAMA_EMBD_LOOKUP_HOST ? (atoi(LLAMA_EMBD_LOOKUP_HOST) != 0) : embd_lookup_host;
++
++        if (embd_lookup_host) {
++            LLAMA_LOG_INFO("%s: the token embedding rows come from the host (LLAMA_EMBD_LOOKUP_HOST)\n", __func__);
++        }
++    }
++
+     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
+     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
+ 
+@@ -1341,12 +1353,16 @@ bool llama_context::set_adapter_cvec(
+ }
+ 
+ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
++    const int64_t t_apply0 = hostprof ? ggml_time_us() : 0;
++
+     if (mctx && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+         ret = GGML_STATUS_FAILED;
+         return nullptr;
+     }
+ 
++    const int64_t t_reuse0 = hostprof ? ggml_time_us() : 0;
++
+     auto * res = get_gf_res_prev();
+     auto * gf  = res->get_gf();
+ 
+@@ -1354,7 +1370,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+ 
+-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
++    const bool reuse = !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams);
++
++    const int64_t t_build0 = hostprof ? ggml_time_us() : 0;
++    int64_t       t_alloc0 = t_build0;
++    int64_t       t_alloc1 = t_build0;
++
++    if (reuse) {
+         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+ 
+         // with pipeline parallelism, the previous graph_compute_async may still be running
+@@ -1365,6 +1387,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         }
+ 
+         n_reused++;
++        hp.n_reused++;
+     } else {
+         gf_res_prev_active = nullptr;
+         res->reset();
+@@ -1372,37 +1395,35 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         ggml_backend_sched_reset(sched.get());
+         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+ 
+-        //const auto t_start_us = ggml_time_us();
+-
+         gf = model.build_graph(gparams);
+ 
+-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+-
+         if (!gf) {
+             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
+             ret = GGML_STATUS_FAILED;
+             return nullptr;
+         }
+ 
++        t_alloc0 = hostprof ? ggml_time_us() : 0;
++
+         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+             ret = GGML_STATUS_ALLOC_FAILED;
+             return nullptr;
+         }
+ 
++        t_alloc1 = hostprof ? ggml_time_us() : 0;
++
+         gf_res_prev_active = res;
+     }
+ 
+     // set the input data for the input tensors
+     {
+-        //const auto t_start_us = ggml_time_us();
+-
+         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+         res->set_inputs(&ubatch);
+-
+-        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+     }
+ 
++    const int64_t t_compute0 = hostprof ? ggml_time_us() : 0;
++
+     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+@@ -1410,11 +1431,77 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         return nullptr;
+     }
+ 
++    if (hostprof) {
++        const int64_t t_compute1 = ggml_time_us();
++        hp.t_apply   += t_reuse0 - t_apply0;
++        hp.t_reuse   += t_build0 - t_reuse0;
++        hp.t_build   += t_alloc0 - t_build0;
++        hp.t_alloc   += t_alloc1 - t_alloc0;
++        hp.t_inputs  += t_compute0 - t_alloc1;
++        hp.t_compute += t_compute1 - t_compute0;
++        hp.n_ubatch++;
++    }
++
+     ret = GGML_STATUS_SUCCESS;
+ 
+     return res;
+ }
+ 
++// Fills embd_lookup_buf with the embedding rows of the tokens of the batch, with the same dequantization
++// function that the CPU GET_ROWS op uses. Returns false when the batch must keep its tokens.
++bool llama_context::embd_lookup(const llama_batch & batch) {
++    if (!batch.token || batch.embd) {
++        return false;
++    }
++    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || model.arch == LLM_ARCH_DFLASH) {
++        return false;
++    }
++    if (loras && !loras->empty()) {
++        return false;  // the token path applies the adapter on the embedding
++    }
++
++    const ggml_tensor * tok_embd = model.tok_embd;
++    if (!tok_embd || !tok_embd->buffer || !ggml_backend_buffer_is_host(tok_embd->buffer)) {
++        return false;
++    }
++
++    const auto & hparams = model.hparams;
++
++    const int64_t n_embd     = hparams.n_embd;
++    const int64_t n_embd_inp = hparams.n_embd_inp();
++    if (tok_embd->ne[0] != n_embd || n_embd_inp < n_embd) {
++        return false;
++    }
++
++    const ggml_type_traits * traits = ggml_get_type_traits(tok_embd->type);
++    if (tok_embd->type != GGML_TYPE_F32 && (!traits || !traits->to_float)) {
++        return false;
++    }
++
++    embd_lookup_buf.resize((size_t) batch.n_tokens * n_embd_inp);
++
++    for (int32_t i = 0; i < batch.n_tokens; i++) {
++        const llama_token token = batch.token[i];
++        if (token < 0 || token >= tok_embd->ne[1]) {
++            return false;  // the batch validation reports it
++        }
++
++        const char * src = (const char *) tok_embd->data + (size_t) token * tok_embd->nb[1];
++        float *      dst = embd_lookup_buf.data() + (size_t) i * n_embd_inp;
++
++        if (tok_embd->type == GGML_TYPE_F32) {
++            memcpy(dst, src, n_embd * sizeof(float));
++        } else {
++            traits->to_float(src, dst, n_embd);
++        }
++        if (n_embd_inp > n_embd) {
++            memset(dst + n_embd, 0, (n_embd_inp - n_embd) * sizeof(float));  // the token path pads with zeros
++        }
++    }
++
++    return true;
++}
++
+ int llama_context::encode(const llama_batch & batch_inp) {
+     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
+     // so accept either present rather than requiring exactly one.
+@@ -1653,21 +1740,31 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+     return false; // all sequences use backend sampling
+ }
+ 
+-int llama_context::decode(const llama_batch & batch_inp) {
++int llama_context::decode(const llama_batch & batch_inp_user) {
+     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
+     // so accept either present rather than requiring exactly one.
+-    GGML_ASSERT(batch_inp.token || batch_inp.embd);
++    GGML_ASSERT(batch_inp_user.token || batch_inp_user.embd);
+ 
+     if (!memory) {
+         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
+-        return encode(batch_inp);
++        return encode(batch_inp_user);
+     }
+ 
+-    if (batch_inp.n_tokens == 0) {
++    if (batch_inp_user.n_tokens == 0) {
+         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
+         return -1;
+     }
+ 
++    const int64_t t_dec0 = hostprof ? ggml_time_us() : 0;
++
++    // The token embedding rows come from the host (LLAMA_EMBD_LOOKUP_HOST): the batch carries the
++    // rows, and the graph has no GET_ROWS node that runs on the CPU.
++    llama_batch batch_inp = batch_inp_user;
++    if (embd_lookup_host && embd_lookup(batch_inp_user)) {
++        batch_inp.token = nullptr;
++        batch_inp.embd  = embd_lookup_buf.data();
++    }
++
+     const auto & vocab   = model.vocab;
+     const auto & hparams = model.hparams;
+ 
+@@ -1815,6 +1912,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
+     int64_t n_outputs_prev = 0;
+     int64_t n_tokens_prev  = 0;
+ 
++    const int64_t t_loop0 = hostprof ? ggml_time_us() : 0;
++
+     do {
+         const auto & ubatch = mctx->get_ubatch();
+ 
+@@ -1893,7 +1992,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             if (n_outputs) {
+                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
+                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
++                const int64_t t_logits0 = hostprof ? ggml_time_us() : 0;
+                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
++                if (hostprof) {
++                    hp.t_logits += ggml_time_us() - t_logits0;
++                }
+             }
+         }
+ 
+@@ -1992,6 +2095,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
+         n_tokens_prev  += ubatch.n_tokens;
+     } while (mctx->next());
+ 
++    const int64_t t_loop1 = hostprof ? ggml_time_us() : 0;
++
+     // set to total number of outputs in the batch, for use in llama_get_logits_ith
+     n_outputs = n_outputs_all;
+ 
+@@ -2045,6 +2150,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
+     // wait for the computation to finish (automatically done when obtaining the model output)
+     //synchronize();
+ 
++    if (hostprof) {
++        const int64_t t_end = ggml_time_us();
++        const int64_t t_ub  = hp.t_apply + hp.t_reuse + hp.t_build + hp.t_alloc + hp.t_inputs + hp.t_compute + hp.t_logits;
++        hp_n_decode++;
++        LLAMA_LOG_INFO("hostprof: decode #%d tokens %u ubatches %d reused %d embd_host %d | prologue %lld apply %lld reuse_check %lld build %lld alloc %lld inputs %lld compute %lld logits_get %lld loop_other %lld epilogue %lld total %lld | since_last_return %lld us\n",
++                hp_n_decode, n_tokens_all, hp.n_ubatch, hp.n_reused, batch_inp.embd && !batch_inp_user.embd ? 1 : 0,
++                (long long) (t_loop0 - t_dec0), (long long) hp.t_apply, (long long) hp.t_reuse, (long long) hp.t_build,
++                (long long) hp.t_alloc, (long long) hp.t_inputs, (long long) hp.t_compute, (long long) hp.t_logits,
++                (long long) ((t_loop1 - t_loop0) - t_ub), (long long) (t_end - t_loop1), (long long) (t_end - t_dec0),
++                (long long) (hp_t_return ? t_dec0 - hp_t_return : 0));
++        hp = llama_hostprof_data();
++        hp_t_return = ggml_time_us();
++    }
++
+     return 0;
+ }
+ 
+@@ -3113,11 +3232,17 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
+         io = std::make_unique<llama_io_write_host>(dst, size);
+     }
+ 
++    const int64_t t0 = hostprof ? ggml_time_us() : 0;
++
+     try {
+         io->write(&io_magic, sizeof(io_magic));
+         io->write(&seq_id, sizeof(seq_id));
+ 
+-        return state_seq_write_data(*io, seq_id, flags);
++        const size_t n = state_seq_write_data(*io, seq_id, flags);
++        if (hostprof) {
++            LLAMA_LOG_INFO("hostprof: state_seq_get seq %d flags %u bytes %zu us %lld\n", seq_id, (unsigned) flags, n, (long long) (ggml_time_us() - t0));
++        }
++        return n;
+     } catch (const std::exception & err) {
+         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+         return 0;
+@@ -3156,7 +3281,12 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
+         llama_seq_id seq_id_read;
+         io->read(&seq_id_read, sizeof(seq_id_read));
+ 
+-        return state_seq_read_data(*io, seq_id, flags);
++        const int64_t t0 = hostprof ? ggml_time_us() : 0;
++        const size_t  n  = state_seq_read_data(*io, seq_id, flags);
++        if (hostprof) {
++            LLAMA_LOG_INFO("hostprof: state_seq_set seq %d flags %u bytes %zu us %lld\n", seq_id, (unsigned) flags, n, (long long) (ggml_time_us() - t0));
++        }
++        return n;
+     } catch (const std::exception & err) {
+         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
+         return 0;
+diff --git a/src/llama-context.h b/src/llama-context.h
+index b7a9db5..46be478 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -397,4 +397,29 @@ private:
+     mutable int32_t n_eval   = 0; // number of eval calls
+ 
+     mutable int32_t n_reused = 0; // number of times the previous graph was reused
++
++    // env: LLAMA_HOSTPROF - print the host-side times of each decode call
++    bool hostprof = false;
++
++    struct llama_hostprof_data {
++        int64_t t_apply   = 0;  // the memory context apply
++        int64_t t_reuse   = 0;  // the graph reuse check
++        int64_t t_build   = 0;  // the graph build
++        int64_t t_alloc   = 0;  // the scheduler split and allocation
++        int64_t t_inputs  = 0;  // set_inputs
++        int64_t t_compute = 0;  // the scheduler compute (the backends queue their work here)
++        int64_t t_logits  = 0;  // the copy of the logits to the host (the wait for the device is in here)
++        int32_t n_reused  = 0;
++        int32_t n_ubatch  = 0;
++    };
++    llama_hostprof_data hp;
++    int64_t hp_t_return = 0;  // the time the last decode call returned
++    int32_t hp_n_decode = 0;
++
++    // env: LLAMA_EMBD_LOOKUP_HOST - the token embedding rows come from the host, thus the graph has
++    // no GET_ROWS node for them and no split on the CPU
++    bool embd_lookup_host = false;
++    std::vector<float> embd_lookup_buf;
++
++    bool embd_lookup(const llama_batch & batch);
+ };
+diff --git a/tools/completion/completion.cpp b/tools/completion/completion.cpp
+index 941b739..037ea7a 100644
+--- a/tools/completion/completion.cpp
++++ b/tools/completion/completion.cpp
+@@ -665,8 +665,17 @@ int llama_completion(int argc, char ** argv) {
+ 
+         if ((int) embd_inp.size() <= n_consumed && !is_interacting) {
+ 
++            // LLAMA_HOSTPROF: the time of the sampler for each token
++            static const bool hostprof = [] { const char * s = getenv("LLAMA_HOSTPROF"); return s && atoi(s) != 0; }();
++            static int n_hostprof_samples = 0;
++            const int64_t t_sample0 = hostprof ? ggml_time_us() : 0;
++
+             const llama_token id = common_sampler_sample(smpl, ctx, -1);
+ 
++            if (hostprof) {
++                LOG_INF("hostprof: sample #%d us %lld\n", ++n_hostprof_samples, (long long) (ggml_time_us() - t_sample0));
++            }
++
+             common_sampler_accept(smpl, id, /* accept_grammar= */ true);
+ 
+             // LOG_DBG("last: %s\n", string_from(ctx, smpl->prev.to_vector()).c_str());
+diff --git a/examples/simple/simple.cpp b/examples/simple/simple.cpp
+index 9f0a25d..6cbcff3 100644
+--- a/examples/simple/simple.cpp
++++ b/examples/simple/simple.cpp
+@@ -179,8 +179,16 @@ int main(int argc, char ** argv) {
+ 
+         // sample the next token
+         {
++            // LLAMA_HOSTPROF: the time of the sampler for each token
++            static const bool hostprof = [] { const char * s = getenv("LLAMA_HOSTPROF"); return s && atoi(s) != 0; }();
++            const int64_t t_sample0 = hostprof ? ggml_time_us() : 0;
++
+             new_token_id = llama_sampler_sample(smpl, ctx, -1);
+ 
++            if (hostprof) {
++                fprintf(stderr, "hostprof: sample #%d us %lld\n", n_decode + 1, (long long) (ggml_time_us() - t_sample0));
++            }
++
+             // is it an end of generation?
+             if (llama_vocab_is_eog(vocab, new_token_id)) {
+                 break;
