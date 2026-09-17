@@ -1,0 +1,91 @@
+# Perfetto trace config for the Qwen Mobile app (ai.airi.qwenmobile) on Android 15.
+#
+# The file is a text proto of perfetto.protos.TraceConfig. capture.sh puts the
+# line "duration_ms: N" in front of this text and sends the result to
+# "perfetto -c - --txt" on the phone.
+#
+# The sources: the scheduler (sched_switch, sched_wakeup, sched_waking), the CPU
+# clocks and the idle states, the GPU clock, the system memory counters, the
+# memory counters of each process, and the atrace sections of the app. The JNI of
+# the app emits the sections prefill, decode-step, sample, image-encode and ui-post
+# through ATrace. On a user build, atrace_apps operates only for an app that is
+# debuggable or that has <profileable android:shell="true" /> in its manifest.
+
+# Buffer 0: the ftrace events (the scheduler gives many events, thus the buffer is large).
+buffers: {
+    size_kb: 131072
+    fill_policy: RING_BUFFER
+}
+
+# Buffer 1: the process and the system counters.
+buffers: {
+    size_kb: 8192
+    fill_policy: RING_BUFFER
+}
+
+data_sources: {
+    config {
+        name: "linux.ftrace"
+        target_buffer: 0
+        ftrace_config {
+            ftrace_events: "sched/sched_switch"
+            ftrace_events: "sched/sched_wakeup"
+            ftrace_events: "sched/sched_waking"
+            ftrace_events: "sched/sched_process_exit"
+            ftrace_events: "sched/sched_process_free"
+            ftrace_events: "task/task_newtask"
+            ftrace_events: "task/task_rename"
+            ftrace_events: "power/cpu_frequency"
+            ftrace_events: "power/cpu_idle"
+            ftrace_events: "power/gpu_frequency"
+            ftrace_events: "power/suspend_resume"
+            ftrace_events: "gpu_mem/gpu_mem_total"
+            ftrace_events: "ftrace/print"
+            atrace_categories: "gfx"
+            atrace_categories: "view"
+            atrace_categories: "sched"
+            atrace_categories: "freq"
+            atrace_categories: "idle"
+            atrace_categories: "binder_driver"
+            atrace_apps: "ai.airi.qwenmobile"
+            buffer_size_kb: 16384
+            drain_period_ms: 250
+        }
+    }
+}
+
+# The process names and the thread names for the scheduler tracks, and the
+# memory counters of each process (RSS, VM) every 500 ms.
+data_sources: {
+    config {
+        name: "linux.process_stats"
+        target_buffer: 1
+        process_stats_config {
+            scan_all_processes_on_start: true
+            record_thread_names: true
+            proc_stats_poll_ms: 500
+        }
+    }
+}
+
+data_sources: {
+    config {
+        name: "linux.sys_stats"
+        target_buffer: 1
+        sys_stats_config {
+            meminfo_period_ms: 500
+            meminfo_counters: MEMINFO_MEM_TOTAL
+            meminfo_counters: MEMINFO_MEM_FREE
+            meminfo_counters: MEMINFO_MEM_AVAILABLE
+            meminfo_counters: MEMINFO_CACHED
+            meminfo_counters: MEMINFO_SWAP_FREE
+            cpufreq_period_ms: 500
+        }
+    }
+}
+
+# The trace stops after duration_ms. The daemon writes the ring buffers to the
+# file every 2.5 s, thus a trace can be longer than the buffers.
+write_into_file: true
+file_write_period_ms: 2500
+flush_period_ms: 5000
