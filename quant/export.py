@@ -67,6 +67,7 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
     writer.add_file_type(gguf.LlamaFileType.MOSTLY_Q4_0)
 
     counts: dict[str, int] = {}
+    adapter: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     for t in reader.tensors:
         name = t.name
         kind = plan.type_of(name)
@@ -85,6 +86,8 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
                 raise ValueError(f"{name}: the solved blocks are {z['kind']}, the plan says {kind}")
             d = torch.from_numpy(z["d"].view(np.float16))
             writer.add_tensor(name, pack_nibbles(idx, d), raw_dtype=getattr(gguf.GGMLQuantizationType, GGUF_4BIT[kind]))
+            if "lora_a" in z.files:
+                adapter[name] = (z["lora_a"], z["lora_b"])
             kind = f"{kind} (solved)"
         elif kind in GGUF_4BIT:
             w = torch.from_numpy(_f32_of(t)).to(device)
@@ -111,3 +114,28 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
     for kind, n in sorted(counts.items()):
         print(f"  {kind:16s} {n:4d} tensors")
     print(f"wrote {out_gguf} ({out_gguf.stat().st_size / 2**30:.2f} GiB)")
+    if adapter:
+        write_adapter(gguf, arch, out_gguf.with_name(out_gguf.stem + "-lora.gguf"), adapter)
+
+
+def write_adapter(gguf, arch: str, path: Path, adapter: dict[str, tuple[np.ndarray, np.ndarray]]) -> None:
+    """Write the low-rank corrections as a GGUF LoRA adapter, alpha = rank thus scale 1.
+
+    llama.cpp expects ``<name>.lora_a`` as [rank, in] and ``<name>.lora_b``
+    as [out, rank], and computes W·x + b·(a·x).
+    """
+    rank = next(iter(adapter.values()))[0].shape[0]
+    writer = gguf.GGUFWriter(str(path), arch)
+    writer.add_type("adapter")
+    writer.add_string(gguf.Keys.Adapter.TYPE, "lora")
+    writer.add_float32(gguf.Keys.Adapter.LORA_ALPHA, float(rank))
+    total = 0
+    for name, (a, b) in adapter.items():
+        writer.add_tensor(f"{name}.lora_a", a.astype(np.float16))
+        writer.add_tensor(f"{name}.lora_b", b.astype(np.float16))
+        total += (a.size + b.size) * 2
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file(progress=False)
+    writer.close()
+    print(f"wrote {path} ({len(adapter)} corrections of rank {rank}, {total / 2**20:.1f} MiB)")

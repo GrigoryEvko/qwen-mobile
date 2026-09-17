@@ -35,7 +35,7 @@ import torch
 from torch import nn
 from transformers.models.qwen3_5.modeling_qwen3_5 import create_causal_mask, create_recurrent_attention_mask
 
-from .blockopt import FROZEN, OptOptions, optimize_head, optimize_layer
+from .blockopt import FROZEN, OptOptions, Solved, Target, optimize_head, optimize_layer
 from .grid import dequantize, q8_0_dequantize, q8_0_quantize, quantize
 from .grids import Grid, IQ4NLGrid, Q4_0Grid, fit_codebook
 from .names import to_gguf
@@ -218,9 +218,9 @@ class Quantizer:
         self.opts = opts
         self.cfg = step.cfg
         self.fixed = {"Q4_0": Q4_0Grid().to(step.device), "IQ4_NL": IQ4NLGrid().to(step.device)}
-        # The grid and the Hessian diagonal of each solved matrix, by (layer, relative name). The head is layer -1.
+        # The grid and the input Hessian of each solved matrix, by (layer, relative name). The head is layer -1.
         self.grids: dict[tuple[int, str], Grid] = {}
-        self.h_diag: dict[tuple[int, str], torch.Tensor] = {}
+        self.hess: dict[tuple[int, str], torch.Tensor] = {}
         out_dir.mkdir(parents=True, exist_ok=True)
 
     # --- grids ---
@@ -275,16 +275,23 @@ class Quantizer:
 
     # --- solving ---
 
-    def save_pack(self, name: str, kind: str, grid: Grid, idx: torch.Tensor, d: torch.Tensor) -> None:
+    def save_pack(self, name: str, kind: str, grid: Grid, idx: torch.Tensor, d: torch.Tensor,
+                  low_rank: tuple[torch.Tensor, torch.Tensor] | None = None) -> None:
+        extra = {}
+        if low_rank is not None:
+            extra = {"lora_a": low_rank[0].cpu().numpy(), "lora_b": low_rank[1].cpu().numpy()}
         np.savez(self.out_dir / f"{name}.npz", q=idx.cpu().numpy(), d=d.cpu().numpy().view(np.uint16),
-                 levels=grid.levels.cpu().numpy(), kind=np.array(kind))
+                 levels=grid.levels.cpu().numpy(), kind=np.array(kind), **extra)
+
+    def save_solved(self, name: str, kind: str, solved: Solved) -> None:
+        self.save_pack(name, kind, solved.grid, solved.idx, solved.d, solved.low_rank)
 
     def solve(self, key: tuple[int, str], name: str, kind: str, lin: nn.Linear, h: torch.Tensor, g: torch.Tensor,
               tag: str) -> None:
         """The initial rounding of one matrix onto its grid. The block optimization moves it later."""
         t0 = time.time()
         grid = self.grid_for(kind, lin.weight.data, torch.diag(h))
-        self.grids[key], self.h_diag[key] = grid, torch.diag(h).clone()
+        self.grids[key], self.hess[key] = grid, h.clone()
         if self.opts.init == "rtn":
             idx, d = quantize(grid, lin.weight.data, weights=torch.diag(h), search=True)
             err, change = float("nan"), 0.0
@@ -308,11 +315,12 @@ class Quantizer:
     def optimize(self, li: int) -> None:
         """Block reconstruction of layer li, then the Q8 members back on their grid."""
         self.step.advance_ref(li)
-        targets = {rel: (self.grids[(l, rel)], self.h_diag[(l, rel)]) for (l, rel) in list(self.grids) if l == li}
+        targets = {rel: Target(self.grids[(l, rel)], self.hess[(l, rel)], self.both(li, rel)[0].weight.data)
+                   for (l, rel) in list(self.grids) if l == li}
         result = optimize_layer(self.step, li, targets, self.opts.opt)
-        for rel, (grid, idx, d) in result.items():
-            self.grids[(li, rel)] = grid
-            self.save_pack(self.name(li, rel), self.kind(li, rel), grid, idx, d)
+        for rel, solved in result.items():
+            self.grids[(li, rel)] = solved.grid
+            self.save_solved(self.name(li, rel), self.kind(li, rel), solved)
         work_layer = self.step.layers(li)[1]
         for rel, lin in work_layer.named_modules():
             if isinstance(lin, nn.Linear) and self.kind(li, rel) == "Q8_0":
@@ -432,8 +440,8 @@ class Quantizer:
         key = (-1, "lm_head")
         self.solve(key, "output.weight", kind, heads[1], h, g, "head    ")
         if self.opts.method == "blockopt":
-            grid, idx, d = optimize_head(self.step, self.grids[key], self.h_diag[key], self.opts.opt)
-            self.save_pack("output.weight", kind, grid, idx, d)
+            solved = optimize_head(self.step, Target(self.grids[key], self.hess[key], heads[0].weight.data), self.opts.opt)
+            self.save_solved("output.weight", kind, solved)
 
     # --- the run ---
 

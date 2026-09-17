@@ -104,7 +104,8 @@ def cmd_quantize(args: argparse.Namespace) -> None:
     opts = Options(method=args.method, init=args.init, scale=not args.no_scale, permute_mlp=not args.no_permute,
                    mismatch=args.mismatch, damp=args.damp, refit_damp=args.refit_damp, batch=args.batch,
                    opt=OptOptions(epochs=args.epochs, batch=args.opt_batch, lr_weight=args.lr_weight,
-                                  lr_scale=args.lr_scale, lr_other=args.lr_other, head_steps=args.head_steps))
+                                  lr_scale=args.lr_scale, lr_other=args.lr_other, rank=args.rank,
+                                  head_rank=args.head_rank, head_steps=args.head_steps))
     print(f"quantize {args.model}: {opts}", flush=True)
     Quantizer(Lockstep(ref, work, ids, args.batch), plan, out, opts).run()
     print(f"solved blocks in {out}", flush=True)
@@ -160,6 +161,10 @@ def cmd_eval(args: argparse.Namespace) -> None:
     cmd = [str(ROOT / "llama.cpp" / "build-cuda" / "bin" / "llama-perplexity"), "-m", str(args.gguf), "-ngl", "99",
            "-f", str(ROOT / "data" / "wiki.test.raw"), "-c", "512", "--chunks", "16",
            "--kl-divergence-base", str(base), "--kl-divergence"]
+    lora = Path(args.gguf).with_name(Path(args.gguf).stem + "-lora.gguf")
+    if lora.exists():
+        cmd += ["--lora", str(lora)]
+        print(f"with the adapter {lora.name}")
     res = subprocess.run(cmd, capture_output=True, text=True)
     for line in (res.stdout + res.stderr).splitlines():
         if any(k in line for k in ("Mean    KLD", "Maximum KLD", "99.9%   KLD", "99.0%   KLD", "Median  KLD",
@@ -208,6 +213,8 @@ def main() -> None:
     q.add_argument("--lr-scale", type=float, default=1e-4)
     q.add_argument("--lr-other", type=float, default=1e-4)
     q.add_argument("--head-steps", type=int, default=300)
+    q.add_argument("--rank", type=int, default=0, help="rank of the low-rank correction per decoder matrix, 0 for none")
+    q.add_argument("--head-rank", type=int, default=0, help="rank of the low-rank correction of the head")
     q.add_argument("--no-scale", action="store_true", help="no folded column scales")
     q.add_argument("--no-permute", action="store_true", help="no permutation of the MLP intermediate channels")
     q.add_argument("--mismatch", choices=("model", "layer"), default="model",
