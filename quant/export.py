@@ -15,6 +15,12 @@ head from ``token_embd.weight``, through the dense map ``output_rot.weight``
 that the graph applies after the final norm. The file then holds one tensor
 for the lookup and the head, which removes the separate embedding tensor
 from the RAM of the phone.
+
+The MTP block passes through with the type ``mtp`` of the plan. A rotated
+source holds its two dense maps, which the transform wrote for an output
+norm of one. The calibration can move the output norm to s, and the main
+graph then supplies s ⊙ norm(h'). Thus the export divides the columns of
+``hnorm_rot`` by s and multiplies the rows of ``shared_head_rot`` by s.
 """
 
 from __future__ import annotations
@@ -22,7 +28,7 @@ from __future__ import annotations
 import json
 import re
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -30,7 +36,7 @@ import torch
 
 from .grid import BLOCK, pack_nibbles, pack_q8_0, q8_0_quantize, quantize
 from .grids import make_grid
-from .plan import Plan
+from .plan import MTP_MAPS, Plan
 
 GGUF_4BIT = {"Q4_0": "Q4_0", "IQ4_NL": "IQ4_NL"}
 FILE_TYPES = {"Q4_0": "MOSTLY_Q4_0", "IQ4_NL": "MOSTLY_IQ4_NL", "Q8_0": "MOSTLY_Q8_0"}
@@ -168,6 +174,24 @@ def output_rot(rot: Path | None, folds, reader) -> np.ndarray:
                      "or a tied source GGUF")
 
 
+def mtp_map(name: str, a: np.ndarray, out_norm: np.ndarray) -> np.ndarray:
+    """A dense map of the MTP block, [out, in] float32, for the exported output norm ``out_norm``.
+
+    The transform wrote the maps for an output norm of one. With the norm s
+    the main graph supplies s ⊙ norm(h') in place of norm(h'). Thus
+    ``hnorm_rot`` takes diag(s)⁻¹ on its input side, and ``shared_head_rot``
+    takes diag(s) on its output side, which keeps the state of the block in
+    the convention of the main graph.
+    """
+    if a.shape != (out_norm.shape[0], out_norm.shape[0]):
+        raise ValueError(f"{name} has the shape {a.shape}, the hidden size is {out_norm.shape[0]}")
+    if name.endswith("nextn.hnorm_rot.weight"):
+        return a / out_norm[None, :]
+    if name.endswith("nextn.shared_head_rot.weight"):
+        return a * out_norm[:, None]
+    raise ValueError(f"{name} is not a dense map of the MTP block")
+
+
 def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: Path,
            device: torch.device, only: str | None = None, invert: bool = False,
            source_folded: bool = False, tie_head: bool = False, rot: Path | None = None) -> None:
@@ -194,6 +218,10 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
     head has no column scales. ``token_embd.weight`` then follows the plan,
     from the pack ``token_embd.weight.npz`` when the calibration solved the
     tied head.
+
+    The dense maps of the MTP block must be those of the transform (a
+    converter F16 as the source), because the export scales them by the
+    exported output norm (refer to ``mtp_map``).
     """
     gguf = _load_gguf_module(llama_dir)
     selector = re.compile(only) if only else None
@@ -203,9 +231,9 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
     if folds is not None and not source_folded:
         if only is not None:
             raise ValueError("--only keeps solved tensors in F16: export from the folded reference (--source tf)")
-        # The embedding is never folded, thus its type can change on the unfolded source.
-        wanted = json.loads(json.dumps(asdict(plan)))
-        if saved_plan is not None and {**saved_plan, "embedding": None} != {**wanted, "embedding": None}:
+        # The embedding and the MTP block are never calibrated, thus their types can change on the unfolded source.
+        wanted = json.loads(json.dumps(plan.calibrated()))
+        if saved_plan is not None and Plan(**saved_plan).calibrated() != wanted:
             raise ValueError(f"the plan differs from the calibration plan {saved_plan}: "
                              "export from the folded reference (--source tf)")
 
@@ -219,6 +247,14 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
             a = folds[t.name].astype(np.float32).reshape([int(x) for x in reversed(t.shape)])
             return layout.array(t.name, a) if layout is not None else a
         return _f32_of(t)
+
+    # The exported output norm: the identity for a tied head without folds, else the source or the folds.
+    t_norm = next((t for t in reader.tensors if t.name == "output_norm.weight"), None)
+    if t_norm is None:
+        raise ValueError(f"{f16_gguf} has no output_norm.weight")
+    out_norm = source(t_norm).astype(np.float32)
+    if tie_head and (folds is None or "output_norm.weight" not in folds.files):
+        out_norm = np.ones_like(out_norm)
 
     writer = gguf.GGUFWriter(str(out_gguf), arch)
     skip = {"general.architecture", "general.file_type", "GGUF.version", "GGUF.tensor_count", "GGUF.kv_count"}
@@ -273,17 +309,16 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
             q, d = q8_0_quantize(w)
             writer.add_tensor(name, pack_q8_0(q, d), raw_dtype=gguf.GGMLQuantizationType.Q8_0)
         elif kind == "F32":
-            a = source(t).astype(np.float32)
+            a = out_norm if name == "output_norm.weight" else source(t).astype(np.float32)
+            writer.add_tensor(name, a)
             if tie_head and name == "output_norm.weight":
-                if folds is None or name not in folds.files:
-                    a = np.ones_like(a)
-                writer.add_tensor(name, a)
                 if rot_m.shape != (a.shape[0], a.shape[0]):
                     raise ValueError(f"output_rot has the shape {rot_m.shape}, the hidden size is {a.shape[0]}")
                 writer.add_tensor("output_rot.weight", rot_m.astype(np.float16))
                 counts["F16 (output_rot)"] = counts.get("F16 (output_rot)", 0) + 1
-            else:
-                writer.add_tensor(name, a)
+        elif name.endswith(MTP_MAPS):
+            writer.add_tensor(name, mtp_map(name, _f32_of(t), out_norm).astype(np.float16))
+            kind = "F16 (MTP maps)"
         else:
             if t.tensor_type not in (gguf.GGMLQuantizationType.F16, gguf.GGMLQuantizationType.F32):
                 raise ValueError(f"{name}: the F16 GGUF holds an unexpected type {t.tensor_type.name}")

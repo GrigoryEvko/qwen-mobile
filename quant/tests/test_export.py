@@ -148,12 +148,14 @@ def test_gguf_keeps_the_numpy_row_order_of_a_2d_tensor(tmp_path: Path) -> None:
 
 
 def write_toy_f16(gguf, path: Path, vocab: int, d: int, gen: np.random.Generator, tied: bool = False,
-                  layer: bool = False) -> dict[str, np.ndarray]:
+                  layer: bool = False, mtp: bool = False) -> dict[str, np.ndarray]:
     """A small F16 GGUF with the head tensors of the converter: token_embd, output_norm, output.
 
     ``tied`` gives no ``output.weight``, as the converter does for a tied
     checkpoint. ``layer`` adds one decoder block: two F16 matrices, the F16
-    GDN control ``ssm_alpha`` and an F32 norm.
+    GDN control ``ssm_alpha`` and an F32 norm. ``mtp`` adds the MTP block as
+    block 1 of a rotated checkpoint: three F16 matrices, two F32 norms and
+    the two F16 dense maps.
     """
     tensors = {
         "token_embd.weight": gen.standard_normal((vocab, d)).astype(np.float16),
@@ -166,6 +168,14 @@ def write_toy_f16(gguf, path: Path, vocab: int, d: int, gen: np.random.Generator
         tensors["blk.0.attn_gate.weight"] = gen.standard_normal((d, d)).astype(np.float16)
         tensors["blk.0.ssm_alpha.weight"] = gen.standard_normal((2, d)).astype(np.float16)
         tensors["blk.0.attn_norm.weight"] = (0.5 + gen.random(d)).astype(np.float32)
+    if mtp:
+        tensors["blk.1.nextn.eh_proj.weight"] = gen.standard_normal((d, 2 * d)).astype(np.float16)
+        tensors["blk.1.attn_q.weight"] = gen.standard_normal((2 * d, d)).astype(np.float16)
+        tensors["blk.1.ffn_down.weight"] = gen.standard_normal((d, 2 * d)).astype(np.float16)
+        tensors["blk.1.attn_norm.weight"] = (0.5 + gen.random(d)).astype(np.float32)
+        tensors["blk.1.nextn.hnorm.weight"] = (0.5 + gen.random(d)).astype(np.float32)
+        tensors["blk.1.nextn.hnorm_rot.weight"] = gen.standard_normal((d, d)).astype(np.float16)
+        tensors["blk.1.nextn.shared_head_rot.weight"] = gen.standard_normal((d, d)).astype(np.float16)
     writer = gguf.GGUFWriter(str(path), "qwen35")
     writer.add_uint32("qwen35.embedding_length", d)
     for name, a in tensors.items():
@@ -238,6 +248,79 @@ def test_q8_0_export_of_a_plain_source_matches_gguf_py(tmp_path: Path) -> None:
     for name in ("output_norm.weight", "blk.0.attn_norm.weight", "blk.0.ssm_alpha.weight"):
         assert got[name].tensor_type.name == "F32", name
         np.testing.assert_array_equal(_f32_of(got[name]), tensors[name].astype(np.float32))
+
+
+def mtp_maps_for(tensors: dict[str, np.ndarray], out_norm: np.ndarray) -> dict[str, np.ndarray]:
+    """The two maps of the toy MTP block for the exported output norm, after the F16 round trip."""
+    h = tensors["blk.1.nextn.hnorm_rot.weight"].astype(np.float32) / out_norm[None, :]
+    s = tensors["blk.1.nextn.shared_head_rot.weight"].astype(np.float32) * out_norm[:, None]
+    return {"blk.1.nextn.hnorm_rot.weight": h.astype(np.float16).astype(np.float32),
+            "blk.1.nextn.shared_head_rot.weight": s.astype(np.float16).astype(np.float32)}
+
+
+def test_export_passes_the_mtp_block_and_scales_its_maps(tmp_path: Path) -> None:
+    """The MTP block keeps F16 or takes the type ``mtp``, its norms stay F32, and its maps take the output norm.
+
+    An untied source without folds exports its own output norm, thus the
+    maps take that norm: diag(s)⁻¹ on the input of ``hnorm_rot`` and
+    diag(s) on the output of ``shared_head_rot``.
+    """
+    gguf = gguf_module()
+    gen = np.random.default_rng(3)
+    vocab, d = 48, 64
+    src = tmp_path / "src.gguf"
+    tensors = write_toy_f16(gguf, src, vocab, d, gen, layer=True, mtp=True)
+    expected_maps = mtp_maps_for(tensors, tensors["output_norm.weight"])
+    for mtp_type, out_name in (("F16", "mtp-f16.gguf"), ("Q8_0", "mtp-q8.gguf")):
+        out = tmp_path / out_name
+        export(src, out, tmp_path / "no-packs", Plan(bulk="Q8_0", gdn_gate="Q8_0", n_layers=1, mtp=mtp_type), LLAMA,
+               torch.device("cpu"))
+        got = read_all(gguf, out)
+        assert set(got) == set(tensors)
+        for name in ("blk.1.nextn.eh_proj.weight", "blk.1.attn_q.weight", "blk.1.ffn_down.weight"):
+            assert got[name][0] == mtp_type, (mtp_type, name)
+            w = torch.from_numpy(tensors[name].astype(np.float32))
+            if mtp_type == "F16":
+                np.testing.assert_array_equal(_f32_of(got[name][1]), w.numpy())
+            else:
+                packed = np.asarray(got[name][1].data).reshape(w.shape[0], -1)
+                reference = gguf.quants.dequantize(packed, gguf.GGMLQuantizationType.Q8_0)
+                np.testing.assert_allclose(reference, q8_0_dequantize(*q8_0_quantize(w)).numpy(), rtol=0, atol=1e-7)
+        for name in ("blk.1.attn_norm.weight", "blk.1.nextn.hnorm.weight"):
+            assert got[name][0] == "F32", name
+            np.testing.assert_array_equal(_f32_of(got[name][1]), tensors[name])
+        for name, expected in expected_maps.items():
+            assert got[name][0] == "F16", name
+            np.testing.assert_array_equal(_f32_of(got[name][1]), expected)
+        assert not np.array_equal(_f32_of(got["blk.1.nextn.hnorm_rot.weight"][1]),
+                                  tensors["blk.1.nextn.hnorm_rot.weight"].astype(np.float32)), "the norm is not one"
+
+
+def test_tied_export_scales_the_mtp_maps_by_the_folded_norm(tmp_path: Path) -> None:
+    """A tied export takes the identity output norm without folds, and the folded norm with them, in its maps too."""
+    gguf = gguf_module()
+    gen = np.random.default_rng(4)
+    vocab, d = 48, 64
+    src = tmp_path / "src.gguf"
+    tensors = write_toy_f16(gguf, src, vocab, d, gen, mtp=True)
+    rot = gen.standard_normal((d, d)).astype(np.float32)
+    rot_path = tmp_path / "rot.npy"
+    np.save(rot_path, rot)
+    packs = tmp_path / "packs"
+    packs.mkdir()
+    out = tmp_path / "tied-plain.gguf"
+    export(src, out, packs, Plan(n_layers=1), LLAMA, torch.device("cpu"), only="^$", tie_head=True, rot=rot_path)
+    got = read_all(gguf, out)
+    for name, expected in mtp_maps_for(tensors, np.ones(d, dtype=np.float32)).items():
+        np.testing.assert_array_equal(_f32_of(got[name][1]), expected)
+    norm = (1.0 + 0.1 * gen.standard_normal(d)).astype(np.float32)
+    np.savez(packs / "folds.npz", **{"output_norm.weight": norm, "output_rot.weight": rot})
+    out = tmp_path / "tied-folded.gguf"
+    export(src, out, packs, Plan(n_layers=1), LLAMA, torch.device("cpu"), source_folded=True, tie_head=True)
+    got = read_all(gguf, out)
+    np.testing.assert_array_equal(_f32_of(got["output_norm.weight"][1]), norm)
+    for name, expected in mtp_maps_for(tensors, norm).items():
+        np.testing.assert_array_equal(_f32_of(got[name][1]), expected)
 
 
 def test_tied_export_takes_the_head_pack_and_the_folds(tmp_path: Path) -> None:

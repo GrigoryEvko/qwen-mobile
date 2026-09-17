@@ -1,12 +1,12 @@
 """Command line of the pipeline.
 
-    python -m quant.run transform  --model Qwen3.5-2B [--no-rotate] [--block 32] [--permute-mlp] [--tie-head] [--suffix t]
+    python -m quant.run transform  --model Qwen3.5-2B [--no-rotate] [--block 32] [--permute-mlp] [--tie-head] [--no-mtp] [--suffix t]
     python -m quant.run verify     --model Qwen3.5-2B
     python -m quant.run convert    --model Qwen3.5-2B
     python -m quant.run quantize   --model Qwen3.5-2B [--init qronos|gptq] [--no-scale] [--mismatch model|layer] [--drift]
     python -m quant.run quantize   --model Qwen3.5-2B --head-only --packs quant-out/<previous run> [--stream]
     python -m quant.run convert    --model Qwen3.5-2B --source tf
-    python -m quant.run export     --model Qwen3.5-2B --source tf [--head Q8_0] [--only <regex>] [--invert] [--tie-head]
+    python -m quant.run export     --model Qwen3.5-2B --source tf [--head Q8_0] [--mtp Q8_0] [--only <regex>] [--invert] [--tie-head]
     python -m quant.run export     --model Qwen3.5-2B --f16 weights/gguf/Qwen3.5-2B-F16.gguf --bulk Q8_0 --gdn-gate Q8_0 --tag Q8_0
     python -m quant.run eval       --model Qwen3.5-2B --gguf <file> [--ngl 99]
     python -m quant.run drift      --model Qwen3.5-2B --source t --out analysis/<file>.drift.md
@@ -30,7 +30,7 @@ from pathlib import Path
 
 import torch
 
-from .checkpoint import OUTPUT_ROT, layer_types, load_checkpoint, load_tensor, num_layers, save_checkpoint
+from .checkpoint import MTP_HNORM_ROT, OUTPUT_ROT, layer_types, load_checkpoint, load_tensor, num_layers, save_checkpoint
 from .plan import Plan
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -45,10 +45,10 @@ def cmd_transform(args: argparse.Namespace) -> None:
     tensors = load_checkpoint(src)
     out = transform(tensors, num_layers(src), layer_types(src), rotate=not args.no_rotate,
                     block=args.block, seed=args.seed, permute_mlp=args.permute_mlp,
-                    device=torch.device(args.device), tie_head=args.tie_head)
+                    device=torch.device(args.device), tie_head=args.tie_head, mtp=False if args.no_mtp else None)
     save_checkpoint(out, src, dst, tie_word_embeddings=args.tie_head)
     print(f"wrote {dst}: rotate={not args.no_rotate} block={args.block} permute_mlp={args.permute_mlp} "
-          f"tie_head={args.tie_head}")
+          f"tie_head={args.tie_head} mtp={MTP_HNORM_ROT in out}")
 
 
 @torch.no_grad()
@@ -248,7 +248,7 @@ def _plan(args: argparse.Namespace, n_layers: int, tied: bool = False) -> Plan:
     """The plan of the flags. A tied head takes the type of the embedding, because it is the embedding."""
     edges = tuple(int(x) for x in args.edge_layers.split(",")) if args.edge_layers else ()
     return Plan(bulk=args.bulk, head=args.embedding if tied else args.head, embedding=args.embedding, kv_proj=args.kv_proj,
-                gdn_gate=args.gdn_gate, edge_layers=edges, edge_type="Q8_0", n_layers=n_layers)
+                gdn_gate=args.gdn_gate, edge_layers=edges, edge_type="Q8_0", n_layers=n_layers, mtp=args.mtp)
 
 
 def main() -> None:
@@ -265,6 +265,8 @@ def main() -> None:
     t.add_argument("--permute-mlp", action="store_true")
     t.add_argument("--tie-head", action="store_true",
                    help="keep the head tied to the embedding and write the dense map output_rot after the final norm")
+    t.add_argument("--no-mtp", action="store_true",
+                   help="keep the MTP block as it is (the default transforms it and writes its two dense maps)")
     t.add_argument("--suffix", default="t", help="the suffix of the output checkpoint, weights/<model>-<suffix>")
 
     v = sub.add_parser("verify", parents=[common])
@@ -348,6 +350,8 @@ def _plan_args(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--kv-proj", default="Q8_0")
     sp.add_argument("--gdn-gate", default="Q4_0")
     sp.add_argument("--edge-layers", default="")
+    sp.add_argument("--mtp", default="F16", choices=("F16", "Q8_0", "Q4_0", "IQ4_NL"),
+                    help="the matrices of the MTP block: F16 as the converter wrote them, or round-to-nearest")
 
 
 if __name__ == "__main__":
