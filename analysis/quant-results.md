@@ -400,7 +400,33 @@ unfolded source (`--source tu`) and `quant/refold.py` makes the folded weight fr
 - The packs of `ffn_gate` and `ffn_up`, which give the channel permutation by the cosine of each
   row, and the `ffn_down` column scales by the least-squares ratio of the rows.
 
-Three numbers check the result, because `search_column_scales` makes scales of geometric mean one.
+The strongest check compares each refolded tensor with its own pack, over all the 138 layer packs of
+row 7. The pack holds the 4-bit rounding of the folded weight, thus the difference must be the
+4-bit rounding error and nothing more. It is, for every class:
+
+| Class | Packs | Relative difference against the pack (min, mean, max) | The recovery |
+|---|---|---|---|
+| `attn_qkv` | 18 | 0.0947, 0.0966, 0.0984 | the norm ratio, exact |
+| `attn_gate` | 18 | 0.0946, 0.0967, 0.0985 | the norm ratio, exact |
+| `attn_q` | 6 | 0.0942, 0.0967, 0.0995 | the norm ratio, exact |
+| `ffn_gate` | 24 | 0.0935, 0.0963, 0.1027 | the norm ratio and the row match |
+| `ffn_up` | 24 | 0.0935, 0.0963, 0.1027 | the same, and the `ffn_down` scales |
+| `ssm_out` | 18 | 0.1012, 0.1105, 0.1254 | the norm ratio, exact |
+| `attn_output` | 6 | 0.1043, 0.1102, 0.1196 | the rows of the folded `attn_v` |
+| `ffn_down` | 24 | 0.0930, 0.0998, 0.1191 | the row ratio of the `ffn_up` packs |
+
+A wrong coordinate would show at once, because the column scales have an rms log of 0.04 to 0.31,
+which is 4 % to 31 % per column. Every class stays at 9.3 % to 12.5 %, which is the 4-bit error of
+Q4_0 on these weights. `ssm_out` and `attn_output` hold the two highest values, and that is the
+property of those matrices and not of the recovery: `ssm_out` is the class that this whole section
+ranks as the hardest. The `ffn_up` row is not an independent check, because the `ffn_down` scales
+come from the `ffn_up` packs.
+
+The one estimated quantity is the `ffn_down` column scale. A row of `ffn_up` has 2048 columns, and
+the least-squares ratio averages the 4-bit error over them. Thus its noise is approximately
+0.096 / sqrt(2048), which is 0.2 %, of the order of the Q8_0 rounding itself.
+
+Three more numbers check the result, because `search_column_scales` makes scales of geometric mean one.
 The recovered `ssm_norm` scales have a geometric mean of 0.9989 to 1.0003, the `attn_v` row scales
 1.0000 to 1.0001, and the `ffn_down` scales 0.9967 to 0.9998 before the correction of their mean.
 The row match of the MLP has a minimum cosine of 0.9935 and a minimum margin of 0.022 over the 24
