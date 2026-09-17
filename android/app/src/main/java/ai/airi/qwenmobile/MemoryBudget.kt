@@ -24,8 +24,21 @@ object MemoryBudget {
         return model * copies + projector
     }
 
-    /** The bytes the system reports as available without swapping. */
+    /**
+     * The bytes the kernel can give without swapping: MemAvailable of
+     * /proc/meminfo, which counts the reclaimable caches. The activity
+     * manager's figure leaves those out and refuses loads that fit.
+     */
     fun availableBytes(context: Context): Long {
+        val fromKernel = runCatching {
+            File("/proc/meminfo").useLines { lines ->
+                lines.firstOrNull { it.startsWith("MemAvailable:") }
+                    ?.split(Regex("\\s+"))?.getOrNull(1)?.toLongOrNull()?.times(1024)
+            }
+        }.getOrNull()
+        if (fromKernel != null) {
+            return fromKernel
+        }
         val info = ActivityManager.MemoryInfo()
         val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         am.getMemoryInfo(info)
