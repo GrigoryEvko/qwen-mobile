@@ -1,0 +1,631 @@
+Hexagon HTP: the slot index from the host, the error report of a batch, and --chunks in the KL mode
+
+Base: llama.cpp commit c6824a9, with patches 0001, 0002 and 0003 applied.
+
+Files:
+    ggml/src/ggml-hexagon/htp-gdn-match.h           the slot index check, with a named reason
+    ggml/src/ggml-hexagon/htp-opnode.h              the unfused ops of a chain travel with the fused op
+    ggml/src/ggml-hexagon/ggml-hexagon.cpp          index from the host, fallback to the unfused ops, error report
+    ggml/src/ggml-hexagon/htp/htp-ops.h             the batch response names the first op that failed
+    ggml/src/ggml-hexagon/htp/htp-ctx.h             the op context holds an error detail code
+    ggml/src/ggml-hexagon/htp/main.c                records the first failed op of a batch
+    ggml/src/ggml-hexagon/htp/gdn-conv-ops.c        index from the kernel params, detail codes
+    ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c index from the kernel params, detail codes
+    tools/perplexity/perplexity.cpp                 --chunks limits a KL run
+
+How to apply, from the llama.cpp root:
+
+    git apply patches/hexagon-fusion/0004-hexagon-htp-gdn-slot-index-from-host-and-error-report.patch
+    cmake --build build-snapdragon -j
+
+Push to the phone: libggml-htp-v79.so (ggml/src/ggml-hexagon/), libggml-hexagon.so (bin/),
+test-backend-ops (bin/) and libllama-perplexity-impl.so (bin/, the llama-perplexity launcher
+loads it). The batch response struct changed, thus the two ggml libraries must come from the
+same build.
+
+Problem 1: INVAL-PARAMS in the warmup decode with GGML_HEXAGON_OPFUSION_STATE=1
+
+The warmup decode of common_init_from_params is one token at the start of a sequence with one
+slot. A host replay of each check of the fused ops on that graph passes: s_copy[0] is 0, the
+state table has one row, and all 36 chains match. Each other INVAL-PARAMS source of the DSP is
+a thread count check, and the host computes the same thread count with and without the fusion.
+The one input that the DSP reads as a value, and not as a tensor, is s_copy. The unfused
+GET_ROWS reads the same value and never validates it, thus a stale value there is invisible
+without the fusion. The batch response of 0003 gives no op attribution, thus the failed op
+stays unknown.
+
+This patch removes the read of s_copy from the DSP. The host reads the index at enqueue time,
+validates it against the state table, and passes it in kernel_params[0] with a valid flag in
+kernel_params[1]. When the index is not a row of the state table, the host logs the reason
+("the s_copy index is not a row of the state table") and runs the unfused ops of the chain,
+which travel with the fused op. Thus the fused graph runs with a correct index, or the unfused
+ops run for that token, and the run does not abort.
+
+The batch response now carries err_op, err_opcode and err_detail. The DSP records the first op
+that fails, and each check of the fused ops sets a detail code. The host prints them:
+    ggml-hex: HTP0 dspcall : dsp-rsp INVAL-PARAMS : op #17 of 96 is GDN_STATE_STEP (opcode 60), detail 0xa
+If the abort remains, this line names the op and the check.
+
+Problem 2: --chunks has no effect with --kl-divergence
+
+kl_divergence reads n_chunk from the header of the base file, and the loop runs over all of
+them. With --chunks N, the run now scores only the first N chunks of the file, and logs that.
+diff --git a/ggml/src/ggml-hexagon/htp-gdn-match.h b/ggml/src/ggml-hexagon/htp-gdn-match.h
+index be1dca2..eeca0c8 100644
+--- a/ggml/src/ggml-hexagon/htp-gdn-match.h
++++ b/ggml/src/ggml-hexagon/htp-gdn-match.h
+@@ -181,6 +181,23 @@ static inline ggml_tensor * ggml_hexagon_gdn_find_cpy(const ggml_cgraph * gf, co
+     return n_found == 1 ? P : nullptr;
+ }
+ 
++// The slot index of the state read: the one value of the s_copy input. The host reads it at enqueue
++// time, once per token, and gives it to the DSP in the kernel params. When the value is not a valid
++// row of the state table, the fused op must not run, and the unfused chain runs in its place.
++static inline const char * ggml_hexagon_gdn_slot_index_check(const ggml_tensor * idx, const ggml_tensor * states,
++                                                             int32_t * slot) {
++    *slot = -1;
++    if (!idx->data) {
++        return "s_copy has no data at enqueue time";
++    }
++    const int32_t v = *(const int32_t *) idx->data;
++    *slot = v;
++    if (v < 0 || v >= states->ne[1]) {
++        return "the s_copy index is not a row of the state table";
++    }
++    return nullptr;
++}
++
+ // True for the node that ends the conv chain: SILU of an SSM_CONV
+ static inline bool ggml_hexagon_gdn_is_conv_candidate(const ggml_tensor * t) {
+     return t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_SILU && t->src[0] &&
+diff --git a/ggml/src/ggml-hexagon/htp-opnode.h b/ggml/src/ggml-hexagon/htp-opnode.h
+index ef7b518..2d918c3 100644
+--- a/ggml/src/ggml-hexagon/htp-opnode.h
++++ b/ggml/src/ggml-hexagon/htp-opnode.h
+@@ -24,6 +24,10 @@ struct htp_opnode {
+     std::vector<ggml_tensor *>                fused;
+     std::vector<std::shared_ptr<ggml_tensor>> dummy;
+ 
++    // The unfused ops that this node replaces, in graph order. The session runs them in place of the
++    // node when a per-token condition of the fusion does not hold.
++    std::vector<htp_opnode>                   alt;
++
+     std::vector<const ggml_tensor *> inputs;
+     std::vector<const ggml_tensor *> outputs;
+     std::string                      name;
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 3751b25..2518efd 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -154,6 +154,72 @@ static const char * status_to_str(uint32_t status) {
+     }
+ }
+ 
++// The name of an opcode, for the error report of a batch
++static const char * htp_op_name(uint32_t opcode) {
++    switch (opcode) {
++        case HTP_OP_MUL:              return "MUL";
++        case HTP_OP_ADD:              return "ADD";
++        case HTP_OP_SUB:              return "SUB";
++        case HTP_OP_DIV:              return "DIV";
++        case HTP_OP_MUL_MAT:          return "MUL_MAT";
++        case HTP_OP_MUL_MAT_ID:       return "MUL_MAT_ID";
++        case HTP_OP_MUL_MAT_NX:       return "MUL_MAT_NX";
++        case HTP_OP_MUL_MAT_ID_NX:    return "MUL_MAT_ID_NX";
++        case HTP_OP_MUL_MAT_ADD:      return "MUL_MAT_ADD";
++        case HTP_OP_RMS_NORM:         return "RMS_NORM";
++        case HTP_OP_RMS_NORM_MUL:     return "RMS_NORM_MUL";
++        case HTP_OP_UNARY_SILU:       return "UNARY_SILU";
++        case HTP_OP_UNARY_GELU:       return "UNARY_GELU";
++        case HTP_OP_UNARY_SIGMOID:    return "UNARY_SIGMOID";
++        case HTP_OP_UNARY_EXP:        return "UNARY_EXP";
++        case HTP_OP_UNARY_NEG:        return "UNARY_NEG";
++        case HTP_OP_UNARY_SOFTPLUS:   return "UNARY_SOFTPLUS";
++        case HTP_OP_UNARY_TANH:       return "UNARY_TANH";
++        case HTP_OP_UNARY_ABS:        return "UNARY_ABS";
++        case HTP_OP_UNARY_LOG:        return "UNARY_LOG";
++        case HTP_OP_UNARY_RELU:       return "UNARY_RELU";
++        case HTP_OP_GLU_SWIGLU:       return "GLU_SWIGLU";
++        case HTP_OP_GLU_SWIGLU_OAI:   return "GLU_SWIGLU_OAI";
++        case HTP_OP_GLU_GEGLU:        return "GLU_GEGLU";
++        case HTP_OP_SOFTMAX:          return "SOFTMAX";
++        case HTP_OP_ADD_ID:           return "ADD_ID";
++        case HTP_OP_ROPE:             return "ROPE";
++        case HTP_OP_FLASH_ATTN_EXT:   return "FLASH_ATTN_EXT";
++        case HTP_OP_SET_ROWS:         return "SET_ROWS";
++        case HTP_OP_GET_ROWS:         return "GET_ROWS";
++        case HTP_OP_SCALE:            return "SCALE";
++        case HTP_OP_CPY:              return "CPY";
++        case HTP_OP_CPY_FENCE:        return "CPY_FENCE";
++        case HTP_OP_ARGSORT:          return "ARGSORT";
++        case HTP_OP_SQR:              return "SQR";
++        case HTP_OP_SQRT:             return "SQRT";
++        case HTP_OP_SUM_ROWS:         return "SUM_ROWS";
++        case HTP_OP_SSM_CONV:         return "SSM_CONV";
++        case HTP_OP_REPEAT:           return "REPEAT";
++        case HTP_OP_CUMSUM:           return "CUMSUM";
++        case HTP_OP_FILL:             return "FILL";
++        case HTP_OP_DIAG:             return "DIAG";
++        case HTP_OP_SOLVE_TRI:        return "SOLVE_TRI";
++        case HTP_OP_L2_NORM:          return "L2_NORM";
++        case HTP_OP_GATED_DELTA_NET:  return "GATED_DELTA_NET";
++        case HTP_OP_TRI:              return "TRI";
++        case HTP_OP_PAD:              return "PAD";
++        case HTP_OP_NORM:             return "NORM";
++        case HTP_OP_CONCAT:           return "CONCAT";
++        case HTP_OP_CLAMP:            return "CLAMP";
++        case HTP_OP_LEAKY_RELU:       return "LEAKY_RELU";
++        case HTP_OP_IM2COL:           return "IM2COL";
++        case HTP_OP_FENCE:            return "FENCE";
++        case HTP_OP_ALLREDUCE:        return "ALLREDUCE";
++        case HTP_OP_ALLREDUCE_ADD:    return "ALLREDUCE_ADD";
++        case HTP_OP_GLU_SWIGLU_CLAMP: return "GLU_SWIGLU_CLAMP";
++        case HTP_OP_MDEV_GROUP:       return "MDEV_GROUP";
++        case HTP_OP_GDN_CONV_STEP:    return "GDN_CONV_STEP";
++        case HTP_OP_GDN_STATE_STEP:   return "GDN_STATE_STEP";
++        default:                      return "?";
++    }
++}
++
+ // ** debug helpers
+ 
+ static void ggml_hexagon_dump_op_exec(const std::string &sess_name, const htp_opnode & node, const uint32_t req_flags) {
+@@ -3259,7 +3325,13 @@ void ggml_hexagon_session::flush_pending(bool all) {
+         }
+ 
+         if (rsp.status > HTP_STATUS_OK) {
+-            GGML_LOG_ERROR("ggml-hex: %s dspcall : dsp-rsp %s\n", this->c_name(), status_to_str(rsp.status));
++            if (rsp.err_op != 0xffffffffu) {
++                GGML_LOG_ERROR("ggml-hex: %s dspcall : dsp-rsp %s : op #%u of %u is %s (opcode %u), detail 0x%x\n",
++                               this->c_name(), status_to_str(rsp.status), rsp.err_op, rsp.n_ops,
++                               htp_op_name(rsp.err_opcode), rsp.err_opcode, rsp.err_detail);
++            } else {
++                GGML_LOG_ERROR("ggml-hex: %s dspcall : dsp-rsp %s\n", this->c_name(), status_to_str(rsp.status));
++            }
+             this->last_error = rsp.status;
+             for (auto & sub : this->mdev.sessions) {
+                 sub->last_error = rsp.status;
+@@ -3347,6 +3419,40 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
+         clone_tensor_buffer(t);
+     }
+ 
++    // The fused recurrent state ops take the slot index from the s_copy input. The host reads it here,
++    // once per token, and gives it to the DSP in the kernel params. When the index is not a row of the
++    // state table, the unfused ops of the chain run in place of the fused op.
++    if (node.opcode == HTP_OP_GDN_CONV_STEP || node.opcode == HTP_OP_GDN_STATE_STEP) {
++        const bool          conv   = node.opcode == HTP_OP_GDN_CONV_STEP;
++        const ggml_tensor * states = node.inputs[conv ? 0 : 5];
++        const ggml_tensor * idx    = node.inputs[conv ? 1 : 6];
++
++        int32_t      slot   = -1;
++        const char * reason = ggml_hexagon_gdn_slot_index_check(idx, states, &slot);
++        if (reason) {
++            GGML_LOG_WARN("ggml-hex: %s %s %s: %s (index %d, %d slots), the unfused ops run\n", this->c_name(),
++                          node.name.c_str(), node.dst()->name, reason, (int) slot, (int) states->ne[1]);
++            for (const auto & alt : node.alt) {
++                enqueue_op(alt);
++            }
++            return;
++        }
++
++        htp_opnode fused = node;
++        fused.alt.clear();
++        fused.kernel_params[0] = slot;
++        fused.kernel_params[1] = 1;
++
++        if (!op_batch->fit_op(fused)) {
++            flush_async();
++        }
++        if (this->mdev.count > 1 && op_batch->n_ops == 0) {
++            enqueue_mdev_group();
++        }
++        op_batch->add_op(fused);
++        return;
++    }
++
+     if (opt_opfusion && op_batch->try_fuse(node)) {
+         return;
+     }
+@@ -5866,21 +5972,27 @@ static bool is_mergeable_mul_mat_id_pair(const ggml_tensor * n1, const ggml_tens
+ // builds the fused ops and logs the first failed condition of each candidate chain.
+ 
+ struct ggml_hexagon_gdn_fusion {
+-    std::vector<uint8_t>                skip; // graph index -> the node is replaced by a fused op
+-    std::unordered_map<int, htp_opnode> at;   // graph index -> the fused op emitted at that index
++    std::vector<uint8_t>                          skip;       // graph index -> the node is replaced by a fused op
++    std::unordered_map<int, htp_opnode>           at;         // graph index -> the fused op emitted at that index
++    std::unordered_map<int, std::vector<int>>     members_at; // graph index -> the graph indices of the replaced nodes
+ };
+ 
+ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, const ggml_cgraph * gf,
+                                            ggml_hexagon_gdn_fusion & fu) {
+     const auto index = ggml_hexagon_gdn_index(gf);
+ 
+-    auto skip_members = [&](const std::vector<ggml_tensor *> & members) {
++    // Marks the replaced nodes and records their graph indices in graph order under the emit index
++    auto skip_members = [&](int emit, const std::vector<ggml_tensor *> & members) {
++        std::vector<int> at;
+         for (auto * t : members) {
+             auto it = index.find(t);
+             if (it != index.end()) {
+                 fu.skip[it->second] = 1;
++                at.push_back(it->second);
+             }
+         }
++        std::sort(at.begin(), at.end());
++        fu.members_at.emplace(emit, std::move(at));
+     };
+ 
+     for (int i = 0; i < gf->n_nodes; i++) {
+@@ -5904,7 +6016,7 @@ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, co
+             node.fused   = { m.R, m.CI, m.C, m.P };
+ 
+             fu.at.emplace(m.emit, std::move(node));
+-            skip_members(m.members);
++            skip_members(m.emit, m.members);
+ 
+             HEX_VERBOSE("ggml-hex: %s fused GDN_CONV_STEP %s (n_ch %d d_conv %d) at node %d\n",
+                         sess->name.c_str(), m.S->name, (int) m.n_ch, (int) m.d_conv, m.emit);
+@@ -5923,7 +6035,7 @@ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, co
+             node.fused   = { m.R, m.P };
+ 
+             fu.at.emplace(m.emit, std::move(node));
+-            skip_members(m.members);
++            skip_members(m.emit, m.members);
+ 
+             HEX_VERBOSE("ggml-hex: %s fused GDN_STATE_STEP %s (S_v %d H %d) at node %d\n",
+                         sess->name.c_str(), m.G->name, (int) m.S_v, (int) m.H, m.emit);
+@@ -5974,20 +6086,8 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+ 
+         computed_nodes.reserve(graph->n_nodes);
+ 
+-        for (int i = 0; i < graph->n_nodes; ++i) {
+-            auto fit = gdn_fu.at.find(i);
+-            if (fit != gdn_fu.at.end()) {
+-                computed_nodes.push_back(std::move(fit->second));
+-            }
+-            if (gdn_fu.skip[i]) {
+-                continue;
+-            }
+-
+-            ggml_tensor * n = graph->nodes[i];
+-            if (!op_is_compute(n)) {
+-                continue;
+-            }
+-
++        // Builds the op node of one graph node, with the kernel params that the host precomputes
++        auto make_node = [sess](ggml_tensor * n) {
+             htp_opnode node(HTP_OP_INVALID, n);
+             node.opcode = op_remap_to_htp(n);
+             if (node.opcode == HTP_OP_MUL_MAT || node.opcode == HTP_OP_MUL_MAT_ID) {
+@@ -6024,7 +6124,33 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+                     (struct htp_rope_kernel_params *)node.kernel_params
+                 );
+             }
+-            computed_nodes.push_back(std::move(node));
++            return node;
++        };
++
++        for (int i = 0; i < graph->n_nodes; ++i) {
++            auto fit = gdn_fu.at.find(i);
++            if (fit != gdn_fu.at.end()) {
++                // The fused op carries the unfused ops of its chain. The session runs them in place of
++                // the fused op when the slot index of the token is not valid.
++                htp_opnode fused = std::move(fit->second);
++                for (int mi : gdn_fu.members_at[i]) {
++                    ggml_tensor * mn = graph->nodes[mi];
++                    if (op_is_compute(mn)) {
++                        fused.alt.push_back(make_node(mn));
++                    }
++                }
++                computed_nodes.push_back(std::move(fused));
++            }
++            if (gdn_fu.skip[i]) {
++                continue;
++            }
++
++            ggml_tensor * n = graph->nodes[i];
++            if (!op_is_compute(n)) {
++                continue;
++            }
++
++            computed_nodes.push_back(make_node(n));
+         }
+ 
+         if (graph->uid != 0) {
+diff --git a/ggml/src/ggml-hexagon/htp/htp-ops.h b/ggml/src/ggml-hexagon/htp/htp-ops.h
+index e6cf9df..62d06f9 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-ops.h
++++ b/ggml/src/ggml-hexagon/htp/htp-ops.h
+@@ -242,6 +242,9 @@ struct htp_opbatch_rsp {
+     uint32_t n_ops;          // Number of op profile descriptors
+     uint32_t usecs;          // Number of usec
+     uint32_t n_traces[HTP_MAX_NTHREADS + 1];
++    uint32_t err_op;         // Index of the first op that failed, or 0xffffffff
++    uint32_t err_opcode;     // Its opcode
++    uint32_t err_detail;     // A code from that op (the op's source lists the codes), 0 when none
+     // struct htp_prof_desc profs[];  -- dspqueue buf 0
+ };
+ 
+diff --git a/ggml/src/ggml-hexagon/htp/htp-ctx.h b/ggml/src/ggml-hexagon/htp/htp-ctx.h
+index 144e7e2..f5c62ab 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-ctx.h
++++ b/ggml/src/ggml-hexagon/htp/htp-ctx.h
+@@ -82,6 +82,7 @@ struct htp_ops_context {
+     uint32_t              n_threads;
+     struct fastdiv_values n_threads_div;
+     int                   status;
++    uint32_t              err_detail; // set by an op before it returns an error, reported to the host
+ };
+ 
+ // Main context for htp DSP backend
+@@ -129,6 +130,7 @@ struct htp_context {
+ 
+ static inline bool htp_ops_context_set_n_threads(struct htp_ops_context * octx, uint32_t n_threads) {
+     if (n_threads == 0 || n_threads > octx->ctx->n_threads) {
++        octx->err_detail = 0x1000 + n_threads; // the host gave a thread count out of [1, n_threads]
+         return false;
+     }
+ 
+diff --git a/ggml/src/ggml-hexagon/htp/main.c b/ggml/src/ggml-hexagon/htp/main.c
+index 6b5bfd0..8c235e2 100644
+--- a/ggml/src/ggml-hexagon/htp/main.c
++++ b/ggml/src/ggml-hexagon/htp/main.c
+@@ -1042,6 +1042,7 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
+     octx->op            = op->opcode;
+     octx->n_threads     = octx->ctx->n_threads;
+     octx->n_threads_div = octx->ctx->n_threads_div;
++    octx->err_detail    = 0;
+ 
+     FARF(HIGH, "proc-op #%u: opcode %u flags 0x%x", idx, octx->op, octx->flags);
+ 
+@@ -1166,6 +1167,12 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
+ 
+     int op_status = HTP_STATUS_OK;
+     octx->status  = HTP_STATUS_OK;
++
++    // The first op that fails, reported to the host with the batch status
++    uint32_t err_op     = 0xffffffffu;
++    uint32_t err_opcode = 0;
++    uint32_t err_detail = 0;
++
+     for (uint32_t i = 0; i < n_ops; i++) {
+         struct profile_data prof;
+ 
+@@ -1175,6 +1182,13 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
+ 
+         profile_stop(ctx->profiler, &prof);
+ 
++        if (op_status != HTP_STATUS_OK && err_op == 0xffffffffu) {
++            err_op     = i;
++            err_opcode = ops[i].opcode;
++            err_detail = octx->err_detail;
++            FARF(ERROR, "op #%u opcode %u failed with status %d detail 0x%x", i, ops[i].opcode, op_status, err_detail);
++        }
++
+         htp_ops_context_set_status(octx, op_status);
+ 
+         if (ctx->profiler) {
+@@ -1213,6 +1227,9 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
+     rsp.usecs        = batch_prof.usecs;
+     rsp.cycles_start = batch_prof.cycles_start;
+     rsp.cycles_stop  = batch_prof.cycles_stop;
++    rsp.err_op       = err_op;
++    rsp.err_opcode   = err_opcode;
++    rsp.err_detail   = err_detail;
+ 
+     if (ctx->profiler == HTP_PROF_TRACE) {
+         for (int t = 0; t <= HTP_MAX_NTHREADS; t++) {
+diff --git a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
+index 01b5da7..73e8968 100644
+--- a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
++++ b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
+@@ -275,6 +275,23 @@ static void gdn_conv_step_thread(unsigned int nth, unsigned int ith, void * data
+     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) (c0 + n));
+ }
+ 
++// The error detail codes of this op (reported to the host with the batch status)
++enum {
++    GDN_CONV_ERR_INPUT  = 1,  // an input or the output is missing
++    GDN_CONV_ERR_TYPE   = 2,  // a tensor type is not the expected one
++    GDN_CONV_ERR_MDEV   = 3,  // more than one device
++    GDN_CONV_ERR_DCONV  = 4,  // the conv width is not 4
++    GDN_CONV_ERR_NCH    = 5,  // no channels
++    GDN_CONV_ERR_STATES = 6,  // the state table shape
++    GDN_CONV_ERR_X      = 7,  // the column shape
++    GDN_CONV_ERR_W      = 8,  // the weights shape
++    GDN_CONV_ERR_SLOT   = 9,  // the slot shape
++    GDN_CONV_ERR_Y      = 10, // the output shape
++    GDN_CONV_ERR_INDEX  = 11, // the slot index is out of range
++};
++
++#define GDN_CONV_FAIL(code, status) do { octx->err_detail = (code); return (status); } while (0)
++
+ int op_gdn_conv_step(struct htp_ops_context * octx) {
+     const struct htp_tensor * states = octx->src[0];
+     const struct htp_tensor * s_copy = octx->src[1];
+@@ -284,46 +301,49 @@ int op_gdn_conv_step(struct htp_ops_context * octx) {
+     const struct htp_tensor * y      = octx->dst;
+ 
+     if (!states || !s_copy || !x || !w || !slot || !y) {
+-        return HTP_STATUS_INVAL_PARAMS;
++        GDN_CONV_FAIL(GDN_CONV_ERR_INPUT, HTP_STATUS_INVAL_PARAMS);
+     }
+     if (states->type != HTP_TYPE_F32 || x->type != HTP_TYPE_F32 || w->type != HTP_TYPE_F32 ||
+         slot->type != HTP_TYPE_F32 || y->type != HTP_TYPE_F32 || s_copy->type != HTP_TYPE_I32) {
+-        return HTP_STATUS_NO_SUPPORT;
++        GDN_CONV_FAIL(GDN_CONV_ERR_TYPE, HTP_STATUS_NO_SUPPORT);
+     }
+     if (octx->ctx->mdev.count > 1) {
+-        return HTP_STATUS_NO_SUPPORT;
++        GDN_CONV_FAIL(GDN_CONV_ERR_MDEV, HTP_STATUS_NO_SUPPORT);
+     }
+ 
+     const uint32_t d_conv = w->ne[0];
+     const uint32_t n_ch   = w->ne[1];
+     if (d_conv != GDN_CONV_D_CONV) {
+-        return HTP_STATUS_NO_SUPPORT;
++        GDN_CONV_FAIL(GDN_CONV_ERR_DCONV, HTP_STATUS_NO_SUPPORT);
+     }
+     if (n_ch == 0) {
+-        return HTP_STATUS_INVAL_PARAMS;
++        GDN_CONV_FAIL(GDN_CONV_ERR_NCH, HTP_STATUS_INVAL_PARAMS);
+     }
+     const uint32_t row = (d_conv - 1) * n_ch;
+ 
+     if (states->ne[0] != row || states->nb[0] != sizeof(float) || states->nb[1] != row * sizeof(float)) {
+-        return HTP_STATUS_INVAL_PARAMS;
++        GDN_CONV_FAIL(GDN_CONV_ERR_STATES, HTP_STATUS_INVAL_PARAMS);
+     }
+     if (x->ne[0] != 1 || x->ne[1] != n_ch || x->nb[1] != sizeof(float)) {
+-        return HTP_STATUS_INVAL_PARAMS;
++        GDN_CONV_FAIL(GDN_CONV_ERR_X, HTP_STATUS_INVAL_PARAMS);
+     }
+     if (w->nb[0] != sizeof(float) || w->nb[1] != d_conv * sizeof(float)) {
+-        return HTP_STATUS_INVAL_PARAMS;
++        GDN_CONV_FAIL(GDN_CONV_ERR_W, HTP_STATUS_INVAL_PARAMS);
+     }
+     if (slot->ne[0] != row || slot->nb[0] != sizeof(float)) {
+-        return HTP_STATUS_INVAL_PARAMS;
++        GDN_CONV_FAIL(GDN_CONV_ERR_SLOT, HTP_STATUS_INVAL_PARAMS);
+     }
+     if (y->ne[0] != n_ch || y->nb[0] != sizeof(float)) {
+-        return HTP_STATUS_INVAL_PARAMS;
++        GDN_CONV_FAIL(GDN_CONV_ERR_Y, HTP_STATUS_INVAL_PARAMS);
+     }
+ 
+-    const int32_t src_idx = *(const int32_t *) (uintptr_t) s_copy->data;
+-    if (src_idx < 0 || (uint32_t) src_idx >= states->ne[1]) {
+-        FARF(ERROR, "gdn-conv-step: slot index %d is out of range (%u slots)\n", src_idx, states->ne[1]);
+-        return HTP_STATUS_INVAL_PARAMS;
++    // The host reads the slot index from s_copy at enqueue time, validates it, and passes it here.
++    // Thus the op does not depend on the view the DSP has of the s_copy input.
++    const int32_t src_idx = octx->kernel_params[0];
++    if (octx->kernel_params[1] != 1 || src_idx < 0 || (uint32_t) src_idx >= states->ne[1]) {
++        FARF(ERROR, "gdn-conv-step: slot index %d is out of range (%u slots, valid flag %d)\n",
++             src_idx, states->ne[1], octx->kernel_params[1]);
++        GDN_CONV_FAIL(GDN_CONV_ERR_INDEX, HTP_STATUS_INVAL_PARAMS);
+     }
+ 
+     if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
+diff --git a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
+index 3a9454c..b1c4266 100644
+--- a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
++++ b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
+@@ -1213,6 +1213,24 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
+ // The kernel is the single-token thread of the plain op. Only the three base pointers differ. When the
+ // source slot and the destination slot are the same, each head reads its state into VTCM before it
+ // writes the state back, thus the update in place is safe.
++
++// The error detail codes of this op (reported to the host with the batch status)
++enum {
++    GDN_STATE_ERR_INPUT  = 1,  // an input or the output is missing
++    GDN_STATE_ERR_TYPE   = 2,  // a tensor type is not the expected one
++    GDN_STATE_ERR_MDEV   = 3,  // more than one device
++    GDN_STATE_ERR_SHAPE  = 4,  // not one token of one sequence with K = 1, or S_v out of range
++    GDN_STATE_ERR_GATE   = 5,  // the gate or beta shape
++    GDN_STATE_ERR_QK     = 6,  // the q or k shape
++    GDN_STATE_ERR_STATES = 7,  // the state table shape
++    GDN_STATE_ERR_SLOT   = 8,  // the slot shape
++    GDN_STATE_ERR_DST    = 9,  // the output shape
++    GDN_STATE_ERR_INDEX  = 10, // the slot index is out of range
++    GDN_STATE_ERR_VTCM   = 11, // the VTCM reservation is too small
++};
++
++#define GDN_STATE_FAIL(code, status) do { octx->err_detail = (code); return (status); } while (0)
++
+ int op_gdn_state_step(struct htp_ops_context * octx) {
+     const struct htp_tensor * q      = octx->src[0];
+     const struct htp_tensor * k      = octx->src[1];
+@@ -1225,15 +1243,15 @@ int op_gdn_state_step(struct htp_ops_context * octx) {
+     const struct htp_tensor * dst    = octx->dst;
+ 
+     if (!q || !k || !v || !g || !beta || !states || !s_copy || !slot || !dst) {
+-        return HTP_STATUS_INVAL_PARAMS;
++        GDN_STATE_FAIL(GDN_STATE_ERR_INPUT, HTP_STATUS_INVAL_PARAMS);
+     }
+     if (q->type != HTP_TYPE_F32 || k->type != HTP_TYPE_F32 || v->type != HTP_TYPE_F32 ||
+         g->type != HTP_TYPE_F32 || beta->type != HTP_TYPE_F32 || states->type != HTP_TYPE_F32 ||
+         slot->type != HTP_TYPE_F32 || dst->type != HTP_TYPE_F32 || s_copy->type != HTP_TYPE_I32) {
+-        return HTP_STATUS_NO_SUPPORT;
++        GDN_STATE_FAIL(GDN_STATE_ERR_TYPE, HTP_STATUS_NO_SUPPORT);
+     }
+     if (octx->ctx->mdev.count > 1) {
+-        return HTP_STATUS_NO_SUPPORT;
++        GDN_STATE_FAIL(GDN_STATE_ERR_MDEV, HTP_STATUS_NO_SUPPORT);
+     }
+ 
+     const uint32_t S_v      = v->ne[0];
+@@ -1243,31 +1261,34 @@ int op_gdn_state_step(struct htp_ops_context * octx) {
+     const uint32_t K        = octx->op_params[0];
+ 
+     if (S_v == 0 || S_v > HTP_GDN_MAX_SV || H == 0 || n_tokens != 1 || n_seqs != 1 || K != 1) {
+-        return HTP_STATUS_NO_SUPPORT;
++        GDN_STATE_FAIL(GDN_STATE_ERR_SHAPE, HTP_STATUS_NO_SUPPORT);
+     }
+     if ((g->ne[0] != 1 && g->ne[0] != S_v) || beta->ne[0] != 1) {
+-        return HTP_STATUS_NO_SUPPORT;
++        GDN_STATE_FAIL(GDN_STATE_ERR_GATE, HTP_STATUS_NO_SUPPORT);
+     }
+     if (q->ne[0] != S_v || k->ne[0] != S_v || q->ne[1] == 0 || k->ne[1] == 0 ||
+         q->ne[2] != 1 || k->ne[2] != 1 || q->ne[3] != 1 || k->ne[3] != 1) {
+-        return HTP_STATUS_NO_SUPPORT;
++        GDN_STATE_FAIL(GDN_STATE_ERR_QK, HTP_STATUS_NO_SUPPORT);
+     }
+ 
+     const uint32_t D = S_v * S_v * H;
+     if (states->ne[0] != D || states->nb[0] != sizeof(float) || states->nb[1] != D * sizeof(float)) {
+-        return HTP_STATUS_INVAL_PARAMS;
++        GDN_STATE_FAIL(GDN_STATE_ERR_STATES, HTP_STATUS_INVAL_PARAMS);
+     }
+     if (slot->ne[0] != D || slot->nb[0] != sizeof(float)) {
+-        return HTP_STATUS_INVAL_PARAMS;
++        GDN_STATE_FAIL(GDN_STATE_ERR_SLOT, HTP_STATUS_INVAL_PARAMS);
+     }
+     if (dst->ne[0] != S_v * H || dst->ne[1] != 1 + S_v) {
+-        return HTP_STATUS_INVAL_PARAMS;
++        GDN_STATE_FAIL(GDN_STATE_ERR_DST, HTP_STATUS_INVAL_PARAMS);
+     }
+ 
+-    const int32_t src_idx = *(const int32_t *) (uintptr_t) s_copy->data;
+-    if (src_idx < 0 || (uint32_t) src_idx >= states->ne[1]) {
+-        FARF(ERROR, "gdn-state-step: slot index %d is out of range (%u slots)\n", src_idx, states->ne[1]);
+-        return HTP_STATUS_INVAL_PARAMS;
++    // The host reads the slot index from s_copy at enqueue time, validates it, and passes it here.
++    // Thus the op does not depend on the view the DSP has of the s_copy input.
++    const int32_t src_idx = octx->kernel_params[0];
++    if (octx->kernel_params[1] != 1 || src_idx < 0 || (uint32_t) src_idx >= states->ne[1]) {
++        FARF(ERROR, "gdn-state-step: slot index %d is out of range (%u slots, valid flag %d)\n",
++             src_idx, states->ne[1], octx->kernel_params[1]);
++        GDN_STATE_FAIL(GDN_STATE_ERR_INDEX, HTP_STATUS_INVAL_PARAMS);
+     }
+ 
+     if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
+@@ -1282,7 +1303,7 @@ int op_gdn_state_step(struct htp_ops_context * octx) {
+     if (octx->ctx->vtcm_size < 2 * state_aligned * n_threads) {
+         FARF(ERROR, "gdn-state-step: VTCM reservation %zu is too small, needed %zu\n",
+              octx->ctx->vtcm_size, 2 * state_aligned * n_threads);
+-        return HTP_STATUS_VTCM_TOO_SMALL;
++        GDN_STATE_FAIL(GDN_STATE_ERR_VTCM, HTP_STATUS_VTCM_TOO_SMALL);
+     }
+ 
+     struct htp_gdn_context gctx;
+diff --git a/tools/perplexity/perplexity.cpp b/tools/perplexity/perplexity.cpp
+index ba41287..b752d0f 100644
+--- a/tools/perplexity/perplexity.cpp
++++ b/tools/perplexity/perplexity.cpp
+@@ -1739,6 +1739,14 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
+         return;
+     }
+ 
++    // The base file holds each chunk that the base run scored. With --chunks, the run scores only
++    // the first chunks of the file, thus a short run on a slow device is possible.
++    if (params.n_chunks > 0 && params.n_chunks < n_chunk) {
++        LOG_INF("%s: --chunks limits the run to the first %d of the %d chunks in %s\n",
++                __func__, params.n_chunks, n_chunk, params.logits_file.c_str());
++        n_chunk = params.n_chunks;
++    }
++
+     const int n_batch = params.n_batch;
+     const int num_batches = (static_cast<int>(n_ctx) + n_batch - 1) / n_batch;
+     // Calculate n_seq based on the logits file's n_ctx, but cap it at what the context supports
