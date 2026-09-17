@@ -15,7 +15,9 @@ E = W_ref − W_q, the SVD of E·L gives the factors. The factors then train
 with the rest. They export as a GGUF LoRA adapter with alpha = rank.
 
 The head gets the same treatment with the KL divergence of the logits as
-the objective, on random token subsets.
+the objective, on random token subsets. Its logits come in row chunks of
+the vocabulary, thus the device never holds a full-size temporary of the
+head. A tied head reads the norm through the dense map M of the transform.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .grid import BLOCK, dequantize, quantize
+from .grid import BLOCK, ROW_CHUNK, dequantize, quantize
 from .grids import CodebookGrid, Grid
 
 # The small tensors that stay fixed: their GGUF form is not a plain copy of the checkpoint value.
@@ -49,6 +51,7 @@ class OptOptions:
     head_rank: int = 0
     head_tokens: int = 512
     head_steps: int = 400
+    head_chunk: int = ROW_CHUNK
 
 
 def _grid_like(grid: Grid, levels: torch.Tensor) -> Grid:
@@ -66,7 +69,7 @@ def weighted_low_rank(residual: torch.Tensor, hessian: torch.Tensor, rank: int,
     Minimizes ‖(E − b·a)·L‖ with H = L·Lᵀ, thus the correction spends its
     rank on the input directions with energy. Complexity is O(rows · cols²).
     """
-    h = hessian.to(torch.float32)
+    h = hessian.to(residual.device, torch.float32)
     h = h + damp * torch.mean(torch.diag(h)) * torch.eye(h.shape[0], device=h.device)
     low = torch.linalg.cholesky(h)
     u, s, vh = torch.linalg.svd(residual.to(torch.float32) @ low, full_matrices=False)
@@ -91,11 +94,15 @@ class STELinear(nn.Module):
         self.rows, self.cols = weight.shape
         self.weight = nn.Parameter(weight.detach().clone().to(torch.float32))
         # A Q4_0 scale carries the sign of the signed maximum. The sign stays, the magnitude learns.
-        d = d.detach().to(torch.float32)
-        self.sign = torch.where(d < 0, -torch.ones_like(d), torch.ones_like(d))
+        # The sign and the fixed levels are buffers, thus ``to(device)`` moves them with the parameters.
+        d = d.detach().to(weight.device, torch.float32)
+        self.register_buffer("sign", torch.where(d < 0, -torch.ones_like(d), torch.ones_like(d)))
         self.log_d = nn.Parameter(d.abs().clamp_min(1e-12).log())
-        levels = grid.levels.detach().clone()
-        self.levels = nn.Parameter(levels) if learn_levels else levels
+        levels = grid.levels.detach().clone().to(weight.device)
+        if learn_levels:
+            self.levels = nn.Parameter(levels)
+        else:
+            self.register_buffer("levels", levels)
         self.grid = grid
         self.lora_a = nn.Parameter(low_rank[0].clone()) if low_rank else None
         self.lora_b = nn.Parameter(low_rank[1].clone()) if low_rank else None
@@ -110,15 +117,20 @@ class STELinear(nn.Module):
             levels = torch.clamp(torch.round(levels), -127, 127)
         return _grid_like(self.grid, levels)
 
-    def quantized_weight(self) -> torch.Tensor:
-        d = self.scale()
-        blocks = self.weight.view(self.rows, -1, BLOCK)
+    def quantized_rows(self, r0: int, r1: int) -> torch.Tensor:
+        """The quantized weight of the rows r0 … r1, [r1 − r0, cols], with the gradient paths of the whole."""
+        n = r1 - r0
+        d = self.scale()[r0:r1]
+        blocks = self.weight[r0:r1].view(n, -1, BLOCK)
         # The grid rounds on the sorted levels, thus the lookup must use the same order when the levels learn.
         levels = self.levels.sort().values if isinstance(self.levels, nn.Parameter) else self.levels
         idx = _grid_like(self.grid, levels.detach()).round(blocks.detach() / d.detach()[..., None])
         w_q = d[..., None] * levels[idx]
         w_ste = blocks + (w_q - blocks).detach()
-        return (w_ste + (w_q - w_q.detach())).view(self.rows, self.cols)
+        return (w_ste + (w_q - w_q.detach())).view(n, self.cols)
+
+    def quantized_weight(self) -> torch.Tensor:
+        return self.quantized_rows(0, self.rows)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.quantized_weight())
@@ -128,14 +140,17 @@ class STELinear(nn.Module):
 
     @torch.no_grad()
     def finalize(self) -> "Solved":
-        """The final grid, indices, F16 scales, and the low-rank factors."""
+        """The final grid, indices, F16 scales, and the low-rank factors. The indices come in row chunks."""
         grid = self.current_grid()
         d = self.scale().to(torch.float16).to(torch.float32)
-        idx = grid.round(self.weight.view(self.rows, -1, BLOCK) / d[..., None]).view(self.rows, self.cols)
+        idx = torch.empty(self.rows, self.cols, dtype=torch.int8, device=d.device)
+        for r in range(0, self.rows, ROW_CHUNK):
+            blocks = self.weight[r:r + ROW_CHUNK].view(-1, self.cols // BLOCK, BLOCK)
+            idx[r:r + ROW_CHUNK] = grid.round(blocks / d[r:r + ROW_CHUNK, :, None]).view(-1, self.cols).to(torch.int8)
         low_rank = None
         if self.lora_a is not None:
             low_rank = (self.lora_a.detach().clone(), self.lora_b.detach().clone())
-        return Solved(grid, idx.to(torch.int8), d.to(torch.float16), low_rank)
+        return Solved(grid, idx, d.to(torch.float16), low_rank)
 
 
 @dataclass
@@ -188,14 +203,14 @@ def make_ste(lin: nn.Linear, target: Target, rank: int) -> STELinear:
     """
     w = lin.weight.data
     if target.d is not None:
-        d = target.d.to(torch.float32)
+        d = target.d.to(w.device, torch.float32)
         w_q = w
     else:
-        idx, d = quantize(target.grid, w, weights=torch.diag(target.hessian), search=True)
+        idx, d = quantize(target.grid, w, weights=torch.diag(target.hessian).to(w.device), search=True)
         w_q = dequantize(target.grid, idx, d)
     low_rank = None
     if rank > 0:
-        low_rank = weighted_low_rank(target.w_ref.to(torch.float32) - w_q, target.hessian, rank)
+        low_rank = weighted_low_rank(target.w_ref.to(w.device, torch.float32) - w_q, target.hessian, rank)
     return STELinear(w, d, target.grid, isinstance(target.grid, CodebookGrid), low_rank)
 
 
@@ -259,91 +274,135 @@ def optimize_layer(step, li: int, targets: dict[str, Target], opts: OptOptions) 
 
     ``step`` is a Lockstep whose reference cache already holds the outputs
     of layer li (advance the reference first) and whose working cache holds
-    the inputs. Returns the solution per target and prints the loss.
+    the inputs. The layer sits on the compute device during the
+    optimization. Returns the solution per target and prints the loss.
     """
     layer = step.work.model.layers[li]
-    wrapped = wrap_layer(layer, targets, opts.rank)
-    for name, p in layer.named_parameters():
-        p.requires_grad_(not any(f in name for f in FROZEN))
-    opt = torch.optim.Adam(param_groups(layer, wrapped, opts), betas=(0.9, 0.99))
-    base_lrs = [g["lr"] for g in opt.param_groups]
-    n = step.n_seq
-    order = torch.randperm(n, generator=torch.Generator().manual_seed(li))
-    total = opts.epochs * math.ceil(n / opts.batch)
-    it = 0
-    first = last = 0.0
-    for _ in range(opts.epochs):
-        for s in range(0, n, opts.batch):
-            rows = order[s:s + opts.batch]
-            x = step.work_in[rows]
-            target = step.ref_in[rows]
-            for g, lr in zip(opt.param_groups, base_lrs):
-                g["lr"] = lr * cosine(it, total)
-            with torch.enable_grad():
-                out = step.run_layer(layer, li, x)
-                loss = (out - target).pow(2).mean() / target.pow(2).mean().clamp_min(1e-12)
-                loss.backward()
-            opt.step()
-            opt.zero_grad(set_to_none=True)
-            if it == 0:
-                first = loss.item()
-            last = loss.item()
-            it += 1
-    for p in layer.parameters():
-        p.requires_grad_(False)
-    result = unwrap_layer(wrapped)
+    with step.on_device(layer):
+        wrapped = wrap_layer(layer, targets, opts.rank)
+        for name, p in layer.named_parameters():
+            p.requires_grad_(not any(f in name for f in FROZEN))
+        opt = torch.optim.Adam(param_groups(layer, wrapped, opts), betas=(0.9, 0.99))
+        base_lrs = [g["lr"] for g in opt.param_groups]
+        n = step.n_seq
+        order = torch.randperm(n, generator=torch.Generator().manual_seed(li))
+        total = opts.epochs * math.ceil(n / opts.batch)
+        it = 0
+        first = last = 0.0
+        for _ in range(opts.epochs):
+            for s in range(0, n, opts.batch):
+                rows = order[s:s + opts.batch]
+                x = step.work_in[rows].to(step.device)
+                target = step.ref_in[rows].to(step.device)
+                for g, lr in zip(opt.param_groups, base_lrs):
+                    g["lr"] = lr * cosine(it, total)
+                with torch.enable_grad():
+                    out = step.run_layer(layer, li, x)
+                    loss = (out - target).pow(2).mean() / target.pow(2).mean().clamp_min(1e-12)
+                    loss.backward()
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+                if it == 0:
+                    first = loss.item()
+                last = loss.item()
+                it += 1
+        for p in layer.parameters():
+            p.requires_grad_(False)
+        result = unwrap_layer(wrapped)
     print(f"layer {li:2d} block optimization: relative loss {first:.5f} -> {last:.5f} in {it} steps"
           f"{f', rank {opts.rank}' if opts.rank else ''}", flush=True)
     return result
 
 
-def optimize_head(step, target: Target, opts: OptOptions) -> Solved:
+def _logits_by_rows(v: torch.Tensor, rows_of, n_rows: int, chunk: int) -> torch.Tensor:
+    """v · Wᵀ for a weight that ``rows_of(r0, r1)`` supplies in row chunks. No gradient."""
+    out = torch.empty(v.shape[0], n_rows, dtype=torch.float32, device=v.device)
+    with torch.no_grad():
+        for r0 in range(0, n_rows, chunk):
+            r1 = min(r0 + chunk, n_rows)
+            out[:, r0:r1] = F.linear(v, rows_of(r0, r1))
+    return out
+
+
+def optimize_head(step, lin: nn.Linear, ref_w: torch.Tensor, target: Target, opts: OptOptions,
+                  rot: torch.Tensor | None = None) -> Solved:
     """Optimize the head and the final norm of the working copy on the KL of the logits.
 
-    The caches hold the final-layer outputs of both copies. Each step takes
-    ``opts.head_tokens`` random tokens.
+    The caches hold the final-layer outputs of both copies. ``lin`` is the
+    head of the working copy, ``ref_w`` the head weight of the reference,
+    on any device, and ``rot`` the dense map M of a tied head, which both
+    copies apply after the norm. Each step takes ``opts.head_tokens``
+    random tokens. The logits come in chunks of ``opts.head_chunk`` rows of
+    the head, thus the device holds no full-size temporary of the head: a
+    pass without gradient gives the loss and its gradient with respect to
+    the logits, then a second pass sends that gradient into each chunk.
     """
     work, ref = step.work, step.ref
+    dev = step.device
     d_model = step.cfg.hidden_size
     ref_flat = step.ref_in.view(-1, d_model)
-    lin = work.lm_head
-    torch.cuda.empty_cache()
-    ste = make_ste(lin, target, opts.head_rank)
-    norm = work.model.norm
-    norm.weight.requires_grad_(True)
-    groups = [{"params": [ste.log_d], "lr": opts.lr_scale}, {"params": [norm.weight], "lr": opts.lr_other}]
-    if opts.freeze_weights:
-        ste.weight.requires_grad_(False)
-    else:
-        groups.append({"params": [ste.weight], "lr": opts.lr_weight})
-    if isinstance(ste.levels, nn.Parameter):
-        groups.append({"params": [ste.levels], "lr": opts.lr_levels})
-    if ste.lora_a is not None:
-        groups.append({"params": [ste.lora_a, ste.lora_b], "lr": opts.lr_other})
-    opt = torch.optim.Adam(groups, betas=(0.9, 0.99))
-    base_lrs = [g["lr"] for g in opt.param_groups]
-    n_tok = step.n_seq * step.seq_len
-    gen = torch.Generator(device="cpu").manual_seed(0)
-    first = last = 0.0
     work_flat = step.work_in.view(-1, d_model)
-    for it in range(opts.head_steps):
-        rows = torch.randint(0, n_tok, (opts.head_tokens,), generator=gen).to(step.device)
-        for g, lr in zip(opt.param_groups, base_lrs):
-            g["lr"] = lr * cosine(it, opts.head_steps)
-        with torch.enable_grad():
-            logits_q = ste(norm(work_flat[rows]))
+    torch.cuda.empty_cache()
+    ste = make_ste(lin, target, opts.head_rank).to(dev)
+    rot = None if rot is None else rot.to(dev, torch.float32)
+    norm, norm_ref = work.model.norm, ref.model.norm
+    n_tok = step.n_seq * step.seq_len
+    chunk = opts.head_chunk
+    first = last = 0.0
+    with step.on_device(norm), step.on_device(norm_ref):
+        norm.weight.requires_grad_(True)
+        groups = [{"params": [ste.log_d], "lr": opts.lr_scale}, {"params": [norm.weight], "lr": opts.lr_other}]
+        if opts.freeze_weights:
+            ste.weight.requires_grad_(False)
+        else:
+            groups.append({"params": [ste.weight], "lr": opts.lr_weight})
+        if isinstance(ste.levels, nn.Parameter):
+            groups.append({"params": [ste.levels], "lr": opts.lr_levels})
+        if ste.lora_a is not None:
+            groups.append({"params": [ste.lora_a, ste.lora_b], "lr": opts.lr_other})
+        opt = torch.optim.Adam(groups, betas=(0.9, 0.99))
+        base_lrs = [g["lr"] for g in opt.param_groups]
+        gen = torch.Generator(device="cpu").manual_seed(0)
+        for it in range(opts.head_steps):
+            rows = torch.randint(0, n_tok, (opts.head_tokens,), generator=gen)
+            for g, lr in zip(opt.param_groups, base_lrs):
+                g["lr"] = lr * cosine(it, opts.head_steps)
             with torch.no_grad():
-                log_p = F.log_softmax(ref.lm_head(ref.model.norm(ref_flat[rows])), -1)
-            log_q = F.log_softmax(logits_q, -1)
-            loss = (log_p.exp() * (log_p - log_q)).sum(-1).mean()
-            loss.backward()
-        opt.step()
-        opt.zero_grad(set_to_none=True)
-        if it == 0:
-            first = loss.item()
-        last = loss.item()
-    norm.weight.requires_grad_(False)
+                v_r = norm_ref(ref_flat[rows].to(dev))
+                if rot is not None:
+                    v_r = v_r @ rot.T
+                log_p = F.log_softmax(_logits_by_rows(v_r, lambda r0, r1: ref_w[r0:r1].to(dev, torch.float32),
+                                                      ste.rows, chunk), -1)
+            with torch.enable_grad():
+                v_q = norm(work_flat[rows].to(dev))
+                if rot is not None:
+                    v_q = v_q @ rot.T
+                # The chunks read a detached copy of the head input, thus each chunk frees its graph after
+                # its backward. The gradient of the input then goes through the norm in one step.
+                v_in = v_q.detach().requires_grad_(True)
+                with torch.no_grad():
+                    log_q = F.log_softmax(_logits_by_rows(v_in, ste.quantized_rows, ste.rows, chunk), -1)
+                    diff = log_p - log_q
+                    p = log_p.exp_()
+                    loss = (p * diff).sum(-1).mean()
+                    del diff
+                    # dKL/dlogits_q = (q − p) / tokens, written into the buffer of log_q.
+                    grad = log_q.exp_().sub_(p).div_(opts.head_tokens)
+                    del p, log_p
+                for r0 in range(0, ste.rows, chunk):
+                    r1 = min(r0 + chunk, ste.rows)
+                    F.linear(v_in, ste.quantized_rows(r0, r1)).backward(grad[:, r0:r1])
+                v_q.backward(v_in.grad)
+                del grad, v_in, v_q
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+            if it == 0:
+                first = loss.item()
+            last = loss.item()
+        norm.weight.requires_grad_(False)
     solved = ste.finalize()
+    del ste, opt
+    torch.cuda.empty_cache()
     lin.weight.data.copy_(solved.dequantized())
     print(f"head block optimization: KL {first:.5f} -> {last:.5f} in {opts.head_steps} steps", flush=True)
     return solved

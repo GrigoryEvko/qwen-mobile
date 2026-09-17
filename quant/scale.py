@@ -20,13 +20,17 @@ from .grids import Grid
 EXPONENTS = (0.0, 0.25, 0.5, 0.75, 1.0)
 
 
-def column_rms(ws: list[torch.Tensor]) -> torch.Tensor:
-    """The root mean square of each column over all the rows of all the matrices, in row chunks."""
+def column_rms(ws: list[torch.Tensor], device: torch.device | None = None) -> torch.Tensor:
+    """The root mean square of each column over all the rows of all the matrices, in row chunks.
+
+    The work runs on ``device``, or on the device of the first matrix.
+    """
     total: torch.Tensor | None = None
     rows = 0
+    device = device or ws[0].device
     for w in ws:
         for r in range(0, w.shape[0], ROW_CHUNK):
-            part = w[r:r + ROW_CHUNK].to(torch.float32).pow(2).sum(0)
+            part = w[r:r + ROW_CHUNK].to(device, torch.float32).pow(2).sum(0)
             total = part if total is None else total + part
         rows += w.shape[0]
     assert total is not None, "no matrices"
@@ -46,7 +50,7 @@ def search_column_scales(grid: Grid, ws: list[torch.Tensor], h_diag: torch.Tenso
     within-head channel). Complexity is O(|exponents|² · Σ rows · cols · 41).
     """
     a = h_diag.to(torch.float32).clamp_min(1e-12).sqrt()
-    log_a, log_r = a.log(), column_rms(ws).log()
+    log_a, log_r = a.log(), column_rms(ws, a.device).log()
     best_t = torch.ones_like(a)
     best_err = None
     for alpha in exponents:

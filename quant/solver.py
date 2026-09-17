@@ -13,14 +13,16 @@ not rounded yet. Without ``cross`` the solver is GPTQ.
 
 Each block of 32 gets its scale when the solver reaches it, from the
 compensated weights, by the weighted scale search on the grid.
-Complexity is O(rows · cols²) per matrix.
+Complexity is O(rows · cols²) per matrix. The rows are independent given
+the Hessian, thus the solver works in row chunks: the head of 248320 rows
+runs on a device that cannot hold it in float32.
 """
 
 from __future__ import annotations
 
 import torch
 
-from .grid import BLOCK, scale_search
+from .grid import BLOCK, ROW_CHUNK, scale_search
 from .grids import Grid
 
 
@@ -34,34 +36,63 @@ def _damped(h: torch.Tensor, damp: float, relative_to: str) -> torch.Tensor:
 
 
 def solve_grid(w: torch.Tensor, hessian: torch.Tensor, grid: Grid, cross: torch.Tensor | None = None,
-               damp: float = 0.01, refit_damp: float = 1e-6, chunk: int = 128, search: bool = True):
+               damp: float = 0.01, refit_damp: float = 1e-6, chunk: int = 128, search: bool = True,
+               rows_per_chunk: int = ROW_CHUNK) -> tuple[torch.Tensor, torch.Tensor, float, float]:
     """Return (indices int8 [rows, cols], d float16 [rows, cols // 32], weighted error, refit change).
 
-    ``w`` is [rows, cols] float32 on the device. ``hessian`` and ``cross``
-    are [cols, cols] float32. The refit change is ‖W' − W‖ / ‖W‖, zero
-    without ``cross``.
+    ``w`` is [rows, cols] on any device. ``hessian`` and ``cross`` are
+    [cols, cols] float32 on the compute device, and the results come back
+    on that device. The work runs in chunks of ``rows_per_chunk`` rows,
+    thus the device holds one chunk of ``w`` at a time. The weighted error
+    is the mean over the rows of the squared residual of a row. The refit
+    change is ‖W' − W‖ / ‖W‖ over all the rows, zero without ``cross``.
     """
-    w = w.to(torch.float32).clone()
+    device = hessian.device
     rows, cols = w.shape
     h = hessian.to(torch.float32).clone()
 
     dead = torch.diag(h) == 0
     h[dead, dead] = 1.0
-    w[:, dead] = 0.0
 
-    refit_change = 0.0
+    # Qronos: W' = W · Aᵀ with A = H̃⁻¹ · G. The refit uses a much lighter damping than the
+    # rounding, thus the least-squares solution stays close to the exact one.
+    a_t = None
     if cross is not None:
-        # Qronos: the refit uses a much lighter damping than the rounding, thus
-        # the least-squares solution stays close to the exact one.
-        w_ref = w
-        w = torch.linalg.solve(_damped(h, refit_damp, "sigma"), cross.to(torch.float32) @ w_ref.T).T.contiguous()
-        refit_change = ((w - w_ref).norm() / w_ref.norm().clamp_min(1e-12)).item()
+        a_t = torch.linalg.solve(_damped(h, refit_damp, "sigma"), cross.to(device, torch.float32)).T.contiguous()
 
     hinv = torch.linalg.cholesky(_damped(h, damp, "mean"))
     hinv = torch.cholesky_inverse(hinv)
     hinv = torch.linalg.cholesky(hinv, upper=True)
-    diag_h = torch.diag(hessian).to(torch.float32)
+    diag_h = torch.diag(hessian).to(device, torch.float32)
 
+    idx_all = torch.empty(rows, cols, dtype=torch.int8, device=device)
+    d_all = torch.empty(rows, cols // BLOCK, dtype=torch.float16, device=device)
+    err_sum = torch.zeros((), dtype=torch.float32, device=device)
+    delta_sq = torch.zeros((), dtype=torch.float32, device=device)
+    ref_sq = torch.zeros((), dtype=torch.float32, device=device)
+    for r in range(0, rows, rows_per_chunk):
+        w_r = w[r:r + rows_per_chunk].to(device, torch.float32).clone()
+        w_r[:, dead] = 0.0
+        if a_t is not None:
+            refit = w_r @ a_t
+            delta_sq += (refit - w_r).pow(2).sum()
+            ref_sq += w_r.pow(2).sum()
+            w_r = refit
+        idx_r, d_r, err_r = _solve_rows(w_r, hinv, diag_h, grid, chunk, search)
+        idx_all[r:r + rows_per_chunk] = idx_r
+        d_all[r:r + rows_per_chunk] = d_r
+        err_sum += err_r
+    refit_change = (delta_sq.sqrt() / ref_sq.sqrt().clamp_min(1e-12)).item() if a_t is not None else 0.0
+    return idx_all, d_all, err_sum.item() / rows, refit_change
+
+
+def _solve_rows(w: torch.Tensor, hinv: torch.Tensor, diag_h: torch.Tensor, grid: Grid, chunk: int,
+                search: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The Cholesky rounding of the rows of ``w`` (float32 on the device, changed in place).
+
+    Returns (indices int8, d float16, the sum of the squared residuals).
+    """
+    rows, cols = w.shape
     idx_all = torch.zeros(rows, cols, dtype=torch.int8, device=w.device)
     d_all = torch.zeros(rows, cols // BLOCK, dtype=torch.float32, device=w.device)
     total_err = torch.zeros(rows, device=w.device)
@@ -98,4 +129,4 @@ def solve_grid(w: torch.Tensor, hessian: torch.Tensor, grid: Grid, cross: torch.
         idx_all[:, i1:i2] = idx1.to(torch.int8)
         w[:, i2:] -= err1 @ hinv[i1:i2, i2:]
 
-    return idx_all, d_all.to(torch.float16), total_err.mean().item(), refit_change
+    return idx_all, d_all.to(torch.float16), total_err.sum()

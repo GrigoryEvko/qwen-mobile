@@ -1,10 +1,17 @@
 """The quantized-flow driver, one decoder layer at a time, in lockstep with the FP model.
 
-Two copies of the transformed checkpoint sit on the GPU in float32: the
-reference, whose function never changes, and the working copy that receives
-the quantized weights. The driver caches the inputs of the current layer for
-the whole calibration set from both copies, thus each sub-pass runs one
-decoder layer and not the model.
+Two copies of the transformed checkpoint sit on the store device in float32:
+the reference, whose function never changes, and the working copy that
+receives the quantized weights. The driver caches the inputs of the current
+layer for the whole calibration set from both copies, thus each sub-pass
+runs one decoder layer and not the model. With the copies on the CPU and a
+compute device, each layer moves to the device for its passes and back,
+thus the 2B calibrates on a GPU with 6 GB.
+
+A tied head (``tie_head``) reads the final norm through the dense map M of
+the transform in both copies: logits = E'·M·norm(h). Its pack is
+``token_embd.weight``, and the working embedding holds the rounded rows,
+thus the layers see the lookup of the file.
 
 Every fold is a re-parametrization that keeps the function, and the driver
 applies it to both copies. Thus the two copies always share coordinates, the
@@ -28,8 +35,10 @@ from __future__ import annotations
 
 import json
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Iterator
 
 import numpy as np
 import torch
@@ -37,7 +46,7 @@ from torch import nn
 from transformers.masking_utils import create_causal_mask
 
 from .blockopt import FROZEN, OptOptions, Solved, Target, optimize_head, optimize_layer
-from .grid import dequantize, q8_0_dequantize, q8_0_quantize, quantize
+from .grid import ROW_CHUNK, dequantize, q8_0_dequantize, q8_0_quantize, quantize
 from .grids import Grid, IQ4NLGrid, Q4_0Grid, fit_codebook
 from .names import to_gguf
 from .plan import Plan
@@ -76,6 +85,48 @@ def q8_round_trip_(w: torch.Tensor) -> None:
     """Replace ``w`` by its Q8_0 round trip, in place."""
     q, d = q8_0_quantize(w)
     w.copy_(q8_0_dequantize(q, d))
+
+
+def grid_round_trip_(w: torch.Tensor, grid: Grid) -> None:
+    """Replace ``w`` by its round trip through ``grid`` with the scale search, in place.
+
+    The work runs in row chunks on the device of the grid, thus the
+    embedding of 248320 rows needs no full-size temporary there.
+    """
+    for r in range(0, w.shape[0], ROW_CHUNK):
+        idx, d = quantize(grid, w[r:r + ROW_CHUNK], search=True)
+        w[r:r + ROW_CHUNK].copy_(dequantize(grid, idx, d))
+
+
+def tie_head(model: nn.Module, rot: torch.Tensor) -> None:
+    """Make a tied HF model read the final norm through M: lm_head becomes Sequential(Linear(M), lm_head).
+
+    The forward of transformers calls ``lm_head`` on the normed hidden
+    state, thus the logits become E'·M·norm(h). Raises ValueError when the
+    head of the model does not share the embedding.
+    """
+    lin = model.lm_head
+    if not isinstance(lin, nn.Linear) or lin.weight is not model.model.embed_tokens.weight:
+        raise ValueError("tie_head needs a model whose lm_head shares the embedding (tie_word_embeddings)")
+    d = lin.weight.shape[1]
+    m = nn.Linear(d, d, bias=False)
+    m.weight = nn.Parameter(rot.to(lin.weight.device, torch.float32).clone(), requires_grad=False)
+    model.lm_head = nn.Sequential(m, lin)
+
+
+def head_linear(model: nn.Module) -> nn.Linear:
+    """The big matrix of the head: the last module of a tied head, or the head."""
+    return model.lm_head[-1] if isinstance(model.lm_head, nn.Sequential) else model.lm_head
+
+
+def head_rot(model: nn.Module) -> torch.Tensor | None:
+    """The dense map M of a tied head, or None for an untied head."""
+    return model.lm_head[0].weight.data if isinstance(model.lm_head, nn.Sequential) else None
+
+
+def is_tied(model: nn.Module) -> bool:
+    """True when the head of the model is the embedding tensor."""
+    return head_linear(model).weight is model.model.embed_tokens.weight
 
 
 def recurrent_mask(text_model: nn.Module, kw: dict) -> torch.Tensor | None:
@@ -124,37 +175,67 @@ class PairedMoments:
 class Lockstep:
     """The two copies, the token ids, and the cached inputs of the current layer.
 
-    The caches are [n_seq, seq_len, hidden] float32 on the device, one per
-    copy. ``advance`` moves them through one layer.
+    The copies and the caches live on the store device, the device of the
+    models. The compute runs on ``device``: a layer moves there for its
+    passes through ``on_device`` and back after them. With one device the
+    moves are no-ops. The caches are [n_seq, seq_len, hidden] float32, one
+    per copy. ``advance`` moves them through one layer.
     """
 
-    def __init__(self, ref, work, ids: torch.Tensor, batch: int) -> None:
+    def __init__(self, ref, work, ids: torch.Tensor, batch: int, device: torch.device | None = None) -> None:
         self.ref, self.work = ref, work
         self.ids = ids
         self.batch = batch
-        self.device = ref.device
+        self.store = ref.device
+        self.device = device or self.store
         self.cfg = ref.config
         self.n_seq, self.seq_len = ids.shape
         shape = (self.n_seq, self.seq_len, self.cfg.hidden_size)
-        self.ref_in = torch.empty(shape, dtype=torch.float32, device=self.device)
-        self.work_in = torch.empty(shape, dtype=torch.float32, device=self.device)
+        self.ref_in = torch.empty(shape, dtype=torch.float32, device=self.store)
+        self.work_in = torch.empty(shape, dtype=torch.float32, device=self.store)
         self._context: dict[int, tuple] = {}
-        with torch.no_grad():
-            for i, tok in self.batches():
-                self.ref_in[i:i + tok.shape[0]] = ref.model.embed_tokens(tok)
-                self.work_in[i:i + tok.shape[0]] = work.model.embed_tokens(tok)
+        # The rotary module holds inv_freq on its device, and the positions live on the compute device.
+        ref.model.rotary_emb.to(self.device)
+        self.embed(ref, self.ref_in)
+        self.embed_work()
+
+    @torch.no_grad()
+    def embed(self, model: nn.Module, cache: torch.Tensor) -> None:
+        """Fill ``cache`` with the embedding of the tokens by ``model``."""
+        for i, tok in self.batches():
+            cache[i:i + tok.shape[0]] = model.model.embed_tokens(tok)
+
+    def embed_work(self) -> None:
+        """Reset the working cache to the lookup of the working embedding, which can hold rounded rows."""
+        self.embed(self.work, self.work_in)
 
     def batches(self):
-        """(start, ids) of each batch, on the device."""
+        """(start, ids) of each batch, on the store device."""
         for i in range(0, self.n_seq, self.batch):
-            yield i, self.ids[i:i + self.batch].to(self.device)
+            yield i, self.ids[i:i + self.batch].to(self.store)
+
+    @contextmanager
+    def on_device(self, module: nn.Module) -> Iterator[nn.Module]:
+        """``module`` on the compute device inside the block, back on the store after it.
+
+        A module that is on the compute device already stays there, thus
+        the blocks nest.
+        """
+        if self.device == self.store or next(module.parameters()).device == self.device:
+            yield module
+            return
+        module.to(self.device)
+        try:
+            yield module
+        finally:
+            module.to(self.store)
 
     def context(self, n: int) -> tuple:
         """The rotary embeddings, the two masks, and the text positions for n sequences."""
         if n not in self._context:
             length = self.seq_len
             pos = torch.arange(length, device=self.device).view(1, 1, -1).expand(4, n, -1)
-            hidden = self.ref_in[:n]
+            hidden = self.ref_in[:n].to(self.device)
             rotary = self.ref.model.rotary_emb(hidden, pos[1:])
             kw = dict(config=self.cfg, inputs_embeds=hidden, attention_mask=None, past_key_values=None,
                       position_ids=pos[0])
@@ -163,10 +244,10 @@ class Lockstep:
         return self._context[n]
 
     def run_layer(self, layer: nn.Module, li: int, hidden: torch.Tensor) -> torch.Tensor:
-        """One decoder layer on [n, seq_len, hidden]."""
+        """One decoder layer on [n, seq_len, hidden]. The input moves to the compute device, the output stays there."""
         rotary, masks, text_pos = self.context(hidden.shape[0])
-        return layer(hidden, position_embeddings=rotary, attention_mask=masks[self.cfg.layer_types[li]],
-                     position_ids=text_pos)
+        return layer(hidden.to(self.device), position_embeddings=rotary,
+                     attention_mask=masks[self.cfg.layer_types[li]], position_ids=text_pos)
 
     def layers(self, li: int) -> tuple[nn.Module, nn.Module]:
         return self.ref.model.layers[li], self.work.model.layers[li]
@@ -182,10 +263,11 @@ class Lockstep:
             m = PairedMoments(lin_work.in_features, self.device)
             handles += [lin_ref.register_forward_hook(m.take_ref), lin_work.register_forward_hook(m.take_work)]
             moments[rel] = m
-        for i, tok in self.batches():
-            n = tok.shape[0]
-            self.run_layer(ref_layer, li, self.ref_in[i:i + n])
-            self.run_layer(work_layer, li, self.work_in[i:i + n])
+        with self.on_device(ref_layer), self.on_device(work_layer):
+            for i, tok in self.batches():
+                n = tok.shape[0]
+                self.run_layer(ref_layer, li, self.ref_in[i:i + n])
+                self.run_layer(work_layer, li, self.work_in[i:i + n])
         for h in handles:
             h.remove()
         return moments
@@ -194,17 +276,19 @@ class Lockstep:
     def advance_ref(self, li: int) -> None:
         """Replace the cached reference inputs by the reference outputs of layer li."""
         layer = self.ref.model.layers[li]
-        for i, tok in self.batches():
-            n = tok.shape[0]
-            self.ref_in[i:i + n] = self.run_layer(layer, li, self.ref_in[i:i + n])
+        with self.on_device(layer):
+            for i, tok in self.batches():
+                n = tok.shape[0]
+                self.ref_in[i:i + n].copy_(self.run_layer(layer, li, self.ref_in[i:i + n]))
 
     @torch.no_grad()
     def advance_work(self, li: int) -> None:
         """Replace the cached working inputs by the working outputs of layer li."""
         layer = self.work.model.layers[li]
-        for i, tok in self.batches():
-            n = tok.shape[0]
-            self.work_in[i:i + n] = self.run_layer(layer, li, self.work_in[i:i + n])
+        with self.on_device(layer):
+            for i, tok in self.batches():
+                n = tok.shape[0]
+                self.work_in[i:i + n].copy_(self.run_layer(layer, li, self.work_in[i:i + n]))
 
     def advance(self, li: int) -> None:
         """Move both caches through layer li."""
@@ -233,6 +317,7 @@ class Quantizer:
         self.out_dir = out_dir
         self.opts = opts
         self.cfg = step.cfg
+        self.tied = is_tied(step.work)
         self.fixed = {"Q4_0": Q4_0Grid().to(step.device), "IQ4_NL": IQ4NLGrid().to(step.device)}
         # The grid, the input Hessian and the block scales of each solved matrix, by (layer, relative name).
         # The head is layer -1. The Hessian and the scales live until the block optimization of the layer.
@@ -305,18 +390,24 @@ class Quantizer:
         self.save_pack(name, kind, solved.grid, solved.idx, solved.d, solved.low_rank)
 
     def solve(self, key: tuple[int, str], name: str, kind: str, lin: nn.Linear, h: torch.Tensor, g: torch.Tensor,
-              tag: str) -> None:
-        """The initial rounding of one matrix onto its grid. The block optimization moves it later."""
+              tag: str, w_src: torch.Tensor | None = None) -> None:
+        """The initial rounding of one matrix onto its grid. The block optimization moves it later.
+
+        The solver reads ``w_src``, or the weight of ``lin``, and writes the
+        rounded values into ``lin``. A tied head gives the reference
+        embedding as ``w_src``, because the working embedding is on the
+        grid already.
+        """
         t0 = time.time()
-        grid = self.grid_for(kind, lin.weight.data, torch.diag(h))
+        w = lin.weight.data if w_src is None else w_src
+        grid = self.grid_for(kind, w, torch.diag(h))
         self.grids[key], self.hess[key] = grid, h.clone()
         if self.opts.init == "rtn":
-            idx, d = quantize(grid, lin.weight.data, weights=torch.diag(h), search=True)
+            idx, d = quantize(grid, w, weights=torch.diag(h), search=True)
             err, change = float("nan"), 0.0
         else:
             cross = g if self.opts.init == "qronos" else None
-            idx, d, err, change = solve_grid(lin.weight.data, h, grid, cross, damp=self.opts.damp,
-                                             refit_damp=self.opts.refit_damp)
+            idx, d, err, change = solve_grid(w, h, grid, cross, damp=self.opts.damp, refit_damp=self.opts.refit_damp)
         self.scales[key] = d
         lin.weight.data.copy_(dequantize(grid, idx, d))
         self.save_pack(name, kind, grid, idx, d)
@@ -357,7 +448,8 @@ class Quantizer:
         The optimization moves the norms, the gate projections and the Q8
         matrices. The zero-centered norms get their +1. The plan goes with
         them: the export refuses a different plan on the unfolded F16 GGUF,
-        because the folds moved the coordinates of the solved classes.
+        because the folds moved the coordinates of the solved classes. A
+        tied head adds its dense map ``output_rot.weight``.
         """
         folds: dict[str, np.ndarray] = {}
         for full, p in self.step.work.named_parameters():
@@ -370,6 +462,9 @@ class Quantizer:
             if gguf.endswith(ZERO_CENTERED):
                 v = v + 1.0
             folds[gguf] = v.numpy()
+        rot = head_rot(self.step.work)
+        if rot is not None:
+            folds["output_rot.weight"] = rot.to("cpu", torch.float32).numpy()
         np.savez(self.out_dir / "folds.npz", plan=np.array(json.dumps(asdict(self.plan))), **folds)
         print(f"wrote {len(folds)} small tensors to folds.npz", flush=True)
 
@@ -450,70 +545,140 @@ class Quantizer:
         h, g = self.step.collect(li, [down])[down].mean()
         self.solve_or_round(li, down, h, g)
 
-    def head(self) -> None:
-        """The untied head on the final-norm outputs, with its column scales in the final norm."""
-        kind = self.plan.type_of("output.weight")
-        if kind not in self.plan.solved_types():
-            return
+    # --- the head ---
+
+    def head_name(self) -> str:
+        """The GGUF name of the head pack: the embedding for a tied head."""
+        return "token_embd.weight" if self.tied else "output.weight"
+
+    @torch.no_grad()
+    def head_moments(self, rot: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+        """H and G of the head input over the calibration set: the final-norm output, through M when tied."""
         step = self.step
         d = self.cfg.hidden_size
         h = torch.zeros(d, d, dtype=torch.float32, device=step.device)
         g = torch.zeros(d, d, dtype=torch.float32, device=step.device)
-        for i, tok in step.batches():
-            n = tok.shape[0]
-            r = step.ref.model.norm(step.ref_in[i:i + n]).reshape(-1, d)
-            w = step.work.model.norm(step.work_in[i:i + n]).reshape(-1, d)
-            h.addmm_(w.T, w)
-            g.addmm_(w.T, r)
+        norm_ref, norm_work = step.ref.model.norm, step.work.model.norm
+        rot = None if rot is None else rot.to(step.device, torch.float32)
+        with step.on_device(norm_ref), step.on_device(norm_work):
+            for i, tok in step.batches():
+                n = tok.shape[0]
+                r = norm_ref(step.ref_in[i:i + n].to(step.device)).reshape(-1, d)
+                w = norm_work(step.work_in[i:i + n].to(step.device)).reshape(-1, d)
+                if rot is not None:
+                    r, w = r @ rot.T, w @ rot.T
+                h.addmm_(w.T, w)
+                g.addmm_(w.T, r)
         h /= step.n_seq * step.seq_len
         g /= step.n_seq * step.seq_len
-        heads = (step.ref.lm_head, step.work.lm_head)
-        if self.opts.scale:
+        return h, g
+
+    def head(self, optimize: bool = True) -> None:
+        """The head on the final-norm outputs of both copies.
+
+        Untied: the column scales of the head go into the final norm. Tied:
+        the head is the embedding E' and its input is M·norm(h). No column
+        scale is possible then, because the rows must stay the rows of the
+        lookup. With ``optimize`` the block optimization on the KL follows
+        the solve, and the working embedding holds the result.
+        """
+        name = self.head_name()
+        kind = self.plan.type_of(name)
+        if kind not in self.plan.solved_types():
+            return
+        step = self.step
+        rot = head_rot(step.work)
+        h, g = self.head_moments(rot)
+        heads = (head_linear(step.ref), head_linear(step.work))
+        if self.opts.scale and not self.tied:
             t = search_column_scales(self.search_grid(kind), [heads[1].weight.data], torch.diag(h))
             for lin in heads:
-                lin.weight.data.mul_(t[None, :])
-            for norm in (self.step.ref.model.norm, self.step.work.model.norm):
-                norm.weight.data.copy_((1.0 + norm.weight.data) / t - 1.0)
+                lin.weight.data.mul_(t.to(lin.weight.device)[None, :])
+            for norm in (step.ref.model.norm, step.work.model.norm):
+                norm.weight.data.copy_((1.0 + norm.weight.data) / t.to(norm.weight.device) - 1.0)
             h, g = scaled_moments(h, g, t)
         key = (-1, "lm_head")
-        self.solve(key, "output.weight", kind, heads[1], h, g, "head    ")
-        if self.opts.method == "blockopt":
-            # The head optimization needs only the norm and the head of the reference.
-            # The reference decoder and embedding wait on the CPU meanwhile.
+        self.solve(key, name, kind, heads[1], h, g, "head    ", w_src=heads[0].weight.data if self.tied else None)
+        if optimize and self.opts.method == "blockopt":
+            # The head optimization needs only the norm and the head of the reference. With the copies
+            # on the compute device, the reference decoder and embedding wait on the CPU meanwhile.
             ref = step.ref.model
-            ref.layers.to("cpu")
-            ref.embed_tokens.to("cpu")
-            torch.cuda.empty_cache()
+            offload = step.store.type == "cuda"
+            if offload:
+                ref.layers.to("cpu")
+                ref.embed_tokens.to("cpu")
+                torch.cuda.empty_cache()
             target = Target(self.grids[key], self.hess[key], heads[0].weight.data, self.scales[key])
-            solved = optimize_head(step, target, self.opts.opt)
-            self.save_solved("output.weight", kind, solved)
-            ref.layers.to(step.device)
-            ref.embed_tokens.to(step.device)
+            solved = optimize_head(step, heads[1], heads[0].weight.data, target, self.opts.opt, rot=rot)
+            self.save_solved(name, kind, solved)
+            if offload:
+                ref.layers.to(step.store)
+                ref.embed_tokens.to(step.store)
+
+    def round_embedding(self) -> None:
+        """Put the working embedding on its grid, thus the layers see the lookup of the file.
+
+        Untied: the Q8_0 round trip. Tied: the 4-bit round trip with the
+        scale search, a first rounding that the head solve replaces.
+        """
+        kind = self.plan.type_of("token_embd.weight")
+        w = self.step.work.model.embed_tokens.weight.data
+        if kind == "Q8_0":
+            q8_round_trip_(w)
+        elif kind in self.fixed:
+            grid_round_trip_(w, self.fixed[kind])
+        self.step.embed_work()
 
     # --- the run ---
 
     @torch.no_grad()
     def run(self) -> None:
         step = self.step
-        if self.plan.type_of("token_embd.weight") == "Q8_0":
-            q8_round_trip_(step.work.model.embed_tokens.weight.data)
+        self.round_embedding()
         for li in range(self.cfg.num_hidden_layers):
             t0 = time.time()
             if self.opts.mismatch == "layer":
                 step.ref_in.copy_(step.work_in)
-            if self.cfg.layer_types[li] == "linear_attention":
-                self.mixer_input(li, GDN_IN, "input_layernorm")
-                self.gdn_output(li)
-            else:
-                h_in, g_in = self.mixer_input(li, ATTN_IN, "input_layernorm", defer=("self_attn.v_proj",))
-                self.attention_output(li, h_in, g_in)
-            self.mlp(li)
-            if self.opts.method == "blockopt":
-                self.optimize(li)
-            else:
-                step.advance(li)
+            ref_layer, work_layer = step.layers(li)
+            with step.on_device(ref_layer), step.on_device(work_layer):
+                if self.cfg.layer_types[li] == "linear_attention":
+                    self.mixer_input(li, GDN_IN, "input_layernorm")
+                    self.gdn_output(li)
+                else:
+                    h_in, g_in = self.mixer_input(li, ATTN_IN, "input_layernorm", defer=("self_attn.v_proj",))
+                    self.attention_output(li, h_in, g_in)
+                self.mlp(li)
+                if self.opts.method == "blockopt":
+                    self.optimize(li)
+                else:
+                    step.advance(li)
             print(f"layer {li:2d} done in {time.time() - t0:5.1f}s", flush=True)
         self.head()
+        self.save_folds()
+
+    @torch.no_grad()
+    def run_head_only(self) -> None:
+        """Solve and optimize only the head, on layers that hold the packs of a previous run.
+
+        The caches move through all the layers, then the head follows as in
+        ``run``. A tied head takes two passes: the first solves the head on
+        the flow of the round-to-nearest embedding, the second on the flow
+        of the solved embedding, which is what the file holds.
+        """
+        step = self.step
+        self.round_embedding()
+        passes = 2 if self.tied else 1
+        for p in range(passes):
+            t0 = time.time()
+            for li in range(self.cfg.num_hidden_layers):
+                if p == 0:
+                    step.advance(li)
+                else:
+                    step.advance_work(li)
+            print(f"pass {p}: the caches went through the layers in {time.time() - t0:.0f}s", flush=True)
+            self.head(optimize=p == passes - 1)
+            if p < passes - 1:
+                step.embed_work()
         self.save_folds()
 
 
@@ -522,9 +687,14 @@ def state_as_checkpoint(model, src_tensors: dict[str, torch.Tensor]) -> dict[str
 
     The CausalLM names its text model ``model``; the checkpoint names it
     ``model.language_model``. The vision and MTP tensors stay as they are.
+    The embedding carries a tied head, and its dense map passes through
+    from the source.
     """
     out = dict(src_tensors)
+    tied = is_tied(model)
     for key, value in model.state_dict().items():
+        if tied and key.startswith("lm_head."):
+            continue
         ck = "model.language_model." + key[len("model."):] if key.startswith("model.") else key
         if ck not in out:
             raise KeyError(f"{key} has no tensor {ck} in the source checkpoint")
