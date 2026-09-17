@@ -93,8 +93,9 @@ class SettingsStore private constructor(context: Context) {
         /** The fastest visible compute unit. The enum lists them from slow to fast. */
         fun defaultBackend(): Backend = Backend.entries.lastOrNull { LlamaEngine.has(it) } ?: Backend.CPU
 
-        /** Keep every value inside its permitted range. */
+        /** Keep every value inside its permitted range. A backend without a visible device falls back. */
         fun sanitize(s: AppSettings): AppSettings = s.copy(
+            backend = if (LlamaEngine.has(s.backend)) s.backend else defaultBackend(),
             threads = s.threads.coerceIn(MIN_THREADS, MAX_THREADS),
             nCtx = if (s.nCtx in CONTEXT_LENGTHS) s.nCtx else 8192,
             temperature = s.temperature.coerceIn(0f, MAX_TEMPERATURE),
