@@ -19,8 +19,10 @@
  *
  * The output of the vision encoder goes into a second store
  * (image_cache.h) by the hash of the image file, in RAM and on disk. A
- * known image tokenizes as a placeholder, thus its JPEG is not decoded
- * again.
+ * known image tokenizes as a placeholder, thus its file is not decoded
+ * again. A new image decodes in the app (LlamaNative.decodeImage) at the
+ * size that the preprocessor selects, thus mtmd gets RGB pixels and
+ * copies them without a resize.
  */
 
 #include <android/log.h>
@@ -236,6 +238,8 @@ void log_to_logcat(ggml_log_level level, const char * text, void *) {
     }
     __android_log_write(prio, "llama.cpp", text);
 }
+
+std::string jstring_to_std(JNIEnv * env, jstring s);
 
 /** Throw a java.lang.RuntimeException with the message. */
 void throw_java(JNIEnv * env, const std::string & msg) {
@@ -732,13 +736,109 @@ bool prefill(Engine & e, const std::vector<MemItem> & items, const std::vector<c
     return true;
 }
 
+/** The message of the pending Java exception, which this call clears. */
+std::string take_exception_message(JNIEnv * env) {
+    jthrowable ex = env->ExceptionOccurred();
+    if (ex == nullptr) {
+        return "no exception";
+    }
+    env->ExceptionClear();
+    jclass cls = env->GetObjectClass(ex);
+    jmethodID to_string = env->GetMethodID(cls, "toString", "()Ljava/lang/String;");
+    std::string text = "no message";
+    if (to_string != nullptr) {
+        jstring s = (jstring) env->CallObjectMethod(ex, to_string);
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        } else if (s != nullptr) {
+            text = jstring_to_std(env, s);
+            env->DeleteLocalRef(s);
+        }
+    }
+    env->DeleteLocalRef(cls);
+    env->DeleteLocalRef(ex);
+    return text;
+}
+
+/**
+ * The bitmap of a new image: the pixels come from the app
+ * (LlamaNative.decodeImage) at the size that the preprocessor selects for
+ * the token limit of the engine, as RGBA rows in a direct buffer. The
+ * decoder of the platform samples the file in the DCT domain and applies
+ * the EXIF orientation, thus mtmd gets the bitmap it would make itself,
+ * without its own decode and resize. A file that the platform does not
+ * decode goes through the stb decoder of mtmd, and then the preprocessor
+ * resizes it. Returns null with the error text set.
+ */
+mtmd_bitmap * decode_image(JNIEnv * env, jclass native_class, Engine & e, jbyteArray image, std::string & error) {
+    TraceSection trace("image-decode");
+    jmethodID method = env->GetStaticMethodID(native_class, "decodeImage", "([BI[I)Ljava/nio/ByteBuffer;");
+    if (method == nullptr) {
+        error = "LlamaNative.decodeImage is missing: " + take_exception_message(env);
+        return nullptr;
+    }
+    jintArray dims = env->NewIntArray(3);
+    jobject buffer = env->CallStaticObjectMethod(native_class, method, image, (jint) e.image_max_tokens, dims);
+    if (env->ExceptionCheck()) {
+        error = "The image did not decode in the app: " + take_exception_message(env);
+        env->DeleteLocalRef(dims);
+        return nullptr;
+    }
+    mtmd_bitmap * bitmap = nullptr;
+    if (buffer != nullptr) {
+        jint d[3] = {0, 0, 0};
+        env->GetIntArrayRegion(dims, 0, 3, d);
+        const int   nx     = d[0];
+        const int   ny     = d[1];
+        const int   stride = d[2];
+        const auto * px    = static_cast<const unsigned char *>(env->GetDirectBufferAddress(buffer));
+        const jlong  bytes = env->GetDirectBufferCapacity(buffer);
+        if (px != nullptr && nx > 0 && ny > 0 && stride >= nx * 4 && bytes >= (jlong) stride * ny) {
+            // RGBA rows with the stride to packed RGB, the layout of mtmd.
+            std::vector<unsigned char> rgb((size_t) nx * ny * 3);
+            for (int y = 0; y < ny; ++y) {
+                const unsigned char * row = px + (size_t) y * stride;
+                unsigned char *       out = rgb.data() + (size_t) y * nx * 3;
+                for (int x = 0; x < nx; ++x) {
+                    out[x * 3 + 0] = row[x * 4 + 0];
+                    out[x * 3 + 1] = row[x * 4 + 1];
+                    out[x * 3 + 2] = row[x * 4 + 2];
+                }
+            }
+            bitmap = mtmd_bitmap_init((uint32_t) nx, (uint32_t) ny, rgb.data());
+        } else {
+            LOGE("the decoded image has an unusable layout: %d x %d, stride %d, %lld bytes", nx, ny, stride, (long long) bytes);
+        }
+        env->DeleteLocalRef(buffer);
+    }
+    env->DeleteLocalRef(dims);
+    if (bitmap == nullptr) {
+        const jsize len = env->GetArrayLength(image);
+        jbyte * bytes = env->GetByteArrayElements(image, nullptr);
+        if (bytes == nullptr) {
+            error = "The image bytes are not readable";
+            return nullptr;
+        }
+        bitmap = mtmd_helper_bitmap_init_from_buf(e.mctx, reinterpret_cast<const unsigned char *>(bytes), (size_t) len,
+                                                  false, mtmd_helper_init_opt_default()).bitmap;
+        env->ReleaseByteArrayElements(image, bytes, JNI_ABORT);
+        if (bitmap == nullptr) {
+            error = "The image did not decode";
+            return nullptr;
+        }
+        LOGI("image decoded by mtmd, %u x %u", mtmd_bitmap_get_nx(bitmap), mtmd_bitmap_get_ny(bitmap));
+    }
+    return bitmap;
+}
+
 /**
  * Tokenize the prompt. With images, mtmd replaces each media marker with
  * the chunk of the image in order, and chunk_of points at the image chunks.
+ * native_class is LlamaNative, for the decode of a new image in the app.
  * Returns false with the error text set.
  */
-bool tokenize_prompt(JNIEnv * env, Engine & e, const std::string & prompt, const std::vector<jbyteArray> & images,
-                     mtmd::input_chunks & chunks, std::vector<MemItem> & items,
+bool tokenize_prompt(JNIEnv * env, jclass native_class, Engine & e, const std::string & prompt,
+                     const std::vector<jbyteArray> & images, mtmd::input_chunks & chunks, std::vector<MemItem> & items,
                      std::vector<const mtmd_input_chunk *> & chunk_of, std::string & error) {
     items.clear();
     chunk_of.clear();
@@ -756,9 +856,10 @@ bool tokenize_prompt(JNIEnv * env, Engine & e, const std::string & prompt, const
         return false;
     }
     // A known image gives a placeholder bitmap with its dimensions and its
-    // id: the same chunk as its decode gives, without the decode of the JPEG
-    // and its preprocessing. The id is the SHA-256 of the file bytes, the
-    // same value that the helper gives a decoded bitmap.
+    // id: the same chunk as its decode gives, without the decode of the file
+    // and its preprocessing. The id is the SHA-256 of the file bytes. The
+    // dimensions of a new image are the target of the preprocessor, thus
+    // the placeholder of a later turn gives the same target.
     mtmd::bitmaps bitmaps;
     e.turn_images.clear();
     e.turn.images_total = (int) images.size();
@@ -770,26 +871,22 @@ bool tokenize_prompt(JNIEnv * env, Engine & e, const std::string & prompt, const
             return false;
         }
         const std::string id = cache_io::sha256_hex(bytes, (size_t) len);
+        env->ReleaseByteArrayElements(image, bytes, JNI_ABORT);
         ImageInfo info;
         mtmd_bitmap * bitmap = nullptr;
         if (e.images->info(id, info)) {
             bitmap = mtmd_bitmap_init(info.nx, info.ny, nullptr);
-            mtmd_bitmap_set_id(bitmap, id.c_str());
             e.turn.images_known += 1;
         } else {
-            bitmap = mtmd_helper_bitmap_init_from_buf(e.mctx, reinterpret_cast<const unsigned char *>(bytes),
-                                                      (size_t) len, false, mtmd_helper_init_opt_default()).bitmap;
-            if (bitmap != nullptr) {
-                info.nx = mtmd_bitmap_get_nx(bitmap);
-                info.ny = mtmd_bitmap_get_ny(bitmap);
-                e.turn_images[mtmd_bitmap_get_id(bitmap)] = info;
+            bitmap = decode_image(env, native_class, e, image, error);
+            if (bitmap == nullptr) {
+                return false;
             }
+            info.nx = mtmd_bitmap_get_nx(bitmap);
+            info.ny = mtmd_bitmap_get_ny(bitmap);
+            e.turn_images[id] = info;
         }
-        env->ReleaseByteArrayElements(image, bytes, JNI_ABORT);
-        if (bitmap == nullptr) {
-            error = "The image did not decode";
-            return false;
-        }
+        mtmd_bitmap_set_id(bitmap, id.c_str());
         bitmaps.entries.emplace_back(bitmap);
     }
 
@@ -1163,7 +1260,7 @@ Java_ai_airi_qwenmobile_LlamaNative_modelInfo(JNIEnv * env, jclass, jlong handle
 }
 
 JNIEXPORT jint JNICALL
-Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass, jlong handle,
+Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass native_class, jlong handle,
                                                jobjectArray roles, jobjectArray contents,
                                                jobjectArray images, jboolean thinking,
                                                jfloat temperature, jfloat top_p) {
@@ -1228,7 +1325,7 @@ Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass, jlong handle
     mtmd::input_chunks chunks;
     std::vector<MemItem> items;
     std::vector<const mtmd_input_chunk *> chunk_of;
-    if (!tokenize_prompt(env, *e, prompt, image_refs, chunks, items, chunk_of, error)) {
+    if (!tokenize_prompt(env, native_class, *e, prompt, image_refs, chunks, items, chunk_of, error)) {
         throw_java(env, error);
         return -1;
     }

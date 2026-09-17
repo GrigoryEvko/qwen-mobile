@@ -1,5 +1,8 @@
 package ai.airi.qwenmobile
 
+import androidx.annotation.Keep
+import java.nio.ByteBuffer
+
 /**
  * The JNI entry points of libqwenmobile.so. All calls that take a handle
  * must come from one thread. [LlamaEngine] gives that thread.
@@ -64,6 +67,17 @@ object LlamaNative {
         cacheDir: String?,
     ): Long
 
+    /**
+     * The pixels of an image file for the vision encoder. The engine calls
+     * this on its thread from [chatStart], for an image that its cache does
+     * not know, with the token limit of the load. Refer to
+     * [ImageBytes.decodeForModel] for the contract.
+     */
+    @Keep
+    @JvmStatic
+    fun decodeImage(bytes: ByteArray, maxTokens: Int, dims: IntArray): ByteBuffer? =
+        ImageBytes.decodeForModel(bytes, maxTokens, dims)
+
     /** Release the engine. The handle is not valid after this call. */
     @JvmStatic external fun free(handle: Long)
 
@@ -75,7 +89,8 @@ object LlamaNative {
      * the longest prefix of the prompt that a snapshot of an earlier turn
      * holds, and decodes only the rest.
      *
-     * @param images       One entry per message: the encoded image bytes (JPEG, PNG) or null
+     * @param images       One entry per message: the encoded image bytes (JPEG, PNG) or null. A new
+     *                     image decodes through [decodeImage], a known one is not decoded
      * @param thinking     Enable the thinking mode of the chat template
      * @param temperature  The sampling temperature, 0 for greedy
      * @param topP         The nucleus probability mass
