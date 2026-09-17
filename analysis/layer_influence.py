@@ -56,11 +56,13 @@ class Stats:
         self.residual: torch.Tensor | None = None
 
     def pre(self, module, args, kwargs) -> None:
-        self.residual = args[0].detach().float().reshape(-1, args[0].shape[-1])
+        x = args[0] if args else kwargs["hidden_states"]
+        self.residual = x.detach().float().reshape(-1, x.shape[-1])
 
     def post(self, module, args, output) -> None:
-        upd = (output[0] if isinstance(output, tuple) else output).detach().float().reshape(-1, args[0].shape[-1])
         h0 = self.residual
+        assert h0 is not None
+        upd = (output[0] if isinstance(output, tuple) else output).detach().float().reshape(-1, h0.shape[-1])
         h1 = h0 + upd
         self.cos += F.cosine_similarity(h0, h1, dim=-1).sum().item()
         self.rel += (upd.norm(dim=-1) / h0.norm(dim=-1).clamp_min(1e-6)).sum().item()
