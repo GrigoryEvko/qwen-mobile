@@ -14,8 +14,7 @@ hexagon-host/0001-hexagon-host-timers-and-batch-cache.patch
 hexagon-host/0002-llama-host-timers-and-embd-lookup.patch
 hexagon-host/0003-llama-sampler-topset.patch
 # hexagon-fusion/0005-hexagon-htp-gdn-chunked-hmx.patch
-#   The chunked gated delta rule on the HMX. The patch applies as the last
-#   entry, and the kernel hangs the DSP on the first batch of 512 tokens
-#   (test-backend-ops stops in that case, and llama-bench never reaches its
-#   first token). Its switch GGML_HEXAGON_GDN_CHUNK is on by default, thus the
-#   line stays a comment until the hang is gone.
+#   The chunked gated delta rule on the HMX. The hang is gone, and the kernel
+#   now returns INTERNAL-ERROR detail 0x14 for a two-sequence case of one
+#   token, which the pre-flight check must send to the sequential kernel. The
+#   line stays a comment until the operator test passes.
