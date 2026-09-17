@@ -19,9 +19,18 @@ Hadamard R1 on the residual stream, head untied.
 | 4 | Qronos refit (FP-flow reference across the model) + folded column scales + MLP permutation, head solved, Q4_0, solver only | 1.62 GiB file | 0.0299 | 0.727 | 2.97 | 90.47 % | 14.08 |
 | 5 | Block optimization from the RTN start (8 epochs on 128 x 2048, all layer parameters, head on the KL), folds as row 4, Q4_0 | 1.62 GiB file | 0.0412 | 0.598 | 2.08 | 88.38 % | 14.69 |
 
+| 6 | GPTQ start + folded column scales + MLP permutation, solver only | 1.62 GiB file | 0.0325 | | | 89.85 % | |
+| 7 | Block optimization, 2 epochs, latent weights frozen (scales, norms, gates, head on the KL), GPTQ start, folds as row 6 | 1.62 GiB file | 0.0295 | | | 91.35 % | |
+| 8 | As row 7 with the latent weights free at 3e-6 | 1.62 GiB file | 0.0314 | | | 90.12 % | |
+| 9 | As row 7 from the round-to-nearest start | 1.62 GiB file | 0.0482 | | | 87.77 % | |
+
 Row 5 over-fits: the per-layer training loss halves, the held-out error grows at every layer (drift
-KL 0.0421 against 0.0291 for row 3). The diagnostics (solver start, frozen latent weights, 2 epochs,
-4x data) follow.
+KL 0.0421 against 0.0291 for row 3). The diagnostics say: the rounding must come from a Hessian
+solver (row 9 against row 7), the latent weights must stay frozen on 128 x 2048 tokens (row 8
+against row 7), and the block optimization then refines the scales, the norms and the head for a
+gain of 10 % KL and 1.5 points of top-1 over its start (row 7 against row 6). Row 7 is the file on
+the phone as of 2026-09-17 08:05 (`Qwen3.5-2B-gptq-Q4_0.gguf`). The drift KLs of rows 6 to 9:
+0.0329, 0.0303, 0.0320, 0.0515.
 
 Phone speed of row 3 (the GPTQ Q4_0 file, llama-bench, thermal status 0, 2026-09-17, op fusion off on
 the NPU): GPU OpenCL pp512 574 t/s, tg64 30.1 t/s. NPU HTP0 pp512 968 t/s, tg64 31.9 t/s. The F16

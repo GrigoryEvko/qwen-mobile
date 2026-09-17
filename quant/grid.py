@@ -111,18 +111,27 @@ def pack_nibbles(idx: torch.Tensor, d: torch.Tensor) -> np.ndarray:
 
 
 def q8_0_quantize(w: torch.Tensor):
-    """Round-to-nearest Q8_0: (q int8 [rows, cols], d float16 [rows, nblocks])."""
-    blocks = blocks_of(w.to(torch.float32))
-    amax = blocks.abs().amax(dim=-1)
-    d = torch.where(amax == 0, torch.ones_like(amax), amax / 127.0).to(torch.float16).to(torch.float32)
-    q = torch.clamp(torch.round(blocks / d[..., None]), -127, 127)
-    return q.reshape(w.shape).to(torch.int8), d.to(torch.float16)
+    """Round-to-nearest Q8_0: (q int8 [rows, cols], d float16 [rows, nblocks]), in row chunks."""
+    rows, cols = w.shape
+    q_out = torch.empty(rows, cols, dtype=torch.int8, device=w.device)
+    d_out = torch.empty(rows, cols // BLOCK, dtype=torch.float16, device=w.device)
+    for r in range(0, rows, ROW_CHUNK):
+        blocks = blocks_of(w[r:r + ROW_CHUNK].to(torch.float32))
+        amax = blocks.abs().amax(dim=-1)
+        d = torch.where(amax == 0, torch.ones_like(amax), amax / 127.0).to(torch.float16).to(torch.float32)
+        q_out[r:r + ROW_CHUNK] = torch.clamp(torch.round(blocks / d[..., None]), -127, 127).reshape(-1, cols).to(torch.int8)
+        d_out[r:r + ROW_CHUNK] = d.to(torch.float16)
+    return q_out, d_out
 
 
 def q8_0_dequantize(q: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
-    """The float32 values d · q of a Q8_0 matrix."""
+    """The float32 values d · q of a Q8_0 matrix, in row chunks."""
     rows, cols = q.shape
-    return (q.reshape(rows, cols // BLOCK, BLOCK).to(torch.float32) * d.to(torch.float32)[..., None]).reshape(rows, cols)
+    out = torch.empty(rows, cols, dtype=torch.float32, device=q.device)
+    for r in range(0, rows, ROW_CHUNK):
+        blocks = q[r:r + ROW_CHUNK].reshape(-1, cols // BLOCK, BLOCK).to(torch.float32)
+        out[r:r + ROW_CHUNK] = (blocks * d[r:r + ROW_CHUNK].to(torch.float32)[..., None]).reshape(-1, cols)
+    return out
 
 
 def pack_q8_0(q: torch.Tensor, d: torch.Tensor) -> np.ndarray:
