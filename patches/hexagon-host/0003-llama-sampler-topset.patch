@@ -1,0 +1,386 @@
+llama: the top set of the sampler chain
+
+Base: llama.cpp commit c6824a9. The files of this patch are not touched by the other patches of this
+repository.
+
+Files:
+    include/llama.h        llama_sampler_topset
+    src/llama-sampler.cpp  the bound of the chain, the selection, the verify mode, the hook in llama_sampler_sample
+    common/sampling.cpp    the hook in common_sampler::set_logits, the verify mode in common_sampler_sample
+
+How to apply, from the llama.cpp root:
+
+    git apply patches/hexagon-host/0003-llama-sampler-topset.patch
+    cmake --build build-snapdragon -j
+
+Only libllama.so and libllama-common.so change (the app links both).
+
+Switch (environment variable):
+
+    LLAMA_SAMPLER_TOPSET=N   0 = all the logits go to the chain (the previous behavior),
+                             1 = the top set goes to the chain,
+                             2 = the top set goes to the chain, and a clone of the chain runs on all the
+                                 logits for a comparison of the two selected tokens
+
+The problem
+
+The sampler chain of the app is penalties, then top-k 20, top-p, temperature and dist (or greedy). The
+vocabulary has 248320 tokens. For each token, llama_sampler_sample builds an array of 248320 candidates
+(3 MB), the penalties sampler does one hash lookup for each candidate, and the top-k sampler does a
+partial sort of the 248320 candidates. This work is the largest host cost of a token on the NPU.
+
+The top set
+
+A chain that cuts the candidates with top-k (or greedy) reads only the k best logits after the samplers
+before the cut. The samplers before the cut move a bounded set of tokens by id: the penalties move the
+tokens of the last-n window, and the logit bias moves its tokens. Let m = k + n_moved. A token outside the
+m highest logits is not moved, and at least k tokens that are not moved have a logit equal to or higher
+than its logit. Thus the top-k after the penalties is a subset of the m highest logits plus the moved
+tokens, and the samplers after the cut (top-p, min-p, temperature, dist) see the same k candidates in the
+same order. The selection is the same, and the random draw of dist is the same, thus the token stream is
+the same. The one exception is a tie of the k-th and the (k+1)-th highest logits: the partial sort of
+the full array and the partial sort of the top set can then keep a different token.
+
+llama_sampler_topset finds m from the chain, and returns 0 when the chain needs all the logits: a grammar
+or a reasoning budget (common_sampler applies them before the chain), dry, top-n-sigma, a dynamic
+temperature (the entropy of all the candidates), a temperature of 0 or less before the cut, or no top-k
+and no greedy sampler. The selection is one pass over the logits with a min-heap of m entries, thus
+O(n_vocab) with a compare of each logit against the m-th best. The result is in token order, as the full
+array is.
+
+LLAMA_SAMPLER_TOPSET=2 clones the chain (with its random state), runs the clone on all the logits, and
+compares the selected token with the one of the top set. A difference is a warn line. Every 64 tokens a
+line gives the counts. The stream of the run is the one of the top set.
+diff --git a/include/llama.h b/include/llama.h
+index 3ab9359..834147c 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1539,6 +1539,14 @@ extern "C" {
+     // Returns the sampled token
+     LLAMA_API llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx);
+ 
++    /// @details Fill dst with the candidates that a chain needs to select the same token as with all the logits:
++    /// the highest logits, plus the tokens that the samplers before the first top-k or greedy sampler move by id
++    /// (the penalties and the logit bias). dst must have room for n_vocab entries. The entries are in token order.
++    /// Returns the number of entries, or 0 when the chain needs all the logits (a grammar, dry, typical, top-p or
++    /// min-p before a top-k, a dynamic temperature, or no top-k). The selection equals the one with all the
++    /// logits, unless the k-th and the (k+1)-th highest logits are equal.
++    LLAMA_API size_t llama_sampler_topset(struct llama_sampler * smpl, const float * logits, int32_t n_vocab, llama_token_data * dst);
++
+     // TODO: extend in the future
+     //LLAMA_API void llama_decode_with_sampler(struct llama_context * ctx, struct llama_sampler * smpl, struct llama_batch batch, ...);
+ 
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+index 61d28ad..f79ae5b 100644
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -892,6 +892,18 @@ uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler) {
+     return chain->n_nodes;
+ }
+ 
++// LLAMA_SAMPLER_TOPSET: 0 = all the logits, 1 = the top set of the chain, 2 = the top set, and a clone of the
++// chain runs on all the logits to compare the selected tokens
++static int llama_sampler_topset_mode() {
++    static const int mode = [] {
++        const char * s = getenv("LLAMA_SAMPLER_TOPSET");
++        return s ? atoi(s) : 0;
++    }();
++    return mode;
++}
++
++static void llama_sampler_topset_verify(struct llama_sampler * smpl, const float * logits, int32_t n_vocab, const std::vector<llama_token_data> & top);
++
+ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx) {
+     const llama_token   sampled_token  = llama_get_sampled_token_ith     (ctx, idx);
+     const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
+@@ -939,8 +951,17 @@ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_conte
+         const auto * logits = llama_get_logits_ith(ctx, idx);
+         GGML_ASSERT(logits != nullptr);
+         cur.resize(n_vocab);
+-        for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+-            cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
++
++        const size_t n_top = llama_sampler_topset_mode() > 0 ? llama_sampler_topset(smpl, logits, n_vocab, cur.data()) : 0;
++        if (n_top > 0) {
++            cur.resize(n_top);
++            if (llama_sampler_topset_mode() >= 2) {
++                llama_sampler_topset_verify(smpl, logits, n_vocab, cur);
++            }
++        } else {
++            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
++                cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
++            }
+         }
+     }
+ 
+@@ -4383,3 +4404,187 @@ void llama_perf_sampler_reset(struct llama_sampler * chain) {
+     ctx->t_sample_us = 0;
+     ctx->n_sample    = 0;
+ }
++
++//
++// top set (LLAMA_SAMPLER_TOPSET)
++//
++// A chain that cuts the candidates with top-k (or greedy) reads only the k best logits after the samplers
++// before the cut. Those samplers move a bounded set of tokens by id: the penalties move the tokens of the
++// last-n window, the logit bias moves its tokens. A token outside the m = k + n_moved highest logits is
++// not moved, and at least k tokens that are not moved have a higher logit. Thus the top-k after the cut
++// is a subset of the m highest logits plus the moved tokens, and the samplers after the cut see the same
++// k candidates. The one exception is a tie of the k-th and the (k+1)-th logit: the two partial sorts can
++// then keep a different token.
++//
++
++// The bound m for the chain, and the tokens that the samplers before the cut move. 0 when the chain
++// needs all the logits.
++static int32_t llama_sampler_chain_topset_bound(const llama_sampler_chain * chain, std::vector<llama_token> & moved) {
++    int32_t slack = 0;
++
++    for (const auto & info : chain->samplers) {
++        const llama_sampler * s = info.ptr;
++
++        if (s->iface == &llama_sampler_logit_bias_i) {
++            const auto * ctx = (const llama_sampler_logit_bias *) s->ctx;
++            for (const auto & lb : ctx->logit_bias) {
++                moved.push_back(lb.token);
++            }
++            slack += (int32_t) ctx->logit_bias.size();
++        } else if (s->iface == &llama_sampler_penalties_i) {
++            const auto * ctx = (const llama_sampler_penalties *) s->ctx;
++            if (ctx->is_disabled()) {
++                continue;
++            }
++            for (const auto & kv : ctx->token_count) {
++                moved.push_back(kv.first);
++            }
++            slack += (int32_t) ctx->token_count.size();
++        } else if (s->iface == &llama_sampler_dry_i) {
++            const auto * ctx = (const llama_sampler_dry *) s->ctx;
++            if (ctx->dry_multiplier == 0.0f || ctx->dry_base < 1.0f || ctx->dry_penalty_last_n == 0) {
++                continue;
++            }
++            return 0;
++        } else if (s->iface == &llama_sampler_top_n_sigma_i) {
++            const auto * ctx = (const llama_sampler_top_n_sigma *) s->ctx;
++            if (ctx->n <= 0.0f) {
++                continue;
++            }
++            return 0;
++        } else if (s->iface == &llama_sampler_temp_i) {
++            const auto * ctx = (const llama_sampler_temp *) s->ctx;
++            if (ctx->temp <= 0.0f) {
++                return 0;
++            }
++            continue;  // a uniform scale keeps the order
++        } else if (s->iface == &llama_sampler_temp_ext_i) {
++            const auto * ctx = (const llama_sampler_temp_ext *) s->ctx;
++            if (ctx->delta > 0.0f || ctx->temp <= 0.0f) {
++                return 0;  // the dynamic temperature reads the entropy of all the candidates
++            }
++            continue;
++        } else if (s->iface == &llama_sampler_top_k_i) {
++            const auto * ctx = (const llama_sampler_top_k *) s->ctx;
++            if (ctx->k <= 0) {
++                return 0;
++            }
++            return ctx->k + slack;
++        } else if (s->iface == &llama_sampler_greedy_i) {
++            return 1 + slack;
++        } else {
++            return 0;
++        }
++    }
++
++    return 0;
++}
++
++size_t llama_sampler_topset(struct llama_sampler * smpl, const float * logits, int32_t n_vocab, llama_token_data * dst) {
++    if (!smpl || smpl->iface != &llama_sampler_chain_i || !logits || !dst || n_vocab <= 0) {
++        return 0;
++    }
++
++    const auto * chain = (const llama_sampler_chain *) smpl->ctx;
++
++    std::vector<llama_token> moved;
++    const int32_t m = llama_sampler_chain_topset_bound(chain, moved);
++    if (m <= 0 || m + (int32_t) moved.size() >= n_vocab / 2) {
++        return 0;
++    }
++
++    // a min-heap of the m highest logits
++    static const auto by_logit_desc = [](const llama_token_data & a, const llama_token_data & b) {
++        return a.logit > b.logit;
++    };
++
++    std::vector<llama_token_data> heap;
++    heap.reserve(m);
++
++    llama_token id = 0;
++    for (; id < n_vocab && (int32_t) heap.size() < m; id++) {
++        heap.push_back(llama_token_data{id, logits[id], 0.0f});
++    }
++    std::make_heap(heap.begin(), heap.end(), by_logit_desc);
++
++    float threshold = heap.front().logit;
++    for (; id < n_vocab; id++) {
++        const float l = logits[id];
++        if (l > threshold) {
++            std::pop_heap(heap.begin(), heap.end(), by_logit_desc);
++            heap.back() = llama_token_data{id, l, 0.0f};
++            std::push_heap(heap.begin(), heap.end(), by_logit_desc);
++            threshold = heap.front().logit;
++        }
++    }
++
++    // token order, as in the full array
++    std::sort(heap.begin(), heap.end(), [](const llama_token_data & a, const llama_token_data & b) {
++        return a.id < b.id;
++    });
++
++    std::sort(moved.begin(), moved.end());
++    moved.erase(std::unique(moved.begin(), moved.end()), moved.end());
++
++    // merge the two ordered lists into dst
++    size_t n  = 0;
++    size_t ih = 0;
++    size_t im = 0;
++    while (ih < heap.size() || im < moved.size()) {
++        if (im < moved.size() && (moved[im] < 0 || moved[im] >= n_vocab)) {
++            im++;
++            continue;
++        }
++        if (im >= moved.size() || (ih < heap.size() && heap[ih].id <= moved[im])) {
++            if (im < moved.size() && heap[ih].id == moved[im]) {
++                im++;
++            }
++            dst[n++] = heap[ih++];
++        } else {
++            dst[n++] = llama_token_data{moved[im], logits[moved[im]], 0.0f};
++            im++;
++        }
++    }
++
++    return n;
++}
++
++// Runs a clone of the chain on all the logits and a clone on the top set, and compares the two selected
++// tokens. The clones keep the random state of the chain, thus the chain itself is not changed.
++static void llama_sampler_topset_verify(struct llama_sampler * smpl, const float * logits, int32_t n_vocab, const std::vector<llama_token_data> & top) {
++    static int64_t n_same = 0;
++    static int64_t n_diff = 0;
++
++    struct llama_sampler * chain_full = llama_sampler_clone(smpl);
++    struct llama_sampler * chain_top  = llama_sampler_clone(smpl);
++
++    std::vector<llama_token_data> full(n_vocab);
++    for (llama_token id = 0; id < n_vocab; id++) {
++        full[id] = llama_token_data{id, logits[id], 0.0f};
++    }
++    std::vector<llama_token_data> part = top;
++
++    llama_token_data_array full_p = { full.data(), full.size(), -1, false };
++    llama_token_data_array part_p = { part.data(), part.size(), -1, false };
++
++    llama_sampler_apply(chain_full, &full_p);
++    llama_sampler_apply(chain_top,  &part_p);
++
++    const llama_token id_full = full_p.selected >= 0 ? full_p.data[full_p.selected].id : LLAMA_TOKEN_NULL;
++    const llama_token id_top  = part_p.selected >= 0 ? part_p.data[part_p.selected].id : LLAMA_TOKEN_NULL;
++
++    if (id_full == id_top) {
++        n_same++;
++    } else {
++        n_diff++;
++        LLAMA_LOG_WARN("topset verify: the top set of %zu candidates selects token %d, all the logits select token %d\n",
++                       top.size(), id_top, id_full);
++    }
++
++    if ((n_same + n_diff) % 64 == 0) {
++        LLAMA_LOG_INFO("topset verify: %lld same, %lld different\n", (long long) n_same, (long long) n_diff);
++    }
++
++    llama_sampler_free(chain_full);
++    llama_sampler_free(chain_top);
++}
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 06dea1e..42c91c2 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -153,14 +153,34 @@ struct common_sampler {
+             const auto * logits = llama_get_logits_ith(ctx, idx);
+             GGML_ASSERT(logits != nullptr);
+             cur.resize(n_vocab);
+-            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+-                cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
++
++            // The top set of the chain (LLAMA_SAMPLER_TOPSET). A grammar or a reasoning budget runs
++            // before the chain and reads all the logits.
++            const size_t n_top = (topset_mode() > 0 && !grmr && !rbudget) ? llama_sampler_topset(chain, logits, n_vocab, cur.data()) : 0;
++            if (n_top > 0) {
++                cur.resize(n_top);
++                cur_is_topset = true;
++            } else {
++                for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
++                    cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
++                }
++                cur_is_topset = false;
+             }
+         }
+ 
+         cur_p = { cur.data(), cur.size(), -1, false };
+     }
+ 
++    bool cur_is_topset = false;
++
++    static int topset_mode() {
++        static const int mode = [] {
++            const char * s = getenv("LLAMA_SAMPLER_TOPSET");
++            return s ? atoi(s) : 0;
++        }();
++        return mode;
++    }
++
+     common_time_meas tm() {
+         return common_time_meas(t_total_us, params.no_perf);
+     }
+@@ -635,10 +655,41 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+         llama_sampler_apply(grmr, &cur_p);
+     }
+ 
++    // LLAMA_SAMPLER_TOPSET=2: a clone of the chain runs on all the logits, and the two tokens are compared
++    llama_sampler * chain_verify = (gsmpl->cur_is_topset && common_sampler::topset_mode() >= 2) ? llama_sampler_clone(chain) : nullptr;
++
+     llama_sampler_apply(chain, &cur_p);
+ 
+     id = cur_p.data[cur_p.selected].id;
+ 
++    if (chain_verify) {
++        static int64_t n_same = 0;
++        static int64_t n_diff = 0;
++
++        const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
++        const int n_vocab = llama_vocab_n_tokens(vocab);
++        const auto * logits = llama_get_logits_ith(ctx, idx);
++
++        std::vector<llama_token_data> full(n_vocab);
++        for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
++            full[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
++        }
++        llama_token_data_array full_p = { full.data(), full.size(), -1, false };
++        llama_sampler_apply(chain_verify, &full_p);
++        const llama_token id_full = full_p.data[full_p.selected].id;
++        llama_sampler_free(chain_verify);
++
++        if (id_full == id) {
++            n_same++;
++        } else {
++            n_diff++;
++            LOG_WRN("topset verify: the top set of %zu candidates selects token %d, all the logits select token %d\n", cur_p.size, id, id_full);
++        }
++        if ((n_same + n_diff) % 64 == 0) {
++            LOG_INF("topset verify: %lld same, %lld different\n", (long long) n_same, (long long) n_diff);
++        }
++    }
++
+     if (grammar_first || !grammar_should_apply(gsmpl)) {
+         return id;
+     }
