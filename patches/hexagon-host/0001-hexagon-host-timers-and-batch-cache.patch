@@ -1,0 +1,891 @@
+Hexagon host: the per-token host timers, the graph cache by uid, and the packed batch cache
+
+Base: llama.cpp commit c6824a9, with the patches hexagon-fusion 0001 thru 0004, hexagon-vit 0001
+and llama-tied-head 0001 applied. The hunks of ggml-hexagon.cpp assume that state.
+
+Files:
+    ggml/src/ggml-backend.cpp               the time of the input copies and of the compute call of each split
+    ggml/src/ggml-hexagon/ggml-hexagon.cpp  the host timers of a session, the graph cache by uid, the packed batch cache
+
+How to apply, from the llama.cpp root:
+
+    git apply patches/hexagon-host/0001-hexagon-host-timers-and-batch-cache.patch
+    cmake --build build-snapdragon -j
+
+Only the host libraries change: libggml-base.so and libggml-hexagon.so (build-snapdragon/bin). The DSP
+library stays as it is. The descriptors that the DSP reads do not change.
+
+Switches (environment variables):
+
+    LLAMA_HOSTPROF=1            print one line for each token with the host times of the session
+    GGML_HEXAGON_BATCHCACHE=N   0 = pack the ops of each graph_compute call (the previous behavior),
+                                1 = replay the packed batch of a repeated graph (the preset value),
+                                2 = replay, and compare each replay with a fresh packing
+    GGML_HEXAGON_GRAPHCACHE=N   the number of graphs that a session keeps (the preset value is 8)
+
+The host timers
+
+With LLAMA_HOSTPROF=1 the session prints, at each synchronize call that follows a batch:
+
+    hostprof: HTP0 graphs 1 ops 513 hits 1 replays 1 verified 0 batches 1 | pack 40 submit 210 wait 25100
+              pop 0 get 95 (993280 B) set 12 (20480 B) | turnaround 3900 us
+
+The fields are microseconds: pack is the time in graph_compute (the op packing, or the replay check),
+submit is the time in flush_batch (the copy of the descriptors into the queue block and the queue write),
+wait is the time in dspqueue_read, pop is the time of the profile dump of the responses, get and set are
+the tensor copies, and turnaround is the time from the last response of the previous token to the first
+submit of this token. The scheduler prints one line for each compute call:
+
+    hostprof: sched splits 2 [CPU nodes 1 inputs 0 copy 0 compute 180] [HTP0 nodes 898 inputs 8 copy 35 compute 900] us
+
+The op node cache by uid
+
+The session kept the op nodes of one graph (cached_uid). A draft context and a target context alternate
+two graphs on the same session, thus each call rebuilt the nodes. The session now keeps a map from the
+graph uid to the op nodes and the packed batch, with GGML_HEXAGON_GRAPHCACHE entries. When the map is
+full, the graph that ran the longest time ago goes.
+
+The packed batch cache
+
+The descriptors of a batch (the buffers, the tensors and the ops) depend on four inputs: the graph (its
+uid names the topology, the shapes and the types), the data pointer of each tensor, the op params of each
+node, and the slot index of each fused state op of a gated delta net layer. When a graph_compute call
+packs one graph into one batch, and nothing else is in that batch, the session keeps the descriptors with
+the list of the tensors and the nodes they came from. When the same graph runs again, the session compares
+the data pointer of each referenced tensor and the op params of each node with the kept values, reads the
+slot index of each fused state op again, and loads the kept descriptors into the batch. The flush of the
+batch happens where it happened before (the next synchronize or get-tensor call), thus the batch
+boundaries do not change. The DSP reads the descriptors of each batch from the queue block as before,
+thus it needs no change and no other flush: the DSP cleans its cache at the start and at the end of each
+batch, and the host writes the input tensors before the submit as before.
+
+A replay is not possible, and the session packs the graph again, when: a data pointer or an op param
+differs, a slot index is not a row of the state table (the unfused chain must run), the batch holds ops
+of a different call (a copy between sessions), the graph did not fit in one batch, or an op has a dummy
+node with a per-call value (a fence sequence).
+
+GGML_HEXAGON_BATCHCACHE=2 packs the graph a second time into a separate batch after each replay and
+compares the three descriptor arrays byte for byte. A difference is an error line that names the first
+differing entry, and the fresh packing runs. The count of the confirmed replays is the "verified" field of
+the hostprof line.
+
+The profile dump (GGML_HEXAGON_PROFILE) needs the op nodes of a batch. The queue kept a copy of the whole
+op node array of the batch (1280 nodes) for each push. It now keeps a shared pointer to the nodes of the
+batch, and only when the profile is on.
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 6faa680..4e45113 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1650,11 +1650,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+ 
+     int prev_backend_id = -1;
+ 
++    // LLAMA_HOSTPROF: the time of the input copies and of the compute call of each split
++    static const int hostprof = [] { const char * s = getenv("LLAMA_HOSTPROF"); return s ? atoi(s) : 0; }();
++    char   hp_line[1024];
++    size_t hp_len = 0;
++    hp_line[0] = '\0';
++
+     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+         struct ggml_backend_sched_split * split = &splits[split_id];
+         int split_backend_id = split->backend_id;
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
+ 
++        const int64_t hp_t0 = hostprof ? ggml_time_us() : 0;
++        int64_t       hp_t1 = 0;
++
+         // ensure the previous split's async work has completed before we start
+         // this split, the allocator may have reused buffer regions across splits
+         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+@@ -1792,6 +1801,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
++        hp_t1 = hostprof ? ggml_time_us() : 0;
++
+         if (!sched->callback_eval) {
+             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+             if (ec != GGML_STATUS_SUCCESS) {
+@@ -1836,9 +1847,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+         }
+ 
++        if (hostprof && hp_len < sizeof(hp_line)) {
++            const int64_t hp_t2 = ggml_time_us();
++            const int n = snprintf(hp_line + hp_len, sizeof(hp_line) - hp_len, " [%s nodes %d inputs %d copy %lld compute %lld]",
++                                   ggml_backend_name(split_backend), split->graph.n_nodes, split->n_inputs,
++                                   (long long) (hp_t1 - hp_t0), (long long) (hp_t2 - hp_t1));
++            hp_len = n > 0 ? hp_len + (size_t) n : sizeof(hp_line);
++        }
++
+         prev_backend_id = split_backend_id;
+     }
+ 
++    if (hostprof) {
++        GGML_LOG_INFO("hostprof: sched splits %d%s us\n", sched->n_splits, hp_line);
++    }
++
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 2518efd..9b249de 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -119,6 +119,16 @@ enum ggml_hexagon_fusion_flags {
+ 
+ static int opt_opfusion_state = -1; // GGML_HEXAGON_OPFUSION_STATE: -1 = follow GGML_HEXAGON_OPFUSION, 0 = off, 1 = on
+ 
++// GGML_HEXAGON_BATCHCACHE: 0 = pack the ops of each graph_compute call, 1 = replay the packed batch of a
++// repeated graph when only the input data changed, 2 = replay and compare the replay with a fresh packing
++static int opt_batchcache = 1;
++
++// LLAMA_HOSTPROF: print the host-side times of each token (the same variable as in llama-context.cpp)
++static int opt_hostprof = 0;
++
++// GGML_HEXAGON_GRAPHCACHE: the number of graphs whose op nodes and packed batch a session keeps
++static int opt_graphcache = 8;
++
+ static inline bool ggml_hexagon_is_fusion_enabled(int flag) {
+     if (opt_opfusion <= 0) return false;
+     if (opt_opfusion == 1) return true; // 1 enables all
+@@ -486,6 +496,81 @@ struct ggml_hexagon_event {
+     uint32_t               seq          = 0;
+ };
+ 
++// The host-side times of one token, in microseconds (LLAMA_HOSTPROF)
++struct ggml_hexagon_hostprof {
++    int64_t  pack_us       = 0;  // graph_compute: the op packing, or the replay check of the cached batch
++    int64_t  submit_us     = 0;  // flush_batch: the copy of the descriptors into the queue block and the queue write
++    int64_t  wait_us       = 0;  // flush_pending: the wait for the responses of the DSP
++    int64_t  pop_us        = 0;  // flush_pending: the profile dump of the responses
++    int64_t  get_us        = 0;  // get-tensor: the copy of the outputs after the wait
++    int64_t  set_us        = 0;  // set-tensor: the copy of the inputs
++    int64_t  turnaround_us = 0;  // the time from the last response of the previous token to the first submit
++    uint64_t get_bytes     = 0;
++    uint64_t set_bytes     = 0;
++    uint32_t n_graphs      = 0;
++    uint32_t n_ops         = 0;
++    uint32_t n_hits        = 0;  // graph_compute calls that found the op nodes of the graph in the cache
++    uint32_t n_replays     = 0;  // graph_compute calls that replayed the packed batch
++    uint32_t n_verified    = 0;  // replays that a fresh packing confirmed
++    uint32_t n_batches     = 0;
++    int64_t  t_rsp         = 0;  // the time of the last response
++
++    void reset() {
++        const int64_t keep = t_rsp;
++        *this = ggml_hexagon_hostprof();
++        t_rsp = keep;
++    }
++};
++
++// The packed batch of one graph_compute call, kept for a replay when the same graph runs again
++// (GGML_HEXAGON_BATCHCACHE). The descriptors depend on the graph (its uid), on the data pointers
++// of the tensors, on the op params, and on the slot index of the fused state ops. The replay checks
++// the last three and reads the slot index again.
++struct ggml_hexagon_batch_snapshot {
++    uint64_t uid = 0;
++
++    std::vector<htp_buf_desc> bufs;
++    std::vector<htp_tensor>   tens;
++    std::vector<htp_op_desc>  ops;
++    size_t                    b_vmem = 0;
++
++    std::shared_ptr<const std::vector<htp_opnode>> nodes;  // the op nodes for the profile dump, null without profiling
++
++    std::vector<std::pair<const ggml_tensor *, uint16_t>> t_refs;   // each add_tensor call: the tensor and its index
++    std::vector<const ggml_tensor *>                      o_nodes;  // each op: the ggml node whose op params it copied
++
++    struct gdn_ref {
++        uint32_t            oi;      // the op index
++        const ggml_tensor * states;  // the state table
++        const ggml_tensor * idx;     // the s_copy input with the slot index
++    };
++    std::vector<gdn_ref> gdn;        // the fused state ops of the gated delta net layers
++
++    bool valid = false;
++};
++
++// The op nodes and the packed batch of one graph, keyed by the graph uid. A session keeps the last
++// GGML_HEXAGON_GRAPHCACHE graphs, thus the graphs of two contexts (a draft and a target) alternate
++// without a rebuild.
++struct ggml_hexagon_graph_cache_entry {
++    std::vector<htp_opnode>     nodes;
++    ggml_hexagon_batch_snapshot snap;
++    uint64_t                    last_use = 0;
++};
++
++// The descriptors of one batch, as the queue sends them
++struct ggml_hexagon_batch_view {
++    const htp_buf_desc * bufs   = nullptr;
++    const htp_tensor *   tens   = nullptr;
++    const htp_op_desc *  ops    = nullptr;
++    uint32_t             n_bufs = 0;
++    uint32_t             n_tens = 0;
++    uint32_t             n_ops  = 0;
++    size_t               b_vmem = 0;
++
++    std::shared_ptr<const std::vector<htp_opnode>> nodes;  // for the profile dump, null without profiling
++};
++
+ struct ggml_hexagon_session {
+     std::string      name;
+     remote_handle64  handle;
+@@ -519,8 +604,14 @@ struct ggml_hexagon_session {
+     std::atomic<uint64_t> batch_rsp_seq{0};
+     std::atomic<uint32_t> last_error{HTP_STATUS_OK};
+ 
+-    uint64_t                cached_uid = 0;
+-    std::vector<htp_opnode> cached_nodes;
++    std::unordered_map<uint64_t, ggml_hexagon_graph_cache_entry> graph_cache;        // by graph uid
++    uint64_t                                                     graph_cache_clock = 0;
++
++    ggml_hexagon_opbatch * verify_batch = nullptr;  // a fresh packing to compare with a replay (GGML_HEXAGON_BATCHCACHE=2)
++    ggml_hexagon_hostprof  hp;                      // the host-side times of the current token (LLAMA_HOSTPROF)
++
++    ggml_hexagon_graph_cache_entry * graph_cache_find(uint64_t uid);
++    ggml_hexagon_graph_cache_entry & graph_cache_insert(uint64_t uid, std::vector<htp_opnode> && nodes);
+ 
+     mutable std::unordered_set<const ggml_tensor *> needs_repack;
+ 
+@@ -557,6 +648,11 @@ struct ggml_hexagon_session {
+     void flush_peers();
+     void flush_pending(bool all = true);
+ 
++    void batch_snapshot(ggml_hexagon_graph_cache_entry & entry, uint64_t uid);
++    bool batch_replay(ggml_hexagon_graph_cache_entry & entry, uint64_t uid);
++    void batch_verify(ggml_hexagon_graph_cache_entry & entry, uint64_t uid);
++    void hostprof_print();
++
+     bool clone_buffer(const ggml_hexagon_shared_buffer*);
+     void release_buffer(const ggml_hexagon_shared_buffer*);
+     void unclone_buffer(const ggml_hexagon_shared_buffer*);
+@@ -1819,7 +1915,12 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
+         sess->c_name(), tensor->name, data, offset, size, (int) buffer->usage, extra->flags);
+ 
+     if ((extra->flags & GGML_HEXAGON_TENSOR_REPACK) == 0) {
++        const int64_t t_set0 = opt_hostprof ? ggml_time_us() : 0;
+         memcpy((char *) tensor->data + offset, data, size);
++        if (opt_hostprof) {
++            sess->hp.set_us    += ggml_time_us() - t_set0;
++            sess->hp.set_bytes += size;
++        }
+         return;
+     }
+ 
+@@ -2223,6 +2324,13 @@ struct ggml_hexagon_opbatch {
+     unsigned int n_ops_max;
+     size_t       b_vmem_max;
+ 
++    // The inputs of the batch snapshot (GGML_HEXAGON_BATCHCACHE)
++    std::vector<std::pair<const ggml_tensor *, uint16_t>> t_refs;   // each add_tensor call: the tensor and its index
++    std::vector<const ggml_tensor *>                      o_nodes;  // each op: the ggml node whose op params it copied
++    std::vector<ggml_hexagon_batch_snapshot::gdn_ref>     gdn_refs; // the fused state ops in this batch
++    bool     has_alt    = false;  // the batch holds the unfused ops of a state chain (no snapshot of it)
++    uint64_t arrays_uid = 0;      // the graph uid whose descriptors the h_* arrays hold, 0 after a packing
++
+     void reset() {
+         n_bufs = 0;
+         n_tens = 0;
+@@ -2233,6 +2341,25 @@ struct ggml_hexagon_opbatch {
+         t_map.clear();
+         d_map.clear();
+         ops.resize(n_ops_max);
++
++        t_refs.clear();
++        o_nodes.clear();
++        gdn_refs.clear();
++        has_alt = false;
++    }
++
++    // The descriptors that the queue sends. The op nodes go with them only for the profile dump.
++    ggml_hexagon_batch_view view(std::shared_ptr<const std::vector<htp_opnode>> nodes) const {
++        ggml_hexagon_batch_view v;
++        v.bufs   = h_bufs.data();
++        v.tens   = h_tens.data();
++        v.ops    = h_ops.data();
++        v.n_bufs = n_bufs;
++        v.n_tens = n_tens;
++        v.n_ops  = n_ops;
++        v.b_vmem = b_vmem;
++        v.nodes  = std::move(nodes);
++        return v;
+     }
+ 
+     ggml_hexagon_opbatch(ggml_hexagon_session *sess, size_t batch_size, size_t max_vmem) {
+@@ -2272,6 +2399,7 @@ struct ggml_hexagon_opbatch {
+         GGML_ASSERT(n_bufs < HTP_OP_MAX_BUFS);
+         int bi = n_bufs++;
+ 
++        arrays_uid = 0;
+         b_map.insert({sbuf->fd(), bi});
+ 
+         htp_buf_desc &b = h_bufs[bi];
+@@ -2314,19 +2442,27 @@ struct ggml_hexagon_opbatch {
+         auto range = d_map.equal_range(t->data);
+         for (auto it = range.first; it != range.second; ++it) {
+             htp_tensor * h = &h_tens[it->second];
+-            if (same_shape(h, t)) { return it->second; }
++            if (same_shape(h, t)) {
++                t_refs.emplace_back(t, (uint16_t) it->second);
++                return it->second;
++            }
+         }
+ 
+         // Lookup by tensor ptr
+         auto it = t_map.find(t);
+-        if (it != t_map.end()) { return it->second; }
++        if (it != t_map.end()) {
++            t_refs.emplace_back(t, (uint16_t) it->second);
++            return it->second;
++        }
+ 
+         // Add new tensor to the batch
+         int ti = n_tens++;
+         GGML_ASSERT(n_tens <= n_tens_max);
+ 
++        arrays_uid = 0;
+         t_map.insert({t,       ti});
+         d_map.insert({t->data, ti});
++        t_refs.emplace_back(t, (uint16_t) ti);
+ 
+         uint64_t t_offset = (uint8_t *) t->data - sbuf->base();
+         size_t   t_size   = ggml_nbytes(t);
+@@ -2416,7 +2552,9 @@ struct ggml_hexagon_opbatch {
+         unsigned int n = n_ops++;
+         GGML_ASSERT(n_ops <= n_ops_max);
+ 
++        arrays_uid = 0;
+         ops[n] = node;
++        o_nodes.push_back(node.node);
+ 
+         htp_op_desc &o = h_ops[n];
+         memcpy(o.params,        node.node->op_params, sizeof(node.node->op_params));
+@@ -3106,9 +3244,9 @@ struct ggml_hexagon_opqueue {
+     size_t                      shm_blk_size;
+     size_t                      depth;
+ 
+-    using opvec = std::vector<htp_opnode>;
++    using opvec = std::shared_ptr<const std::vector<htp_opnode>>;
+ 
+-    std::vector<opvec>          op_cache;       // per batch op cache
++    std::vector<opvec>          op_cache;       // per batch op nodes, for the profile dump (null without profiling)
+     std::vector<uint64_t>       start_usec;     // per batch start time
+ 
+     ggml_hexagon_opqueue(ggml_hexagon_session *sess, size_t batch_size, size_t depth) : depth(depth) {
+@@ -3145,7 +3283,7 @@ struct ggml_hexagon_opqueue {
+     size_t shm_size() const { return shm_buf ? shm_buf->size() : 0; }
+ 
+     // push new batch
+-    bool push(htp_opbatch_req& req, dspqueue_buffer& dbuf, const ggml_hexagon_opbatch* op_batch, uint64_t seq) {
++    bool push(htp_opbatch_req& req, dspqueue_buffer& dbuf, const ggml_hexagon_batch_view & op_batch, uint64_t seq) {
+         static_assert(sizeof(htp_opbatch_req) % 8 == 0, "sizeof(htp_opbatch_req) must be multiple of 8");
+         static_assert(sizeof(htp_opbatch_rsp) % 8 == 0, "sizeof(htp_opbatch_rsp) must be multiple of 8");
+         static_assert(sizeof(htp_buf_desc)    % 8 == 0, "sizeof(htp_buf_desc) must be multiple of 8");
+@@ -3158,11 +3296,11 @@ struct ggml_hexagon_opqueue {
+         const uint32_t slot = (uint32_t) ((seq - 1) % depth);
+ 
+         req.seq       = seq;
+-        req.n_bufs    = op_batch->n_bufs;
+-        req.n_tensors = op_batch->n_tens;
+-        req.n_ops     = op_batch->n_ops;
++        req.n_bufs    = op_batch.n_bufs;
++        req.n_tensors = op_batch.n_tens;
++        req.n_ops     = op_batch.n_ops;
+ 
+-        op_cache[slot]   = op_batch->ops;
++        op_cache[slot]   = op_batch.nodes;
+         start_usec[slot] = ggml_time_us();
+ 
+         const size_t b_size = sizeof(htp_buf_desc)  * req.n_bufs;
+@@ -3191,12 +3329,12 @@ struct ggml_hexagon_opqueue {
+         uint8_t * t_ptr = m_ptr; m_ptr += t_size;
+         uint8_t * o_ptr = m_ptr;
+ 
+-        memcpy(b_ptr, (void *) op_batch->h_bufs.data(), b_size);
+-        memcpy(t_ptr, (void *) op_batch->h_tens.data(), t_size);
+-        memcpy(o_ptr, (void *) op_batch->h_ops.data(),  o_size);
++        memcpy(b_ptr, (const void *) op_batch.bufs, b_size);
++        memcpy(t_ptr, (const void *) op_batch.tens, t_size);
++        memcpy(o_ptr, (const void *) op_batch.ops,  o_size);
+ 
+         HEX_VERBOSE("ggml-hex: %s opqueue-push batch #%llu : n-bufs %u n-tensors %u n-ops %u vmem %zu : b-size %zu t-size %zu o-size %zu m-size %zu\n",
+-                shm_buf->sess->c_name(), (unsigned long long) req.seq, req.n_bufs, req.n_tensors, req.n_ops, op_batch->b_vmem,
++                shm_buf->sess->c_name(), (unsigned long long) req.seq, req.n_bufs, req.n_tensors, req.n_ops, op_batch.b_vmem,
+                 b_size, t_size, o_size, (size_t) dbuf.size);
+ 
+         if (opt_verbose > 1) {
+@@ -3241,8 +3379,8 @@ struct ggml_hexagon_opqueue {
+         uint8_t * m_ptr = (uint8_t*) dbuf.ptr;
+         uint8_t * p_ptr = m_ptr + (b_size + t_size + o_size);
+ 
+-        if (rsp.n_ops > 0) {
+-            auto & ops = op_cache[slot];
++        if (rsp.n_ops > 0 && opt_profile && op_cache[slot]) {
++            const auto & ops = *op_cache[slot];
+             GGML_ASSERT(rsp.n_ops <= ops.size());
+ 
+             const htp_prof_desc * pd = (const htp_prof_desc *) p_ptr;
+@@ -3299,6 +3437,9 @@ void ggml_hexagon_session::flush_pending(bool all) {
+         }
+     }
+ 
++    const int64_t t_wait0 = opt_hostprof ? ggml_time_us() : 0;
++    int64_t       t_pop   = 0;
++
+     while (this->batch_rsp_seq < this->batch_req_seq) {
+         struct htp_opbatch_rsp rsp;
+         uint32_t               rsp_size;
+@@ -3315,6 +3456,8 @@ void ggml_hexagon_session::flush_pending(bool all) {
+             continue;
+         }
+ 
++        const int64_t t_rsp = opt_hostprof ? ggml_time_us() : 0;
++
+         if (err != 0) {
+             GGML_ABORT("ggml-hex: dspqueue_read failed: 0x%08x\n", (unsigned) err);
+         }
+@@ -3340,11 +3483,21 @@ void ggml_hexagon_session::flush_pending(bool all) {
+ 
+         op_queue->pop(rsp, dbuf);
+ 
++        if (opt_hostprof) {
++            this->hp.t_rsp = t_rsp;
++            t_pop += ggml_time_us() - t_rsp;
++        }
++
+         GGML_ASSERT(rsp.seq == this->batch_rsp_seq + 1);
+         this->batch_rsp_seq = rsp.seq;
+ 
+         if (!all) break;
+     }
++
++    if (opt_hostprof) {
++        this->hp.wait_us += (ggml_time_us() - t_wait0) - t_pop;
++        this->hp.pop_us  += t_pop;
++    }
+ }
+ 
+ void ggml_hexagon_session::flush_sync(bool all) {
+@@ -3355,6 +3508,8 @@ void ggml_hexagon_session::flush_sync(bool all) {
+ void ggml_hexagon_session::flush_batch(size_t min_ops) {
+     if (op_batch->n_ops < min_ops) { return; }
+ 
++    const int64_t t_submit0 = opt_hostprof ? ggml_time_us() : 0;
++
+     op_batch->sort_buffers();
+ 
+     htp_opbatch_req req {};
+@@ -3364,9 +3519,22 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
+ 
+     op_batch->update_mdev_group(this->mdev.idx);
+ 
+-    if (!op_queue->push(req, dbuf, op_batch, seq)) {
++    // The op nodes travel with the batch only for the profile dump. A replayed batch shares the
++    // nodes of its snapshot.
++    std::shared_ptr<const std::vector<htp_opnode>> nodes;
++    if (opt_profile) {
++        const auto * entry = op_batch->arrays_uid ? graph_cache_find(op_batch->arrays_uid) : nullptr;
++        if (entry && entry->snap.valid && entry->snap.nodes) {
++            nodes = entry->snap.nodes;
++        } else {
++            nodes = std::make_shared<const std::vector<htp_opnode>>(op_batch->ops.begin(), op_batch->ops.begin() + op_batch->n_ops);
++        }
++    }
++    const ggml_hexagon_batch_view view = op_batch->view(std::move(nodes));
++
++    if (!op_queue->push(req, dbuf, view, seq)) {
+         flush_pending(false);
+-        op_queue->push(req, dbuf, op_batch, seq);
++        op_queue->push(req, dbuf, view, seq);
+     }
+ 
+     for (auto & sub : this->mdev.sessions) {
+@@ -3376,9 +3544,9 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
+         sub->batch_req_seq = seq;
+         op_batch->update_mdev_group(sub->mdev.idx);
+ 
+-        if (!sub->op_queue->push(sub_req, sub_dbuf, op_batch, seq)) {
++        if (!sub->op_queue->push(sub_req, sub_dbuf, view, seq)) {
+             sub->flush_pending(false);
+-            sub->op_queue->push(sub_req, sub_dbuf, op_batch, seq);
++            sub->op_queue->push(sub_req, sub_dbuf, view, seq);
+         }
+ 
+         HEX_VERBOSE("ggml-hex: %s queue-opbatch: %p size %u\n", sub->c_name(), sub_dbuf.ptr, sub_dbuf.size);
+@@ -3396,9 +3564,214 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
+         GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x\n", this->c_name(), (unsigned) err);
+     }
+ 
++    if (opt_hostprof) {
++        if (this->hp.n_batches == 0) {
++            this->hp.turnaround_us = this->hp.t_rsp ? t_submit0 - this->hp.t_rsp : 0;
++        }
++        this->hp.n_batches++;
++        this->hp.submit_us += ggml_time_us() - t_submit0;
++    }
++
+     op_batch->reset();
+ }
+ 
++ggml_hexagon_graph_cache_entry * ggml_hexagon_session::graph_cache_find(uint64_t uid) {
++    auto it = graph_cache.find(uid);
++    if (it == graph_cache.end()) {
++        return nullptr;
++    }
++    it->second.last_use = ++graph_cache_clock;
++    return &it->second;
++}
++
++// Adds the op nodes of a graph. When the cache is full, the graph that ran the longest time ago goes.
++ggml_hexagon_graph_cache_entry & ggml_hexagon_session::graph_cache_insert(uint64_t uid, std::vector<htp_opnode> && nodes) {
++    const size_t cap = opt_graphcache > 0 ? (size_t) opt_graphcache : 1;
++    while (graph_cache.size() >= cap) {
++        auto oldest = graph_cache.begin();
++        for (auto it = graph_cache.begin(); it != graph_cache.end(); ++it) {
++            if (it->second.last_use < oldest->second.last_use) {
++                oldest = it;
++            }
++        }
++        if (op_batch->arrays_uid == oldest->first) {
++            op_batch->arrays_uid = 0;
++        }
++        graph_cache.erase(oldest);
++    }
++
++    auto & entry    = graph_cache[uid];
++    entry.nodes     = std::move(nodes);
++    entry.snap      = ggml_hexagon_batch_snapshot();
++    entry.last_use  = ++graph_cache_clock;
++    return entry;
++}
++
++// Keeps the packed batch of one graph for a replay. The caller made sure that the batch holds this
++// graph and nothing else, and that no flush happened while the graph was packed.
++void ggml_hexagon_session::batch_snapshot(ggml_hexagon_graph_cache_entry & entry, uint64_t uid) {
++    auto &       s = entry.snap;
++    const auto & b = *op_batch;
++
++    s.uid    = uid;
++    s.bufs.assign(b.h_bufs.begin(), b.h_bufs.begin() + b.n_bufs);
++    s.tens.assign(b.h_tens.begin(), b.h_tens.begin() + b.n_tens);
++    s.ops.assign(b.h_ops.begin(),   b.h_ops.begin()  + b.n_ops);
++    s.b_vmem = b.b_vmem;
++    s.nodes  = opt_profile ? std::make_shared<const std::vector<htp_opnode>>(b.ops.begin(), b.ops.begin() + b.n_ops) : nullptr;
++    s.t_refs  = b.t_refs;
++    s.o_nodes = b.o_nodes;
++    s.gdn     = b.gdn_refs;
++    s.valid   = true;
++
++    op_batch->arrays_uid = uid;
++
++    HEX_VERBOSE("ggml-hex: %s batch-cache: kept graph %llu : n-bufs %u n-tensors %u n-ops %u refs %zu gdn %zu\n", c_name(),
++                (unsigned long long) uid, b.n_bufs, b.n_tens, b.n_ops, s.t_refs.size(), s.gdn.size());
++}
++
++// Loads the packed batch of the graph into the empty op batch, when the batch is still correct:
++// the same data pointer for each tensor, the same op params, and a valid slot index for each fused
++// state op. The descriptors then equal a fresh packing byte for byte (GGML_HEXAGON_BATCHCACHE=2 checks).
++bool ggml_hexagon_session::batch_replay(ggml_hexagon_graph_cache_entry & entry, uint64_t uid) {
++    auto & s = entry.snap;
++    if (!s.valid || s.uid != uid) {
++        return false;
++    }
++
++    for (const auto & ref : s.t_refs) {
++        const ggml_tensor * t = ref.first;
++        const htp_tensor &  h = s.tens[ref.second];
++        if (!t->buffer) {
++            return false;
++        }
++        auto sbuf = static_cast<const ggml_hexagon_shared_buffer *>(t->buffer->context);
++        if ((uint64_t) ((const uint8_t *) t->data - sbuf->base()) != h.data) {
++            return false;
++        }
++        if (s.bufs[h.bi].fd != (uint32_t) sbuf->fd()) {
++            return false;
++        }
++    }
++
++    for (size_t i = 0; i < s.o_nodes.size(); i++) {
++        if (s.o_nodes[i] && memcmp(s.o_nodes[i]->op_params, s.ops[i].params, sizeof(s.ops[i].params)) != 0) {
++            return false;
++        }
++    }
++
++    // The slot index of a fused state op is a value of the token. When it is not valid, the unfused
++    // chain must run, thus the graph is packed again.
++    for (const auto & g : s.gdn) {
++        int32_t slot = -1;
++        if (ggml_hexagon_gdn_slot_index_check(g.idx, g.states, &slot)) {
++            return false;
++        }
++        s.ops[g.oi].kernel_params[0] = slot;
++    }
++
++    auto & b = *op_batch;
++    if (b.arrays_uid != uid) {
++        std::copy(s.bufs.begin(), s.bufs.end(), b.h_bufs.begin());
++        std::copy(s.tens.begin(), s.tens.end(), b.h_tens.begin());
++        std::copy(s.ops.begin(),  s.ops.end(),  b.h_ops.begin());
++        if (s.nodes) {
++            std::copy(s.nodes->begin(), s.nodes->end(), b.ops.begin());  // the profile dump of ops added after the replay
++        }
++        b.arrays_uid = uid;
++    } else {
++        // The arrays still hold this batch (sorted by the last flush). Only the slots can differ.
++        for (const auto & g : s.gdn) {
++            b.h_ops[g.oi].kernel_params[0] = s.ops[g.oi].kernel_params[0];
++        }
++    }
++
++    b.n_bufs = (unsigned int) s.bufs.size();
++    b.n_tens = (unsigned int) s.tens.size();
++    b.n_ops  = (unsigned int) s.ops.size();
++    b.b_vmem = s.b_vmem;
++
++    // Later ops in the same batch find the buffers. The tensor maps stay empty: such ops add their
++    // tensors again, which costs descriptor entries only.
++    b.b_map.clear();
++    for (unsigned int bi = 0; bi < b.n_bufs; bi++) {
++        b.b_map.insert({(int) b.h_bufs[bi].fd, (int) bi});
++    }
++
++    return true;
++}
++
++// Packs the graph again into a second batch and compares the result with the replay
++// (GGML_HEXAGON_BATCHCACHE=2). When the two differ, the fresh packing runs.
++void ggml_hexagon_session::batch_verify(ggml_hexagon_graph_cache_entry & entry, uint64_t uid) {
++    if (!verify_batch) {
++        verify_batch = new ggml_hexagon_opbatch(this, opt_opbatch, this->max_vmem);
++    }
++
++    const uint64_t seq_before = batch_req_seq;
++
++    std::swap(op_batch, verify_batch);
++    for (const auto & node : entry.nodes) {
++        enqueue_op(node);
++    }
++    std::swap(op_batch, verify_batch);
++
++    auto & r = *op_batch;      // the replay
++    auto & v = *verify_batch;  // the fresh packing
++
++    const char * diff = nullptr;
++    size_t       at   = 0;
++
++    if (batch_req_seq != seq_before) {
++        diff = "the fresh packing did not fit in one batch";
++    } else if (r.n_bufs != v.n_bufs || r.n_tens != v.n_tens || r.n_ops != v.n_ops) {
++        diff = "the counts";
++    } else {
++        r.sort_buffers();
++        v.sort_buffers();
++        for (unsigned int i = 0; i < r.n_bufs && !diff; i++) {
++            if (memcmp(&r.h_bufs[i], &v.h_bufs[i], sizeof(htp_buf_desc)) != 0) { diff = "buffer"; at = i; }
++        }
++        for (unsigned int i = 0; i < r.n_tens && !diff; i++) {
++            if (memcmp(&r.h_tens[i], &v.h_tens[i], sizeof(htp_tensor)) != 0) { diff = "tensor"; at = i; }
++        }
++        for (unsigned int i = 0; i < r.n_ops && !diff; i++) {
++            if (memcmp(&r.h_ops[i], &v.h_ops[i], sizeof(htp_op_desc)) != 0) { diff = "op"; at = i; }
++        }
++    }
++
++    if (!diff) {
++        hp.n_verified++;
++        HEX_VERBOSE("ggml-hex: %s batch-cache verify: graph %llu : the replay equals the fresh packing (%u ops)\n",
++                    c_name(), (unsigned long long) uid, r.n_ops);
++        v.reset();
++        return;
++    }
++
++    GGML_LOG_ERROR("ggml-hex: %s batch-cache verify: graph %llu : the replay differs from the fresh packing at %s #%zu, the fresh packing runs\n",
++                   c_name(), (unsigned long long) uid, diff, at);
++
++    if (batch_req_seq == seq_before) {
++        std::swap(op_batch, verify_batch);
++    }
++    verify_batch->reset();
++    entry.snap.valid = false;
++}
++
++void ggml_hexagon_session::hostprof_print() {
++    if (!opt_hostprof || hp.n_batches == 0) {
++        return;
++    }
++
++    GGML_LOG_INFO("hostprof: %s graphs %u ops %u hits %u replays %u verified %u batches %u | pack %lld submit %lld wait %lld pop %lld get %lld (%llu B) set %lld (%llu B) | turnaround %lld us\n",
++                  c_name(), hp.n_graphs, hp.n_ops, hp.n_hits, hp.n_replays, hp.n_verified, hp.n_batches,
++                  (long long) hp.pack_us, (long long) hp.submit_us, (long long) hp.wait_us, (long long) hp.pop_us,
++                  (long long) hp.get_us, (unsigned long long) hp.get_bytes, (long long) hp.set_us, (unsigned long long) hp.set_bytes,
++                  (long long) hp.turnaround_us);
++
++    hp.reset();
++}
++
+ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
+     auto clone_tensor_buffer = [this](const ggml_tensor * t) {
+         if (t && t->buffer && ggml_backend_buffer_is_hexagon(t->buffer)) {
+@@ -3432,6 +3805,7 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
+         if (reason) {
+             GGML_LOG_WARN("ggml-hex: %s %s %s: %s (index %d, %d slots), the unfused ops run\n", this->c_name(),
+                           node.name.c_str(), node.dst()->name, reason, (int) slot, (int) states->ne[1]);
++            op_batch->has_alt = true;
+             for (const auto & alt : node.alt) {
+                 enqueue_op(alt);
+             }
+@@ -3449,6 +3823,7 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
+         if (this->mdev.count > 1 && op_batch->n_ops == 0) {
+             enqueue_mdev_group();
+         }
++        op_batch->gdn_refs.push_back({ op_batch->n_ops, states, idx });
+         op_batch->add_op(fused);
+         return;
+     }
+@@ -4022,6 +4397,7 @@ void ggml_hexagon_session::release() noexcept(true) {
+     }
+ 
+     delete this->op_batch;
++    delete this->verify_batch;
+     delete this->op_queue;
+     for (auto & it : this->cpy_fence_slots) {
+         free_fence((void *) it.second, 1);
+@@ -4070,6 +4446,7 @@ ggml_hexagon_session::ggml_hexagon_session(const ggml_hexagon_device_config & co
+     this->mdev.idx   = mdev_idx;
+     this->mdev.count = mdev_count > 0 ? mdev_count : (uint32_t) (1 + config.mdev_group.size());
+     op_batch         = nullptr;
++    verify_batch     = nullptr;
+     op_queue         = nullptr;
+     fence_buf        = nullptr;
+     fence_seq        = ((uintptr_t)this) & 0xFFFF;
+@@ -6050,15 +6427,37 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+         return GGML_STATUS_FAILED;
+     }
+ 
++    const int64_t t_start = opt_hostprof ? ggml_time_us() : 0;
++    if (opt_hostprof) {
++        sess->hostprof_print();  // the times of the previous token, when no synchronize call printed them
++    }
++
+     HEX_VERBOSE("ggml-hex: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
+ 
+     const std::vector<htp_opnode> * nodes_ptr = nullptr;
+     std::vector<htp_opnode> computed_nodes;
+ 
+     // Check for cache hit
+-    bool cache_hit = (graph->uid != 0 && sess->cached_uid == graph->uid);
++    ggml_hexagon_graph_cache_entry * entry = graph->uid != 0 ? sess->graph_cache_find(graph->uid) : nullptr;
++    const bool cache_hit = entry != nullptr;
++
++    // The packed batch of the last run of this graph, when only the input data changed
++    if (cache_hit && opt_batchcache && sess->op_batch->n_ops == 0 && sess->batch_replay(*entry, graph->uid)) {
++        if (opt_batchcache >= 2) {
++            sess->batch_verify(*entry, graph->uid);
++        }
++        if (opt_hostprof) {
++            sess->hp.n_graphs++;
++            sess->hp.n_hits++;
++            sess->hp.n_replays++;
++            sess->hp.n_ops   += sess->op_batch->n_ops;
++            sess->hp.pack_us += ggml_time_us() - t_start;
++        }
++        return sess->last_error > HTP_STATUS_OK ? GGML_STATUS_FAILED : GGML_STATUS_SUCCESS;
++    }
++
+     if (cache_hit) {
+-        nodes_ptr = &sess->cached_nodes;
++        nodes_ptr = &entry->nodes;
+     } else {
+         // Tag fusable tensors in graph
+         for (int i = 0; i < graph->n_nodes; i++) {
+@@ -6154,19 +6553,39 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+         }
+ 
+         if (graph->uid != 0) {
+-            sess->cached_uid   = graph->uid;
+-            sess->cached_nodes = std::move(computed_nodes);
+-            nodes_ptr = &sess->cached_nodes;
++            entry     = &sess->graph_cache_insert(graph->uid, std::move(computed_nodes));
++            nodes_ptr = &entry->nodes;
+         } else {
+             nodes_ptr = &computed_nodes;
+         }
+     }
+ 
+     // Queue and execute
++    const bool     batch_empty = sess->op_batch->n_ops == 0;
++    const uint64_t seq_before  = sess->batch_req_seq;
++
+     for (const auto & node : *nodes_ptr) {
+         sess->enqueue_op(node);
+     }
+ 
++    const bool one_batch = batch_empty && sess->batch_req_seq == seq_before && sess->op_batch->n_ops > 0;
++
++    if (opt_batchcache && entry) {
++        // One batch that holds this graph, and nothing else, can be replayed
++        if (one_batch && !sess->op_batch->has_alt) {
++            sess->batch_snapshot(*entry, graph->uid);
++        } else {
++            entry->snap.valid = false;
++        }
++    }
++
++    if (opt_hostprof) {
++        sess->hp.n_graphs++;
++        sess->hp.n_hits  += cache_hit ? 1 : 0;
++        sess->hp.n_ops   += one_batch ? sess->op_batch->n_ops : (uint32_t) nodes_ptr->size();
++        sess->hp.pack_us += ggml_time_us() - t_start;
++    }
++
+     if (sess->last_error > HTP_STATUS_OK) {
+         return GGML_STATUS_FAILED;
+     }
+@@ -6184,6 +6603,8 @@ static void ggml_backend_hexagon_synchronize(ggml_backend_t backend) {
+     if (sess->last_error > HTP_STATUS_OK) {
+         GGML_ABORT("ggml-hex: %s synchronize failed : dsp-error %s\n", sess->c_name(), status_to_str(sess->last_error));
+     }
++
++    sess->hostprof_print();
+ }
+ 
+ enum ggml_hexagon_mem_range_type {
+@@ -6640,7 +7061,12 @@ static void ggml_backend_hexagon_get_tensor_async(ggml_backend_t backend, const
+     if (sess->last_error > HTP_STATUS_OK) {
+         GGML_ABORT("ggml-hex: %s get-tensor-async failed : dsp-error %s\n", sess->c_name(), status_to_str(sess->last_error));
+     }
++    const int64_t t_get0 = opt_hostprof ? ggml_time_us() : 0;
+     ggml_backend_tensor_get(tensor, data, offset, size);
++    if (opt_hostprof) {
++        sess->hp.get_us    += ggml_time_us() - t_get0;
++        sess->hp.get_bytes += size;
++    }
+ }
+ 
+ static void ggml_backend_hexagon_set_tensor_2d_async(ggml_backend_t backend,
+@@ -7432,6 +7858,9 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     const char * str_mbuf     = getenv("GGML_HEXAGON_MBUF");
+     const char * str_optrace  = getenv("GGML_HEXAGON_OPTRACE");
+     const char * str_hostbuf  = getenv("GGML_HEXAGON_HOSTBUF");
++    const char * str_batchcache = getenv("GGML_HEXAGON_BATCHCACHE");
++    const char * str_graphcache = getenv("GGML_HEXAGON_GRAPHCACHE");
++    const char * str_hostprof   = getenv("LLAMA_HOSTPROF");
+ 
+     // Init Arch first since it affects other defaults
+     if (!str_arch) {
+@@ -7480,6 +7909,13 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     opt_mbuf      = str_mbuf     ? strtoul(str_mbuf, NULL, 0) * MiB       : opt_mbuf;
+     opt_vmem      = str_vmem     ? strtoul(str_vmem, NULL, 0) * MiB       : opt_vmem;
+     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf) != 0                 : opt_hostbuf;
++    opt_batchcache = str_batchcache ? atoi(str_batchcache)                : opt_batchcache;
++    opt_graphcache = str_graphcache ? atoi(str_graphcache)                : opt_graphcache;
++    opt_hostprof   = str_hostprof   ? atoi(str_hostprof)                  : opt_hostprof;
++
++    if (opt_batchcache) {
++        GGML_LOG_INFO("ggml-hex: batch cache %s\n", opt_batchcache >= 2 ? "on, with a verify packing of each replay" : "on");
++    }
+ 
+     // Parse device configuration
+     const char * str_devices  = getenv("GGML_HEXAGON_DEVICES");
