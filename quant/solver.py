@@ -61,10 +61,11 @@ def gptq_q4_0(w: torch.Tensor, hessian: torch.Tensor, damp: float = 0.01, chunk:
             q = torch.clamp(torch.round(wc / d_cur), Q4_MIN, Q4_MAX)
             deq = q * d_cur
             q1[:, i] = q
-            err = (wc - deq) / dd
+            resid = wc - deq
+            total_err += resid.pow(2)
+            err = resid / dd
             w1[:, i:] -= err[:, None] * hinv1[i, i:][None, :]
             err1[:, i] = err
-            total_err += (wc - deq).pow(2)
         q_all[:, i1:i2] = q1.to(torch.int8)
         w[:, i2:] -= err1 @ hinv[i1:i2, i2:]
 
