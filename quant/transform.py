@@ -15,6 +15,12 @@ Three transforms, all offline, all exact up to floating point:
 The rotation is Q = H · D with H a Hadamard matrix (full or block diagonal)
 and D a random sign diagonal. RMSNorm(Qᵀh) = Qᵀ RMSNorm(h) for orthogonal Q,
 thus the network function does not change.
+
+With ``tie_head`` the head stays the embedding E' = E·Q. The final norm
+weight and the rotation go into one dense matrix M = Qᵀ·diag(γ_f)·Q that the
+graph applies after the final norm: logits = E'·M·norm(h'). Because
+E'·M = E·diag(γ_f)·Q, the tied head gives the logits of the untied head, and
+the file holds one tensor for the lookup and the head.
 """
 
 from __future__ import annotations
@@ -24,7 +30,7 @@ from collections import OrderedDict
 
 import torch
 
-from .checkpoint import LM
+from .checkpoint import LM, OUTPUT_ROT
 
 GDN_INPUTS = ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_b", "linear_attn.in_proj_a")
 ATTN_INPUTS = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj")
@@ -78,11 +84,16 @@ def _rotate_output(w: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
 
 def transform(tensors: "OrderedDict[str, torch.Tensor]", n_layers: int, layer_types: list[str],
               rotate: bool, block: int | None, seed: int, permute_mlp: bool,
-              device: torch.device) -> "OrderedDict[str, torch.Tensor]":
+              device: torch.device, tie_head: bool = False) -> "OrderedDict[str, torch.Tensor]":
     """Apply the transforms and return a new dictionary in float32.
 
-    The vision tensors pass through unchanged. Complexity is O(params · d)
-    for the rotation, dominated by the embedding (V × d × d).
+    With ``tie_head`` the output has no ``lm_head.weight`` and holds the
+    dense map ``OUTPUT_ROT`` (float32, d × d) in its place. The vision
+    tensors pass through unchanged. Complexity is O(params · d) for the
+    rotation, dominated by the embedding (V × d × d).
+
+    Raises ValueError when ``tie_head`` is set and the checkpoint has a head
+    that is not its embedding.
     """
     out: "OrderedDict[str, torch.Tensor]" = OrderedDict()
     d = tensors[LM + "embed_tokens.weight"].shape[1]
@@ -98,13 +109,23 @@ def transform(tensors: "OrderedDict[str, torch.Tensor]", n_layers: int, layer_ty
 
     zero = torch.zeros(d, dtype=torch.float32)
 
-    # The embedding and the untied head. logits = H · diag(γ_f) · Q · norm(h'), with H the head of the
-    # checkpoint, or the embedding when the checkpoint ties them.
+    # The embedding and the head. logits = H · diag(γ_f) · Q · norm(h'), with H the head of the
+    # checkpoint, or the embedding when the checkpoint ties them. The untied output folds
+    # diag(γ_f) · Q into the head. The tied output keeps the head as the embedding and puts
+    # M = Qᵀ · diag(γ_f) · Q after the final norm: E · Q · M = E · diag(γ_f) · Q.
     emb = get(LM + "embed_tokens.weight").to(torch.float64)
-    head = get("lm_head.weight").to(torch.float64) if "lm_head.weight" in tensors else emb
     gamma_f = gamma(LM + "norm.weight")
     out[LM + "embed_tokens.weight"] = (emb @ q).to(torch.float32).cpu()
-    out["lm_head.weight"] = ((head * gamma_f[None, :]) @ q).to(torch.float32).cpu()
+    skip: set[str] = set()
+    if tie_head:
+        own_head = "lm_head.weight" in tensors and not torch.equal(tensors["lm_head.weight"], tensors[LM + "embed_tokens.weight"])
+        if own_head:
+            raise ValueError("tie_head needs a checkpoint whose head is its embedding, this one has its own lm_head.weight")
+        out[OUTPUT_ROT] = (q.T @ (gamma_f[:, None] * q)).to(torch.float32).cpu()
+        skip.add("lm_head.weight")
+    else:
+        head = get("lm_head.weight").to(torch.float64) if "lm_head.weight" in tensors else emb
+        out["lm_head.weight"] = ((head * gamma_f[None, :]) @ q).to(torch.float32).cpu()
     out[LM + "norm.weight"] = zero.clone()
 
     # The vision merger writes image features into the residual stream.
@@ -143,7 +164,7 @@ def transform(tensors: "OrderedDict[str, torch.Tensor]", n_layers: int, layer_ty
     # final-norm weight into the head changes that vector. llama.cpp loads the
     # MTP block only for the draft-mtp speculative mode.
     for name, tensor in tensors.items():
-        if name not in out:
+        if name not in out and name not in skip:
             out[name] = tensor.to(torch.float32) if not name.startswith("model.visual") else tensor
     # The vision tower keeps its dtype, the rotated merger tensors included.
     for suffix in ("weight", "bias"):

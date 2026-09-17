@@ -35,10 +35,11 @@ _LAYER_SUFFIX_TO_GGUF = {
 _TOP_TO_GGUF = {
     "embed_tokens.weight": "token_embd.weight",
     "norm.weight": "output_norm.weight",
+    "output_rot.weight": "output_rot.weight",
 }
 
 _LAYER_RE = re.compile(r"^(?:model\.language_model\.|model\.)layers\.(\d+)\.(.+)$")
-_TOP_RE = re.compile(r"^(?:model\.language_model\.|model\.)(embed_tokens\.weight|norm\.weight)$")
+_TOP_RE = re.compile(r"^(?:model\.language_model\.|model\.)(embed_tokens\.weight|norm\.weight|output_rot\.weight)$")
 
 
 def to_gguf(name: str) -> str | None:

@@ -8,7 +8,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from quant.checkpoint import LM
+from quant.checkpoint import LM, OUTPUT_ROT
 from quant.transform import _rotate_output, hadamard, rotation_matrix, transform
 
 EPS = 1e-6
@@ -85,8 +85,12 @@ def toy_forward(t: dict[str, torch.Tensor], layer_types: list[str], ids: torch.T
         n2 = rmsnorm(h, f[p + "post_attention_layernorm.weight"])
         mlp = F.silu(n2 @ f[p + "mlp.gate_proj.weight"].T) * (n2 @ f[p + "mlp.up_proj.weight"].T)
         h = h + mlp @ f[p + "mlp.down_proj.weight"].T
+    # The graph of the tied head: the final norm, then the dense map M, then the embedding as the head.
+    n = rmsnorm(h, f[LM + "norm.weight"])
+    if OUTPUT_ROT in f:
+        n = n @ f[OUTPUT_ROT].T
     head = f["lm_head.weight"] if "lm_head.weight" in f else f[LM + "embed_tokens.weight"]
-    return rmsnorm(h, f[LM + "norm.weight"]) @ head.T
+    return n @ head.T
 
 
 @pytest.mark.parametrize("n", [1, 2, 32, 40, 2560])
@@ -131,6 +135,42 @@ def test_transform_keeps_the_function(d: int, block: int | None, permute: bool, 
     torch.testing.assert_close(out[LM + "embed_tokens.weight"], (emb @ q).to(torch.float32))
     if untied:
         assert not torch.allclose(out["lm_head.weight"], out[LM + "embed_tokens.weight"]), "the untied head stays its own"
+
+
+@pytest.mark.parametrize("d,block", [(32, None), (40, 8)])
+def test_tied_transform_keeps_the_function(d: int, block: int | None) -> None:
+    """With tie_head the head stays the embedding, and the dense map after the final norm gives the same logits."""
+    gen = torch.Generator().manual_seed(d)
+    layer_types = ["linear_attention", "full_attention"]
+    tensors = toy_tensors(d, vocab=50, layer_types=layer_types, untied=False, merger=False, gen=gen)
+    ids = torch.randint(0, 50, (9,), generator=gen)
+    before = toy_forward(tensors, layer_types, ids, None)
+    kw = dict(rotate=True, block=block, seed=1, permute_mlp=True, device=torch.device("cpu"))
+    tied = transform(tensors, 2, layer_types, tie_head=True, **kw)
+    untied = transform(tensors, 2, layer_types, tie_head=False, **kw)
+    assert "lm_head.weight" not in tied and OUTPUT_ROT not in untied
+    m = tied[OUTPUT_ROT]
+    assert m.shape == (d, d) and m.dtype == torch.float32
+    torch.testing.assert_close(m, m.T, atol=0, rtol=0)
+    after = toy_forward(tied, layer_types, ids, None)
+    torch.testing.assert_close(after, before, atol=2e-4 * before.abs().max().item(), rtol=0)
+    assert torch.equal(tied[LM + "norm.weight"], torch.zeros(d))
+    assert torch.equal(tied[LM + "embed_tokens.weight"], untied[LM + "embed_tokens.weight"])
+    # E' · M is the untied head: the two variants differ only in where diag(γ_f) · Q sits.
+    e_m = tied[LM + "embed_tokens.weight"].to(torch.float64) @ m.to(torch.float64)
+    torch.testing.assert_close(e_m, untied["lm_head.weight"].to(torch.float64), atol=1e-5, rtol=1e-4)
+
+
+def test_tie_head_refuses_a_checkpoint_with_its_own_head() -> None:
+    gen = torch.Generator().manual_seed(2)
+    tensors = toy_tensors(32, vocab=20, layer_types=["full_attention"], untied=True, merger=False, gen=gen)
+    with pytest.raises(ValueError):
+        transform(tensors, 1, ["full_attention"], rotate=True, block=None, seed=0, permute_mlp=False,
+                  device=torch.device("cpu"), tie_head=True)
+    tensors["lm_head.weight"] = tensors[LM + "embed_tokens.weight"].clone()
+    out = transform(tensors, 1, ["full_attention"], rotate=True, block=None, seed=0, permute_mlp=False,
+                    device=torch.device("cpu"), tie_head=True)
+    assert "lm_head.weight" not in out, "a head equal to the embedding is a tied head"
 
 
 def test_vision_tensors_keep_their_dtype() -> None:

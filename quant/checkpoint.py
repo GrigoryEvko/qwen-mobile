@@ -17,6 +17,8 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 LM = "model.language_model."
+# The dense map of a tied head, M = Qᵀ·diag(γ_f)·Q. The graph applies it after the final norm.
+OUTPUT_ROT = LM + "output_rot.weight"
 
 
 def load_checkpoint(directory: Path) -> "OrderedDict[str, torch.Tensor]":
@@ -27,6 +29,15 @@ def load_checkpoint(directory: Path) -> "OrderedDict[str, torch.Tensor]":
             for name in f.keys():
                 tensors[name] = f.get_tensor(name)
     return tensors
+
+
+def load_tensor(directory: Path, name: str) -> torch.Tensor | None:
+    """One tensor of the checkpoint, or None when no shard holds it. Reads only that tensor."""
+    for path in sorted(directory.glob("*.safetensors")):
+        with safe_open(path, "pt") as f:
+            if name in f.keys():
+                return f.get_tensor(name)
+    return None
 
 
 def save_checkpoint(tensors: "OrderedDict[str, torch.Tensor]", src: Path, dst: Path,
