@@ -301,3 +301,51 @@ thus the 4B tail comes from the model and not from the packer. The commands, fro
     .venv/bin/python -m quant.run export --model Qwen3.5-4B --device cpu \
         --f16 weights/gguf/Qwen3.5-4B-F16.gguf --packs quant-out/empty --bulk Q8_0 --gdn-gate Q8_0 \
         --only 'ssm_out\.weight' --invert --tag Q8_0-f16-ssmout
+
+## The 3-bit question (2026-09-18)
+
+The verdict is no. No 3-bit type of ggml runs on the Hexagon backend or on the Adreno OpenCL
+backend of llama.cpp c6824a9. A 3-bit file of this pipeline would run on the phone CPU only. Thus
+the pipeline stays at 4 bits, and this section records the survey and the cost.
+
+| Type | Block | Bytes | Bits per weight | Hexagon | Adreno OpenCL |
+|---|---|---|---|---|---|
+| Q8_0 | 32 | 34 | 8.500 | yes | yes |
+| Q6_K | 256 | 210 | 6.562 | yes | yes |
+| Q4_0 | 32 | 18 | 4.500 | yes | yes |
+| IQ4_NL | 32 | 18 | 4.500 | yes | yes |
+| Q4_K | 256 | 144 | 4.500 | yes | yes |
+| MXFP4 | 32 | 17 | 4.250 | yes | yes |
+| Q3_K | 256 | 110 | 3.438 | no | no |
+| IQ3_S | 256 | 110 | 3.438 | no | no |
+| IQ3_XXS | 256 | 98 | 3.062 | no | no |
+| Q2_K | 256 | 84 | 2.625 | no | no |
+
+The Hexagon backend has no reference to `Q3_K`, `IQ3_S` or `IQ3_XXS` in `ggml/src/ggml-hexagon/`.
+Its matmul takes the types of `ggml_hexagon_is_repack_type`: Q4_0, Q4_1, Q8_0, IQ4_NL, MXFP4, Q4_K
+and Q6_K. The OpenCL backend names no 3-bit type in `ggml_backend_opencl_supports_op` for
+`GGML_OP_MUL_MAT`, thus the scheduler puts such a matmul on the CPU. Its one code path that names
+`Q3_K` selects the Q4_K kernel and then stops at `GGML_ASSERT(false && "not implemented")`.
+
+A Q3 block grid in `quant/grids.py` is cheap, and it is not the blocker. The `Grid` class takes any
+number of levels, and the solver and the block optimization read `grid.levels` only. Two places
+assume sixteen levels: `pack_nibbles` (the 4-bit byte layout of ggml) and `fit_codebook`. Thus a
+grid of eight levels with its packer is approximately 40 lines, and it needs less than two hours.
+
+The blocker is the file format and the two kernels. ggml has no 3-bit type with a block of 32 and
+one F16 scale, which is the contract of `Grid`. Its 3-bit types are superblocks of 256 with a
+second scale level: `Q3_K` holds a 6-bit scale for each 16 weights, an F16 super-scale and a mask
+of the high bit, and `IQ3_S` and `IQ3_XXS` add codebook tables. Thus a 3-bit file needs one of two
+paths, and neither is two hours:
+
+- A new ggml type: the enum value, the traits, the CPU kernels, the gguf-py support, an HVX kernel
+  for the Hexagon backend and an OpenCL kernel. An upstream build then does not load the file.
+- The Q3_K layout: a second quantizer in the pipeline for its two scale levels, plus the same two
+  kernels. This is the shorter path of the two, because the two backends hold Q4_K and Q6_K
+  superblock kernels that a Q3_K kernel can follow.
+
+MXFP4 is the one step below Q4_0 that the two backends run today: 4.25 bits per weight, 5.6 % less
+than Q4_0. But its block scale is a power of two (E8M0, one byte) and its levels are the fixed FP4
+table. The gain of this pipeline comes from the fitted F16 scale of each block, from the rotation
+and from the folded column scales. Thus MXFP4 gives up the scale search for 5.6 % of the bytes.
+Measure it before any use.
