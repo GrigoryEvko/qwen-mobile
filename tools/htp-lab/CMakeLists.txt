@@ -32,7 +32,7 @@ function(lab_add_target name source htp_include)
     target_link_options(${name} PRIVATE -m${HEXAGON_ARCH} -mhvx=${HEXAGON_ARCH} -mhmx -G0)
 endfunction()
 
-set(LAB_TARGETS gdn_conv q4 hmx)
+set(LAB_TARGETS gdn_conv q4 q8 hmx)
 foreach(t ${LAB_TARGETS})
     lab_add_target(lab_${t} ${CMAKE_CURRENT_SOURCE_DIR}/lab/target_${t}.c ${HTP_DIR})
     if (HTP_PROPOSED_DIR)

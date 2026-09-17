@@ -82,18 +82,7 @@ static KERNEL_WRAP void kernel_quantize_q8_0(float * x, uint8_t * y, uint32_t k)
     quantize_row_f32_q8_0_tiled(x, y, k);
 }
 
-#ifdef HTP_MM_HAVE_Q4_0_32XN
-static KERNEL_WRAP void kernel_q4_0_32x3(const uint32_t n, float * s0, float * s1, float * s2, const void * vx,
-                                         const void * vy0, const void * vy1, const void * vy2, uint32_t valid_rows) {
-    tiled_vec_dot_q4_0_32x3(n, s0, s1, s2, vx, vy0, vy1, vy2, valid_rows, NULL, NULL, NULL);
-}
-
-static KERNEL_WRAP void kernel_q4_0_32x4(const uint32_t n, float * s0, float * s1, float * s2, float * s3, const void * vx,
-                                         const void * vy0, const void * vy1, const void * vy2, const void * vy3, uint32_t valid_rows) {
-    tiled_vec_dot_q4_0_32x4(n, s0, s1, s2, s3, vx, vy0, vy1, vy2, vy3, valid_rows, NULL, NULL, NULL, NULL);
-}
-
-#ifdef HTP_MM_HAVE_Q4_0_32XNC
+#ifdef HTP_MM_HAVE_MULTIROW
 static KERNEL_WRAP void kernel_q4_0_32x1c(const uint32_t n, float * s0, const void * vx, const void * vy0,
                                           const uint32_t * ya0, const int32_t * yb0, uint32_t valid_rows) {
     tiled_vec_dot_q4_0_32x1c(n, s0, vx, vy0, ya0, yb0, valid_rows, NULL);
@@ -123,10 +112,9 @@ static KERNEL_WRAP void kernel_q4_0_32x4c(const uint32_t n, float * s0, float * 
                              yb0, yb1, yb2, yb3, valid_rows, NULL, NULL, NULL, NULL);
 }
 
-static KERNEL_WRAP void kernel_quantize_q8_0_compact(float * x, uint8_t * y, uint8_t * y_compact, int32_t * y_bias, uint32_t k) {
-    quantize_row_f32_q8_0_tiled_compact(x, y, y_compact, y_bias, k);
+static KERNEL_WRAP void kernel_quantize_q8_0_compact(float * x, uint8_t * y, uint8_t * y_compact, int32_t * y_sum, uint32_t k) {
+    quantize_row_f32_q8_0_tiled_compact(x, y, y_compact, y_sum, k);
 }
-#endif
 #endif
 
 #define TARGET "q4"
@@ -344,34 +332,10 @@ int main(int argc, char ** argv) {
         bad += report_rows("base", n, tiles, out, ref, n_w_rows);
     }
 
-#ifdef HTP_MM_HAVE_Q4_0_32XN
-    // the proposal, step 1: one pass over the weight tile for 3 and 4 rows, vector-loaded activations
-    for (uint32_t n = 3; n <= n_rows; n++) {
-        timing_reset();
-        for (uint32_t it = 0; it < iters; it++) {
-            LAB_BARRIER();
-            const uint64_t t0 = lab_cycles();
-            for (uint32_t ct = 0; ct < n_ct; ct++) {
-                const uint8_t * w_tile = wt + (size_t) ct * n_k_tiles * Q4_TILE_ALN;
-                if (n == 4) {
-                    kernel_q4_0_32x4(k, out[0] + ct * 32, out[1] + ct * 32, out[2] + ct * 32, out[3] + ct * 32,
-                                     w_tile, act_q8[0], act_q8[1], act_q8[2], act_q8[3], 32);
-                } else {
-                    kernel_q4_0_32x3(k, out[0] + ct * 32, out[1] + ct * 32, out[2] + ct * 32,
-                                     w_tile, act_q8[0], act_q8[1], act_q8[2], 32);
-                }
-            }
-            const uint64_t t1 = lab_cycles();
-            LAB_BARRIER();
-            timing_add(t1 - t0);
-        }
-        bad += report_rows("after", n, tiles, out, ref, n_w_rows);
-    }
-
-#ifdef HTP_MM_HAVE_Q4_0_32XNC
+#ifdef HTP_MM_HAVE_MULTIROW
     // the proposal, step 2: the compact Q8 activation in DDR, 4 quants per scalar register
     uint8_t * act_c[MAX_ROWS];
-    int32_t * act_b[MAX_ROWS];
+    int32_t * act_b[MAX_ROWS];  // the sum of each k-tile
     for (uint32_t r = 0; r < n_rows; r++) {
         act_c[r] = lab_ddr_alloc(k, 128);
         act_b[r] = lab_ddr_alloc((size_t) n_k_tiles * sizeof(int32_t), 128);
@@ -389,7 +353,7 @@ int main(int argc, char ** argv) {
     }
     lab_report(TARGET, "quant_compact_cycles_per_128", (double) g_best / ((double) n_rows * k / 128), "cycles");
 
-    // the compact copy must hold the quants of the tiled blocks, and the bias must be 8 * their sum
+    // the compact copy must hold the quants of the tiled blocks, and the sum array their sum
     size_t bad_compact = 0;
     for (uint32_t r = 0; r < n_rows; r++) {
         memcpy(act_q8_ddr[r], act_q8[r], q8_row_size);
@@ -404,7 +368,7 @@ int main(int argc, char ** argv) {
             for (uint32_t j = 0; j < 32; j++) {
                 sum += (int32_t) qt[j];
             }
-            if (act_b[r][kt] != 8 * sum) {
+            if (act_b[r][kt] != sum) {
                 bad_compact++;
             }
         }
@@ -449,7 +413,6 @@ int main(int argc, char ** argv) {
         }
         bad += report_rows("compact", n, tiles, out, ref, n_w_rows);
     }
-#endif
 #endif
 
     lab_report(TARGET, "mismatches", (double) bad, "");
