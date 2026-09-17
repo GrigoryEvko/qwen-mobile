@@ -2,12 +2,17 @@ package ai.airi.qwenmobile
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.concurrent.Executors
 
@@ -68,6 +73,8 @@ object LlamaEngine {
         }, "llama-engine")
     }.asCoroutineDispatcher()
 
+    private val engineScope = CoroutineScope(dispatcher + SupervisorJob())
+
     private var handle = 0L
 
     private val stateFlow = MutableStateFlow<LoadedModel?>(null)
@@ -75,18 +82,49 @@ object LlamaEngine {
     /** The loaded model, or null. */
     val state: StateFlow<LoadedModel?> = stateFlow
 
-    /** The ggml backend devices, one per line. */
-    val devices: String by lazy { LlamaNative.devices() }
+    private val devicesFlow = MutableStateFlow<String?>(null)
 
-    /** Tell if every device of a backend is visible. */
+    /**
+     * The ggml backend devices, one per line, null until the backends are
+     * initialized. The initialization opens the NPU session, which can take
+     * seconds on a hot phone, thus it never runs on the display thread.
+     */
+    val deviceList: StateFlow<String?> = devicesFlow
+
+    /** The device list, or an empty text before the backends are initialized. */
+    val devices: String get() = devicesFlow.value ?: ""
+
+    /** True when the backends are initialized and the device list is known. */
+    val ready: Boolean get() = devicesFlow.value != null
+
+    /**
+     * Initialize the backends on the engine thread. Every native call that
+     * follows queues behind it on the same thread. Call one time from the
+     * application.
+     */
+    fun start(libDir: String, workDir: String) {
+        engineScope.launch {
+            LlamaNative.initialize(libDir)
+            LlamaNative.setWorkingDirectory(workDir)
+            devicesFlow.value = LlamaNative.devices()
+        }
+    }
+
+    /** Suspend until the backends are initialized. */
+    suspend fun awaitReady() {
+        devicesFlow.filterNotNull().first()
+    }
+
+    /** Tell if every device of a backend is visible. False before the backends are initialized. */
     fun has(backend: Backend): Boolean =
-        backend.devices.all { name -> devices.lines().any { it.startsWith("$name:") } }
+        ready && backend.devices.all { name -> devices.lines().any { it.startsWith("$name:") } }
 
     /**
      * Load a model. A model that is loaded already is released first. With an
      * accelerator the CPU only feeds it, thus the threads stay at half the cores.
      */
     suspend fun load(config: EngineConfig): LoadedModel = withContext(dispatcher) {
+        awaitReady()
         releaseLocked()
         val threads = if (config.backend == Backend.CPU) {
             config.threads

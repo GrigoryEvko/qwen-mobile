@@ -90,12 +90,15 @@ class SettingsStore private constructor(context: Context) {
                 instance ?: SettingsStore(context.applicationContext).also { instance = it }
             }
 
-        /** The GPU when it is visible, else the CPU. The NPU is experimental, thus the user selects it. */
-        fun defaultBackend(): Backend = if (LlamaEngine.has(Backend.GPU)) Backend.GPU else Backend.CPU
+        /** The GPU when it is visible or not known yet, else the CPU. The NPU is experimental, thus the user selects it. */
+        fun defaultBackend(): Backend = if (!LlamaEngine.ready || LlamaEngine.has(Backend.GPU)) Backend.GPU else Backend.CPU
 
-        /** Keep every value inside its permitted range. A backend without a visible device falls back. */
+        /**
+         * Keep every value inside its permitted range. A backend without a
+         * visible device falls back, but only when the device list is known.
+         */
         fun sanitize(s: AppSettings): AppSettings = s.copy(
-            backend = if (LlamaEngine.has(s.backend)) s.backend else defaultBackend(),
+            backend = if (!LlamaEngine.ready || LlamaEngine.has(s.backend)) s.backend else defaultBackend(),
             threads = s.threads.coerceIn(MIN_THREADS, MAX_THREADS),
             nCtx = if (s.nCtx in CONTEXT_LENGTHS) s.nCtx else 8192,
             temperature = s.temperature.coerceIn(0f, MAX_TEMPERATURE),

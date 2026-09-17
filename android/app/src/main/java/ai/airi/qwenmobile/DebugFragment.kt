@@ -39,7 +39,12 @@ class DebugFragment : Fragment() {
     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
         val b = FragmentDebugBinding.inflate(inflater, container, false)
         binding = b
-        fillDevices(b.devicesList)
+        viewLifecycleOwner.lifecycleScope.launch {
+            LlamaEngine.deviceList.collect {
+                b.devicesList.removeAllViews()
+                fillDevices(b.devicesList)
+            }
+        }
         for (label in SYSTEM_LABELS) {
             systemValues += addRow(b.systemRows, getString(label))
         }

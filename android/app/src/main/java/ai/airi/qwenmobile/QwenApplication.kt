@@ -2,10 +2,10 @@ package ai.airi.qwenmobile
 
 import android.app.Application
 
-/** Initializes the native backends before any screen uses them. */
+/** Starts the native backends on the engine thread, thus the first screen opens at once. */
 class QwenApplication : Application() {
     override fun onCreate() {
         super.onCreate()
-        LlamaNative.initialize(applicationInfo.nativeLibraryDir)
+        LlamaEngine.start(applicationInfo.nativeLibraryDir, filesDir.absolutePath)
     }
 }

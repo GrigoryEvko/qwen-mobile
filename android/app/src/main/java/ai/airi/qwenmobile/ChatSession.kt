@@ -113,6 +113,7 @@ object ChatSession {
      * the end, or the text of the problem.
      */
     suspend fun loadFromSettings(): String? {
+        LlamaEngine.awaitReady()
         val s = SettingsStore.of(app).state.value
         val path = s.modelPath
         if (path == null || !File(path).isFile) {

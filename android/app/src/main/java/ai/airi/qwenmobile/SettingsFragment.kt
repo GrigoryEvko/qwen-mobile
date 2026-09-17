@@ -43,7 +43,18 @@ class SettingsFragment : Fragment() {
                 b.modelInfoText.text = loaded?.info ?: getString(R.string.settings_no_model_loaded)
             }
         }
+        viewLifecycleOwner.lifecycleScope.launch {
+            LlamaEngine.deviceList.collect { enableBackendChips(b) }
+        }
         return b.root
+    }
+
+    /** The chips of the visible devices. All but the CPU wait for the backends. */
+    private fun enableBackendChips(b: FragmentSettingsBinding) {
+        b.cpuChip.isEnabled = LlamaEngine.has(Backend.CPU)
+        b.gpuChip.isEnabled = LlamaEngine.has(Backend.GPU)
+        b.npuChip.isEnabled = LlamaEngine.has(Backend.NPU)
+        b.hybridChip.isEnabled = LlamaEngine.has(Backend.HYBRID)
     }
 
     override fun onResume() {
@@ -98,10 +109,7 @@ class SettingsFragment : Fragment() {
     // --- Compute ---
 
     private fun setupCompute(b: FragmentSettingsBinding) {
-        b.cpuChip.isEnabled = LlamaEngine.has(Backend.CPU)
-        b.gpuChip.isEnabled = LlamaEngine.has(Backend.GPU)
-        b.npuChip.isEnabled = LlamaEngine.has(Backend.NPU)
-        b.hybridChip.isEnabled = LlamaEngine.has(Backend.HYBRID)
+        enableBackendChips(b)
         b.backendGroup.setOnCheckedStateChangeListener { _, checkedIds ->
             if (applying) return@setOnCheckedStateChangeListener
             val backend = when (checkedIds.firstOrNull()) {
