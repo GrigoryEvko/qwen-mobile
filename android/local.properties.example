@@ -1,0 +1,2 @@
+sdk.dir=/path/to/Android/Sdk
+llama.dir=/path/to/llama.cpp
