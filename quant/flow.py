@@ -35,11 +35,12 @@ import torch
 from torch import nn
 from transformers.models.qwen3_5.modeling_qwen3_5 import create_causal_mask, create_recurrent_attention_mask
 
-from .grid import q4_0_dequantize, q8_0_quantize
+from .grid import dequantize, q8_0_dequantize, q8_0_quantize
+from .grids import Grid, IQ4NLGrid, Q4_0Grid, fit_codebook
 from .names import to_gguf
 from .plan import Plan
 from .scale import permuted_moments, scaled_moments, search_column_scales
-from .solver import gptq_q4_0
+from .solver import solve_grid
 
 GDN_IN = ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_a", "linear_attn.in_proj_b")
 ATTN_IN = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj")
@@ -61,7 +62,7 @@ class Options:
 def q8_round_trip_(w: torch.Tensor) -> None:
     """Replace ``w`` by its Q8_0 round trip, in place."""
     q, d = q8_0_quantize(w)
-    w.copy_(q4_0_dequantize(q, d))
+    w.copy_(q8_0_dequantize(q, d))
 
 
 class PairedMoments:
@@ -128,8 +129,7 @@ class Lockstep:
             pos = torch.arange(length, device=self.device).view(1, 1, -1).expand(4, n, -1)
             hidden = self.ref_in[:n]
             rotary = self.ref.model.rotary_emb(hidden, pos[1:])
-            kw = dict(config=self.cfg, input_embeds=hidden, attention_mask=None,
-                      cache_position=torch.arange(length, device=self.device), past_key_values=None,
+            kw = dict(config=self.cfg, inputs_embeds=hidden, attention_mask=None, past_key_values=None,
                       position_ids=pos[0])
             masks = {"full_attention": create_causal_mask(**kw), "linear_attention": create_recurrent_attention_mask(**kw)}
             self._context[n] = (rotary, masks, pos[0])
@@ -194,7 +194,20 @@ class Quantizer:
         self.out_dir = out_dir
         self.opts = opts
         self.cfg = step.cfg
+        self.fixed = {"Q4_0": Q4_0Grid().to(step.device), "IQ4_NL": IQ4NLGrid().to(step.device)}
         out_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- grids ---
+
+    def search_grid(self, kind: str) -> Grid:
+        """The grid of the scale search. A codebook is not fit yet at that time, the IQ4_NL table stands in."""
+        return self.fixed["Q4_0" if kind == "Q4_0" else "IQ4_NL"]
+
+    def grid_for(self, kind: str, w: torch.Tensor, h_diag: torch.Tensor) -> Grid:
+        """The grid of one matrix: fixed by type, or a codebook fit on the matrix."""
+        if kind == "CB4":
+            return fit_codebook(w, h_diag)
+        return self.fixed[kind]
 
     # --- names and modules ---
 
@@ -232,24 +245,27 @@ class Quantizer:
         if not self.opts.scale or not rels:
             return None
         ws = [self.both(li, rel)[1].weight.data for rel in rels]
-        return search_column_scales(ws, torch.diag(h), share)
+        return search_column_scales(self.search_grid(self.kind(li, rels[0])), ws, torch.diag(h), share)
 
     # --- solving ---
 
-    def solve(self, name: str, lin: nn.Linear, h: torch.Tensor, g: torch.Tensor, tag: str) -> None:
+    def solve(self, name: str, kind: str, lin: nn.Linear, h: torch.Tensor, g: torch.Tensor, tag: str) -> None:
         t0 = time.time()
         cross = g if self.opts.solver == "qronos" else None
-        q, d, err, change = gptq_q4_0(lin.weight.data, h, cross, damp=self.opts.damp, refit_damp=self.opts.refit_damp)
-        lin.weight.data.copy_(q4_0_dequantize(q, d))
-        np.savez(self.out_dir / f"{name}.npz", q=q.cpu().numpy(), d=d.cpu().numpy().view(np.uint16))
-        print(f"{tag} {name:30s} {tuple(lin.weight.shape)} err {err:.3e} refit {change:.3f} "
+        grid = self.grid_for(kind, lin.weight.data, torch.diag(h))
+        idx, d, err, change = solve_grid(lin.weight.data, h, grid, cross, damp=self.opts.damp,
+                                         refit_damp=self.opts.refit_damp)
+        lin.weight.data.copy_(dequantize(grid, idx, d))
+        np.savez(self.out_dir / f"{name}.npz", q=idx.cpu().numpy(), d=d.cpu().numpy().view(np.uint16),
+                 levels=grid.levels.cpu().numpy(), kind=np.array(kind))
+        print(f"{tag} {name:30s} {kind:6s} {tuple(lin.weight.shape)} err {err:.3e} refit {change:.3f} "
               f"solve {time.time() - t0:4.1f}s", flush=True)
 
     def solve_or_round(self, li: int, rel: str, h: torch.Tensor, g: torch.Tensor) -> None:
         kind = self.kind(li, rel)
         lin = self.both(li, rel)[1]
-        if kind == "Q4_0":
-            self.solve(self.name(li, rel), lin, h, g, f"layer {li:2d}")
+        if kind in self.plan.solved_types():
+            self.solve(self.name(li, rel), kind, lin, h, g, f"layer {li:2d}")
         elif kind == "Q8_0":
             q8_round_trip_(lin.weight.data)
 
@@ -327,7 +343,8 @@ class Quantizer:
 
     def head(self) -> None:
         """The untied head on the final-norm outputs, with its column scales in the final norm."""
-        if self.plan.type_of("output.weight") != "Q4_0":
+        kind = self.plan.type_of("output.weight")
+        if kind not in self.plan.solved_types():
             return
         ref_h, work_h = self.step.final_norm()
         n = work_h.shape[0]
@@ -336,13 +353,13 @@ class Quantizer:
         del ref_h, work_h
         heads = (self.step.ref.lm_head, self.step.work.lm_head)
         if self.opts.scale:
-            t = search_column_scales([heads[1].weight.data], torch.diag(h))
+            t = search_column_scales(self.search_grid(kind), [heads[1].weight.data], torch.diag(h))
             for lin in heads:
                 lin.weight.data.mul_(t[None, :])
             for norm in (self.step.ref.model.norm, self.step.work.model.norm):
                 norm.weight.data.copy_((1.0 + norm.weight.data) / t - 1.0)
             h, g = scaled_moments(h, g, t)
-        self.solve("output.weight", heads[1], h, g, "head    ")
+        self.solve("output.weight", kind, heads[1], h, g, "head    ")
 
     # --- the run ---
 

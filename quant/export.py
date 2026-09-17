@@ -15,8 +15,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .grid import pack_q4_0, pack_q8_0, q4_0_quantize, q8_0_quantize
+from .grid import pack_nibbles, pack_q8_0, q8_0_quantize, quantize
+from .grids import make_grid
 from .plan import Plan
+
+GGUF_4BIT = {"Q4_0": "Q4_0", "IQ4_NL": "IQ4_NL"}
 
 
 def _load_gguf_module(llama_dir: Path):
@@ -64,17 +67,23 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
             kind = "keep"
         shape = [int(x) for x in reversed(t.shape)]
         pack = packs / f"{name}.npz"
-        if kind == "Q4_0" and pack.exists():
+        if kind in plan.solved_types() and kind not in GGUF_4BIT:
+            raise ValueError(f"{name}: {kind} has no GGUF type, measure it with the drift report")
+        if kind in GGUF_4BIT and pack.exists():
             z = np.load(pack)
-            q = torch.from_numpy(z["q"])
+            idx = torch.from_numpy(z["q"])
+            if "levels" not in z:
+                idx = idx.to(torch.int16) + 8
+            if "kind" in z and str(z["kind"]) != kind:
+                raise ValueError(f"{name}: the solved blocks are {z['kind']}, the plan says {kind}")
             d = torch.from_numpy(z["d"].view(np.float16))
-            writer.add_tensor(name, pack_q4_0(q, d), raw_dtype=gguf.GGMLQuantizationType.Q4_0)
-            kind = "Q4_0 (solved)"
-        elif kind == "Q4_0":
+            writer.add_tensor(name, pack_nibbles(idx, d), raw_dtype=getattr(gguf.GGMLQuantizationType, GGUF_4BIT[kind]))
+            kind = f"{kind} (solved)"
+        elif kind in GGUF_4BIT:
             w = torch.from_numpy(_f32_of(t)).to(device)
-            q, d = q4_0_quantize(w, search=True)
-            writer.add_tensor(name, pack_q4_0(q, d), raw_dtype=gguf.GGMLQuantizationType.Q4_0)
-            kind = "Q4_0 (rtn)"
+            idx, d = quantize(make_grid(kind).to(device), w, search=True)
+            writer.add_tensor(name, pack_nibbles(idx, d), raw_dtype=getattr(gguf.GGMLQuantizationType, GGUF_4BIT[kind]))
+            kind = f"{kind} (rtn)"
         elif kind == "Q8_0":
             w = torch.from_numpy(_f32_of(t)).to(device)
             q, d = q8_0_quantize(w)

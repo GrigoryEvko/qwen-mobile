@@ -32,7 +32,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from .flow import Lockstep
-from .grid import q4_0_dequantize
+from .grid import dequantize_pack
 from .names import to_gguf
 
 QUANTILES = (0.5, 0.99, 0.999)
@@ -55,9 +55,8 @@ def apply_packs(model, packs: Path) -> dict[str, tuple[float, float]]:
         gguf_name = to_gguf(f"{full_name}.weight")
         if not gguf_name or not (packs / f"{gguf_name}.npz").exists():
             continue
-        z = np.load(packs / f"{gguf_name}.npz")
         w = lin.weight.data
-        deq = q4_0_dequantize(torch.from_numpy(z["q"]).to(w.device), torch.from_numpy(z["d"].view(np.float16)).to(w.device))
+        deq = dequantize_pack(np.load(packs / f"{gguf_name}.npz"), w.device)
         stats[gguf_name] = (((deq - w).norm() / w.norm()).item(), kurtosis(w.reshape(-1)))
         w.copy_(deq.to(w.dtype))
     return stats

@@ -55,5 +55,5 @@ class Plan:
         return "keep"
 
     def solved_types(self) -> set[str]:
-        """The types that the calibrated solver produces. Others use round-to-nearest."""
-        return {"Q4_0"}
+        """The 4-bit grid types that the calibrated solver produces. Others use round-to-nearest."""
+        return {"Q4_0", "IQ4_NL", "CB4"}

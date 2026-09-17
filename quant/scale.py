@@ -6,37 +6,38 @@ weight, the rows of v_proj (attention is linear in V, the output gate is
 per channel), the rows of up_proj (the SwiGLU product is linear in up),
 and the shared weight of the gated norm of the GDN block. The scale gives
 the weights of a column with strong activations more of the block range,
-and the block-32 scales of Q4_0 pay for it. This is the diagonal part of
-WUSH and the input-side scale of SINQ, chosen on the true block error.
+and the block-32 scales pay for it. This is the diagonal part of WUSH and
+the input-side scale of SINQ, chosen on the true block error.
 """
 
 from __future__ import annotations
 
 import torch
 
-from .grid import q4_0_dequantize, q4_0_quantize
+from .grid import dequantize, quantize
+from .grids import Grid
 
 EXPONENTS = (0.0, 0.25, 0.5, 0.75, 1.0)
 
 
-def weighted_block_error(w: torch.Tensor, col_weights: torch.Tensor) -> torch.Tensor:
+def weighted_block_error(grid: Grid, w: torch.Tensor, col_weights: torch.Tensor) -> torch.Tensor:
     """The diagonal-Hessian error of the block-RTN quantization of ``w`` with the scale search."""
-    q, d = q4_0_quantize(w, weights=col_weights, search=True)
-    return ((q4_0_dequantize(q, d) - w).pow(2) * col_weights[None, :]).sum()
+    idx, d = quantize(grid, w, weights=col_weights, search=True)
+    return ((dequantize(grid, idx, d) - w).pow(2) * col_weights[None, :]).sum()
 
 
-def search_column_scales(ws: list[torch.Tensor], h_diag: torch.Tensor, share: int | None = None,
+def search_column_scales(grid: Grid, ws: list[torch.Tensor], h_diag: torch.Tensor,
+                         share: torch.Tensor | None = None,
                          exponents: tuple[float, ...] = EXPONENTS) -> torch.Tensor:
     """Column scales t for matrices that read the same input, geometric mean 1.
 
     Candidates are t_j = a_j^α / r_j^γ, with a the activation rms of column j
     (from the Hessian diagonal), r the weight rms of column j over all the
     matrices, and α, γ from ``exponents``. The winner minimizes the weighted
-    block-RTN error summed over the matrices. With ``share``, the scale is
-    the same for the columns j with the same j mod share (one value per
+    block-RTN error summed over the matrices. ``share`` [cols] gives a group
+    id per column, and the columns of a group take one scale (one value per
     within-head channel). Complexity is O(|exponents|² · Σ rows · cols · 40).
     """
-    cols = h_diag.shape[0]
     a = h_diag.to(torch.float32).clamp_min(1e-12).sqrt()
     r = torch.cat([w.to(torch.float32) for w in ws], 0).pow(2).mean(0).clamp_min(1e-12).sqrt()
     log_a, log_r = a.log(), r.log()
@@ -46,12 +47,20 @@ def search_column_scales(ws: list[torch.Tensor], h_diag: torch.Tensor, share: in
         for gamma in exponents:
             log_t = alpha * log_a - gamma * log_r
             if share is not None:
-                log_t = log_t.view(-1, share).mean(0).repeat(cols // share)
+                log_t = group_mean(log_t, share)
             t = (log_t - log_t.mean()).exp()
-            err = sum(weighted_block_error(w.to(torch.float32) * t[None, :], h_diag / t.pow(2)) for w in ws)
+            err = sum(weighted_block_error(grid, w.to(torch.float32) * t[None, :], h_diag / t.pow(2)) for w in ws)
             if best_err is None or err < best_err:
                 best_err, best_t = err, t
     return best_t
+
+
+def group_mean(x: torch.Tensor, group: torch.Tensor) -> torch.Tensor:
+    """Replace each value by the mean of its group."""
+    n = int(group.max().item()) + 1
+    total = torch.zeros(n, device=x.device, dtype=x.dtype).index_add_(0, group, x)
+    count = torch.zeros(n, device=x.device, dtype=x.dtype).index_add_(0, group, torch.ones_like(x))
+    return (total / count.clamp_min(1))[group]
 
 
 def scaled_moments(h: torch.Tensor, g: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

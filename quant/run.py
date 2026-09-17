@@ -166,7 +166,7 @@ def cmd_eval(args: argparse.Namespace) -> None:
 
 def _plan(args: argparse.Namespace, n_layers: int) -> Plan:
     edges = tuple(int(x) for x in args.edge_layers.split(",")) if args.edge_layers else ()
-    return Plan(bulk="Q4_0", head=args.head, embedding=args.embedding, kv_proj=args.kv_proj,
+    return Plan(bulk=args.bulk, head=args.head, embedding=args.embedding, kv_proj=args.kv_proj,
                 gdn_gate=args.gdn_gate, edge_layers=edges, edge_type="Q8_0", n_layers=n_layers)
 
 
@@ -229,6 +229,7 @@ def main() -> None:
 
 
 def _plan_args(sp: argparse.ArgumentParser) -> None:
+    sp.add_argument("--bulk", default="Q4_0", choices=("Q4_0", "IQ4_NL", "CB4"), help="the 4-bit grid of the bulk")
     sp.add_argument("--head", default="Q4_0")
     sp.add_argument("--embedding", default="Q8_0")
     sp.add_argument("--kv-proj", default="Q8_0")
