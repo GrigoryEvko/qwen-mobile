@@ -61,9 +61,10 @@ object ModelFiles {
      * "Qwen3.5-2B · Q4_0 · Hadamard · col-scales · GPTQ · block-opt".
      */
     fun displayName(file: File): String {
-        val parts = file.nameWithoutExtension.removeSuffix(".mmproj").split("-")
+        val base = file.nameWithoutExtension.removeSuffix(".mmproj")
+        val parts = base.split("-")
         if (parts.size <= 2) {
-            return file.nameWithoutExtension
+            return base
         }
         val family = parts.take(2).joinToString("-")
         val tags = parts.drop(2).map { TAGS[it] ?: it }

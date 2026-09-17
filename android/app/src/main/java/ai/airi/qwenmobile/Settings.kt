@@ -2,8 +2,12 @@ package ai.airi.qwenmobile
 
 import android.content.Context
 import android.content.SharedPreferences
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 
 /** The user settings. The model path is null until the user selects a model. */
 data class AppSettings(
@@ -25,9 +29,18 @@ data class AppSettings(
 class SettingsStore private constructor(context: Context) {
     private val prefs: SharedPreferences = context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
     private val stateFlow = MutableStateFlow(read())
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     /** The current settings. */
     val state: StateFlow<AppSettings> = stateFlow
+
+    init {
+        // The device list comes after the first read. A backend without a device changes to the default at that time.
+        scope.launch {
+            LlamaEngine.awaitReady()
+            update { it }
+        }
+    }
 
     /** Replace the settings by the result of [transform] and save them. */
     @Synchronized

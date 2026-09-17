@@ -9,7 +9,9 @@ import androidx.lifecycle.lifecycleScope
 import ai.airi.qwenmobile.databinding.FragmentSettingsBinding
 import ai.airi.qwenmobile.databinding.ItemModelBinding
 import com.google.android.material.chip.Chip
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Locale
 
@@ -44,10 +46,17 @@ class SettingsFragment : Fragment() {
             }
         }
         viewLifecycleOwner.lifecycleScope.launch {
-            LlamaEngine.deviceList.collect { enableBackendChips(b) }
+            LlamaEngine.deviceList.collect {
+                enableBackendChips(b)
+                b.deviceText.text = firstDeviceLine()
+            }
         }
         return b.root
     }
+
+    /** The OpenCL device line, or the text for no device. */
+    private fun firstDeviceLine(): String =
+        LlamaEngine.devices.lineSequence().firstOrNull { it.isNotBlank() } ?: getString(R.string.settings_no_devices)
 
     /** The chips of the visible devices. All but the CPU wait for the backends. */
     private fun enableBackendChips(b: FragmentSettingsBinding) {
@@ -76,24 +85,29 @@ class SettingsFragment : Fragment() {
         b.refreshButton.setOnClickListener { refreshModels() }
     }
 
-    /** Read the model directories again and rebuild the list. */
+    /** Read the model directories again, off the main thread, and rebuild the list. */
     private fun refreshModels() {
         val b = binding ?: return
         b.grantButton.visibility = if (ModelFiles.hasAllFilesAccess()) View.GONE else View.VISIBLE
-        val models = ModelFiles.list(requireContext())
-        b.modelList.removeAllViews()
-        modelRows.clear()
-        b.noModelsText.visibility = if (models.isEmpty()) View.VISIBLE else View.GONE
-        for (file in models) {
-            val row = ItemModelBinding.inflate(layoutInflater, b.modelList, true)
-            row.nameText.text = ModelFiles.displayName(file)
-            row.sizeText.text = formatSize(file.length())
-            val select = View.OnClickListener { selectModel(file) }
-            row.root.setOnClickListener(select)
-            row.radio.setOnClickListener(select)
-            modelRows[file.absolutePath] = row
+        val context = requireContext()
+        viewLifecycleOwner.lifecycleScope.launch {
+            // The shared directory goes through FUSE, thus the listing and the sizes stay off the main thread.
+            val models = withContext(Dispatchers.IO) { ModelFiles.list(context).map { it to it.length() } }
+            val list = binding ?: return@launch
+            list.modelList.removeAllViews()
+            modelRows.clear()
+            list.noModelsText.visibility = if (models.isEmpty()) View.VISIBLE else View.GONE
+            for ((file, size) in models) {
+                val row = ItemModelBinding.inflate(layoutInflater, list.modelList, true)
+                row.nameText.text = ModelFiles.displayName(file)
+                row.sizeText.text = formatSize(size)
+                val select = View.OnClickListener { selectModel(file) }
+                row.root.setOnClickListener(select)
+                row.radio.setOnClickListener(select)
+                modelRows[file.absolutePath] = row
+            }
+            applyModel(store.state.value.modelPath)
         }
-        applyModel(store.state.value.modelPath)
     }
 
     private fun selectModel(file: File) {
@@ -176,8 +190,7 @@ class SettingsFragment : Fragment() {
         val context = requireContext()
         val version = context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "?"
         b.versionText.text = getString(R.string.settings_version, version)
-        b.deviceText.text = LlamaEngine.devices.lineSequence().firstOrNull { it.isNotBlank() }
-            ?: getString(R.string.settings_no_devices)
+        b.deviceText.text = firstDeviceLine()
     }
 
     // --- Store to views ---

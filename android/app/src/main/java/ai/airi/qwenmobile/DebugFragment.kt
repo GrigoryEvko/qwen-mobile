@@ -14,9 +14,11 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import ai.airi.qwenmobile.databinding.FragmentDebugBinding
 import com.google.android.material.color.MaterialColors
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -122,9 +124,12 @@ class DebugFragment : Fragment() {
         return valueView
     }
 
-    private fun refreshSystem() {
+    /** The System card. The sysfs and proc files are read off the main thread. */
+    private suspend fun refreshSystem() {
+        val context = context ?: return
+        val profile = profilingFile()
+        val (s, hasProfile) = withContext(Dispatchers.IO) { SystemStatus.read(context) to profile.exists() }
         val b = binding ?: return
-        val s = SystemStatus.read(requireContext())
         val thermal = systemValues[0]
         thermal.text = if (s.cool) {
             "${s.thermalStatus} ${s.thermalName}, headroom ${s.headroom}"
@@ -138,15 +143,23 @@ class DebugFragment : Fragment() {
         systemValues[3].text = "cpu0 ${s.cpu0Cur} / ${s.cpu0Cap} MHz\ncpu7 ${s.cpu7Cur} / ${s.cpu7Cap} MHz"
         systemValues[4].text = "${s.availMb} MB free of ${s.totalMb} MB"
         systemValues[5].text = "${s.gameMode}, ${s.adpf}"
-        b.benchRun.isEnabled = LlamaEngine.state.value != null && !running
-        b.profilingShare.isEnabled = profilingFile().exists()
+        b.benchRun.isEnabled = LlamaEngine.state.value != null && !running && !ChatSession.generating.value
+        b.profilingShare.isEnabled = hasProfile
     }
 
-    /** The model line and the turn statistics. The statistics call waits behind a running generation. */
+    /**
+     * The model line and the turn statistics. The statistics call queues
+     * behind a streamed answer on the engine thread, thus the row keeps its
+     * last value while an answer streams.
+     */
     private suspend fun refreshEngine() {
         val loaded = LlamaEngine.state.value
         engineModel.text = loaded?.info ?: getString(R.string.debug_no_engine)
-        engineTurn.text = if (loaded == null) "" else runCatching { LlamaEngine.stats() }.getOrDefault("")
+        when {
+            loaded == null -> engineTurn.text = ""
+            ChatSession.generating.value -> return
+            else -> engineTurn.text = runCatching { LlamaEngine.stats() }.getOrDefault("")
+        }
     }
 
     private fun onRun() {
