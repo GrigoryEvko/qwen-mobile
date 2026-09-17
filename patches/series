@@ -16,4 +16,7 @@ hexagon-host/0003-llama-sampler-topset.patch
 # hexagon-fusion/0005-hexagon-htp-gdn-chunked-hmx.patch
 #   The chunked gated delta rule of a batch on the HMX. The patch is in the
 #   repository, and the line above stays a comment until the kernel runs on the
-#   phone: it takes the switch GGML_HEXAGON_OPFUSION_STATE, which the app sets.
+#   phone. The kernel sits inside the plain GATED_DELTA_NET op, thus the switch
+#   GGML_HEXAGON_OPFUSION_STATE does not reach it. Its own switch is
+#   GGML_HEXAGON_GDN_CHUNK, which is on by default, and 0 keeps the sequential
+#   kernel for an A/B run of the same build.
