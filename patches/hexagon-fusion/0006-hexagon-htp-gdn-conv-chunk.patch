@@ -1,0 +1,770 @@
+Hexagon HTP: the conv chain of a gated delta net layer over a batch of tokens
+
+Base: llama.cpp commit c6824a9 with patches/series applied in order, thru hexagon-fusion/0005.
+
+This patch is the last entry of patches/series, after hexagon-fusion/0005.
+
+Files:
+    ggml/src/ggml-hexagon/htp/gdn-conv-ops.c   the batch kernel, and the lane math as shared helpers
+    ggml/src/ggml-hexagon/htp/htp-ops.h        the opcode
+    ggml/src/ggml-hexagon/htp/main.c           the dispatch
+    ggml/src/ggml-hexagon/htp/htp-ctx.h        the prototype
+    ggml/src/ggml-hexagon/htp-gdn-match.h      the chain match, from one token to a batch
+    ggml/src/ggml-hexagon/ggml-hexagon.cpp     the opcode of a batch, the name, the slot index
+    tests/test-backend-ops.cpp                 the fusion test over a batch
+
+How to apply, from the llama.cpp root:
+
+    git apply patches/hexagon-fusion/0006-hexagon-htp-gdn-conv-chunk.patch
+    cmake --build build-snapdragon -j
+
+Push to the phone: libggml-htp-v79.so (ggml/src/ggml-hexagon/), libggml-hexagon.so (bin/) and
+test-backend-ops (bin/). The switch is the one of the state fusion, GGML_HEXAGON_OPFUSION_STATE,
+which the app sets.
+
+Problem: the conv of a prefill batch moves the tokens twice
+
+A gated delta net layer builds its conv input with a CONCAT that puts the three state columns of the
+cache in front of the transposed projection. That CONCAT writes a copy of the whole batch, and the
+SSM_CONV then reads that copy. One batch of 256 tokens and 6144 channels is 6.3 MB, thus the pair
+moves 25.3 MB where the work needs 12.7 MB. The profile of one pp512 batch of Qwen3.5-2B shows it:
+CONCAT 36 ops 25.9 ms and SSM_CONV 36 ops 28.5 ms, 54.4 ms together, and each op runs at 16 to 18
+GB/s, which is the bandwidth of the part. The pair is not slow, it is twice as much traffic as the
+work needs.
+
+Patches 0002 thru 0004 already fuse that chain at one token, for decode. This patch takes the same
+chain over a batch. One op reads the projection once, and writes the conv output and the new state of
+the cache:
+
+    GET_ROWS(cache_r, s_copy) -> CONCAT(state, projection^T) -> SSM_CONV -> SILU, and the CPY of the
+    last three columns into the slot of the cache        ->   HTP_OP_GDN_CONV_CHUNK
+
+The kernel
+
+A thread owns a range of channels, a multiple of 32, over every token of the batch. Its prologue
+turns the weights and the state of those channels into planes, one lane per channel, in VTCM. The
+token loop then reads one vector for each of the four taps and writes one vector of outputs, and the
+four taps of a token are four rows of the batch, or a state plane at the first three tokens. Thus the
+loop never converts a lane layout again, and it runs 20 vector operations for each 32 channels of a
+token.
+
+The channels of one token are contiguous in the projection and in the output, thus each thread walks
+its own block of each row, and the four rows that one token reads stay in L2 over the channel sweep.
+The DDR traffic is one read of the projection and one write of the output.
+
+The new state of the cache is the last three tokens of the batch in the layout of the cache. Three
+steps of the single token block of patch 0003, from an empty state, give exactly that, thus the lane
+packing of the state has one implementation and one test.
+
+The lane math of patch 0003 is now four helpers (the deal of four vectors, the lanes of a block to
+the four tap form, the four taps and the SiLU, and the four tap form back to the lanes of the state).
+The single token block is those four helpers in a row, thus the decode path keeps the instructions
+that the phone already runs.
+
+The numbers
+
+The sum of the four taps keeps the order of the CPU reference, and the SiLU is the sigmoid and the
+multiply of the SILU op of this backend. Thus the result of the fused op is the result of the four
+ops that it replaces, bit for bit, which the test holds at the tolerance of an exact kernel.
+
+Expected speed, from the traffic and the measured bandwidth of the part:
+
+    one pp512 batch   54.4 ms today  ->  26 to 28 ms, thus 27 ms of the batch
+    one image turn    71 ms today    ->  35 ms, thus 36 ms of the turn (672 tokens)
+
+The compute of one op is 164 us over six threads against 750 us of traffic, thus the op stays at the
+bandwidth of the part.
+
+The match
+
+The chain of a batch matches when: the conv width is 4, the batch holds at least 4 tokens, the
+channel count is a multiple of 32, the CONCAT holds the state columns in front of the batch, the
+projection is the transposed view with a stride of one float between channels, and the CPY takes the
+last three columns into one row of the cache. Each condition that fails names itself with
+GGML_HEXAGON_VERBOSE=1, and the unfused ops run. One token keeps HTP_OP_GDN_CONV_STEP of patch 0003,
+thus decode does not change.
+diff --git a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
+index 73e8968..eb0c029 100644
+--- a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
++++ b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
+@@ -119,12 +119,26 @@ static inline HVX_Vector gdn_lane_select(HVX_Vector mask, HVX_Vector a, HVX_Vect
+     return Q6_V_vor_VV(Q6_V_vand_VV(a, mask), Q6_V_vand_VV(b, Q6_V_vnot_V(mask)));
+ }
+ 
+-// One block of 32 channels: s0, s1, s2 hold the 96 slot lanes, x the 32 column lanes, w0..w3 the 128
+-// weight lanes. The block gives the 32 outputs and the 96 new slot lanes.
+-static inline void gdn_conv_block(const struct gdn_conv_masks * mk,
+-                                  HVX_Vector s0, HVX_Vector s1, HVX_Vector s2, HVX_Vector x,
+-                                  HVX_Vector w0, HVX_Vector w1, HVX_Vector w2, HVX_Vector w3,
+-                                  HVX_Vector * y, HVX_Vector * n0, HVX_Vector * n1, HVX_Vector * n2) {
++// Four vectors of 32 lanes each, dealt by 4: out[j] lane i = in[j + 4 * (i mod 8) ... ]. The pair of
++// deals turns the 4-lane form of a block into the four tap planes, and the same pair turns the 128
++// weight lanes of a block into the four weight planes.
++static inline void gdn_conv_deal4(HVX_Vector a0, HVX_Vector a1, HVX_Vector a2, HVX_Vector a3,
++                                  HVX_Vector * p0, HVX_Vector * p1, HVX_Vector * p2, HVX_Vector * p3) {
++    HVX_VectorPair d01 = Q6_W_vdeal_VVR(a1, a0, -4);
++    HVX_VectorPair d23 = Q6_W_vdeal_VVR(a3, a2, -4);
++    HVX_VectorPair e02 = Q6_W_vdeal_VVR(Q6_V_lo_W(d23), Q6_V_lo_W(d01), -4);
++    HVX_VectorPair e13 = Q6_W_vdeal_VVR(Q6_V_hi_W(d23), Q6_V_hi_W(d01), -4);
++    *p0 = Q6_V_lo_W(e02);
++    *p1 = Q6_V_lo_W(e13);
++    *p2 = Q6_V_hi_W(e02);
++    *p3 = Q6_V_hi_W(e13);
++}
++
++// The 96 slot lanes and the 32 column lanes of a block of 32 channels, to the 4-lane form:
++// c[g] lane 4k + t = tap t of channel 8g + k, with t = 3 the new column.
++static inline void gdn_conv_lanes_to_c(const struct gdn_conv_masks * mk,
++                                       HVX_Vector s0, HVX_Vector s1, HVX_Vector s2, HVX_Vector x,
++                                       HVX_Vector * c) {
+     // windows of 8 channels: lanes 0..23 hold the 3 taps of the 8 channels, 3 lanes per channel
+     HVX_Vector sw[4];
+     sw[0] = s0;
+@@ -143,7 +157,6 @@ static inline void gdn_conv_block(const struct gdn_conv_masks * mk,
+     xs[3] = gdn_lane_rot_up(Q6_V_hi_W(q1), 3);
+ 
+     // the 4-lane layout: c[g] lane 4k + t = tap t of channel 8g + k
+-    HVX_Vector c[4];
+     for (uint32_t g = 0; g < 4; g++) {
+         HVX_Vector v = Q6_V_vand_VV(sw[g], mk->ms[0]);
+         for (uint32_t k = 1; k < 8; k++) {
+@@ -151,28 +164,13 @@ static inline void gdn_conv_block(const struct gdn_conv_masks * mk,
+         }
+         c[g] = Q6_V_vor_VV(v, Q6_V_vand_VV(xs[g], mk->mx));
+     }
++}
+ 
+-    // the tap planes: lane = channel
+-    HVX_VectorPair d01 = Q6_W_vdeal_VVR(c[1], c[0], -4);
+-    HVX_VectorPair d23 = Q6_W_vdeal_VVR(c[3], c[2], -4);
+-    HVX_VectorPair e02 = Q6_W_vdeal_VVR(Q6_V_lo_W(d23), Q6_V_lo_W(d01), -4);
+-    HVX_VectorPair e13 = Q6_W_vdeal_VVR(Q6_V_hi_W(d23), Q6_V_hi_W(d01), -4);
+-    HVX_Vector t0 = Q6_V_lo_W(e02);
+-    HVX_Vector t1 = Q6_V_lo_W(e13);
+-    HVX_Vector t2 = Q6_V_hi_W(e02);
+-    HVX_Vector t3 = Q6_V_hi_W(e13);
+-
+-    HVX_VectorPair f01 = Q6_W_vdeal_VVR(w1, w0, -4);
+-    HVX_VectorPair f23 = Q6_W_vdeal_VVR(w3, w2, -4);
+-    HVX_VectorPair g02 = Q6_W_vdeal_VVR(Q6_V_lo_W(f23), Q6_V_lo_W(f01), -4);
+-    HVX_VectorPair g13 = Q6_W_vdeal_VVR(Q6_V_hi_W(f23), Q6_V_hi_W(f01), -4);
+-    HVX_Vector wt0 = Q6_V_lo_W(g02);
+-    HVX_Vector wt1 = Q6_V_lo_W(g13);
+-    HVX_Vector wt2 = Q6_V_hi_W(g02);
+-    HVX_Vector wt3 = Q6_V_hi_W(g13);
+-
+-    // the convolution, in the order of the CPU reference. The two functions are the arithmetic of
+-    // the ADD and MUL ops of this backend (hvx-base.h, per architecture).
++// The convolution of one block of 32 channels from its four tap planes and its four weight planes,
++// and the SiLU. The sum keeps the order of the CPU reference, and the two functions are the
++// arithmetic of the ADD and MUL ops of this backend (hvx-base.h, per architecture).
++static inline HVX_Vector gdn_conv_tap_silu(HVX_Vector t0, HVX_Vector t1, HVX_Vector t2, HVX_Vector t3,
++                                           HVX_Vector wt0, HVX_Vector wt1, HVX_Vector wt2, HVX_Vector wt3) {
+     HVX_Vector acc = hvx_vec_mul_f32_f32(t0, wt0);
+     acc = hvx_vec_add_f32_f32(acc, hvx_vec_mul_f32_f32(t1, wt1));
+     acc = hvx_vec_add_f32_f32(acc, hvx_vec_mul_f32_f32(t2, wt2));
+@@ -183,8 +181,13 @@ static inline void gdn_conv_block(const struct gdn_conv_masks * mk,
+     const HVX_Vector max_exp = hvx_vec_splat_f32(87.f);
+     const HVX_Vector min_exp = hvx_vec_splat_f32(-87.f);
+     HVX_Vector sig = hvx_vec_fast_sigmoid_f32_guard(acc, one, max_exp, min_exp);
+-    *y = hvx_vec_mul_f32_f32(acc, sig);
++    return hvx_vec_mul_f32_f32(acc, sig);
++}
+ 
++// The 96 new slot lanes of a block, from its 4-lane form: the taps 1, 2 and 3 become the taps 0, 1
++// and 2 of the next token.
++static inline void gdn_conv_c_to_slot(const struct gdn_conv_masks * mk, const HVX_Vector * c,
++                                      HVX_Vector * n0, HVX_Vector * n1, HVX_Vector * n2) {
+     // the new slot windows: nw[g] lane 3k + t = c[g] lane 4k + 1 + t
+     HVX_Vector nw[4];
+     for (uint32_t g = 0; g < 4; g++) {
+@@ -204,6 +207,26 @@ static inline void gdn_conv_block(const struct gdn_conv_masks * mk,
+     *n2 = gdn_lane_select(mk->lt8,  r2, r3);
+ }
+ 
++// One block of 32 channels at one token: s0, s1, s2 hold the 96 slot lanes, x the 32 column lanes,
++// w0..w3 the 128 weight lanes. The block gives the 32 outputs and the 96 new slot lanes.
++static inline void gdn_conv_block(const struct gdn_conv_masks * mk,
++                                  HVX_Vector s0, HVX_Vector s1, HVX_Vector s2, HVX_Vector x,
++                                  HVX_Vector w0, HVX_Vector w1, HVX_Vector w2, HVX_Vector w3,
++                                  HVX_Vector * y, HVX_Vector * n0, HVX_Vector * n1, HVX_Vector * n2) {
++    HVX_Vector c[4];
++    gdn_conv_lanes_to_c(mk, s0, s1, s2, x, c);
++
++    HVX_Vector t0, t1, t2, t3;
++    gdn_conv_deal4(c[0], c[1], c[2], c[3], &t0, &t1, &t2, &t3);
++
++    HVX_Vector wt0, wt1, wt2, wt3;
++    gdn_conv_deal4(w0, w1, w2, w3, &wt0, &wt1, &wt2, &wt3);
++
++    *y = gdn_conv_tap_silu(t0, t1, t2, t3, wt0, wt1, wt2, wt3);
++
++    gdn_conv_c_to_slot(mk, c, n0, n1, n2);
++}
++
+ static void gdn_conv_step_thread(unsigned int nth, unsigned int ith, void * data) {
+     (void) nth;
+     struct htp_gdn_conv_context * cctx = (struct htp_gdn_conv_context *) data;
+@@ -371,3 +394,250 @@ int op_gdn_conv_step(struct htp_ops_context * octx) {
+ 
+     return HTP_STATUS_OK;
+ }
++
++// ---- the conv over a batch of tokens
++//
++// One op replaces the same chain over a batch of T tokens: the GET_ROWS of the conv state, the
++// transposing CONCAT of the state and the projection, the SSM_CONV, the SILU, and the CPY of the new
++// state into the cache. The unfused chain moves the batch twice, because the CONCAT writes a copy of
++// it, and this op moves it once.
++//
++// Inputs:
++//   src[0] states  [row, n_slots] F32, row = 3 * n_ch, contiguous rows
++//   src[1] s_copy  I32, the host validates the index and passes it in kernel_params[0]
++//   src[2] x       [T, n_ch] F32, the transposed projection: element (c, t) at t * nb[0] + c * nb[1]
++//                  with nb[1] = 4, thus the channels of one token are contiguous
++//   src[3] w       [4, n_ch] F32, the conv weights
++//   src[4] slot    [row, 1] F32, the destination slot
++// Outputs:
++//   dst[0] y       [n_ch, T] F32, silu(conv)
++//   dst[1] slot    the same tensor as src[4], listed for the dirty tracking of the cache
++//
++// A thread owns a range of channels, a multiple of 32, over every token. Its prologue turns the
++// weights and the state of those channels into planes (one lane per channel) in VTCM. The token loop
++// then reads one vector for each of the four taps and writes one vector of outputs. The four taps of
++// a token are four rows of the batch, or a state plane at the first three tokens, thus the loop never
++// converts a lane layout again. The channels of one token are contiguous, thus each thread walks its
++// own block of each row, and the four rows that one token reads stay in L2 over the channel sweep.
++
++struct htp_gdn_conv_chunk_context {
++    struct htp_ops_context * octx;
++    const float * src_slot;   // source slot, DDR, three floats per channel
++    float *       dst_slot;   // destination slot, DDR
++    const float * x;          // the projection, DDR
++    float *       y;          // the output, DDR
++    const float * w;          // the conv weights, DDR
++    uint32_t      x_stride;   // floats between two tokens of x
++    uint32_t      y_stride;   // floats between two tokens of y
++    uint32_t      n_ch;
++    uint32_t      n_tokens;
++    uint32_t      chunk;      // channels per thread, a multiple of 32
++    uint8_t *     vtcm;       // the plane buffers of the threads
++    size_t        vtcm_per_thread;
++};
++
++static void gdn_conv_chunk_thread(unsigned int nth, unsigned int ith, void * data) {
++    (void) nth;
++    struct htp_gdn_conv_chunk_context * cctx = (struct htp_gdn_conv_chunk_context *) data;
++    struct htp_ops_context *            octx = cctx->octx;
++
++    const uint32_t c0 = ith * cctx->chunk;
++    if (c0 >= cctx->n_ch) {
++        return;
++    }
++    const uint32_t n  = MIN(cctx->chunk, cctx->n_ch - c0);
++    const uint32_t nb = n / VLEN_FP32;
++    const uint32_t T  = cctx->n_tokens;
++
++    struct gdn_conv_masks mk __attribute__((aligned(VLEN)));
++    gdn_conv_masks_init(&mk);
++
++    float * planes = (float *) (cctx->vtcm + cctx->vtcm_per_thread * ith);
++    float * wt     = planes;             // [4][n] the weight planes
++    float * st     = planes + 4 * n;     // [3][n] the state planes
++
++    const float * w_ptr = cctx->w + (size_t) c0 * GDN_CONV_D_CONV;
++    const float * s_ptr = cctx->src_slot + (size_t) c0 * (GDN_CONV_D_CONV - 1);
++
++    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
++    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c0);
++
++    // the planes of the weights and of the state
++    for (uint32_t i = 0; i < nb; i++) {
++        HVX_Vector p0, p1, p2, p3;
++
++        gdn_conv_deal4(hvx_vmemu(w_ptr + i * 128), hvx_vmemu(w_ptr + i * 128 + 32),
++                       hvx_vmemu(w_ptr + i * 128 + 64), hvx_vmemu(w_ptr + i * 128 + 96),
++                       &p0, &p1, &p2, &p3);
++        hvx_vmem(wt + 0 * n + i * VLEN_FP32) = p0;
++        hvx_vmem(wt + 1 * n + i * VLEN_FP32) = p1;
++        hvx_vmem(wt + 2 * n + i * VLEN_FP32) = p2;
++        hvx_vmem(wt + 3 * n + i * VLEN_FP32) = p3;
++
++        HVX_Vector c[4];
++        gdn_conv_lanes_to_c(&mk, hvx_vmemu(s_ptr + i * 96), hvx_vmemu(s_ptr + i * 96 + 32),
++                            hvx_vmemu(s_ptr + i * 96 + 64), Q6_V_vzero(), c);
++        gdn_conv_deal4(c[0], c[1], c[2], c[3], &p0, &p1, &p2, &p3);
++        hvx_vmem(st + 0 * n + i * VLEN_FP32) = p0;
++        hvx_vmem(st + 1 * n + i * VLEN_FP32) = p1;
++        hvx_vmem(st + 2 * n + i * VLEN_FP32) = p2;
++    }
++
++    // the tokens. Tap j of token t reads the row t - 3 + j, or the state plane of that index when the
++    // row is before the batch.
++    for (uint32_t t = 0; t < T; t++) {
++        const float * tap[GDN_CONV_D_CONV];
++        for (int j = 0; j < GDN_CONV_D_CONV; j++) {
++            const int idx = (int) t - (GDN_CONV_D_CONV - 1) + j;
++            tap[j] = (idx >= 0) ? (cctx->x + (size_t) idx * cctx->x_stride + c0)
++                                : (const float *) (st + (idx + (GDN_CONV_D_CONV - 1)) * n);
++        }
++
++        float * out = cctx->y + (size_t) t * cctx->y_stride + c0;
++
++        for (uint32_t i = 0; i < nb; i++) {
++            const uint32_t o = i * VLEN_FP32;
++            HVX_Vector r = gdn_conv_tap_silu(hvx_vmemu(tap[0] + o), hvx_vmemu(tap[1] + o),
++                                             hvx_vmemu(tap[2] + o), hvx_vmemu(tap[3] + o),
++                                             hvx_vmem(wt + 0 * n + o), hvx_vmem(wt + 1 * n + o),
++                                             hvx_vmem(wt + 2 * n + o), hvx_vmem(wt + 3 * n + o));
++            hvx_vmemu(out + o) = r;
++        }
++    }
++
++    // The new state is the last three tokens of the batch, in the layout of the cache. Three steps of
++    // the single token block from an empty state give exactly that, and the output of those steps is
++    // not used.
++    float * d_ptr = cctx->dst_slot + (size_t) c0 * (GDN_CONV_D_CONV - 1);
++
++    for (uint32_t i = 0; i < nb; i++) {
++        HVX_Vector w0 = hvx_vmemu(w_ptr + i * 128);
++        HVX_Vector w1 = hvx_vmemu(w_ptr + i * 128 + 32);
++        HVX_Vector w2 = hvx_vmemu(w_ptr + i * 128 + 64);
++        HVX_Vector w3 = hvx_vmemu(w_ptr + i * 128 + 96);
++
++        HVX_Vector n0 = Q6_V_vzero();
++        HVX_Vector n1 = Q6_V_vzero();
++        HVX_Vector n2 = Q6_V_vzero();
++        HVX_Vector y;
++
++        for (uint32_t t = T - (GDN_CONV_D_CONV - 1); t < T; t++) {
++            HVX_Vector xv = hvx_vmemu(cctx->x + (size_t) t * cctx->x_stride + c0 + i * VLEN_FP32);
++            gdn_conv_block(&mk, n0, n1, n2, xv, w0, w1, w2, w3, &y, &n0, &n1, &n2);
++        }
++
++        hvx_vmemu(d_ptr + i * 96)      = n0;
++        hvx_vmemu(d_ptr + i * 96 + 32) = n1;
++        hvx_vmemu(d_ptr + i * 96 + 64) = n2;
++    }
++
++    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) (c0 + n));
++}
++
++// The error detail codes of this op (reported to the host with the batch status)
++enum {
++    GDN_CHUNK_ERR_INPUT  = 30, // an input or the output is missing
++    GDN_CHUNK_ERR_TYPE   = 31, // a tensor type is not the expected one
++    GDN_CHUNK_ERR_SHAPE  = 32, // a shape or a stride is not the expected one
++    GDN_CHUNK_ERR_INDEX  = 33, // the slot index is out of range
++    GDN_CHUNK_ERR_VTCM   = 34, // the VTCM reservation is too small
++};
++
++#define GDN_CHUNK_FAIL(code, status) do { octx->err_detail = (code); return (status); } while (0)
++
++int op_gdn_conv_chunk(struct htp_ops_context * octx) {
++    const struct htp_tensor * states = octx->src[0];
++    const struct htp_tensor * s_copy = octx->src[1];
++    const struct htp_tensor * x      = octx->src[2];
++    const struct htp_tensor * w      = octx->src[3];
++    const struct htp_tensor * slot   = octx->src[4];
++    const struct htp_tensor * y      = octx->dst;
++
++    if (!states || !s_copy || !x || !w || !slot || !y) {
++        GDN_CHUNK_FAIL(GDN_CHUNK_ERR_INPUT, HTP_STATUS_INVAL_PARAMS);
++    }
++    if (states->type != HTP_TYPE_F32 || x->type != HTP_TYPE_F32 || w->type != HTP_TYPE_F32 ||
++        slot->type != HTP_TYPE_F32 || y->type != HTP_TYPE_F32 || s_copy->type != HTP_TYPE_I32) {
++        GDN_CHUNK_FAIL(GDN_CHUNK_ERR_TYPE, HTP_STATUS_NO_SUPPORT);
++    }
++    if (octx->ctx->mdev.count > 1) {
++        GDN_CHUNK_FAIL(GDN_CHUNK_ERR_TYPE, HTP_STATUS_NO_SUPPORT);
++    }
++
++    const uint32_t d_conv = w->ne[0];
++    const uint32_t n_ch   = w->ne[1];
++    const uint32_t T      = x->ne[0];
++
++    if (d_conv != GDN_CONV_D_CONV) {
++        GDN_CHUNK_FAIL(GDN_CHUNK_ERR_SHAPE, HTP_STATUS_NO_SUPPORT);
++    }
++    // The host matcher holds every condition below. They stay here because a mismatch would give a
++    // wrong result without a word.
++    if (n_ch == 0 || (n_ch % VLEN_FP32) != 0 || T < GDN_CONV_D_CONV) {
++        GDN_CHUNK_FAIL(GDN_CHUNK_ERR_SHAPE, HTP_STATUS_INVAL_PARAMS);
++    }
++
++    const uint32_t row = (d_conv - 1) * n_ch;
++
++    if (states->ne[0] != row || states->nb[0] != sizeof(float) || states->nb[1] != row * sizeof(float)) {
++        GDN_CHUNK_FAIL(GDN_CHUNK_ERR_SHAPE, HTP_STATUS_INVAL_PARAMS);
++    }
++    if (x->ne[1] != n_ch || x->nb[1] != sizeof(float) || (x->nb[0] % sizeof(float)) != 0) {
++        GDN_CHUNK_FAIL(GDN_CHUNK_ERR_SHAPE, HTP_STATUS_INVAL_PARAMS);
++    }
++    if (w->nb[0] != sizeof(float) || w->nb[1] != d_conv * sizeof(float)) {
++        GDN_CHUNK_FAIL(GDN_CHUNK_ERR_SHAPE, HTP_STATUS_INVAL_PARAMS);
++    }
++    if (slot->ne[0] != row || slot->nb[0] != sizeof(float)) {
++        GDN_CHUNK_FAIL(GDN_CHUNK_ERR_SHAPE, HTP_STATUS_INVAL_PARAMS);
++    }
++    if (y->ne[0] != n_ch || y->ne[1] != T || y->nb[0] != sizeof(float) ||
++        (y->nb[1] % sizeof(float)) != 0) {
++        GDN_CHUNK_FAIL(GDN_CHUNK_ERR_SHAPE, HTP_STATUS_INVAL_PARAMS);
++    }
++
++    const int32_t src_idx = octx->kernel_params[0];
++    if (octx->kernel_params[1] != 1 || src_idx < 0 || (uint32_t) src_idx >= states->ne[1]) {
++        FARF(ERROR, "gdn-conv-chunk: slot index %d is out of range (%u slots, valid flag %d)\n",
++             src_idx, states->ne[1], octx->kernel_params[1]);
++        GDN_CHUNK_FAIL(GDN_CHUNK_ERR_INDEX, HTP_STATUS_INVAL_PARAMS);
++    }
++
++    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
++        return HTP_STATUS_OK;
++    }
++
++    const uint32_t n_threads = octx->n_threads;
++    const uint32_t chunk     = hex_round_up(fastdiv(n_ch + n_threads - 1, &octx->n_threads_div), VLEN_FP32);
++
++    // the weight planes and the state planes of one thread
++    const size_t vtcm_per_thread = hex_round_up((size_t) 7 * chunk * sizeof(float), 128);
++    if (octx->ctx->vtcm_size < vtcm_per_thread * n_threads) {
++        FARF(ERROR, "gdn-conv-chunk: VTCM %zu is too small, needed %zu\n",
++             octx->ctx->vtcm_size, vtcm_per_thread * n_threads);
++        GDN_CHUNK_FAIL(GDN_CHUNK_ERR_VTCM, HTP_STATUS_VTCM_TOO_SMALL);
++    }
++
++    struct htp_gdn_conv_chunk_context cctx;
++    memset(&cctx, 0, sizeof(cctx));
++    cctx.octx     = octx;
++    cctx.src_slot = (const float *) ((const uint8_t *) (uintptr_t) states->data + (size_t) src_idx * states->nb[1]);
++    cctx.dst_slot = (float *) (uintptr_t) slot->data;
++    cctx.x        = (const float *) (uintptr_t) x->data;
++    cctx.y        = (float *) (uintptr_t) y->data;
++    cctx.w        = (const float *) (uintptr_t) w->data;
++    cctx.x_stride = x->nb[0] / sizeof(float);
++    cctx.y_stride = y->nb[1] / sizeof(float);
++    cctx.n_ch     = n_ch;
++    cctx.n_tokens = T;
++    cctx.chunk    = chunk;
++    cctx.vtcm     = octx->ctx->vtcm_base;
++    cctx.vtcm_per_thread = vtcm_per_thread;
++
++    FARF(HIGH, "gdn-conv-chunk: n_ch %u tokens %u slot %d chunk %u threads %u vtcm %zu\n",
++         n_ch, T, src_idx, chunk, n_threads, vtcm_per_thread * n_threads);
++
++    work_queue_run(octx->ctx->work_queue, gdn_conv_chunk_thread, &cctx, n_threads);
++
++    return HTP_STATUS_OK;
++}
+diff --git a/ggml/src/ggml-hexagon/htp/htp-ops.h b/ggml/src/ggml-hexagon/htp/htp-ops.h
+index 62d06f9..f27fd12 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-ops.h
++++ b/ggml/src/ggml-hexagon/htp/htp-ops.h
+@@ -107,6 +107,7 @@ enum htp_op_code {
+     HTP_OP_MDEV_GROUP,
+     HTP_OP_GDN_CONV_STEP,   // fused GET_ROWS + CONCAT + SSM_CONV + SILU + CPY of the conv state (one token)
+     HTP_OP_GDN_STATE_STEP,  // fused GET_ROWS + GATED_DELTA_NET + CPY of the delta net state (one token)
++    HTP_OP_GDN_CONV_CHUNK,  // the same conv chain over a batch of tokens
+ 
+     HTP_OP_INVALID
+ };
+diff --git a/ggml/src/ggml-hexagon/htp/main.c b/ggml/src/ggml-hexagon/htp/main.c
+index 8c235e2..59c9d21 100644
+--- a/ggml/src/ggml-hexagon/htp/main.c
++++ b/ggml/src/ggml-hexagon/htp/main.c
+@@ -892,6 +892,9 @@ static int execute_op(struct htp_ops_context * octx) {
+         case HTP_OP_GDN_CONV_STEP:
+             return op_gdn_conv_step(octx);
+ 
++        case HTP_OP_GDN_CONV_CHUNK:
++            return op_gdn_conv_chunk(octx);
++
+         case HTP_OP_TRI:
+             return op_unary(octx);
+ 
+diff --git a/ggml/src/ggml-hexagon/htp/htp-ctx.h b/ggml/src/ggml-hexagon/htp/htp-ctx.h
+index 247ae38..2068d4e 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-ctx.h
++++ b/ggml/src/ggml-hexagon/htp/htp-ctx.h
+@@ -176,6 +176,7 @@ int op_solve_tri(struct htp_ops_context * octx);
+ int op_gated_delta_net(struct htp_ops_context * octx);
+ int op_gdn_state_step(struct htp_ops_context * octx);
+ int op_gdn_conv_step(struct htp_ops_context * octx);
++int op_gdn_conv_chunk(struct htp_ops_context * octx);
+ int op_gated_delta_net_chunked(struct htp_ops_context * octx);
+ int op_pad(struct htp_ops_context * octx);
+ int op_im2col(struct htp_ops_context * octx);
+diff --git a/ggml/src/ggml-hexagon/htp-gdn-match.h b/ggml/src/ggml-hexagon/htp-gdn-match.h
+index eeca0c8..fc840ad 100644
+--- a/ggml/src/ggml-hexagon/htp-gdn-match.h
++++ b/ggml/src/ggml-hexagon/htp-gdn-match.h
+@@ -38,9 +38,10 @@ struct ggml_hexagon_gdn_conv_match {
+     ggml_tensor * P      = nullptr; // CPY into the slot
+     ggml_tensor * slot   = nullptr; // the destination slot view [row, 1]
+     std::vector<ggml_tensor *> members; // every node the fused op replaces
+-    int     emit   = -1;                // graph index where the fused op goes
+-    int64_t d_conv = 0;
+-    int64_t n_ch   = 0;
++    int     emit     = -1;              // graph index where the fused op goes
++    int64_t d_conv   = 0;
++    int64_t n_ch     = 0;
++    int64_t n_tokens = 0;               // 1 is the decode step, more is a batch
+ };
+ 
+ struct ggml_hexagon_gdn_state_match {
+@@ -75,6 +76,12 @@ static inline bool ggml_hexagon_gdn_is_f32_row(const ggml_tensor * t, int64_t n)
+            t->nb[0] == sizeof(float);
+ }
+ 
++// A contiguous F32 block of n0 by n1 with unit outer dimensions
++static inline bool ggml_hexagon_gdn_is_f32_2d(const ggml_tensor * t, int64_t n0, int64_t n1) {
++    return t->type == GGML_TYPE_F32 && t->ne[0] == n0 && t->ne[1] == n1 && t->ne[2] == 1 && t->ne[3] == 1 &&
++           t->nb[0] == sizeof(float);
++}
++
+ // The "states" tensor of build_rs: an F32 table [row, n_slots] of the cache with contiguous rows
+ static inline bool ggml_hexagon_gdn_is_state_table(const ggml_tensor * t, int64_t row) {
+     return t->type == GGML_TYPE_F32 && t->ne[0] == row && t->ne[1] >= 1 && t->ne[2] == 1 && t->ne[3] == 1 &&
+@@ -226,21 +233,43 @@ static inline const char * ggml_hexagon_gdn_conv_chain_check(const ggml_cgraph *
+     if (CI->type != GGML_TYPE_F32 || !ggml_is_contiguous(CI) || CI->ne[2] != 1 || CI->ne[3] != 1) {
+         return "the CONCAT is not one contiguous F32 sequence";
+     }
+-    const int64_t d_conv = CI->ne[0];
+-    const int64_t n_ch   = CI->ne[1];
++    // The weights give the conv width and the channel count, and the CONCAT holds the state columns
++    // of the cache and the tokens of the batch.
++    if (W->type != GGML_TYPE_F32 || W->ne[2] != 1 || W->ne[3] != 1 || W->nb[0] != sizeof(float) ||
++        W->nb[1] != (size_t) W->ne[0] * sizeof(float)) {
++        return "the conv weights are not a contiguous F32 [d_conv, n_ch]";
++    }
++    const int64_t d_conv   = W->ne[0];
++    const int64_t n_ch     = W->ne[1];
++    const int64_t n_tokens = CI->ne[0] - (d_conv - 1);
+     if (d_conv != 4) {
+         return "the conv kernel is not 4 wide (the DSP kernel is for d_conv = 4)";
+     }
+     if (n_ch < 1) {
+         return "no channels";
+     }
+-    const int64_t row = (d_conv - 1) * n_ch;
+-    if (W->type != GGML_TYPE_F32 || W->ne[0] != d_conv || W->ne[1] != n_ch || W->nb[0] != sizeof(float) ||
+-        W->nb[1] != (size_t) d_conv * sizeof(float)) {
+-        return "the conv weights are not a contiguous F32 [d_conv, n_ch]";
++    if (CI->ne[1] != n_ch) {
++        return "the CONCAT does not hold one column of each channel";
++    }
++    if (n_tokens < 1) {
++        return "the CONCAT is shorter than the conv state";
+     }
+-    if (!ggml_hexagon_gdn_is_f32_row(C, n_ch) || !ggml_hexagon_gdn_is_f32_row(S, n_ch)) {
+-        return "the conv output is not one token";
++    const int64_t row = (d_conv - 1) * n_ch;
++    if (!ggml_hexagon_gdn_is_f32_2d(C, n_ch, n_tokens) || !ggml_hexagon_gdn_is_f32_2d(S, n_ch, n_tokens)) {
++        return "the conv output is not [n_ch, n_tokens]";
++    }
++    // The kernel of a batch walks the channels of one token by vectors of 32, and it takes its four
++    // taps from four tokens of the batch or from the state.
++    if (n_tokens > 1) {
++        if (n_tokens < d_conv) {
++            return "the batch is shorter than the conv kernel";
++        }
++        if ((n_ch % 32) != 0) {
++            return "the channel count of a batch is not a multiple of 32";
++        }
++        if (S->nb[1] % sizeof(float) != 0) {
++            return "the token stride of the output is not a whole number of floats";
++        }
+     }
+ 
+     // the state read: the first CONCAT input is a reshape of GET_ROWS(states, s_copy)
+@@ -270,9 +299,9 @@ static inline const char * ggml_hexagon_gdn_conv_chain_check(const ggml_cgraph *
+ 
+     // the new column: the second CONCAT input is the transposed projection [1, n_ch]
+     ggml_tensor * xt = CI->src[1];
+-    if (!xt || xt->type != GGML_TYPE_F32 || xt->ne[0] != 1 || xt->ne[1] != n_ch || xt->ne[2] != 1 ||
+-        xt->ne[3] != 1 || xt->nb[1] != sizeof(float)) {
+-        return "the second CONCAT input is not a transposed contiguous column [1, n_ch]";
++    if (!xt || xt->type != GGML_TYPE_F32 || xt->ne[0] != n_tokens || xt->ne[1] != n_ch || xt->ne[2] != 1 ||
++        xt->ne[3] != 1 || xt->nb[1] != sizeof(float) || (xt->nb[0] % sizeof(float)) != 0) {
++        return "the second CONCAT input is not the transposed projection [n_tokens, n_ch]";
+     }
+ 
+     // the state write: the one CPY of the last d_conv - 1 columns of the CONCAT into a slot of the cache
+@@ -286,7 +315,7 @@ static inline const char * ggml_hexagon_gdn_conv_chain_check(const ggml_cgraph *
+     }
+     ggml_tensor * last = P->src[0];
+     ggml_tensor * slot = P->src[1];
+-    if (last->view_offs != sizeof(float) || last->ne[0] != d_conv - 1 || last->ne[1] != n_ch ||
++    if (last->view_offs != (size_t) n_tokens * sizeof(float) || last->ne[0] != d_conv - 1 || last->ne[1] != n_ch ||
+         last->ne[2] != 1 || last->ne[3] != 1 || last->nb[0] != sizeof(float) || last->nb[1] != CI->nb[1]) {
+         return "the CPY source is not the last d_conv - 1 columns of the CONCAT";
+     }
+@@ -328,9 +357,10 @@ static inline const char * ggml_hexagon_gdn_conv_chain_check(const ggml_cgraph *
+     m.P      = P;
+     m.slot   = slot;
+     m.members = members;
+-    m.emit   = emit;
+-    m.d_conv = d_conv;
+-    m.n_ch   = n_ch;
++    m.emit     = emit;
++    m.d_conv   = d_conv;
++    m.n_ch     = n_ch;
++    m.n_tokens = n_tokens;
+     return nullptr;
+ }
+ 
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index c095652..9155741 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -231,6 +231,7 @@ static const char * htp_op_name(uint32_t opcode) {
+         case HTP_OP_GLU_SWIGLU_CLAMP: return "GLU_SWIGLU_CLAMP";
+         case HTP_OP_MDEV_GROUP:       return "MDEV_GROUP";
+         case HTP_OP_GDN_CONV_STEP:    return "GDN_CONV_STEP";
++        case HTP_OP_GDN_CONV_CHUNK:   return "GDN_CONV_CHUNK";
+         case HTP_OP_GDN_STATE_STEP:   return "GDN_STATE_STEP";
+         default:                      return "?";
+     }
+@@ -3801,8 +3802,9 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
+     // The fused recurrent state ops take the slot index from the s_copy input. The host reads it here,
+     // once per token, and gives it to the DSP in the kernel params. When the index is not a row of the
+     // state table, the unfused ops of the chain run in place of the fused op.
+-    if (node.opcode == HTP_OP_GDN_CONV_STEP || node.opcode == HTP_OP_GDN_STATE_STEP) {
+-        const bool          conv   = node.opcode == HTP_OP_GDN_CONV_STEP;
++    if (node.opcode == HTP_OP_GDN_CONV_STEP || node.opcode == HTP_OP_GDN_CONV_CHUNK ||
++        node.opcode == HTP_OP_GDN_STATE_STEP) {
++        const bool          conv   = node.opcode != HTP_OP_GDN_STATE_STEP;
+         const ggml_tensor * states = node.inputs[conv ? 0 : 5];
+         const ggml_tensor * idx    = node.inputs[conv ? 1 : 6];
+ 
+@@ -6399,8 +6401,9 @@ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, co
+                 continue;
+             }
+ 
+-            htp_opnode node(HTP_OP_GDN_CONV_STEP, m.S);
+-            node.name    = "GDN_CONV_STEP";
++            const bool batch = m.n_tokens > 1;
++            htp_opnode node(batch ? HTP_OP_GDN_CONV_CHUNK : HTP_OP_GDN_CONV_STEP, m.S);
++            node.name    = batch ? "GDN_CONV_CHUNK" : "GDN_CONV_STEP";
+             node.inputs  = { m.states, m.idx, m.xt, m.W, m.slot };
+             node.outputs = { m.S, m.slot };
+             node.fused   = { m.R, m.CI, m.C, m.P };
+@@ -6408,8 +6411,9 @@ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, co
+             fu.at.emplace(m.emit, std::move(node));
+             skip_members(m.emit, m.members);
+ 
+-            HEX_VERBOSE("ggml-hex: %s fused GDN_CONV_STEP %s (n_ch %d d_conv %d) at node %d\n",
+-                        sess->name.c_str(), m.S->name, (int) m.n_ch, (int) m.d_conv, m.emit);
++            HEX_VERBOSE("ggml-hex: %s fused %s %s (n_ch %d d_conv %d tokens %d) at node %d\n",
++                        sess->name.c_str(), node.name.c_str(), m.S->name, (int) m.n_ch, (int) m.d_conv,
++                        (int) m.n_tokens, m.emit);
+         } else if (n->op == GGML_OP_GATED_DELTA_NET) {
+             ggml_hexagon_gdn_state_match m;
+             const char * reason = ggml_hexagon_gdn_state_chain_check(gf, index, i, m);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 83f6d15..014d121 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4659,6 +4659,16 @@ struct test_gated_delta_net : public test_case {
+             }
+         }
+     }
++
++    // A batch of tokens with a scalar gate and the final state only is the shape where a backend may
++    // rewrite the recurrence of a block of tokens as matrix products (the chunked delta rule). The
++    // rewrite is exact, thus the error is the rounding of those products, and fp16 products with f32
++    // accumulation land near 3e-07 against this f32 reference. The tolerance holds that with a margin
++    // of 20, and every other shape keeps the tight one.
++    double max_nmse_err() override {
++        const bool chunkable = n_seq_tokens >= 32 && !kda && K == 1;
++        return chunkable ? 1e-5 : 1e-7;
++    }
+ };
+ 
+ // GATED_DELTA_NET over a batch of tokens.
+@@ -4682,6 +4692,8 @@ struct test_gated_delta_net_batch : public test_gated_delta_net {
+         return test_gated_delta_net::vars() + "," + VARS_TO_STR1(gate_min);
+     }
+ 
++    // the tolerance of the parent covers these shapes
++
+     void initialize_tensors(ggml_context * ctx) override {
+         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+             if (ggml_is_view_op(t->op)) { continue; }
+@@ -4696,10 +4708,6 @@ struct test_gated_delta_net_batch : public test_gated_delta_net {
+             }
+         }
+     }
+-
+-    double max_nmse_err() override {
+-        return 1e-5;
+-    }
+ };
+ 
+ // GET_ROWS + CONCAT + SSM_CONV + SILU + CPY: the conv half of the recurrent state step at one token.
+@@ -4711,21 +4719,23 @@ struct test_gdn_conv_state_fusion : public test_case {
+     const int64_t n_slots;
+     const int64_t src_slot;
+     const int64_t dst_slot;
++    const int64_t n_tokens; // 1 is the decode step, more is one batch of a prefill
+ 
+     std::string vars() override {
+-        return VARS_TO_STR5(d_conv, n_ch, n_slots, src_slot, dst_slot);
++        return VARS_TO_STR6(d_conv, n_ch, n_slots, src_slot, dst_slot, n_tokens);
+     }
+ 
+     test_gdn_conv_state_fusion(int64_t d_conv = 4, int64_t n_ch = 96, int64_t n_slots = 1,
+-            int64_t src_slot = 0, int64_t dst_slot = 0)
+-        : d_conv(d_conv), n_ch(n_ch), n_slots(n_slots), src_slot(src_slot), dst_slot(dst_slot) {}
++            int64_t src_slot = 0, int64_t dst_slot = 0, int64_t n_tokens = 1)
++        : d_conv(d_conv), n_ch(n_ch), n_slots(n_slots), src_slot(src_slot), dst_slot(dst_slot),
++          n_tokens(n_tokens) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         const int64_t row = (d_conv - 1) * n_ch;
+ 
+         ggml_tensor * states = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row, n_slots);
+         ggml_tensor * s_copy = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_slots);
+-        ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ch, 1);
++        ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ch, n_tokens);
+         ggml_tensor * w      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, n_ch);
+         ggml_set_name(states, "cache_r");
+         ggml_set_name(s_copy, "s_copy");
+@@ -4739,7 +4749,8 @@ struct test_gdn_conv_state_fusion : public test_case {
+         ggml_tensor * ci = ggml_concat(ctx, cs, ggml_transpose(ctx, x), 0);
+         ggml_set_name(ci, "conv_input");
+ 
+-        ggml_tensor * last = ggml_view_3d(ctx, ci, d_conv - 1, n_ch, 1, ci->nb[1], ci->nb[2], ggml_row_size(ci->type, 1));
++        ggml_tensor * last = ggml_view_3d(ctx, ci, d_conv - 1, n_ch, 1, ci->nb[1], ci->nb[2],
++                                          ggml_row_size(ci->type, n_tokens));
+         ggml_tensor * upd  = ggml_view_2d(ctx, states, row, 1, states->nb[1], dst_slot * states->nb[1]);
+         ggml_tensor * cpy  = ggml_cpy(ctx, last, upd);
+         ggml_set_name(cpy, "conv_state_update");
+@@ -4747,7 +4758,9 @@ struct test_gdn_conv_state_fusion : public test_case {
+         ggml_tensor * y = ggml_silu(ctx, ggml_ssm_conv(ctx, ci, w));
+         ggml_set_name(y, "conv_output_silu");
+ 
+-        ggml_tensor * out = ggml_concat(ctx, y, cpy, 0);
++        // one output that holds the conv result and the new state, whatever the token count is
++        ggml_tensor * out = ggml_concat(ctx, ggml_reshape_2d(ctx, y, n_ch * n_tokens, 1),
++                                        ggml_reshape_2d(ctx, cpy, row, 1), 0);
+         return out;
+     }
+ 
+@@ -11112,6 +11125,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_gdn_conv_state_fusion(4, 6144, 3, 2, 1));
+     test_cases.emplace_back(new test_gdn_conv_state_fusion(4, 100, 2, 1, 1));
+     test_cases.emplace_back(new test_gdn_conv_state_fusion(3, 64, 2, 0, 1));
++
++    // the same chain over a batch of tokens, which is what a prefill runs. 6144 channels with 256 and
++    // 512 tokens are the shapes of Qwen3.5-2B, 7 tokens is a short batch, 4 is the shortest one that
++    // a four tap kernel can take, and 100 channels is not a multiple of 32.
++    test_cases.emplace_back(new test_gdn_conv_state_fusion(4, 6144, 1, 0, 0, 256));
++    test_cases.emplace_back(new test_gdn_conv_state_fusion(4, 6144, 1, 0, 0, 512));
++    test_cases.emplace_back(new test_gdn_conv_state_fusion(4, 128, 2, 1, 0, 64));
++    test_cases.emplace_back(new test_gdn_conv_state_fusion(4, 64, 3, 2, 1, 7));
++    test_cases.emplace_back(new test_gdn_conv_state_fusion(4, 96, 1, 0, 0, 4));
++    test_cases.emplace_back(new test_gdn_conv_state_fusion(4, 100, 2, 1, 1, 33));
+     test_cases.emplace_back(new test_gdn_state_fusion(16, 128, 1, 0, 0));
+     test_cases.emplace_back(new test_gdn_state_fusion(16, 128, 3, 2, 1));
+     test_cases.emplace_back(new test_gdn_state_fusion(4, 32, 2, 1, 1));
