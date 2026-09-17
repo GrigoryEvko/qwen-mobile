@@ -113,8 +113,10 @@ class STELinear(nn.Module):
     def quantized_weight(self) -> torch.Tensor:
         d = self.scale()
         blocks = self.weight.view(self.rows, -1, BLOCK)
-        idx = _grid_like(self.grid, self.levels.detach()).round(blocks.detach() / d.detach()[..., None])
-        w_q = d[..., None] * self.levels[idx]
+        # The grid rounds on the sorted levels, thus the lookup must use the same order when the levels learn.
+        levels = self.levels.sort().values if isinstance(self.levels, nn.Parameter) else self.levels
+        idx = _grid_like(self.grid, levels.detach()).round(blocks.detach() / d.detach()[..., None])
+        w_q = d[..., None] * levels[idx]
         w_ste = blocks + (w_q - blocks).detach()
         return (w_ste + (w_q - w_q.detach())).view(self.rows, self.cols)
 
@@ -155,11 +157,17 @@ class Solved:
 
 @dataclass
 class Target:
-    """One matrix to optimize: its grid, the Hessian of its input, the reference weight."""
+    """One matrix to optimize: its grid, the Hessian of its input, the reference weight, the solved scales.
+
+    ``d`` [rows, cols // 32] are the block scales of the initial rounding.
+    The working weight is exactly on the grid with them, thus the STE starts
+    from the solved rounding. Without ``d`` the scale search runs again.
+    """
 
     grid: Grid
     hessian: torch.Tensor
     w_ref: torch.Tensor
+    d: torch.Tensor | None = None
 
 
 def _split(module: nn.Module, rel: str) -> tuple[nn.Module, str]:
@@ -172,15 +180,23 @@ def _split(module: nn.Module, rel: str) -> tuple[nn.Module, str]:
 
 
 def make_ste(lin: nn.Linear, target: Target, rank: int) -> STELinear:
-    """The STE module of a linear, with the scales from the search and the factors from the weighted SVD."""
+    """The STE module of a linear, with the solved scales and the factors from the weighted SVD.
+
+    With the solved scales the weight is already on the grid: a new search
+    could not give the scale back, because its candidates are discrete, and
+    the rounding would move. Without them the search picks the scales.
+    """
     w = lin.weight.data
-    h_diag = torch.diag(target.hessian)
-    idx, d = quantize(target.grid, w, weights=h_diag, search=True)
+    if target.d is not None:
+        d = target.d.to(torch.float32)
+        w_q = w
+    else:
+        idx, d = quantize(target.grid, w, weights=torch.diag(target.hessian), search=True)
+        w_q = dequantize(target.grid, idx, d)
     low_rank = None
     if rank > 0:
-        residual = target.w_ref.to(torch.float32) - dequantize(target.grid, idx, d)
-        low_rank = weighted_low_rank(residual, target.hessian, rank)
-    return STELinear(w, d.to(torch.float32), target.grid, isinstance(target.grid, CodebookGrid), low_rank)
+        low_rank = weighted_low_rank(target.w_ref.to(torch.float32) - w_q, target.hessian, rank)
+    return STELinear(w, d, target.grid, isinstance(target.grid, CodebookGrid), low_rank)
 
 
 def wrap_layer(layer: nn.Module, targets: dict[str, Target], rank: int) -> dict[str, tuple[nn.Module, str, nn.Linear, STELinear]]:

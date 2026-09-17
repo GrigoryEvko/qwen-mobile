@@ -26,21 +26,23 @@ Then the head on the final-norm outputs, with its scales in the final norm.
 
 from __future__ import annotations
 
+import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch import nn
-from transformers.models.qwen3_5.modeling_qwen3_5 import create_causal_mask, create_recurrent_attention_mask
+from transformers.masking_utils import create_causal_mask
 
 from .blockopt import FROZEN, OptOptions, Solved, Target, optimize_head, optimize_layer
 from .grid import dequantize, q8_0_dequantize, q8_0_quantize, quantize
 from .grids import Grid, IQ4NLGrid, Q4_0Grid, fit_codebook
 from .names import to_gguf
 from .plan import Plan
-from .scale import permuted_moments, scaled_moments, search_column_scales
+from .scale import (head_channel_share, kv_group_rows, kv_group_share, permuted_moments, scaled_moments,
+                    search_column_scales)
 from .solver import solve_grid
 
 GDN_IN = ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_a", "linear_attn.in_proj_b")
@@ -74,6 +76,20 @@ def q8_round_trip_(w: torch.Tensor) -> None:
     """Replace ``w`` by its Q8_0 round trip, in place."""
     q, d = q8_0_quantize(w)
     w.copy_(q8_0_dequantize(q, d))
+
+
+def recurrent_mask(text_model: nn.Module, kw: dict) -> torch.Tensor | None:
+    """The mask of the linear-attention layers, from the transformers version at hand.
+
+    Some transformers versions give ``create_recurrent_attention_mask`` in
+    the Qwen3.5 module, other versions a method of the text model. Without
+    padding the mask is None in the two.
+    """
+    try:
+        from transformers.models.qwen3_5.modeling_qwen3_5 import create_recurrent_attention_mask
+    except ImportError:
+        return text_model._update_linear_attn_mask(kw["attention_mask"], kw["past_key_values"])
+    return create_recurrent_attention_mask(**kw)
 
 
 class PairedMoments:
@@ -142,7 +158,7 @@ class Lockstep:
             rotary = self.ref.model.rotary_emb(hidden, pos[1:])
             kw = dict(config=self.cfg, inputs_embeds=hidden, attention_mask=None, past_key_values=None,
                       position_ids=pos[0])
-            masks = {"full_attention": create_causal_mask(**kw), "linear_attention": create_recurrent_attention_mask(**kw)}
+            masks = {"full_attention": create_causal_mask(**kw), "linear_attention": recurrent_mask(self.ref.model, kw)}
             self._context[n] = (rotary, masks, pos[0])
         return self._context[n]
 
@@ -218,9 +234,11 @@ class Quantizer:
         self.opts = opts
         self.cfg = step.cfg
         self.fixed = {"Q4_0": Q4_0Grid().to(step.device), "IQ4_NL": IQ4NLGrid().to(step.device)}
-        # The grid and the input Hessian of each solved matrix, by (layer, relative name). The head is layer -1.
+        # The grid, the input Hessian and the block scales of each solved matrix, by (layer, relative name).
+        # The head is layer -1. The Hessian and the scales live until the block optimization of the layer.
         self.grids: dict[tuple[int, str], Grid] = {}
         self.hess: dict[tuple[int, str], torch.Tensor] = {}
+        self.scales: dict[tuple[int, str], torch.Tensor] = {}
         out_dir.mkdir(parents=True, exist_ok=True)
 
     # --- grids ---
@@ -299,6 +317,7 @@ class Quantizer:
             cross = g if self.opts.init == "qronos" else None
             idx, d, err, change = solve_grid(lin.weight.data, h, grid, cross, damp=self.opts.damp,
                                              refit_damp=self.opts.refit_damp)
+        self.scales[key] = d
         lin.weight.data.copy_(dequantize(grid, idx, d))
         self.save_pack(name, kind, grid, idx, d)
         print(f"{tag} {name:30s} {kind:6s} {tuple(lin.weight.shape)} {self.opts.init} err {err:.3e} "
@@ -315,7 +334,8 @@ class Quantizer:
     def optimize(self, li: int) -> None:
         """Block reconstruction of layer li, then the Q8 members back on their grid."""
         self.step.advance_ref(li)
-        targets = {rel: Target(self.grids[(l, rel)], self.hess[(l, rel)], self.both(li, rel)[0].weight.data)
+        targets = {rel: Target(self.grids[(l, rel)], self.hess[(l, rel)], self.both(li, rel)[0].weight.data,
+                               self.scales[(l, rel)])
                    for (l, rel) in list(self.grids) if l == li}
         result = optimize_layer(self.step, li, targets, self.opts.opt)
         for rel, solved in result.items():
@@ -328,13 +348,16 @@ class Quantizer:
         self.step.advance_work(li)
         for key in [k for k in self.hess if k[0] == li]:
             del self.hess[key]
+            del self.scales[key]
         torch.cuda.empty_cache()
 
     def save_folds(self) -> None:
         """The GGUF-space values of the small tensors of the working copy, for the export.
 
         The optimization moves the norms, the gate projections and the Q8
-        matrices. The zero-centered norms get their +1.
+        matrices. The zero-centered norms get their +1. The plan goes with
+        them: the export refuses a different plan on the unfolded F16 GGUF,
+        because the folds moved the coordinates of the solved classes.
         """
         folds: dict[str, np.ndarray] = {}
         for full, p in self.step.work.named_parameters():
@@ -347,16 +370,20 @@ class Quantizer:
             if gguf.endswith(ZERO_CENTERED):
                 v = v + 1.0
             folds[gguf] = v.numpy()
-        np.savez(self.out_dir / "folds.npz", **folds)
+        np.savez(self.out_dir / "folds.npz", plan=np.array(json.dumps(asdict(self.plan))), **folds)
         print(f"wrote {len(folds)} small tensors to folds.npz", flush=True)
 
     # --- groups ---
 
-    def mixer_input(self, li: int, members: tuple[str, ...], norm_rel: str, defer: tuple[str, ...] = ()) -> None:
-        """The projections that read the input norm. ``defer`` waits for a later fold."""
+    def mixer_input(self, li: int, members: tuple[str, ...], norm_rel: str,
+                    defer: tuple[str, ...] = ()) -> tuple[torch.Tensor, torch.Tensor]:
+        """The projections that read the input norm. ``defer`` waits for a later fold.
+
+        Returns the moments of the (scaled) input, for the deferred members.
+        """
         h, g = self.step.collect(li, [members[0]])[members[0]].mean()
-        q4 = [rel for rel in members if self.kind(li, rel) == "Q4_0"]
-        t = self.column_scales(li, q4, h)
+        solved = [rel for rel in members if self.kind(li, rel) in self.plan.solved_types()]
+        t = self.column_scales(li, solved, h)
         if t is not None:
             self.scale_columns(li, members, t)
             self.scale_norm(li, norm_rel, t)
@@ -364,14 +391,14 @@ class Quantizer:
         for rel in members:
             if rel not in defer:
                 self.solve_or_round(li, rel, h, g)
+        return h, g
 
     def gdn_output(self, li: int) -> None:
         """out_proj, with its column scales in the shared weight of the gated norm."""
         rel = "linear_attn.out_proj"
         h, g = self.step.collect(li, [rel])[rel].mean()
         v_dim = self.cfg.linear_value_head_dim
-        share = torch.arange(h.shape[0], device=h.device) % v_dim
-        t = self.column_scales(li, [rel], h, share)
+        t = self.column_scales(li, [rel], h, head_channel_share(h.shape[0], v_dim, h.device))
         if t is not None:
             self.scale_columns(li, [rel], t)
             for norm in self.both(li, "linear_attn.norm"):
@@ -379,20 +406,21 @@ class Quantizer:
             h, g = scaled_moments(h, g, t)
         self.solve_or_round(li, rel, h, g)
 
-    def attention_output(self, li: int) -> None:
-        """o_proj, with its column scales in the v_proj rows of the KV group of each head."""
+    def attention_output(self, li: int, h_in: torch.Tensor, g_in: torch.Tensor) -> None:
+        """o_proj, with its column scales in the v_proj rows of the KV group of each head.
+
+        ``h_in``, ``g_in`` are the moments of the mixer input: v_proj reads
+        them, and a row scale does not change them.
+        """
         rel = "self_attn.o_proj"
         h, g = self.step.collect(li, [rel])[rel].mean()
         heads, kv_heads, dim = self.cfg.num_attention_heads, self.cfg.num_key_value_heads, self.cfg.head_dim
-        group = heads // kv_heads
-        j = torch.arange(h.shape[0], device=h.device)
-        share = (j // dim // group) * dim + j % dim
-        t = self.column_scales(li, [rel], h, share)
+        t = self.column_scales(li, [rel], h, kv_group_share(h.shape[0], heads, kv_heads, dim, h.device))
         if t is not None:
             self.scale_columns(li, [rel], t)
-            self.scale_rows(li, "self_attn.v_proj", t.view(heads, dim)[::group].reshape(-1))
+            self.scale_rows(li, "self_attn.v_proj", kv_group_rows(t, heads, kv_heads, dim))
             h, g = scaled_moments(h, g, t)
-        self.solve_or_round(li, "self_attn.v_proj", h, g)
+        self.solve_or_round(li, "self_attn.v_proj", h_in, g_in)
         self.solve_or_round(li, rel, h, g)
 
     def mlp(self, li: int) -> None:
@@ -456,7 +484,8 @@ class Quantizer:
             ref.layers.to("cpu")
             ref.embed_tokens.to("cpu")
             torch.cuda.empty_cache()
-            solved = optimize_head(step, Target(self.grids[key], self.hess[key], heads[0].weight.data), self.opts.opt)
+            target = Target(self.grids[key], self.hess[key], heads[0].weight.data, self.scales[key])
+            solved = optimize_head(step, target, self.opts.opt)
             self.save_solved("output.weight", kind, solved)
             ref.layers.to(step.device)
             ref.embed_tokens.to(step.device)
@@ -476,8 +505,8 @@ class Quantizer:
                 self.mixer_input(li, GDN_IN, "input_layernorm")
                 self.gdn_output(li)
             else:
-                self.mixer_input(li, ATTN_IN, "input_layernorm", defer=("self_attn.v_proj",))
-                self.attention_output(li)
+                h_in, g_in = self.mixer_input(li, ATTN_IN, "input_layernorm", defer=("self_attn.v_proj",))
+                self.attention_output(li, h_in, g_in)
             self.mlp(li)
             if self.opts.method == "blockopt":
                 self.optimize(li)
