@@ -233,3 +233,10 @@ MTP on the phone (NPU, llama-server --spec-type draft-mtp, draft 3, one prompt, 
 block drafts as the original (the acceptance matches), but the 2B head is weak, and on the HVX matvec
 a 4-row verify step costs 1.9x a single row, thus MTP pays only where the acceptance is high (the 4B)
 or once the multi-row matvec streams the weights one time for 1 to 4 rows.
+
+MTP on the 4B Q8_0 (NPU, llama-server, 2026-09-18, the fused state step on): a free-form answer of
+160 tokens gives plain 10.4 t/s, draft 3 11.3 t/s (89 of 210 drafts accepted, 42 %), draft 5 8.1 t/s
+(27 %); the morning number of 18.6 t/s with 89 % accepted was a formulaic thinking block. A draft-3
+step costs 2.1 plain tokens (three draft passes through the 0.67 GB head, a four-row verify at 1.9x a
+single row, four host round trips) and yields 2.27 tokens. The gain needs the multi-row matvec and the
+host gap fix; the draft length must follow the recent acceptance.
