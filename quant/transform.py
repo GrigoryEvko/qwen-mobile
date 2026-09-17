@@ -32,13 +32,24 @@ MLP_INPUTS = ("mlp.gate_proj", "mlp.up_proj")
 
 
 def hadamard(n: int, device: torch.device) -> torch.Tensor:
-    """The normalized Sylvester Hadamard matrix of order n (a power of two)."""
-    if n & (n - 1):
-        raise ValueError(f"Hadamard order must be a power of two, got {n}")
+    """An orthogonal mixing matrix of order n, float64.
+
+    For a power of two it is the normalized Sylvester Hadamard matrix. For
+    n = 2^m · r with r odd (the 4B hidden size 2560 = 512 · 5) it is the
+    Kronecker product of the Hadamard matrix of order 2^m and a seeded
+    orthogonal matrix of order r, thus every entry still mixes all channels.
+    """
+    m = n & -n
+    r = n // m
     h = torch.ones(1, 1, dtype=torch.float64, device=device)
-    while h.shape[0] < n:
+    while h.shape[0] < m:
         h = torch.cat([torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0)
-    return h / math.sqrt(n)
+    h = h / math.sqrt(m)
+    if r == 1:
+        return h
+    gen = torch.Generator(device="cpu").manual_seed(r)
+    q, _ = torch.linalg.qr(torch.randn(r, r, generator=gen, dtype=torch.float64))
+    return torch.kron(h, q.to(device))
 
 
 def rotation_matrix(n: int, block: int | None, seed: int, device: torch.device) -> torch.Tensor:
