@@ -54,11 +54,37 @@ s <= t:
     O        = (scale E .* P) Delta + (scale Q e^gamma) S              HMX, two products, one accumulator
     S_next   = e^gamma_C S + (K e^(gamma_C - gamma))^T Delta           HMX product, f32 update
 
-Each chunk is three HMX jobs with HVX work between them. A worker thread owns rows (sequence, head)
-and holds its own VTCM buffers, 440 KB at head size 128. The DMA of the next chunk of q, k and v
-starts before the first job of the chunk in work. The three jobs of the threads go to the one HMX
-queue thread, with a spinlock for the pushes, and each worker waits on the done flag of its own
-descriptor. The op flushes the queue at the end.
+How the threads work, and the hang of the first version
+
+The first version of this kernel gave one row (sequence, head) to each worker thread, and each worker
+pushed its own jobs to the HMX queue and waited for them. On the phone that stopped the DSP with no
+log, at the first batch, every time.
+
+The cause is in main.c and hex-utils.h: the worker count is the number of hardware threads (n_hvx
+comes from qurt_hvx_get_units and the thread count of the core), and hex_pause is pause(#255), which
+holds the hardware thread. When every worker waits for the HMX queue thread, every hardware thread is
+taken, the queue thread never runs, and the jobs never finish. The matmul kernel and the flash
+attention kernel of this backend never do that: the op thread alone pushes and pops the HMX queue,
+and it gives the HVX work between two jobs to the workers. This kernel now follows that pattern.
+
+A group of rows runs together, and the group is as large as VTCM holds (24 rows at most, 16 rows of
+the 2B in one group at 440 KB a row). Each row of the group keeps its buffers over the whole chunk
+loop. One chunk of the group is three phases on the worker threads and three HMX jobs from the op
+thread, and one job carries the products of every row of the group. Thus one chunk of the 2B is 3
+dispatches and 3 HMX jobs, not 3 jobs a row, and one op of 512 tokens is 26 dispatches and 24 jobs.
+The DMA of the next chunk of q, k and v starts at the end of the first phase.
+
+Every wait of the op thread has a bound of 2000000000 cycles, about two seconds. When it fires, the
+op returns INTERNAL-ERROR with a detail code, and the host prints the op and the code (patch 0004
+carries that report):
+
+    20  another op left a job in the HMX queue
+    21  the HMX queue took no job
+    22  an HMX job did not finish inside the bound
+
+The op does not fall back to the sequential kernel after a timeout: a job that is still outstanding
+can write into the VTCM buffers that the fallback would use. The error goes to the host instead, thus
+a wedged DSP gives a message on the next run and not a hang.
 
 Why the result equals the reference, and by how much
 
@@ -121,16 +147,16 @@ profile shows which kernel ran: 6.5 ms per op is the sequential one.
 Expected speed
 
 The HMX work is 1.5 GFLOP per layer of the 2B at 512 tokens, about 0.25 ms at the rate that the
-matmuls of this backend reach. The HVX work is about 0.3 ms per layer over six threads, and the DMA
-of q, k and v is 12 MB per layer, which is the same traffic that the sequential kernel reads. The
-expectation is 0.5 to 1 ms per layer against 6.5 ms, thus about 25 ms of the 235 ms that the 36 ops
-of one pp512 batch take today.
+matmuls of this backend reach. The HVX work is about 0.3 ms per layer over the worker threads, and
+the DMA of q, k and v is 12 MB per layer, which is the same traffic that the sequential kernel reads.
+The phases serialize the HVX work and the HMX work of a group, thus the expectation is 0.5 to 1.5 ms
+per op against 6.5 ms, and 30 to 60 ms of the 235 ms that the 36 ops of one pp512 batch take today.
 diff --git a/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c b/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c
 new file mode 100644
-index 0000000..e70fec1
+index 0000000..c59af91
 --- /dev/null
 +++ b/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c
-@@ -0,0 +1,912 @@
+@@ -0,0 +1,1123 @@
 +// GATED_DELTA_NET for a batch of tokens: the chunked gated delta rule on the HMX.
 +//
 +// The sequential kernel of gated-delta-net-ops.c runs one token after the other on the HVX, thus it
@@ -139,24 +165,35 @@ index 0000000..e70fec1
 +// f32 in VTCM, and the small triangular solve runs in f32 on the HVX.
 +//
 +// For one (sequence, head) row, one chunk of C tokens with gates g_t (log decay), beta_t, and the
-+// state S_0 [D x D] (S[i][j], i = k index, j = v index), with gamma_t = sum of g_s for s <= t:
++// state S_0 [D x D] (S[i][j], i the key index, j the value index), with gamma_t the sum of g_s for
++// s <= t:
 +//
 +//   E[t][s]  = exp(gamma_t - gamma_s) for s <= t, 0 for s > t
 +//   A'[t][s] = beta_t E[t][s] (k_t . k_s) for s < t            (the HMX gives A = (K beta) K^T)
 +//   T        = (I + A')^-1                                      (forward substitution, f32)
 +//   W        = T (K beta e^gamma),  U = T (V beta)               (HMX)
 +//   Delta    = U - W S_0                                        (HMX for W S_0, HVX for the difference)
-+//   O        = scale (E (Q K^T)) Delta + scale (Q e^gamma) S_0   (HMX, both products in one accumulator)
++//   O        = scale (E .* (Q K^T)) Delta + scale (Q e^gamma) S_0 (HMX, both products in one accumulator)
 +//   S_C      = e^gamma_C S_0 + (K e^(gamma_C - gamma))^T Delta  (HMX for the product, HVX for the update)
 +//
 +// The host check scratchpad/gdn_chunk_check.cpp holds the same dataflow next to the sequential
 +// reference. With fp16 at each HMX input and output the NMSE is 3e-7 on the output and 2e-7 on the
 +// state, thus the tests of this path use a tolerance of 1e-5.
 +//
-+// Threads: each HVX worker owns rows (sequence, head), and runs the chunk loop for one row at a time
-+// with its own VTCM buffers. The HMX products of a chunk go to the HMX queue thread as three jobs, and
-+// the worker waits for each job. A spinlock orders the pushes of the workers, and the op flushes the
-+// queue at the end.
++// Threads. The op thread drives the HMX queue, and between two HMX jobs it gives the HVX work of a
++// phase to the worker threads. That is the pattern of the matmul and the flash attention kernels of
++// this backend, and it is the only safe one here: the worker count is the number of hardware threads
++// (main.c takes n_hvx from qurt_hvx_get_units and the thread count of the core), and hex_pause holds
++// the hardware thread. A worker that waits for the HMX queue thread thus holds the hardware thread
++// that the queue thread needs to run, and no thread makes progress.
++//
++// A group of rows runs together, and the group is as large as VTCM holds. Each row of the group keeps
++// its own buffers over the whole chunk loop, and one HMX job carries the products of every row of the
++// group. Thus one chunk of a group is three HMX jobs, not three per row.
++//
++// Every wait of the op thread has a cycle bound. When a bound fires, the op returns an error with a
++// detail code, and the host prints the op and the code. A wedged DSP thus gives a message on the next
++// run instead of a hang.
 +
 +#include <math.h>
 +#include <stdatomic.h>
@@ -177,12 +214,19 @@ index 0000000..e70fec1
 +#include "htp-ctx.h"
 +#include "htp-tensor.h"
 +
-+#define GDN_CH_C         64                      // tokens per chunk
-+#define GDN_CH_CT        (GDN_CH_C / 32)         // token tiles per chunk
-+#define GDN_CH_MAX_D     128                     // head size limit
-+#define GDN_CH_MIN_TOKENS 32                     // below this the sequential kernel is faster
-+#define GDN_CH_TILE      HMX_FP16_TILE_N_ELMS    // fp16 elements per tile
-+#define GDN_CH_ALIGN     2048                    // VTCM buffer alignment, one tile
++#define GDN_CH_C          64                      // tokens per chunk
++#define GDN_CH_CT         (GDN_CH_C / 32)         // token tiles per chunk
++#define GDN_CH_MAX_D      128                     // head size limit (the state transpose scatters one
++                                                  // region of D * D * 4 bytes, and 64 KB is the limit)
++#define GDN_CH_MIN_TOKENS 32                      // below this the sequential kernel is faster
++#define GDN_CH_TILE       HMX_FP16_TILE_N_ELMS    // fp16 elements per tile
++#define GDN_CH_ALIGN      2048                    // VTCM buffer alignment, one tile
++#define GDN_CH_MAX_GROUP  24                      // rows of one group
++#define GDN_CH_MAX_PROD   (GDN_CH_MAX_GROUP * 3)  // products of one HMX job
++
++// The bound of a wait for the HMX queue. The core runs near 1 GHz, thus this is about two seconds,
++// which is far more than any job of this kernel takes.
++#define GDN_CH_WAIT_CYCLES 2000000000ull
 +
 +// One HMX product: out[n_r x n_c tiles] = act[n_r x n_k tiles] * wt[n_c x n_k tiles], with an
 +// optional second product added into the same accumulator before the store
@@ -198,20 +242,23 @@ index 0000000..e70fec1
 +    uint32_t       n_k2;
 +};
 +
++// The products run in order. The products from n_stage0 on read what the products before them wrote,
++// thus one barrier sits at that index.
 +struct gdn_ch_hmx_job {
-+    const uint8_t *       scales;
-+    struct gdn_ch_product prod[4];
-+    uint32_t              n_prod;
++    const uint8_t *               scales;
++    const struct gdn_ch_product * prod;
++    uint32_t                      n_stage0;
++    uint32_t                      n_prod;
 +};
 +
-+// The VTCM buffers of one worker thread
-+struct gdn_ch_thread {
++// The VTCM buffers of one row of the group
++struct gdn_ch_row {
 +    float *   stg_q;     // [C x D] f32 rows of q for the chunk (DMA target)
 +    float *   stg_k;
 +    float *   stg_v;
 +    float *   stg_g;     // [C x H] f32, the gates of all heads for the chunk tokens
 +    float *   stg_b;     // [C x H] f32, beta
-+    float *   s32;       // [D x D] f32, the state S[i][j] of the row in work
++    float *   s32;       // [D x D] f32, the state S[i][j]
 +    float *   e32;       // [C x C] f32, the decay matrix E
 +    float *   a32;       // [C x C] f32, A then A'
 +    float *   t32;       // [C x C] f32, T
@@ -219,34 +266,47 @@ index 0000000..e70fec1
 +    __fp16 *  f16_stage; // [C x D] fp16 rows, the source of the transposing scatters
 +    __fp16 *  act_q;     // tiles [C x D], activation grid
 +    __fp16 *  act_qg;
-+    __fp16 *  act_kb;    // K beta, later reused for (K e^(gamma_C - gamma))^T
++    __fp16 *  act_kb;    // K beta, later the transposed K e^(gamma_C - gamma)
 +    __fp16 *  wt_kt;     // K^T, weight grid [D x C]
 +    __fp16 *  wt_kgb;    // K beta e^gamma, weight grid; with wt_vb the region of S_upd
 +    __fp16 *  wt_vb;
-+    __fp16 *  out_a;     // [C x C] output tiles of A, later T tiles
-+    __fp16 *  out_p;     // [C x C] output tiles of P, later P' tiles
++    __fp16 *  out_a;     // [C x C] output tiles of A, later the T tiles
++    __fp16 *  out_p;     // [C x C] output tiles of P, later the P' tiles
 +    __fp16 *  out_w;     // [C x D], later Delta in the weight grid
 +    __fp16 *  out_ws;    // [C x D], later O
 +    __fp16 *  out_u;     // [C x D]
 +    __fp16 *  s_wt;      // [D x D] weight tiles of S_0
-+    struct gdn_ch_hmx_job job;
 +};
 +
-+struct gdn_ch_context {
++struct gdn_ch_ctx {
 +    struct htp_ops_context * octx;
-+    struct gdn_ch_thread     th[HTP_MAX_NTHREADS];
-+    const uint8_t *          scales;   // 256 bytes in VTCM, the identity column scales
-+    uint32_t                 row_start;
-+    uint32_t                 nrows;
++    struct gdn_ch_row        row[GDN_CH_MAX_GROUP];
++    const uint8_t *          scales;          // the identity column scales, in VTCM
++    uint32_t                 row0;            // the first row of the group
++    uint32_t                 n_rows;          // the rows of the group
++    uint32_t                 n_use;           // the threads of a phase
++    uint32_t                 rows_per_thread;
++    uint32_t                 ic;              // the chunk in work
++    uint32_t                 n_chunks;
 +    uint32_t                 D;
 +    uint32_t                 H;
 +    uint32_t                 n_tokens;
 +    uint32_t                 n_seqs;
-+    uint32_t                 n_kt;     // D / 32
++    uint32_t                 n_kt;            // D / 32
 +    float                    scale;
++    float                    eC[GDN_CH_MAX_GROUP];
++    struct gdn_ch_product    prod[GDN_CH_MAX_PROD];
++    struct gdn_ch_hmx_job    job;
 +};
 +
-+// ---- the HMX job
++// The error detail codes of this op (reported to the host with the batch status)
++enum {
++    GDN_CH_ERR_QUEUE_BUSY = 20, // the HMX queue held a job of another op
++    GDN_CH_ERR_QUEUE_FULL = 21, // the HMX queue took no job
++    GDN_CH_ERR_TIMEOUT    = 22, // the HMX job did not finish inside the bound
++};
++
++// ---- the HMX job, which runs on the HMX queue thread
 +
 +static void gdn_ch_hmx_run(void * data) {
 +    const struct gdn_ch_hmx_job * job = (const struct gdn_ch_hmx_job *) data;
@@ -254,11 +314,12 @@ index 0000000..e70fec1
 +    asm volatile(HMX_SET_BIAS("%0") :: "r"((unsigned int) (uintptr_t) job->scales));
 +
 +    for (uint32_t ip = 0; ip < job->n_prod; ++ip) {
-+        if (ip > 0) {
-+            // A product of a job reads the tiles that the product before it wrote. syncht waits for
-+            // the memory transactions of this thread, thus those tiles are in VTCM before the load.
++        if (ip == job->n_stage0 && ip != 0) {
++            // The products from here on read tiles that the products before them wrote. syncht waits
++            // for the memory transactions of this thread, thus those tiles are in VTCM first.
 +            asm volatile("syncht" : : : "memory");
 +        }
++
 +        const struct gdn_ch_product * p = &job->prod[ip];
 +        const uint32_t range  = 2048u * p->n_k - 1;
 +        const uint32_t range2 = p->act2 ? 2048u * p->n_k2 - 1 : 0;
@@ -285,41 +346,42 @@ index 0000000..e70fec1
 +    }
 +}
 +
-+// The workers push to the one HMX queue. The lock orders the pushes, and each worker waits on the
-+// done flag of its own descriptor. The op flushes the queue at the end, thus the pop index of the
-+// queue stays consistent for the next op.
-+static atomic_flag gdn_ch_hmx_lock = ATOMIC_FLAG_INIT;
++// Gives the job to the HMX queue thread and waits for it. Only the op thread calls this, and one job
++// is in flight at a time, thus the descriptor of this job is the one at the pop index.
++// Returns 0, or the detail code of the failure.
++static int gdn_ch_hmx_submit(struct gdn_ch_ctx * c) {
++    hmx_queue_t q = c->octx->ctx->hmx_queue;
 +
-+static struct hmx_queue_desc * gdn_ch_hmx_submit(hmx_queue_t q, struct gdn_ch_hmx_job * job) {
-+    // The job reads the tiles that this thread wrote. syncht waits for those writes, thus the HMX
-+    // thread sees them.
++    // The job reads the tiles that the workers wrote. syncht waits for the writes of this thread, and
++    // the join of work_queue_run ordered the writes of the workers before it.
 +    asm volatile("syncht" : : : "memory");
 +
-+    while (atomic_flag_test_and_set_explicit(&gdn_ch_hmx_lock, memory_order_acquire)) {
-+        hex_pause();
++    const unsigned int ip = q->idx_pop;
++    if (ip != atomic_load(&q->idx_write)) {
++        // Another op left a job in the queue. This op takes the descriptor at the pop index as its
++        // own, thus it stops instead.
++        FARF(ERROR, "gdn-chunk: the HMX queue is not idle (pop %u write %u)\n", ip, atomic_load(&q->idx_write));
++        return GDN_CH_ERR_QUEUE_BUSY;
 +    }
 +
-+    unsigned int iw = atomic_load(&q->idx_write);
-+    while (((iw + 1) & q->idx_mask) == atomic_load(&q->idx_read)) {
-+        hex_pause();
++    if (!hmx_queue_push(q, hmx_queue_make_desc(gdn_ch_hmx_run, &c->job))) {
++        return GDN_CH_ERR_QUEUE_FULL;
 +    }
 +
-+    struct hmx_queue_desc * d = &q->desc[iw];
-+    d->func = gdn_ch_hmx_run;
-+    d->data = job;
-+    atomic_store(&d->done, 0);
-+    atomic_store(&q->idx_write, (iw + 1) & q->idx_mask);
-+    atomic_fetch_add(&q->seqn, 1);
-+    qurt_futex_wake(&q->seqn, 1);
++    struct hmx_queue_desc * d = &q->desc[ip];
 +
-+    atomic_flag_clear_explicit(&gdn_ch_hmx_lock, memory_order_release);
-+    return d;
-+}
-+
-+static inline void gdn_ch_hmx_wait(const struct hmx_queue_desc * d) {
++    const uint64_t deadline = hex_get_cycles() + GDN_CH_WAIT_CYCLES;
 +    while (!atomic_load(&d->done)) {
++        if (hex_get_cycles() > deadline) {
++            FARF(ERROR, "gdn-chunk: the HMX queue did not finish a job of %u products inside %llu cycles\n",
++                 c->job.n_prod, (unsigned long long) GDN_CH_WAIT_CYCLES);
++            return GDN_CH_ERR_TIMEOUT;
++        }
 +        hex_pause();
 +    }
++
++    q->idx_pop = (ip + 1) & q->idx_mask;
++    return 0;
 +}
 +
 +static inline void gdn_ch_product_set(struct gdn_ch_product * p, const __fp16 * act, const __fp16 * wt, __fp16 * out,
@@ -462,7 +524,8 @@ index 0000000..e70fec1
 +    gdn_ch_mem_sync();
 +}
 +
-+// f32 [n x n] transpose in VTCM through 32-bit scatters: dst[c][r] = src[r][c]. n is a multiple of 32.
++// f32 [n x n] transpose in VTCM through 32-bit scatters: dst[c][r] = src[r][c]. n is a multiple of 32,
++// and n * n * 4 is at most 64 KB, which is the limit of a scatter region.
 +static void gdn_ch_transpose_f32(float * restrict dst, const float * restrict src, uint32_t n) {
 +    const size_t bytes = (size_t) n * n * sizeof(float);
 +    size_t region = 1;
@@ -493,13 +556,13 @@ index 0000000..e70fec1
 +// ---- the per-chunk math on the HVX
 +
 +// gamma, beta and their exponentials for the chunk, from the staged gate blocks
-+static void gdn_ch_gates_init(struct gdn_ch_gates * ga, const struct gdn_ch_thread * th, uint32_t H, uint32_t head,
++static void gdn_ch_gates_init(struct gdn_ch_gates * ga, const struct gdn_ch_row * rw, uint32_t H, uint32_t head,
 +                              uint32_t Cc, float scale) {
 +    float acc = 0.0f;
 +    for (uint32_t t = 0; t < GDN_CH_C; ++t) {
 +        if (t < Cc) {
-+            acc += th->stg_g[t * H + head];
-+            ga->bet[t] = th->stg_b[t * H + head];
++            acc += rw->stg_g[t * H + head];
++            ga->bet[t] = rw->stg_b[t * H + head];
 +        } else {
 +            ga->bet[t] = 0.0f;
 +        }
@@ -522,7 +585,7 @@ index 0000000..e70fec1
 +}
 +
 +// E[t][s] = exp(gamma_t - gamma_s) for s <= t, 0 for s > t
-+static void gdn_ch_decay_matrix(struct gdn_ch_thread * th, const struct gdn_ch_gates * ga) {
++static void gdn_ch_decay_matrix(struct gdn_ch_row * rw, const struct gdn_ch_gates * ga) {
 +    const HVX_Vector vg0 = hvx_vmem(ga->gam);
 +    const HVX_Vector vg1 = hvx_vmem(ga->gam + 32);
 +    const HVX_Vector zero = Q6_V_vzero();
@@ -536,22 +599,22 @@ index 0000000..e70fec1
 +        } else {
 +            e1 = Q6_V_vmux_QVV(Q6_Q_vsetq2_R((t - 31) * 4), e1, zero);
 +        }
-+        hvx_vmem(th->e32 + (size_t) t * GDN_CH_C)      = e0;
-+        hvx_vmem(th->e32 + (size_t) t * GDN_CH_C + 32) = e1;
++        hvx_vmem(rw->e32 + (size_t) t * GDN_CH_C)      = e0;
++        hvx_vmem(rw->e32 + (size_t) t * GDN_CH_C + 32) = e1;
 +    }
 +}
 +
 +// T = (I + A')^-1 with A' = A * E strictly below the diagonal, by forward substitution over the rows.
-+// a32 holds A * E on entry (the diagonal is not read). The result goes to t32.
-+static void gdn_ch_solve(struct gdn_ch_thread * th) {
-+    float * a = th->a32;
-+    float * t = th->t32;
++// a32 holds A on entry. The result goes to t32.
++static void gdn_ch_solve(struct gdn_ch_row * rw) {
++    float * a = rw->a32;
++    float * t = rw->t32;
 +
 +    for (uint32_t i = 0; i < GDN_CH_C; ++i) {
-+        HVX_Vector v0 = hvx_vmem(th->a32 + (size_t) i * GDN_CH_C);
-+        HVX_Vector v1 = hvx_vmem(th->a32 + (size_t) i * GDN_CH_C + 32);
-+        HVX_Vector e0 = hvx_vmem(th->e32 + (size_t) i * GDN_CH_C);
-+        HVX_Vector e1 = hvx_vmem(th->e32 + (size_t) i * GDN_CH_C + 32);
++        HVX_Vector v0 = hvx_vmem(rw->a32 + (size_t) i * GDN_CH_C);
++        HVX_Vector v1 = hvx_vmem(rw->a32 + (size_t) i * GDN_CH_C + 32);
++        HVX_Vector e0 = hvx_vmem(rw->e32 + (size_t) i * GDN_CH_C);
++        HVX_Vector e1 = hvx_vmem(rw->e32 + (size_t) i * GDN_CH_C + 32);
 +        hvx_vmem(a + (size_t) i * GDN_CH_C)      = hvx_vec_mul_f32_f32(v0, e0);
 +        hvx_vmem(a + (size_t) i * GDN_CH_C + 32) = hvx_vec_mul_f32_f32(v1, e1);
 +    }
@@ -615,23 +678,23 @@ index 0000000..e70fec1
 +}
 +
 +// P' = P * E * scale, in place in p32
-+static void gdn_ch_scale_p(struct gdn_ch_thread * th, float scale) {
++static void gdn_ch_scale_p(struct gdn_ch_row * rw, float scale) {
 +    const HVX_Vector vs = hvx_vec_splat_f32(scale);
 +    for (uint32_t i = 0; i < GDN_CH_C; ++i) {
-+        float * p = th->p32 + (size_t) i * GDN_CH_C;
-+        const float * e = th->e32 + (size_t) i * GDN_CH_C;
++        float * p = rw->p32 + (size_t) i * GDN_CH_C;
++        const float * e = rw->e32 + (size_t) i * GDN_CH_C;
 +        hvx_vmem(p)      = hvx_vec_mul_f32_f32(hvx_vec_mul_f32_f32(hvx_vmem(p), hvx_vmem(e)), vs);
 +        hvx_vmem(p + 32) = hvx_vec_mul_f32_f32(hvx_vec_mul_f32_f32(hvx_vmem(p + 32), hvx_vmem(e + 32)), vs);
 +    }
 +}
 +
-+// Delta = U - W S_0 in fp16, from the output grids of U and WS into the weight grid
-+static void gdn_ch_delta(struct gdn_ch_thread * th, uint32_t n_kt) {
++// Delta = U - WS in fp16, from the output grids of U and WS into the weight grid
++static void gdn_ch_delta(struct gdn_ch_row * rw, uint32_t n_kt) {
 +    for (uint32_t jt = 0; jt < n_kt; ++jt) {
 +        for (uint32_t tt = 0; tt < GDN_CH_CT; ++tt) {
-+            const HVX_Vector * u  = (const HVX_Vector *) (th->out_u  + (size_t) (tt * n_kt + jt) * GDN_CH_TILE);
-+            const HVX_Vector * ws = (const HVX_Vector *) (th->out_ws + (size_t) (tt * n_kt + jt) * GDN_CH_TILE);
-+            HVX_Vector *       d  = (HVX_Vector *) (th->out_w + (size_t) (jt * GDN_CH_CT + tt) * GDN_CH_TILE);
++            const HVX_Vector * u  = (const HVX_Vector *) (rw->out_u  + (size_t) (tt * n_kt + jt) * GDN_CH_TILE);
++            const HVX_Vector * ws = (const HVX_Vector *) (rw->out_ws + (size_t) (tt * n_kt + jt) * GDN_CH_TILE);
++            HVX_Vector *       d  = (HVX_Vector *) (rw->out_w + (size_t) (jt * GDN_CH_CT + tt) * GDN_CH_TILE);
 +            for (uint32_t i = 0; i < GDN_CH_TILE * sizeof(__fp16) / VLEN; ++i) {
 +                d[i] = hvx_vec_sub_f16_f16(u[i], ws[i]);
 +            }
@@ -640,11 +703,11 @@ index 0000000..e70fec1
 +}
 +
 +// S = S * e^gamma_C + S_upd, S_upd from its output tiles
-+static void gdn_ch_state_update(struct gdn_ch_thread * th, uint32_t D, uint32_t n_kt, float eC) {
-+    const __fp16 * supd = th->wt_kgb; // the region of wt_kgb and wt_vb holds S_upd
++static void gdn_ch_state_update(struct gdn_ch_row * rw, uint32_t D, uint32_t n_kt, float eC) {
++    const __fp16 * supd = rw->wt_kgb; // the region of wt_kgb and wt_vb holds S_upd
 +    const HVX_Vector ve = hvx_vec_splat_f32(eC);
 +    for (uint32_t i = 0; i < D; i += 2) {
-+        float * p0 = th->s32 + (size_t) i * D;
++        float * p0 = rw->s32 + (size_t) i * D;
 +        float * p1 = p0 + D;
 +        const uint32_t rt = i / 32;
 +        const uint32_t ri = (i % 32) / 2;
@@ -660,8 +723,8 @@ index 0000000..e70fec1
 +}
 +
 +// The output rows of the chunk to DDR: dst row of token t at dst + t * dst_stride floats
-+static void gdn_ch_store_output(struct gdn_ch_thread * th, float * dst, uint32_t dst_stride, uint32_t Cc, uint32_t n_kt) {
-+    const __fp16 * o = th->out_ws; // the region of WS holds O
++static void gdn_ch_store_output(struct gdn_ch_row * rw, float * dst, uint32_t dst_stride, uint32_t Cc, uint32_t n_kt) {
++    const __fp16 * o = rw->out_ws; // the region of WS holds O
 +    for (uint32_t r = 0; r < Cc; r += 2) {
 +        float * p0 = dst + (size_t) r * dst_stride;
 +        float * p1 = p0 + dst_stride;
@@ -687,8 +750,9 @@ index 0000000..e70fec1
 +    }
 +}
 +
-+// ---- the DMA of one chunk of q, k, v, g and beta into the staging buffers
++// ---- the rows of the group
 +
++// The DDR pointers of one row of the group
 +struct gdn_ch_row_ptrs {
 +    const uint8_t * q;      // the row of token 0 of this (sequence, head)
 +    const uint8_t * k;
@@ -700,36 +764,13 @@ index 0000000..e70fec1
 +    uint32_t        v_nb2;
 +    uint32_t        g_nb2;
 +    uint32_t        b_nb2;
++    const float *   s_in;   // the state of the row, M[j][i]
++    float *         s_out;
++    float *         attn;   // the output of token 0 of this row
 +};
 +
-+static void gdn_ch_push_chunk(dma_queue * dma, struct gdn_ch_thread * th, const struct gdn_ch_row_ptrs * rp,
-+                              uint32_t t0, uint32_t Cc, uint32_t D, uint32_t H) {
-+    const size_t row  = (size_t) D * sizeof(float);
-+    const size_t grow = (size_t) H * sizeof(float);
-+    dma_queue_push(dma, dma_make_ptr(th->stg_q, rp->q + (size_t) t0 * rp->q_nb2), row, rp->q_nb2, row, Cc);
-+    dma_queue_push(dma, dma_make_ptr(th->stg_k, rp->k + (size_t) t0 * rp->k_nb2), row, rp->k_nb2, row, Cc);
-+    dma_queue_push(dma, dma_make_ptr(th->stg_v, rp->v + (size_t) t0 * rp->v_nb2), row, rp->v_nb2, row, Cc);
-+    dma_queue_push(dma, dma_make_ptr(th->stg_g, rp->g + (size_t) t0 * rp->g_nb2), grow, rp->g_nb2, grow, Cc);
-+    dma_queue_push(dma, dma_make_ptr(th->stg_b, rp->b + (size_t) t0 * rp->b_nb2), grow, rp->b_nb2, grow, Cc);
-+}
-+
-+static void gdn_ch_pop_chunk(dma_queue * dma) {
-+    for (int i = 0; i < 5; ++i) {
-+        dma_queue_pop(dma);
-+    }
-+}
-+
-+// ---- the worker thread
-+
-+static void gdn_ch_thread_func(unsigned int nth, unsigned int ith, void * data) {
-+    struct gdn_ch_context *  gctx = (struct gdn_ch_context *) data;
-+    struct htp_ops_context * octx = gctx->octx;
-+    struct gdn_ch_thread *   th   = &gctx->th[ith];
-+
-+    if (ith >= gctx->nrows) {
-+        return;
-+    }
-+
++static void gdn_ch_row_ptrs_init(const struct gdn_ch_ctx * c, uint32_t i, struct gdn_ch_row_ptrs * rp) {
++    const struct htp_ops_context * octx = c->octx;
 +    const struct htp_tensor * q     = octx->src[0];
 +    const struct htp_tensor * k     = octx->src[1];
 +    const struct htp_tensor * v     = octx->src[2];
@@ -738,151 +779,302 @@ index 0000000..e70fec1
 +    const struct htp_tensor * state = octx->src[5];
 +    const struct htp_tensor * dst   = octx->dst;
 +
-+    const uint32_t D        = gctx->D;
-+    const uint32_t H        = gctx->H;
-+    const uint32_t n_tokens = gctx->n_tokens;
-+    const uint32_t n_kt     = gctx->n_kt;
-+    const float    scale    = gctx->scale;
-+    const uint32_t row_end  = gctx->row_start + gctx->nrows;
++    const uint32_t D  = c->D;
++    const uint32_t H  = c->H;
++    const uint32_t ir = c->row0 + i;
 +
-+    const uint32_t rq3 = gctx->n_seqs / q->ne[3];
-+    const uint32_t rk3 = gctx->n_seqs / k->ne[3];
++    const uint32_t iv1 = ir % H;
++    const uint32_t iv3 = ir / H;
++    const uint32_t iq1 = iv1 % q->ne[1];
++    const uint32_t ik1 = iv1 % k->ne[1];
++    const uint32_t iq3 = iv3 / (c->n_seqs / q->ne[3]);
++    const uint32_t ik3 = iv3 / (c->n_seqs / k->ne[3]);
 +
-+    float *       attn_base      = (float *) (uintptr_t) dst->data;
-+    float *       state_out_base = attn_base + (size_t) D * H * n_tokens * gctx->n_seqs;
-+    const float * state_in_base  = (const float *) (uintptr_t) state->data;
-+    const size_t  state_seq_stride = state->nb[3] / sizeof(float);
++    rp->q     = (const uint8_t *) (uintptr_t) q->data + (size_t) iq3 * q->nb[3] + (size_t) iq1 * q->nb[1];
++    rp->k     = (const uint8_t *) (uintptr_t) k->data + (size_t) ik3 * k->nb[3] + (size_t) ik1 * k->nb[1];
++    rp->v     = (const uint8_t *) (uintptr_t) v->data + (size_t) iv3 * v->nb[3] + (size_t) iv1 * v->nb[1];
++    rp->g     = (const uint8_t *) (uintptr_t) g->data + (size_t) iv3 * g->nb[3];
++    rp->b     = (const uint8_t *) (uintptr_t) beta->data + (size_t) iv3 * beta->nb[3];
++    rp->q_nb2 = q->nb[2];
++    rp->k_nb2 = k->nb[2];
++    rp->v_nb2 = v->nb[2];
++    rp->g_nb2 = g->nb[2];
++    rp->b_nb2 = beta->nb[2];
 +
-+    dma_queue * dma = octx->ctx->dma[ith];
-+    hmx_queue_t hq  = octx->ctx->hmx_queue;
++    float * attn_base = (float *) (uintptr_t) dst->data;
 +
-+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
-+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) (gctx->row_start + ith));
++    rp->s_in  = (const float *) (uintptr_t) state->data + (size_t) iv3 * (state->nb[3] / sizeof(float)) +
++                (size_t) iv1 * D * D;
++    rp->s_out = attn_base + (size_t) D * H * c->n_tokens * c->n_seqs + ((size_t) iv3 * H + iv1) * D * D;
++    rp->attn  = attn_base + ((size_t) iv3 * c->n_tokens * H + iv1) * D;
++}
 +
-+    const uint32_t n_chunks = (n_tokens + GDN_CH_C - 1) / GDN_CH_C;
++static inline uint32_t gdn_ch_chunk_len(const struct gdn_ch_ctx * c, uint32_t ic) {
++    const uint32_t t0 = ic * GDN_CH_C;
++    const uint32_t left = c->n_tokens - t0;
++    return left < GDN_CH_C ? left : GDN_CH_C;
++}
 +
-+    struct gdn_ch_gates ga;
++static inline void gdn_ch_range(const struct gdn_ch_ctx * c, unsigned int ith, uint32_t * begin, uint32_t * end) {
++    uint32_t b = ith * c->rows_per_thread;
++    uint32_t e = b + c->rows_per_thread;
++    *begin = b < c->n_rows ? b : c->n_rows;
++    *end   = e < c->n_rows ? e : c->n_rows;
++}
 +
-+    for (uint32_t ir = gctx->row_start + ith; ir < row_end; ir += nth) {
-+        const uint32_t iv1 = ir % H;
-+        const uint32_t iv3 = ir / H;
-+        const uint32_t iq1 = iv1 % q->ne[1];
-+        const uint32_t ik1 = iv1 % k->ne[1];
-+        const uint32_t iq3 = iv3 / rq3;
-+        const uint32_t ik3 = iv3 / rk3;
++// The five transfers of one chunk of one row
++static void gdn_ch_push_chunk(dma_queue * dma, struct gdn_ch_row * rw, const struct gdn_ch_row_ptrs * rp,
++                              uint32_t t0, uint32_t Cc, uint32_t D, uint32_t H) {
++    const size_t row  = (size_t) D * sizeof(float);
++    const size_t grow = (size_t) H * sizeof(float);
++    dma_queue_push(dma, dma_make_ptr(rw->stg_q, rp->q + (size_t) t0 * rp->q_nb2), row, rp->q_nb2, row, Cc);
++    dma_queue_push(dma, dma_make_ptr(rw->stg_k, rp->k + (size_t) t0 * rp->k_nb2), row, rp->k_nb2, row, Cc);
++    dma_queue_push(dma, dma_make_ptr(rw->stg_v, rp->v + (size_t) t0 * rp->v_nb2), row, rp->v_nb2, row, Cc);
++    dma_queue_push(dma, dma_make_ptr(rw->stg_g, rp->g + (size_t) t0 * rp->g_nb2), grow, rp->g_nb2, grow, Cc);
++    dma_queue_push(dma, dma_make_ptr(rw->stg_b, rp->b + (size_t) t0 * rp->b_nb2), grow, rp->b_nb2, grow, Cc);
++}
 +
++static void gdn_ch_pop_chunk(dma_queue * dma) {
++    for (int i = 0; i < 5; ++i) {
++        dma_queue_pop(dma);
++    }
++}
++
++// The output rows and the state of a chunk that the HMX finished
++static void gdn_ch_finish_chunk(struct gdn_ch_ctx * c, uint32_t i, uint32_t ic) {
++    struct gdn_ch_row * rw = &c->row[i];
++    struct gdn_ch_row_ptrs rp;
++    gdn_ch_row_ptrs_init(c, i, &rp);
++
++    const uint32_t Cc = gdn_ch_chunk_len(c, ic);
++    float * attn = rp.attn + (size_t) ic * GDN_CH_C * c->H * c->D;
++
++    gdn_ch_store_output(rw, attn, c->D * c->H, Cc, c->n_kt);
++    gdn_ch_state_update(rw, c->D, c->n_kt, c->eC[i]);
++}
++
++// ---- the phases, which the op thread gives to the worker threads
++
++// The state of each row into VTCM, and the first chunk on its way
++static void gdn_ch_phase_begin(unsigned int nth, unsigned int ith, void * data) {
++    struct gdn_ch_ctx * c = (struct gdn_ch_ctx *) data;
++    (void) nth;
++
++    uint32_t begin, end;
++    gdn_ch_range(c, ith, &begin, &end);
++    if (begin >= end) {
++        return;
++    }
++
++    dma_queue * dma = c->octx->ctx->dma[ith];
++
++    for (uint32_t i = begin; i < end; ++i) {
++        struct gdn_ch_row * rw = &c->row[i];
 +        struct gdn_ch_row_ptrs rp;
-+        rp.q     = (const uint8_t *) (uintptr_t) q->data + (size_t) iq3 * q->nb[3] + (size_t) iq1 * q->nb[1];
-+        rp.k     = (const uint8_t *) (uintptr_t) k->data + (size_t) ik3 * k->nb[3] + (size_t) ik1 * k->nb[1];
-+        rp.v     = (const uint8_t *) (uintptr_t) v->data + (size_t) iv3 * v->nb[3] + (size_t) iv1 * v->nb[1];
-+        rp.g     = (const uint8_t *) (uintptr_t) g->data + (size_t) iv3 * g->nb[3];
-+        rp.b     = (const uint8_t *) (uintptr_t) beta->data + (size_t) iv3 * beta->nb[3];
-+        rp.q_nb2 = q->nb[2];
-+        rp.k_nb2 = k->nb[2];
-+        rp.v_nb2 = v->nb[2];
-+        rp.g_nb2 = g->nb[2];
-+        rp.b_nb2 = beta->nb[2];
++        gdn_ch_row_ptrs_init(c, i, &rp);
 +
-+        // The state of the row: DDR holds M[j][i] = S[i][j]. Stage it and transpose into s32.
-+        {
-+            const float * s_in = state_in_base + (size_t) iv3 * state_seq_stride + (size_t) iv1 * D * D;
-+            float * stage = th->stg_q; // stg_q and stg_k are adjacent, together they hold D * D floats
-+            dma_queue_push(dma, dma_make_ptr(stage, s_in), D * sizeof(float), D * sizeof(float), D * sizeof(float), D);
-+            dma_queue_pop(dma);
-+            gdn_ch_transpose_f32(th->s32, stage, D);
-+        }
++        // DDR holds M[j][i] = S[i][j]. Stage it, then transpose into s32. stg_q and stg_k are
++        // adjacent, thus together they hold the D * D floats of the state.
++        const size_t row = (size_t) c->D * sizeof(float);
++        dma_queue_push(dma, dma_make_ptr(rw->stg_q, rp.s_in), row, row, row, c->D);
++        dma_queue_pop(dma);
++        gdn_ch_transpose_f32(rw->s32, rw->stg_q, c->D);
++    }
 +
-+        gdn_ch_push_chunk(dma, th, &rp, 0, n_tokens < GDN_CH_C ? n_tokens : GDN_CH_C, D, H);
++    for (uint32_t i = begin; i < end; ++i) {
++        struct gdn_ch_row_ptrs rp;
++        gdn_ch_row_ptrs_init(c, i, &rp);
++        gdn_ch_push_chunk(dma, &c->row[i], &rp, 0, gdn_ch_chunk_len(c, 0), c->D, c->H);
++    }
++}
 +
-+        for (uint32_t ic = 0; ic < n_chunks; ++ic) {
-+            const uint32_t t0 = ic * GDN_CH_C;
-+            const uint32_t Cc = (n_tokens - t0) < GDN_CH_C ? (n_tokens - t0) : GDN_CH_C;
++// The chunk of the previous round lands, and the tiles of this chunk go up
++static void gdn_ch_phase_a(unsigned int nth, unsigned int ith, void * data) {
++    struct gdn_ch_ctx * c = (struct gdn_ch_ctx *) data;
++    (void) nth;
 +
-+            // H1: the chunk arrives, gates, decay matrix, tiles
-+            gdn_ch_pop_chunk(dma);
-+            if (Cc < GDN_CH_C) {
-+                gdn_ch_zero_rows(th->stg_q, Cc, GDN_CH_C, D);
-+                gdn_ch_zero_rows(th->stg_k, Cc, GDN_CH_C, D);
-+                gdn_ch_zero_rows(th->stg_v, Cc, GDN_CH_C, D);
-+            }
-+            gdn_ch_gates_init(&ga, th, H, iv1, Cc, scale);
-+            gdn_ch_decay_matrix(th, &ga);
++    uint32_t begin, end;
++    gdn_ch_range(c, ith, &begin, &end);
++    if (begin >= end) {
++        return;
++    }
 +
-+            gdn_ch_f32_to_tiles(th->act_q,  th->stg_q, GDN_CH_C, D, D, NULL,      n_kt, 1);
-+            gdn_ch_f32_to_tiles(th->act_qg, th->stg_q, GDN_CH_C, D, D, ga.sc_qg,  n_kt, 1);
-+            gdn_ch_f32_to_tiles(th->act_kb, th->stg_k, GDN_CH_C, D, D, ga.bet,    n_kt, 1);
-+            gdn_ch_f32_to_tiles(th->wt_kgb, th->stg_k, GDN_CH_C, D, D, ga.sc_kgb, 1, GDN_CH_CT);
-+            gdn_ch_f32_to_tiles(th->wt_vb,  th->stg_v, GDN_CH_C, D, D, ga.bet,    1, GDN_CH_CT);
-+            gdn_ch_f32_to_tiles(th->s_wt,   th->s32,   D, D, D, NULL, 1, n_kt);
++    dma_queue * dma = c->octx->ctx->dma[ith];
++    const uint32_t D = c->D;
++    const uint32_t H = c->H;
++    const uint32_t ic = c->ic;
++    const uint32_t Cc = gdn_ch_chunk_len(c, ic);
 +
-+            gdn_ch_f32_to_f16_rows(th->f16_stage, th->stg_k, GDN_CH_C, D, D, NULL);
-+            gdn_ch_scatter_transpose_f16(th->wt_kt, th->f16_stage, GDN_CH_C, D, D, n_kt, 1);
-+
-+            // K e^(gamma_C - gamma), transposed, into the region of K beta after M1 reads it. Stage it now.
-+            gdn_ch_f32_to_f16_rows(th->f16_stage, th->stg_k, GDN_CH_C, D, D, ga.egc);
-+
-+            const float eC = ga.e_gc;
-+
-+            // The staging buffers are free: fetch the next chunk
-+            if (ic + 1 < n_chunks) {
-+                const uint32_t t1  = t0 + GDN_CH_C;
-+                const uint32_t Cc1 = (n_tokens - t1) < GDN_CH_C ? (n_tokens - t1) : GDN_CH_C;
-+                gdn_ch_push_chunk(dma, th, &rp, t1, Cc1, D, H);
-+            }
-+
-+            // M1: A = (K beta) K^T, P = Q K^T
-+            th->job.scales = gctx->scales;
-+            th->job.n_prod = 2;
-+            gdn_ch_product_set(&th->job.prod[0], th->act_kb, th->wt_kt, th->out_a, GDN_CH_CT, GDN_CH_CT, n_kt);
-+            gdn_ch_product_set(&th->job.prod[1], th->act_q,  th->wt_kt, th->out_p, GDN_CH_CT, GDN_CH_CT, n_kt);
-+            gdn_ch_hmx_wait(gdn_ch_hmx_submit(hq, &th->job));
-+
-+            // H2: T, P', and the transposed K e^(gamma_C - gamma)
-+            gdn_ch_tiles_to_f32(th->a32, th->out_a, GDN_CH_C, GDN_CH_C, GDN_CH_C, GDN_CH_CT, 1);
-+            gdn_ch_tiles_to_f32(th->p32, th->out_p, GDN_CH_C, GDN_CH_C, GDN_CH_C, GDN_CH_CT, 1);
-+            gdn_ch_solve(th);
-+            gdn_ch_scale_p(th, scale);
-+            gdn_ch_f32_to_tiles(th->out_a, th->t32, GDN_CH_C, GDN_CH_C, GDN_CH_C, NULL, GDN_CH_CT, 1);
-+            gdn_ch_f32_to_tiles(th->out_p, th->p32, GDN_CH_C, GDN_CH_C, GDN_CH_C, NULL, GDN_CH_CT, 1);
-+            gdn_ch_scatter_transpose_f16(th->act_kb, th->f16_stage, GDN_CH_C, D, D, 1, GDN_CH_CT);
-+
-+            // M2: W = T (K beta e^gamma), WS = W S_0, U = T (V beta)
-+            th->job.n_prod = 3;
-+            gdn_ch_product_set(&th->job.prod[0], th->out_a, th->wt_kgb, th->out_w,  GDN_CH_CT, n_kt, GDN_CH_CT);
-+            gdn_ch_product_set(&th->job.prod[1], th->out_w, th->s_wt,   th->out_ws, GDN_CH_CT, n_kt, n_kt);
-+            gdn_ch_product_set(&th->job.prod[2], th->out_a, th->wt_vb,  th->out_u,  GDN_CH_CT, n_kt, GDN_CH_CT);
-+            gdn_ch_hmx_wait(gdn_ch_hmx_submit(hq, &th->job));
-+
-+            // H3: Delta = U - WS, in the weight grid, in the region of W
-+            gdn_ch_delta(th, n_kt);
-+
-+            // M3: O = P' Delta + (Q scale e^gamma) S_0, S_upd = (K e^(gamma_C - gamma))^T Delta
-+            th->job.n_prod = 2;
-+            gdn_ch_product_set(&th->job.prod[0], th->out_p, th->out_w, th->out_ws, GDN_CH_CT, n_kt, GDN_CH_CT);
-+            th->job.prod[0].act2 = th->act_qg;
-+            th->job.prod[0].wt2  = th->s_wt;
-+            th->job.prod[0].n_k2 = n_kt;
-+            gdn_ch_product_set(&th->job.prod[1], th->act_kb, th->out_w, th->wt_kgb, n_kt, n_kt, GDN_CH_CT);
-+            gdn_ch_hmx_wait(gdn_ch_hmx_submit(hq, &th->job));
-+
-+            // H4: the output rows and the state
-+            float * attn = attn_base + ((size_t) (iv3 * n_tokens + t0) * H + iv1) * D;
-+            gdn_ch_store_output(th, attn, D * H, Cc, n_kt);
-+            gdn_ch_state_update(th, D, n_kt, eC);
-+        }
-+
-+        // The final state, transposed back to M[j][i], to DDR
-+        {
-+            float * s_out = state_out_base + ((size_t) iv3 * H + iv1) * D * D;
-+            float * stage = th->stg_q;
-+            gdn_ch_transpose_f32(stage, th->s32, D);
-+            dma_queue_push(dma, dma_make_ptr(s_out, stage), D * sizeof(float), D * sizeof(float), D * sizeof(float), D);
-+            dma_queue_pop(dma);
++    // The output and the state of the chunk that the HMX finished in the previous round. This runs
++    // before the gates of this chunk, because it takes e^gamma_C of the previous chunk from eC, and
++    // before the tiles, because the state that it updates becomes the weight tiles of this chunk.
++    if (ic > 0) {
++        for (uint32_t i = begin; i < end; ++i) {
++            gdn_ch_finish_chunk(c, i, ic - 1);
 +        }
 +    }
 +
-+    dma_queue_flush(dma);
-+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) row_end);
++    // The transfers of this chunk, in row order. Every phase keeps that order, thus the queue of this
++    // thread stays in step with the rows.
++    for (uint32_t i = begin; i < end; ++i) {
++        (void) i;
++        gdn_ch_pop_chunk(dma);
++    }
++
++    for (uint32_t i = begin; i < end; ++i) {
++        struct gdn_ch_row * rw = &c->row[i];
++        struct gdn_ch_gates ga;
++
++        if (Cc < GDN_CH_C) {
++            gdn_ch_zero_rows(rw->stg_q, Cc, GDN_CH_C, D);
++            gdn_ch_zero_rows(rw->stg_k, Cc, GDN_CH_C, D);
++            gdn_ch_zero_rows(rw->stg_v, Cc, GDN_CH_C, D);
++        }
++
++        const uint32_t head = (c->row0 + i) % H;
++        gdn_ch_gates_init(&ga, rw, H, head, Cc, c->scale);
++        gdn_ch_decay_matrix(rw, &ga);
++        c->eC[i] = ga.e_gc;
++
++        gdn_ch_f32_to_tiles(rw->act_q,  rw->stg_q, GDN_CH_C, D, D, NULL,      c->n_kt, 1);
++        gdn_ch_f32_to_tiles(rw->act_qg, rw->stg_q, GDN_CH_C, D, D, ga.sc_qg,  c->n_kt, 1);
++        gdn_ch_f32_to_tiles(rw->act_kb, rw->stg_k, GDN_CH_C, D, D, ga.bet,    c->n_kt, 1);
++        gdn_ch_f32_to_tiles(rw->wt_kgb, rw->stg_k, GDN_CH_C, D, D, ga.sc_kgb, 1, GDN_CH_CT);
++        gdn_ch_f32_to_tiles(rw->wt_vb,  rw->stg_v, GDN_CH_C, D, D, ga.bet,    1, GDN_CH_CT);
++        gdn_ch_f32_to_tiles(rw->s_wt,   rw->s32,   D, D, D, NULL, 1, c->n_kt);
++
++        gdn_ch_f32_to_f16_rows(rw->f16_stage, rw->stg_k, GDN_CH_C, D, D, NULL);
++        gdn_ch_scatter_transpose_f16(rw->wt_kt, rw->f16_stage, GDN_CH_C, D, D, c->n_kt, 1);
++
++        // K e^(gamma_C - gamma) waits in the fp16 rows. Phase b scatters it into the region of K beta,
++        // which the first job reads before that.
++        gdn_ch_f32_to_f16_rows(rw->f16_stage, rw->stg_k, GDN_CH_C, D, D, ga.egc);
++    }
++
++    // The staging buffers are free again: fetch the next chunk
++    if (ic + 1 < c->n_chunks) {
++        for (uint32_t i = begin; i < end; ++i) {
++            struct gdn_ch_row_ptrs rp;
++            gdn_ch_row_ptrs_init(c, i, &rp);
++            gdn_ch_push_chunk(dma, &c->row[i], &rp, (ic + 1) * GDN_CH_C, gdn_ch_chunk_len(c, ic + 1), D, H);
++        }
++    }
++}
++
++// T and P' from A and P, and the transposed K e^(gamma_C - gamma)
++static void gdn_ch_phase_b(unsigned int nth, unsigned int ith, void * data) {
++    struct gdn_ch_ctx * c = (struct gdn_ch_ctx *) data;
++    (void) nth;
++
++    uint32_t begin, end;
++    gdn_ch_range(c, ith, &begin, &end);
++
++    for (uint32_t i = begin; i < end; ++i) {
++        struct gdn_ch_row * rw = &c->row[i];
++
++        gdn_ch_tiles_to_f32(rw->a32, rw->out_a, GDN_CH_C, GDN_CH_C, GDN_CH_C, GDN_CH_CT, 1);
++        gdn_ch_tiles_to_f32(rw->p32, rw->out_p, GDN_CH_C, GDN_CH_C, GDN_CH_C, GDN_CH_CT, 1);
++        gdn_ch_solve(rw);
++        gdn_ch_scale_p(rw, c->scale);
++        gdn_ch_f32_to_tiles(rw->out_a, rw->t32, GDN_CH_C, GDN_CH_C, GDN_CH_C, NULL, GDN_CH_CT, 1);
++        gdn_ch_f32_to_tiles(rw->out_p, rw->p32, GDN_CH_C, GDN_CH_C, GDN_CH_C, NULL, GDN_CH_CT, 1);
++        gdn_ch_scatter_transpose_f16(rw->act_kb, rw->f16_stage, GDN_CH_C, c->D, c->D, 1, GDN_CH_CT);
++    }
++}
++
++// Delta = U - W S_0
++static void gdn_ch_phase_c(unsigned int nth, unsigned int ith, void * data) {
++    struct gdn_ch_ctx * c = (struct gdn_ch_ctx *) data;
++    (void) nth;
++
++    uint32_t begin, end;
++    gdn_ch_range(c, ith, &begin, &end);
++
++    for (uint32_t i = begin; i < end; ++i) {
++        gdn_ch_delta(&c->row[i], c->n_kt);
++    }
++}
++
++// The last chunk of the group, and the state back to DDR
++static void gdn_ch_phase_end(unsigned int nth, unsigned int ith, void * data) {
++    struct gdn_ch_ctx * c = (struct gdn_ch_ctx *) data;
++    (void) nth;
++
++    uint32_t begin, end;
++    gdn_ch_range(c, ith, &begin, &end);
++    if (begin >= end) {
++        return;
++    }
++
++    dma_queue * dma = c->octx->ctx->dma[ith];
++
++    for (uint32_t i = begin; i < end; ++i) {
++        gdn_ch_finish_chunk(c, i, c->n_chunks - 1);
++
++        struct gdn_ch_row * rw = &c->row[i];
++        struct gdn_ch_row_ptrs rp;
++        gdn_ch_row_ptrs_init(c, i, &rp);
++
++        const size_t row = (size_t) c->D * sizeof(float);
++        gdn_ch_transpose_f32(rw->stg_q, rw->s32, c->D);
++        dma_queue_push(dma, dma_make_ptr(rp.s_out, rw->stg_q), row, row, row, c->D);
++        dma_queue_pop(dma);
++    }
++}
++
++// ---- the HMX jobs of one chunk of the group
++
++static void gdn_ch_job_m1(struct gdn_ch_ctx * c) {
++    uint32_t n = 0;
++    for (uint32_t i = 0; i < c->n_rows; ++i) {
++        struct gdn_ch_row * rw = &c->row[i];
++        gdn_ch_product_set(&c->prod[n++], rw->act_kb, rw->wt_kt, rw->out_a, GDN_CH_CT, GDN_CH_CT, c->n_kt);
++        gdn_ch_product_set(&c->prod[n++], rw->act_q,  rw->wt_kt, rw->out_p, GDN_CH_CT, GDN_CH_CT, c->n_kt);
++    }
++    c->job.scales   = c->scales;
++    c->job.prod     = c->prod;
++    c->job.n_prod   = n;
++    c->job.n_stage0 = n; // no product of this job reads another
++}
++
++static void gdn_ch_job_m2(struct gdn_ch_ctx * c) {
++    uint32_t n = 0;
++    for (uint32_t i = 0; i < c->n_rows; ++i) {
++        struct gdn_ch_row * rw = &c->row[i];
++        gdn_ch_product_set(&c->prod[n++], rw->out_a, rw->wt_kgb, rw->out_w, GDN_CH_CT, c->n_kt, GDN_CH_CT);
++        gdn_ch_product_set(&c->prod[n++], rw->out_a, rw->wt_vb,  rw->out_u, GDN_CH_CT, c->n_kt, GDN_CH_CT);
++    }
++    const uint32_t stage0 = n;
++    for (uint32_t i = 0; i < c->n_rows; ++i) {
++        struct gdn_ch_row * rw = &c->row[i];
++        // W S_0 reads the W that the first stage wrote
++        gdn_ch_product_set(&c->prod[n++], rw->out_w, rw->s_wt, rw->out_ws, GDN_CH_CT, c->n_kt, c->n_kt);
++    }
++    c->job.scales   = c->scales;
++    c->job.prod     = c->prod;
++    c->job.n_prod   = n;
++    c->job.n_stage0 = stage0;
++}
++
++static void gdn_ch_job_m3(struct gdn_ch_ctx * c) {
++    uint32_t n = 0;
++    for (uint32_t i = 0; i < c->n_rows; ++i) {
++        struct gdn_ch_row * rw = &c->row[i];
++
++        // O = P' Delta + (Q scale e^gamma) S_0
++        gdn_ch_product_set(&c->prod[n], rw->out_p, rw->out_w, rw->out_ws, GDN_CH_CT, c->n_kt, GDN_CH_CT);
++        c->prod[n].act2 = rw->act_qg;
++        c->prod[n].wt2  = rw->s_wt;
++        c->prod[n].n_k2 = c->n_kt;
++        n++;
++
++        // S_upd = (K e^(gamma_C - gamma))^T Delta
++        gdn_ch_product_set(&c->prod[n++], rw->act_kb, rw->out_w, rw->wt_kgb, c->n_kt, c->n_kt, GDN_CH_CT);
++    }
++    c->job.scales   = c->scales;
++    c->job.prod     = c->prod;
++    c->job.n_prod   = n;
++    c->job.n_stage0 = n;
 +}
 +
 +// ---- the VTCM layout
@@ -891,9 +1083,8 @@ index 0000000..e70fec1
 +    return (off + GDN_CH_ALIGN - 1) & ~(size_t) (GDN_CH_ALIGN - 1);
 +}
 +
-+// Lays the buffers of one thread from base, and returns the bytes used. With base NULL it only
-+// measures.
-+static size_t gdn_ch_layout_thread(struct gdn_ch_thread * th, uint8_t * base, uint32_t D, uint32_t H) {
++// Lays the buffers of one row from base, and returns the bytes used. With base NULL it only measures.
++static size_t gdn_ch_layout_row(struct gdn_ch_row * rw, uint8_t * base, uint32_t D, uint32_t H) {
 +    const size_t cd_f32  = (size_t) GDN_CH_C * D * sizeof(float);
 +    const size_t cd_f16  = (size_t) GDN_CH_C * D * sizeof(__fp16);
 +    const size_t cc_f32  = (size_t) GDN_CH_C * GDN_CH_C * sizeof(float);
@@ -905,7 +1096,7 @@ index 0000000..e70fec1
 +    size_t off = 0;
 +#define GDN_CH_ALLOC(field, type, bytes)                          \
 +    do {                                                          \
-+        if (base) { th->field = (type *) (base + off); }          \
++        if (base) { rw->field = (type *) (base + off); }          \
 +        off = gdn_ch_align(off + (bytes));                        \
 +    } while (0)
 +
@@ -980,7 +1171,8 @@ index 0000000..e70fec1
 +    if (g->nb[1] != sizeof(float) || beta->nb[1] != sizeof(float) || g->ne[1] != H || beta->ne[1] != H) {
 +        return HTP_STATUS_NO_SUPPORT;
 +    }
-+    if (state->nb[0] != sizeof(float) || state->nb[1] != D * sizeof(float) || state->nb[2] != (size_t) D * D * sizeof(float)) {
++    if (state->nb[0] != sizeof(float) || state->nb[1] != D * sizeof(float) ||
++        state->nb[2] != (size_t) D * D * sizeof(float)) {
 +        return HTP_STATUS_NO_SUPPORT;
 +    }
 +
@@ -1000,46 +1192,91 @@ index 0000000..e70fec1
 +        return HTP_STATUS_OK;
 +    }
 +
-+    uint32_t n_threads = octx->n_threads;
-+    if (n_threads > nrows) {
-+        n_threads = nrows;
-+    }
++    // one static context: the ops of a batch run one after the other
++    static struct gdn_ch_ctx c;
++    memset(&c, 0, sizeof(c));
 +
-+    static struct gdn_ch_context gctx;
-+    memset(&gctx, 0, sizeof(gctx));
++    const size_t per_row = gdn_ch_layout_row(&c.row[0], NULL, D, H);
++    const size_t avail   = (octx->ctx->vtcm_size > GDN_CH_ALIGN) ? (octx->ctx->vtcm_size - GDN_CH_ALIGN) : 0;
 +
-+    const size_t per_thread = gdn_ch_layout_thread(&gctx.th[0], NULL, D, H);
-+    const size_t needed     = per_thread * n_threads + GDN_CH_ALIGN;
-+    if (needed > octx->ctx->vtcm_size) {
-+        FARF(HIGH, "gdn-chunk: VTCM %zu is too small for %u threads (%zu), the sequential kernel runs\n",
-+             octx->ctx->vtcm_size, n_threads, needed);
++    uint32_t group = (per_row > 0) ? (uint32_t) (avail / per_row) : 0;
++    if (group == 0) {
++        FARF(HIGH, "gdn-chunk: VTCM %zu holds no row of %zu bytes, the sequential kernel runs\n",
++             octx->ctx->vtcm_size, per_row);
 +        return HTP_STATUS_NO_SUPPORT;
++    }
++    if (group > GDN_CH_MAX_GROUP) {
++        group = GDN_CH_MAX_GROUP;
++    }
++    if (group > nrows) {
++        group = nrows;
 +    }
 +
 +    uint8_t * base = octx->ctx->vtcm_base;
-+    gctx.scales = base;
++    c.scales = base;
 +    hmx_init_column_scales(base, Q6_V_vsplat_R(0x3c00)); // 1.0 in fp16
 +    base += GDN_CH_ALIGN;
-+    for (uint32_t i = 0; i < n_threads; ++i) {
-+        gdn_ch_layout_thread(&gctx.th[i], base + per_thread * i, D, H);
++
++    c.octx     = octx;
++    c.D        = D;
++    c.H        = H;
++    c.n_tokens = n_tokens;
++    c.n_seqs   = n_seqs;
++    c.n_kt     = D / 32;
++    c.scale    = 1.0f / sqrtf((float) D);
++    c.n_chunks = (n_tokens + GDN_CH_C - 1) / GDN_CH_C;
++
++    FARF(HIGH, "gdn-chunk: D %u H %u n_tokens %u n_seqs %u rows %u..%u group %u per-row %zu chunks %u\n",
++         D, H, n_tokens, n_seqs, row_start, row_start + nrows, group, per_row, c.n_chunks);
++
++    work_queue_t wq = octx->ctx->work_queue;
++
++    for (uint32_t g0 = 0; g0 < nrows; g0 += group) {
++        c.row0   = row_start + g0;
++        c.n_rows = (nrows - g0 < group) ? (nrows - g0) : group;
++
++        for (uint32_t i = 0; i < c.n_rows; ++i) {
++            gdn_ch_layout_row(&c.row[i], base + per_row * i, D, H);
++        }
++
++        c.n_use = octx->n_threads;
++        if (c.n_use > c.n_rows) {
++            c.n_use = c.n_rows;
++        }
++        c.rows_per_thread = (c.n_rows + c.n_use - 1) / c.n_use;
++
++        work_queue_run(wq, gdn_ch_phase_begin, &c, c.n_use);
++
++        for (uint32_t ic = 0; ic < c.n_chunks; ++ic) {
++            c.ic = ic;
++
++            work_queue_run(wq, gdn_ch_phase_a, &c, c.n_use);
++            gdn_ch_job_m1(&c);
++            int err = gdn_ch_hmx_submit(&c);
++            if (err) {
++                octx->err_detail = err;
++                return HTP_STATUS_INTERNAL_ERR;
++            }
++
++            work_queue_run(wq, gdn_ch_phase_b, &c, c.n_use);
++            gdn_ch_job_m2(&c);
++            err = gdn_ch_hmx_submit(&c);
++            if (err) {
++                octx->err_detail = err;
++                return HTP_STATUS_INTERNAL_ERR;
++            }
++
++            work_queue_run(wq, gdn_ch_phase_c, &c, c.n_use);
++            gdn_ch_job_m3(&c);
++            err = gdn_ch_hmx_submit(&c);
++            if (err) {
++                octx->err_detail = err;
++                return HTP_STATUS_INTERNAL_ERR;
++            }
++        }
++
++        work_queue_run(wq, gdn_ch_phase_end, &c, c.n_use);
 +    }
-+
-+    gctx.octx      = octx;
-+    gctx.row_start = row_start;
-+    gctx.nrows     = nrows;
-+    gctx.D         = D;
-+    gctx.H         = H;
-+    gctx.n_tokens  = n_tokens;
-+    gctx.n_seqs    = n_seqs;
-+    gctx.n_kt      = D / 32;
-+    gctx.scale     = 1.0f / sqrtf((float) D);
-+
-+    FARF(HIGH, "gdn-chunk: D %u H %u n_tokens %u n_seqs %u rows %u..%u threads %u vtcm %zu\n",
-+         D, H, n_tokens, n_seqs, row_start, row_start + nrows, n_threads, needed);
-+
-+    work_queue_run(octx->ctx->work_queue, gdn_ch_thread_func, &gctx, n_threads);
-+
-+    hmx_queue_flush(octx->ctx->hmx_queue);
 +
 +    return HTP_STATUS_OK;
 +}
