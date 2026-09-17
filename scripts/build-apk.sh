@@ -49,12 +49,7 @@ jnilibs="android/snapdragon/jniLibs/arm64-v8a"
 [[ -f "$jnilibs/libqwenmobile.so" ]] || die "no native libraries in $jnilibs: scripts/build-native.sh"
 
 # 1. The image.
-engine=$(container_engine)
-image="localhost/qwen-mobile-apk:$(sha256sum ci/Containerfile | cut -c1-12)"
-if ! "$engine" image inspect "$image" > /dev/null 2>&1; then
-    echo "apk: build the image $image"
-    "$engine" build -t "$image" -f ci/Containerfile ci
-fi
+image=$(ensure_apk_image)
 
 # 2. The staged source.
 stage="build/apk/src"
@@ -82,14 +77,16 @@ fi
 # 5. The build.
 SOURCE_DATE_EPOCH=$(source_date_epoch)
 mkdir -p build/cache/gradle
+echo "apk: version $(version_name) ($(version_code))"
 container_run \
     -v "$REPO_ROOT/$stage/android:/workspace/android" \
     -w /workspace/android \
     -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
     -e GRADLE_USER_HOME=/workspace/build/cache/gradle \
     -e ANDROID_USER_HOME=/workspace/build/cache/home/.android \
+    -e VERSION_CODE="$(version_code)" \
     "$image" bash -euo pipefail -c '
-common=(--no-daemon --no-build-cache --console=plain -Pprebuilt=true -Pandroid.builder.sdkDownload=false)
+common=(--no-daemon --no-build-cache --console=plain -Pprebuilt=true -Pandroid.builder.sdkDownload=false -PversionCode="$VERSION_CODE")
 ./gradlew "${common[@]}" -Punsigned=true :app:testDebugUnitTest :app:assembleRelease
 cp app/build/outputs/apk/release/app-release-unsigned.apk /workspace/build/apk/
 ./gradlew "${common[@]}" :app:assembleRelease

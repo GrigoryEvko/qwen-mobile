@@ -11,6 +11,8 @@ name: build
 
 on:
   push:
+    # A push to main runs the same scripts in the release workflow.
+    branches-ignore: [main]
   pull_request:
   workflow_dispatch:
 

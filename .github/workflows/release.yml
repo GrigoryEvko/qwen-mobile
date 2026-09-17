@@ -1,0 +1,185 @@
+# The release of the app, from the same scripts as a laptop build.
+#
+# Every push to main refreshes the prerelease "main-build" with the artifacts
+# of the branch. A push that changes versionName in android/version.properties
+# also creates the tag v<versionName> and the release of that version, thus a
+# release needs no manual tag.
+#
+# versionCode is the number of commits of the branch, thus it increases with
+# each release and Android accepts the APK as an upgrade.
+#
+# The APK that the release holds is signed when the repository has these
+# secrets: ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS
+# and ANDROID_KEY_PASSWORD. Without them the release holds the unsigned APK and
+# the APK of a throwaway debug key, which Android installs but never upgrades.
+# The unsigned APK is the artifact that two machines compare.
+
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Artifacts, rolling build, tagged release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: Read the version
+        id: version
+        run: |
+          name=$(sed -n 's/^versionName=//p' android/version.properties | tr -d ' \r')
+          [ -n "$name" ] || { echo "no versionName in android/version.properties" >&2; exit 1; }
+          code=$(git rev-list --count HEAD)
+          tagged=false
+          git rev-parse -q --verify "refs/tags/v$name" > /dev/null && tagged=true
+          {
+            echo "name=$name"
+            echo "code=$code"
+            echo "tag=v$name"
+            echo "tagged=$tagged"
+          } >> "$GITHUB_OUTPUT"
+          echo "version $name ($code), tag v$name exists: $tagged"
+
+      - name: Build the native libraries
+        run: scripts/build-native.sh
+
+      - name: Build the APK and run the unit tests
+        run: scripts/build-apk.sh
+
+      - name: Sign the APK when the repository has a key
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set +e
+          scripts/sign-apk.sh build/apk/app-release-unsigned.apk build/apk/app-release-signed.apk
+          status=$?
+          set -e
+          case $status in
+            0) echo "signed=true" >> "$GITHUB_ENV" ;;
+            2) echo "signed=false" >> "$GITHUB_ENV" ;;
+            *) exit $status ;;
+          esac
+
+      - name: Collect the artifacts
+        id: collect
+        env:
+          NAME: ${{ steps.version.outputs.name }}
+          CODE: ${{ steps.version.outputs.code }}
+        run: |
+          out=build/release
+          rm -rf "$out"
+          mkdir -p "$out"
+          if [ "${signed:-false}" = true ]; then
+            cp build/apk/app-release-signed.apk "$out/qwen-mobile-$NAME.apk"
+          else
+            cp build/apk/app-release.apk "$out/qwen-mobile-$NAME-debugkey.apk"
+          fi
+          cp build/apk/app-release-unsigned.apk "$out/qwen-mobile-$NAME-unsigned.apk"
+          tar -czf "$out/jniLibs-$NAME.tar.gz" -C android/snapdragon jniLibs
+          ( cd "$out" && sha256sum ./* > SHA256SUMS.txt )
+          cat build/hashes-native.txt build/hashes-apk.txt >> "$out/SHA256SUMS.txt"
+          ls -la "$out"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ steps.version.outputs.name }}-${{ steps.version.outputs.code }}
+          path: build/release
+
+      - name: Write the body of the release
+        env:
+          NAME: ${{ steps.version.outputs.name }}
+          CODE: ${{ steps.version.outputs.code }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          previous=$(git tag --sort=-creatordate | grep -v "^$TAG$" | head -1)
+          {
+            echo "Qwen Mobile $NAME, versionCode $CODE, commit ${GITHUB_SHA:0:12}."
+            echo
+            echo "The app runs Qwen3.5 on the Snapdragon NPU, the Adreno GPU or the CPU."
+            echo "Put a GGUF model and its projector in /sdcard/qwen/models and select it in Settings."
+            echo
+            echo "### Changes"
+            echo
+            if [ -n "$previous" ]; then
+              git log --no-merges --pretty='- %s' "$previous..HEAD" | head -60
+            else
+              git log --no-merges --pretty='- %s' -30
+            fi
+            echo
+            echo "### Artifacts"
+            echo
+            if [ "${signed:-false}" = true ]; then
+              echo "- \`qwen-mobile-$NAME.apk\`, signed with the release key"
+            else
+              echo "- \`qwen-mobile-$NAME-debugkey.apk\`, signed with a throwaway debug key of the runner."
+              echo "  Android installs it, and it never upgrades another build. Add the signing secrets for a stable key."
+            fi
+            echo "- \`qwen-mobile-$NAME-unsigned.apk\`, the artifact that two machines compare"
+            echo "- \`jniLibs-$NAME.tar.gz\`, the native libraries of the build"
+            echo "- \`SHA256SUMS.txt\`"
+            echo
+            echo "### Reproduce"
+            echo
+            echo '```'
+            echo "git clone --recurse-submodules https://github.com/${GITHUB_REPOSITORY}.git"
+            echo "cd qwen-mobile && git checkout $TAG"
+            echo "scripts/build-all.sh"
+            echo '```'
+            echo
+            echo "The native libraries and the unsigned APK of that build have the hashes of SHA256SUMS.txt."
+            echo
+            echo "### Hashes"
+            echo
+            echo '```'
+            cat build/release/SHA256SUMS.txt
+            echo '```'
+          } > build/release-body.md
+          cat build/release-body.md
+
+      - name: Refresh the rolling build of main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: ${{ steps.version.outputs.name }}
+          CODE: ${{ steps.version.outputs.code }}
+        run: |
+          title="Build of main: $NAME ($CODE)"
+          if gh release view main-build > /dev/null 2>&1; then
+            gh release edit main-build --title "$title" --notes-file build/release-body.md --target "$GITHUB_SHA"
+            gh release upload main-build build/release/* --clobber
+          else
+            gh release create main-build build/release/* \
+              --title "$title" --notes-file build/release-body.md \
+              --prerelease --target "$GITHUB_SHA"
+          fi
+
+      - name: Tag and release the version
+        if: steps.version.outputs.tagged == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          NAME: ${{ steps.version.outputs.name }}
+          CODE: ${{ steps.version.outputs.code }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Qwen Mobile $NAME, versionCode $CODE"
+          git push origin "$TAG"
+          gh release create "$TAG" build/release/* \
+            --title "Qwen Mobile $NAME" --notes-file build/release-body.md

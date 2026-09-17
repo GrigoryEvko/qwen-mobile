@@ -64,6 +64,40 @@ container_run() {
     "$engine" run "${opts[@]}" "$@"
 }
 
+# Print the tag of the APK container image, and build the image when it does
+# not exist. The tag holds a hash of ci/Containerfile, thus a change of that
+# file gives a new image. The build output goes to stderr, thus a caller can
+# read the tag from stdout.
+ensure_apk_image() {
+    local engine image
+    engine=$(container_engine)
+    image="localhost/qwen-mobile-apk:$(sha256sum "$REPO_ROOT/ci/Containerfile" | cut -c1-12)"
+    if ! "$engine" image inspect "$image" > /dev/null 2>&1; then
+        echo "apk: build the image $image" >&2
+        "$engine" build -t "$image" -f "$REPO_ROOT/ci/Containerfile" "$REPO_ROOT/ci" >&2
+    fi
+    echo "$image"
+}
+
+# Print the number of commits of the branch, the versionCode of the APK. A tree
+# without a git directory gives the fallback of android/version.properties.
+version_code() {
+    local count
+    if count=$(git -C "$REPO_ROOT" rev-list --count HEAD 2> /dev/null) && [[ -n $count ]]; then
+        echo "$count"
+    else
+        sed -n 's/^versionCodeFallback=//p' "$REPO_ROOT/android/version.properties" | tr -d ' \r'
+    fi
+}
+
+# Print the versionName of android/version.properties.
+version_name() {
+    local name
+    name=$(sed -n 's/^versionName=//p' "$REPO_ROOT/android/version.properties" | tr -d ' \r')
+    [[ -n $name ]] || die "no versionName in android/version.properties"
+    echo "$name"
+}
+
 # Print the SOURCE_DATE_EPOCH of the repository: the date of the last commit.
 source_date_epoch() {
     git -C "$REPO_ROOT" log -1 --format=%ct
