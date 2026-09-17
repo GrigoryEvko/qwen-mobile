@@ -1,4 +1,4 @@
-"""The export against the converter: the value-head order of the GDN tensors, the LoRA adapter, the guard."""
+"""The export against the converter: the value-head order of the GDN tensors, the LoRA adapter, the guard, the tie."""
 
 from __future__ import annotations
 
@@ -10,9 +10,10 @@ import pytest
 import torch
 
 from quant.blockopt import weighted_low_rank
-from quant.export import LinearAttentionLayout, block_permutation, write_adapter
-from quant.grid import dequantize, quantize
+from quant.export import LinearAttentionLayout, _f32_of, block_permutation, export, write_adapter
+from quant.grid import dequantize, pack_nibbles, quantize
 from quant.grids import Q4_0Grid
+from quant.plan import Plan
 
 ROOT = Path(__file__).resolve().parents[2]
 LLAMA = ROOT / "llama.cpp"
@@ -122,3 +123,104 @@ def test_lora_adapter_shapes_pass_the_llama_cpp_checks(tmp_path: Path) -> None:
     a_ne, b_ne = tensors["blk.0.ffn_gate.weight.lora_a"], tensors["blk.0.ffn_gate.weight.lora_b"]
     assert model_ne[0] == a_ne[0] and model_ne[1] == b_ne[1], "the base tensor shape check of llama-adapter.cpp"
     assert a_ne[1] == b_ne[0] == rank, "the transposed lora_a check of llama-adapter.cpp"
+
+
+def test_gguf_keeps_the_numpy_row_order_of_a_2d_tensor(tmp_path: Path) -> None:
+    """A numpy [out, in] array comes back as [out, in], and the GGUF shape (ne) is the reverse.
+
+    llama.cpp writes the head as numpy [vocab, hidden] and computes
+    ``ggml_mul_mat(output, h) = W·h``, thus a numpy [out, in] array is the
+    convention for ``ggml_mul_mat(W, v) = W·v``. The tied export writes M
+    the same way.
+    """
+    gguf = gguf_module()
+    a = np.arange(15, dtype=np.float32).reshape(3, 5)
+    path = tmp_path / "shape.gguf"
+    writer = gguf.GGUFWriter(str(path), "qwen35")
+    writer.add_tensor("output_rot.weight", a.astype(np.float16))
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file(progress=False)
+    writer.close()
+    t = gguf.GGUFReader(str(path)).tensors[0]
+    assert [int(x) for x in t.shape] == [5, 3], "the GGUF shape is ne, the reverse of the numpy shape"
+    assert np.array_equal(_f32_of(t), a)
+
+
+def write_toy_f16(gguf, path: Path, vocab: int, d: int, gen: np.random.Generator) -> dict[str, np.ndarray]:
+    """A small F16 GGUF with the head tensors of the converter: token_embd, output_norm, output."""
+    tensors = {
+        "token_embd.weight": gen.standard_normal((vocab, d)).astype(np.float16),
+        "output_norm.weight": (0.5 + gen.random(d)).astype(np.float32),
+        "output.weight": gen.standard_normal((vocab, d)).astype(np.float16),
+    }
+    writer = gguf.GGUFWriter(str(path), "qwen35")
+    writer.add_uint32("qwen35.embedding_length", d)
+    for name, a in tensors.items():
+        writer.add_tensor(name, a)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file(progress=False)
+    writer.close()
+    return tensors
+
+
+def read_all(gguf, path: Path) -> dict[str, tuple[str, object]]:
+    """(type name, reader tensor) by name."""
+    return {t.name: (t.tensor_type.name, t) for t in gguf.GGUFReader(str(path)).tensors}
+
+
+def test_tied_export_drops_the_head_and_writes_the_map(tmp_path: Path) -> None:
+    """With tie_head: no output.weight, output_rot in F16 as [out, in], the identity output norm without folds."""
+    gguf = gguf_module()
+    gen = np.random.default_rng(0)
+    vocab, d = 48, 64
+    src = tmp_path / "src.gguf"
+    write_toy_f16(gguf, src, vocab, d, gen)
+    rot = gen.standard_normal((d, d)).astype(np.float32)
+    assert not np.allclose(rot, rot.T), "the test map is not symmetric, thus the orientation matters"
+    rot_path = tmp_path / "rot.npy"
+    np.save(rot_path, rot)
+    packs = tmp_path / "packs"
+    packs.mkdir()
+    out = tmp_path / "tied-f16.gguf"
+    export(src, out, packs, Plan(embedding="Q4_0", n_layers=0), LLAMA, torch.device("cpu"), only="^$",
+           tie_head=True, rot=rot_path)
+    got = read_all(gguf, out)
+    assert set(got) == {"token_embd.weight", "output_norm.weight", "output_rot.weight"}
+    assert got["token_embd.weight"][0] == "F16" and got["output_rot.weight"][0] == "F16"
+    assert np.array_equal(_f32_of(got["output_norm.weight"][1]), np.ones(d, dtype=np.float32))
+    np.testing.assert_allclose(_f32_of(got["output_rot.weight"][1]), rot.astype(np.float16).astype(np.float32))
+    with pytest.raises(ValueError):
+        export(out, tmp_path / "untied.gguf", packs, Plan(n_layers=0), LLAMA, torch.device("cpu"), only="^$")
+    with pytest.raises(ValueError):
+        export(src, tmp_path / "no-map.gguf", packs, Plan(n_layers=0), LLAMA, torch.device("cpu"), tie_head=True)
+
+
+def test_tied_export_takes_the_head_pack_and_the_folds(tmp_path: Path) -> None:
+    """The solved tied head becomes token_embd, and folds.npz supplies the final norm and the map."""
+    gguf = gguf_module()
+    gen = np.random.default_rng(1)
+    vocab, d = 48, 64
+    src = tmp_path / "src.gguf"
+    write_toy_f16(gguf, src, vocab, d, gen)
+    torch.manual_seed(1)
+    grid = Q4_0Grid()
+    w = torch.randn(vocab, d) * 0.05
+    idx, sc = quantize(grid, w, search=True)
+    packs = tmp_path / "packs"
+    packs.mkdir()
+    np.savez(packs / "token_embd.weight.npz", q=idx.numpy(), d=sc.numpy().view(np.uint16), levels=grid.levels.numpy(),
+             kind=np.array("Q4_0"))
+    rot = gen.standard_normal((d, d)).astype(np.float32)
+    norm = (1.0 + 0.1 * gen.standard_normal(d)).astype(np.float32)
+    np.savez(packs / "folds.npz", **{"output_norm.weight": norm, "output_rot.weight": rot})
+    out = tmp_path / "tied-q4.gguf"
+    export(src, out, packs, Plan(embedding="Q4_0", n_layers=0), LLAMA, torch.device("cpu"), source_folded=True,
+           tie_head=True)
+    got = read_all(gguf, out)
+    assert "output.weight" not in got
+    assert got["token_embd.weight"][0] == "Q4_0"
+    assert np.array_equal(np.asarray(got["token_embd.weight"][1].data).reshape(vocab, -1), pack_nibbles(idx, sc))
+    assert np.array_equal(_f32_of(got["output_norm.weight"][1]), norm)
+    np.testing.assert_allclose(_f32_of(got["output_rot.weight"][1]), rot.astype(np.float16).astype(np.float32))

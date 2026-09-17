@@ -9,6 +9,12 @@ The solved blocks and the folds are in the order of the checkpoint. The
 converter writes the value heads of the linear attention in a different
 order when a model has fewer key heads than value heads (the 4B: 16 key
 heads, 32 value heads), thus the export permutes those tensors the same way.
+
+A tied head (``tie_head``) has no ``output.weight``: llama.cpp reads the
+head from ``token_embd.weight``, through the dense map ``output_rot.weight``
+that the graph applies after the final norm. The file then holds one tensor
+for the lookup and the head, which removes the separate embedding tensor
+from the RAM of the phone.
 """
 
 from __future__ import annotations
@@ -142,9 +148,29 @@ def plan_of(folds) -> dict | None:
     return json.loads(str(folds["plan"]))
 
 
+def output_rot(rot: Path | None, folds, reader) -> np.ndarray:
+    """The dense map M of a tied head as a numpy [out, in] float32 array.
+
+    The sources, in this order: the ``.npy`` file ``rot``, the tensor
+    ``output_rot.weight`` of folds.npz, the tensor of a tied source GGUF.
+    The GGUF stores a 2-D tensor with its numpy shape reversed, thus a
+    numpy [out, in] array is what ``ggml_mul_mat(output_rot, v)`` reads as
+    M·v, the same as the head ``output.weight`` [vocab, hidden].
+    """
+    if rot is not None:
+        return np.load(rot).astype(np.float32)
+    if folds is not None and "output_rot.weight" in folds.files:
+        return folds["output_rot.weight"].astype(np.float32)
+    for t in reader.tensors:
+        if t.name == "output_rot.weight":
+            return _f32_of(t)
+    raise ValueError("--tie-head needs the dense map M: --rot <file.npy>, output_rot.weight in folds.npz, "
+                     "or a tied source GGUF")
+
+
 def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: Path,
            device: torch.device, only: str | None = None, invert: bool = False,
-           source_folded: bool = False) -> None:
+           source_folded: bool = False, tie_head: bool = False, rot: Path | None = None) -> None:
     """Write ``out_gguf``. Complexity is O(total bytes).
 
     ``only`` is a regular expression on the GGUF tensor name. The tensors
@@ -157,6 +183,13 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
     the F16 GGUF supplies must be in those coordinates when the plan of the
     export differs from the plan of the calibration, or when ``only`` keeps
     some solved tensors in F16.
+
+    ``tie_head`` drops ``output.weight``, writes ``output_rot.weight`` in
+    F16 after the output norm (see ``output_rot`` for its sources), and
+    sets the output norm to the identity unless folds.npz holds it: a tied
+    head has no column scales. ``token_embd.weight`` then follows the plan,
+    from the pack ``token_embd.weight.npz`` when the calibration solved the
+    tied head.
     """
     gguf = _load_gguf_module(llama_dir)
     selector = re.compile(only) if only else None
@@ -166,13 +199,16 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
     if folds is not None and not source_folded:
         if only is not None:
             raise ValueError("--only keeps solved tensors in F16: export from the folded reference (--source tf)")
-        if saved_plan is not None and saved_plan != json.loads(json.dumps(asdict(plan))):
+        # The embedding is never folded, thus its type can change on the unfolded source.
+        wanted = json.loads(json.dumps(asdict(plan)))
+        if saved_plan is not None and {**saved_plan, "embedding": None} != {**wanted, "embedding": None}:
             raise ValueError(f"the plan differs from the calibration plan {saved_plan}: "
                              "export from the folded reference (--source tf)")
 
     reader = gguf.GGUFReader(str(f16_gguf))
     arch = bytes(reader.fields["general.architecture"].parts[-1]).decode()
     layout = LinearAttentionLayout.from_gguf(reader, arch)
+    rot_m = output_rot(rot, folds, reader) if tie_head else None
 
     def source(t) -> np.ndarray:
         if folds is not None and t.name in folds.files:
@@ -194,6 +230,13 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
     adapter: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     for t in reader.tensors:
         name = t.name
+        if name == "output_rot.weight":
+            if not tie_head:
+                raise ValueError("the source GGUF holds a tied head (output_rot.weight): export with --tie-head")
+            continue
+        if tie_head and name == "output.weight":
+            counts["dropped (tied)"] = counts.get("dropped (tied)", 0) + 1
+            continue
         kind = plan.type_of(name)
         if selector is not None and kind in ("Q4_0", "Q8_0") and (selector.search(name) is None) != invert:
             kind = "keep"
@@ -226,7 +269,17 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
             q, d = q8_0_quantize(w)
             writer.add_tensor(name, pack_q8_0(q, d), raw_dtype=gguf.GGMLQuantizationType.Q8_0)
         elif kind == "F32":
-            writer.add_tensor(name, source(t).astype(np.float32))
+            a = source(t).astype(np.float32)
+            if tie_head and name == "output_norm.weight":
+                if folds is None or name not in folds.files:
+                    a = np.ones_like(a)
+                writer.add_tensor(name, a)
+                if rot_m.shape != (a.shape[0], a.shape[0]):
+                    raise ValueError(f"output_rot has the shape {rot_m.shape}, the hidden size is {a.shape[0]}")
+                writer.add_tensor("output_rot.weight", rot_m.astype(np.float16))
+                counts["F16 (output_rot)"] = counts.get("F16 (output_rot)", 0) + 1
+            else:
+                writer.add_tensor(name, a)
         else:
             if t.tensor_type not in (gguf.GGMLQuantizationType.F16, gguf.GGMLQuantizationType.F32):
                 raise ValueError(f"{name}: the F16 GGUF holds an unexpected type {t.tensor_type.name}")
