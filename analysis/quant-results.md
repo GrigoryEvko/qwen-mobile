@@ -24,6 +24,57 @@ Hadamard R1 on the residual stream, head untied.
 | 8 | As row 7 with the latent weights free at 3e-6 | 1.62 GiB file | 0.0314 | | | 90.12 % | |
 | 9 | As row 7 from the round-to-nearest start | 1.62 GiB file | 0.0482 | | | 87.77 % | |
 
+| 7c | Row 7 exported and evaluated on the laptop (RTX 1000 Ada, CUDA 13.1), the control of rows 10 and 11 | 1.62 GiB file | 0.0296 | 0.590 | 7.37 | 91.40 % | 14.43 |
+| 10 | Row 7 with token_embd in Q4_0 (round-to-nearest with the scale search): the price of the 4-bit lookup, laptop | 1.39 GiB file | 0.0309 | 0.788 | 8.07 | 91.18 % | 14.47 |
+| 11 | Tied head: token_embd is the head, Q4_0 by GPTQ on E' with the moments of M·norm(h), then the KL head optimization (frozen latents, 300 steps), layer packs of row 7, output_rot in F16, laptop | 1.13 GiB file | 0.0311 | 0.499 | 6.82 | 90.42 % | 14.46 |
+
+Rows 7c, 10 and 11 ran on the laptop against the F16 base of the box, with llama.cpp c6824a9 plus
+`patches/llama-tied-head`. The control reproduces row 7 (0.0296 / 91.40 % against 0.0295 / 91.35 %).
+The motivation of the tie is RAM and file size, not the bytes of a decode token: the logits still
+read the full Q4_0 head (0.286 GB) tied or not. The tie removes the separate Q8_0 `token_embd`
+tensor (540 MB) from the file and from the RAM of the phone, and adds the dense map M in F16
+(8.4 MB), one 2048 × 2048 matvec per token (+0.8 % of the MACs of the head). The file goes from
+1,743,744,000 to 1,211,788,288 bytes.
+
+The 4-bit lookup alone (row 10) costs 0.0013 of mean KL and 0.2 points of top-1. The tie (row 11)
+costs 0.0003 more KL and 0.8 points of top-1 against row 10, and its 99.9 % KL is lower. A tied head
+has no column scales, because its rows are the rows of the lookup, thus the head solve works on the
+moments of M·norm(h) with no fold. The KL head optimization on the calibration tokens gives
+0.02348 → 0.02145 for the tied head and 0.02189 → 0.01890 for row 7. The head-only path of
+`quantize` reuses the layer packs of row 7: the residual stream and all the layer packs are those of
+row 7, only the head and the lookup change. Its calibration on the laptop took 1364 s for the pass
+of both copies through the layers, 675 s for the second pass of the working copy, 30 s per head
+solve and about 6 min for the head optimization, with the copies on the CPU and one layer at a
+time on the GPU.
+
+The tie is exact. The tied F16 file of the converter (`transform --tie-head`, `convert --source t`)
+and the tied F16 file of `export --tie-head` (from the untied F16 with the map of the tied
+checkpoint) against the untied F16 file, on the CPU build, WikiText-2 16 × 512: mean KL −0.000004
+and −0.000003 (the resolution of the 8-bit logit base), 99.9 % KL 0.000048, max 0.000052, same
+top-1 99.975 % and 100.000 %. The HF model with the M wrapper against the original checkpoint on a
+prompt (`verify`): max abs logit diff 1.8e-5, mean 1.9e-6, top-1 100 %. The local export of row 7
+from the untied F16 is byte-identical to the phone file in 329 of 336 tensors, and the 7 `ssm_a`
+tensors differ by 1 to 2 bytes of an `exp` in the converter.
+
+Record for the 4B (d = 2560, no run): M is 13.1 MB in F16 (a Kronecker rotation, the same
+identity), the Q8_0 `token_embd` is 675 MB, the Q4_0 head 358 MB, the matvec of M adds 1.0 % to
+the MACs of the head. The commands of rows 10 and 11, from the project root with the `.venv`:
+
+    python -m quant.run transform --model Qwen3.5-2B --device cpu --tie-head          # weights/Qwen3.5-2B-t, tied, with output_rot
+    python -m quant.run transform --model Qwen3.5-2B --device cpu --suffix tu         # the untied reference of the exactness test
+    python -m quant.run convert --model Qwen3.5-2B --source t
+    python -m quant.run convert --model Qwen3.5-2B --source tu
+    python -m quant.run quantize --model Qwen3.5-2B --device cuda --stream --head-only --packs quant-out/Qwen3.5-2B-bo-gptq-frozen-e2 \
+        --embedding Q4_0 --init gptq --method blockopt --epochs 2 --freeze-weights --head-steps 300 --head-chunk 8192
+    cp -al quant-out/Qwen3.5-2B quant-out/Qwen3.5-2B-tied-bo-gptq-frozen-e2
+    python -m quant.run export --model Qwen3.5-2B --source tu --packs quant-out/Qwen3.5-2B-tied-bo-gptq-frozen-e2 --embedding Q4_0 --tie-head --tag tied-bo-gptq-frozen-e2
+    python -m quant.run export --model Qwen3.5-2B --source tu --packs quant-out/Qwen3.5-2B-bo-gptq-frozen-e2 --embedding Q4_0 --tag row7-embd-q4
+    python -m quant.run export --model Qwen3.5-2B --source tu --packs quant-out/Qwen3.5-2B-bo-gptq-frozen-e2 --tag local-row7
+    python -m quant.run eval --model Qwen3.5-2B --gguf weights/gguf/Qwen3.5-2B-<tag>.gguf
+    python -m quant.run export --model Qwen3.5-2B --source tu --packs quant-out/empty --only '^$' --tie-head --rot quant-out/Qwen3.5-2B-t-rot.npy --tag tu-F16-tied
+    llama.cpp/build-host/bin/llama-perplexity -m weights/gguf/Qwen3.5-2B-tu-F16.gguf -f data/wiki.test.raw -c 512 --chunks 16 --kl-divergence-base eval/tu.kld
+    llama.cpp/build-host/bin/llama-perplexity -m weights/gguf/Qwen3.5-2B-t-F16.gguf -f data/wiki.test.raw -c 512 --chunks 16 --kl-divergence-base eval/tu.kld --kl-divergence
+
 Row 5 over-fits: the per-layer training loss halves, the held-out error grows at every layer (drift
 KL 0.0421 against 0.0291 for row 3). The diagnostics say: the rounding must come from a Hessian
 solver (row 9 against row 7), the latent weights must stay frozen on 128 x 2048 tokens (row 8
