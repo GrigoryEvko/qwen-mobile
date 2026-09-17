@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="debug_benchmark">Benchmark</string>
-    <string name="debug_pp">Prompt tokens</string>
-    <string name="debug_tg">Generated tokens</string>
-    <string name="debug_reps">Repetitions</string>
+    <string name="debug_pp">Prompt</string>
+    <string name="debug_tg">Answer</string>
+    <string name="debug_reps">Reps</string>
     <string name="debug_run">Run</string>
     <string name="debug_clear">Clear</string>
     <string name="debug_no_model">No model is loaded. Load one on the Chat tab.</string>
