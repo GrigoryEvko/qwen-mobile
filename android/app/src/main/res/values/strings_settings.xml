@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="settings_title">Settings</string>
+    <string name="settings_model">Model</string>
+    <string name="settings_model_hint">Put GGUF files in %1$s. The projector file of a model goes next to it.</string>
+    <string name="settings_no_models">No model file found.</string>
+    <string name="settings_refresh">Refresh</string>
+    <string name="settings_grant_access">Grant all-files access</string>
+    <string name="settings_compute">Compute</string>
+    <string name="settings_backend">Compute unit</string>
+    <string name="settings_backend_cpu">CPU</string>
+    <string name="settings_backend_gpu">GPU</string>
+    <string name="settings_backend_npu">NPU</string>
+    <string name="settings_threads">Threads</string>
+    <string name="settings_context">Context length</string>
+    <string name="settings_generation">Generation</string>
+    <string name="settings_thinking">Thinking mode</string>
+    <string name="settings_thinking_hint">The model reasons before the answer. Slower, better on hard tasks.</string>
+    <string name="settings_temperature">Temperature</string>
+    <string name="settings_top_p">Top-p</string>
+    <string name="settings_about">About</string>
+    <string name="settings_version">Qwen Mobile %1$s</string>
+    <string name="settings_device">Device</string>
+    <string name="settings_no_devices">No backend device</string>
+    <string name="settings_loaded_model">Loaded model</string>
+    <string name="settings_no_model_loaded">No model is loaded.</string>
+</resources>
