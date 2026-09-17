@@ -1,0 +1,48 @@
+# The environment of the quantization pipeline in quant/. uv.lock pins the
+# full graph. Install it with:
+#
+#   uv sync --frozen
+#   uv run --frozen pytest quant/tests
+#
+# The direct dependencies are the versions of the environment that produced
+# the results in analysis/. torch comes from the CUDA 13 index of PyTorch.
+# gguf is the gguf-py package of the llama.cpp submodule, with the patch
+# series applied (scripts/apply-patches.sh). sentencepiece and protobuf are
+# imports of convert_hf_to_gguf.py, which quant/run.py starts as a subprocess.
+
+[project]
+name = "qwen-mobile-quant"
+version = "0.1.0"
+description = "The quantization pipeline of Qwen3.5 for the Snapdragon phone"
+requires-python = ">=3.12"
+dependencies = [
+    "torch==2.12.0",
+    "transformers==5.8.1",
+    "numpy==2.4.4",
+    "safetensors==0.7.0",
+    "gguf",
+    "sentencepiece==0.2.1",
+    "protobuf==6.33.6",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.0.3",
+]
+
+[tool.uv]
+# quant/ is not a distribution: the tests import it from the repository root.
+package = false
+
+[tool.uv.sources]
+gguf = { path = "third_party/llama.cpp/gguf-py", editable = true }
+torch = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["quant/tests"]
+pythonpath = ["."]
