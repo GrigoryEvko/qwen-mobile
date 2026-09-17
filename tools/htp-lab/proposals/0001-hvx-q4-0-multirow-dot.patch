@@ -288,28 +288,47 @@ index c889538..625e1f2 100644
      const uint8_t * restrict tile_ptr = vx;
      const uint8_t * restrict y_q = vy;
 diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
-index 1457a9a..7722ab3 100644
+index 1457a9a..6006228 100644
 --- a/ggml/src/ggml-hexagon/htp/matmul-ops.c
 +++ b/ggml/src/ggml-hexagon/htp/matmul-ops.c
-@@ -433,6 +433,109 @@ static void hvx_mm_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
+@@ -117,6 +117,12 @@ struct htp_mm_context {
+     const struct mmid_row_mapping * matrix_rows;
+     uint32_t mapping_stride;
+ 
++    // The compact activation of the multi-row Q4_0 decode path, in DDR. NULL when that path is off.
++    uint8_t * act_compact;
++    int32_t * act_bias;
++    uint32_t  act_compact_stride;  // bytes between the rows of act_compact
++    uint32_t  act_bias_stride;     // int32 values between the rows of act_bias
++
+     // Dynamic VTCM pointers allocated sequentially
+     uint8_t * vtcm_src0;
+     uint8_t * vtcm_src1;
+@@ -433,6 +439,108 @@ static void hvx_mm_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
      }                                                                                                                             \
  }
  
-+// The pointers of activation row (ir1 + I) for the multi-row loop: the quantized activation column
-+// in VTCM, the output row at the current column tile, and the fused-add row (NULL without src2)
-+#define MM_ROW_PTRS(I, COL, DST_PTR, SRC2_PTR)                                                                                    \
-+    const uint8_t * restrict COL = (const uint8_t *) (src1_data + (ir1 + (I)) * src1_stride);                                     \
-+    float * DST_PTR = (float *) (dst->data + ((ir1 + (I)) * dst_row_size)) + ct * 32;                                             \
-+    const float * SRC2_PTR = src2 ? (const float *) ((const uint8_t *) src2->data + ((ir1 + (I)) * src2_stride)) + ct * 32 : NULL;
++// The pointers of activation row (ir1 + I) for the multi-row loop: the tiled activation column in
++// VTCM (the kernel reads only the scale of each block from it), the compact activation and its
++// bias in DDR, the output row at the current column tile, and the fused-add row (NULL without src2)
++#define MM_MULTIROW_PTRS(I)                                                                                                       \
++    const uint8_t *  src1_col##I = (const uint8_t *) (src1_data + (ir1 + (I)) * src1_stride);                                      \
++    const uint32_t * act_c##I    = (const uint32_t *) (mmctx->act_compact + (ir1 + (I)) * mmctx->act_compact_stride);              \
++    const int32_t *  act_b##I    = mmctx->act_bias + (ir1 + (I)) * mmctx->act_bias_stride;                                         \
++    float *          dst_ptr##I  = (float *) (dst->data + ((ir1 + (I)) * dst_row_size)) + ct * 32;                                 \
++    const float *    src2_ptr##I = src2 ? (const float *) ((const uint8_t *) src2->data + ((ir1 + (I)) * src2_stride)) + ct * 32 : NULL;
 +
-+// The same loop as MATMUL_2D_REPACKED_IMPL with one pass over each weight tile for 3 and 4
-+// activation rows: DOT_4X1 and DOT_3X1 read the weight tile once for all rows. The verify step
-+// of speculative decoding (2 to 4 tokens) thus costs one weight stream, as one row.
-+#define MATMUL_2D_REPACKED_MULTIROW_IMPL(SUFFIX, TILE_SIZE, DOT_4X1, DOT_3X1, DOT_2X2, DOT_2X1)                                    \
-+static void hvx_mm_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void * data) {                                        \
++// The decode path of 2 to 4 activation rows. The op streams each weight tile from DDR once and
++// computes every row from it, thus the verify step of speculative decoding costs one weight
++// stream. The kernels take the activation of a row from its compact copy in DDR through scalar
++// registers, thus more rows cost vrmpy instructions only.
++//
++// Without this function the op calls the 32x2 kernel per row pair and the 32x1 kernel for the last
++// row, thus 3 and 4 rows read and unpack every weight tile twice.
++#define MATMUL_2D_REPACKED_MULTIROW_IMPL(SUFFIX, TILE_SIZE, DOT_4X1, DOT_3X1, DOT_2X1, DOT_1X1)                                   \
++static void hvx_mm_2d_repacked_##SUFFIX##_multirow(unsigned int nth, unsigned int ith, void * data) {                             \
 +    htp_matmul_preamble;                                                                                                          \
 +                                                                                                                                  \
-+    const uint32_t src0_nrows = mmctx->src0_row_end - mmctx->src0_row_start;                                                      \
 +    const uint32_t src1_nrows = ne11 * ne12 * ne13;                                                                               \
 +                                                                                                                                  \
 +    const uint32_t src0_start_row  = mmctx->src0_row_start + src0_nrows_per_thread * ith;                                         \
@@ -320,17 +339,18 @@ index 1457a9a..7722ab3 100644
 +    const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;                      \
 +    const uint32_t n_prefetch = kparams->n_prefetch;                                                                              \
 +    assert(n_prefetch >= 2 && n_prefetch <= HTP_MM_MAX_PREFETCH && (n_prefetch & (n_prefetch - 1)) == 0);                         \
++    assert(src1_nrows >= 2 && src1_nrows <= 4);                                                                                   \
 +                                                                                                                                  \
-+    const size_t dst_row_size  = nb1;                                                                                             \
-+    const size_t src1_stride = mmctx->vtcm_src1_stride;                                                                           \
-+    const size_t src2_stride = src2 ? ((src2->ne[1] == 1) ? 0 : src2->nb[1]) : 0;                                                 \
++    const size_t dst_row_size = nb1;                                                                                              \
++    const size_t src1_stride  = mmctx->vtcm_src1_stride;                                                                          \
++    const size_t src2_stride  = src2 ? ((src2->ne[1] == 1) ? 0 : src2->nb[1]) : 0;                                                \
 +                                                                                                                                  \
 +    uint8_t * restrict vtcm_src0_ptr = mmctx->vtcm_src0 + mmctx->vtcm_src0_size_per_thread * ith;                                 \
-+    uint8_t * restrict src1_data = mmctx->vtcm_src1;                                                                              \
++    uint8_t * restrict src1_data     = mmctx->vtcm_src1;                                                                          \
 +                                                                                                                                  \
 +    const uint8_t * restrict src0_row = (const uint8_t *) src0->data;                                                             \
 +                                                                                                                                  \
-+    const uint32_t tile_size = TILE_SIZE;                                                                                         \
++    const uint32_t tile_size         = TILE_SIZE;                                                                                 \
 +    const uint32_t aligned_tile_size = hex_align_up(tile_size, 128);                                                              \
 +                                                                                                                                  \
 +    uint32_t n_k_tiles_w = ne00 / 32;                                                                                             \
@@ -358,55 +378,126 @@ index 1457a9a..7722ab3 100644
 +    for (uint32_t ct = ct_start; ct < ct_end; ct++) {                                                                             \
 +        const uint8_t * w_tile = dma_queue_pop(dma_queue).dst;                                                                    \
 +                                                                                                                                  \
-+        int valid_rows = (int)ne0 - (int)(ct * 32);                                                                               \
++        int valid_rows = (int) ne0 - (int) (ct * 32);                                                                             \
 +        valid_rows = MIN(32, MAX(0, valid_rows));                                                                                 \
 +                                                                                                                                  \
 +        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);                                                                    \
-+        uint32_t ir1 = 0;                                                                                                         \
-+        for (; ir1 + 4 <= src1_nrows; ir1 += 4) {                                                                                 \
-+            MM_ROW_PTRS(0, src1_col0, dst_ptr0, src2_ptr0)                                                                        \
-+            MM_ROW_PTRS(1, src1_col1, dst_ptr1, src2_ptr1)                                                                        \
-+            MM_ROW_PTRS(2, src1_col2, dst_ptr2, src2_ptr2)                                                                        \
-+            MM_ROW_PTRS(3, src1_col3, dst_ptr3, src2_ptr3)                                                                        \
-+            DOT_4X1(ne10, dst_ptr0, dst_ptr1, dst_ptr2, dst_ptr3, w_tile, src1_col0, src1_col1, src1_col2, src1_col3,             \
-+                    valid_rows, src2_ptr0, src2_ptr1, src2_ptr2, src2_ptr3);                                                      \
-+        }                                                                                                                         \
-+        if (src1_nrows - ir1 == 3) {                                                                                              \
-+            MM_ROW_PTRS(0, src1_col0, dst_ptr0, src2_ptr0)                                                                        \
-+            MM_ROW_PTRS(1, src1_col1, dst_ptr1, src2_ptr1)                                                                        \
-+            MM_ROW_PTRS(2, src1_col2, dst_ptr2, src2_ptr2)                                                                        \
++        const uint32_t ir1 = 0;                                                                                                   \
++        MM_MULTIROW_PTRS(0)                                                                                                       \
++        MM_MULTIROW_PTRS(1)                                                                                                       \
++        if (src1_nrows == 4) {                                                                                                    \
++            MM_MULTIROW_PTRS(2)                                                                                                   \
++            MM_MULTIROW_PTRS(3)                                                                                                   \
++            DOT_4X1(ne10, dst_ptr0, dst_ptr1, dst_ptr2, dst_ptr3, w_tile,                                                         \
++                    src1_col0, src1_col1, src1_col2, src1_col3, act_c0, act_c1, act_c2, act_c3,                                   \
++                    act_b0, act_b1, act_b2, act_b3, valid_rows, src2_ptr0, src2_ptr1, src2_ptr2, src2_ptr3);                      \
++        } else if (src1_nrows == 3) {                                                                                             \
++            MM_MULTIROW_PTRS(2)                                                                                                   \
 +            DOT_3X1(ne10, dst_ptr0, dst_ptr1, dst_ptr2, w_tile, src1_col0, src1_col1, src1_col2,                                  \
-+                    valid_rows, src2_ptr0, src2_ptr1, src2_ptr2);                                                                 \
-+            ir1 += 3;                                                                                                             \
-+        }                                                                                                                         \
-+        for (; ir1 + 1 < src1_nrows; ir1 += 2) {                                                                                  \
-+            MM_ROW_PTRS(0, src1_col0, dst_ptr0, src2_ptr0)                                                                        \
-+            MM_ROW_PTRS(1, src1_col1, dst_ptr1, src2_ptr1)                                                                        \
-+            DOT_2X2(ne10, dst_ptr0, dst_ptr1, w_tile, src1_col0, src1_col1, valid_rows, src2_ptr0, src2_ptr1);                    \
-+        }                                                                                                                         \
-+        for (; ir1 < src1_nrows; ++ir1) {                                                                                         \
-+            MM_ROW_PTRS(0, src1_col, dst_ptr, src2_ptr)                                                                           \
-+            DOT_2X1(ne10, dst_ptr, w_tile, src1_col, valid_rows, src2_ptr);                                                       \
++                    act_c0, act_c1, act_c2, act_b0, act_b1, act_b2, valid_rows, src2_ptr0, src2_ptr1, src2_ptr2);                 \
++        } else {                                                                                                                  \
++            DOT_2X1(ne10, dst_ptr0, dst_ptr1, w_tile, src1_col0, src1_col1, act_c0, act_c1,                                       \
++                    act_b0, act_b1, valid_rows, src2_ptr0, src2_ptr1);                                                            \
 +        }                                                                                                                         \
 +        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);                                                                     \
 +                                                                                                                                  \
 +        if (push_ct < ct_end) {                                                                                                   \
-+            dma_queue_push(dma_queue, dma_make_ptr((uint8_t *)w_tile, src0_row + push_ct * tile_row_stride),                      \
++            dma_queue_push(dma_queue, dma_make_ptr((uint8_t *) w_tile, src0_row + push_ct * tile_row_stride),                     \
 +                           aligned_tile_size, tile_size, tile_size, n_k_tiles_a);                                                 \
 +            push_ct++;                                                                                                            \
 +        }                                                                                                                         \
 +    }                                                                                                                             \
++    (void) DOT_1X1;                                                                                                               \
 +}
 +
  #define MATVEC_2D_REPACKED_IMPL(SUFFIX, TILE_SIZE, DOT_2X1)                                                                       \
  static void hvx_mv_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void * data) {                                        \
      htp_matmul_preamble;                                                                                                          \
-@@ -626,7 +729,7 @@ static void hvx_mm_nx_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, v
-     }                                                                                                                             \
+@@ -680,6 +788,48 @@ QUANTIZE_IMPL(quantize_f32_f32_flat,   "quantize-f32-f32",        quantize_f32_f
+ QUANTIZE_IMPL(quantize_f32_f16_flat,   "quantize-f32-f16",        quantize_f32_f16_flat_kernel,   mmctx->vtcm_src1_stride)
+ QUANTIZE_IMPL(quantize_f16_f16_flat,   "quantize-f16-f16",        quantize_f16_f16_flat_kernel,   mmctx->vtcm_src1_stride)
+ 
++// The row-parallel quantizer of the multi-row decode path. It writes the tiled blocks in VTCM, as
++// the other quantizers do, and the compact copy and the bias of each row in DDR.
++static void quantize_f32_q8_0_tiled_compact(unsigned int nth, unsigned int ith, void * data) {
++    (void) nth;
++    struct htp_mm_context *  mmctx = data;
++    struct htp_ops_context * octx  = mmctx->octx;
++    const struct htp_tensor * src  = mmctx->act;
++
++    const uint32_t ne0   = src->ne[0];
++    const uint32_t nrows = src->ne[1] * src->ne[2] * src->ne[3];
++    const uint32_t nrows_per_thread = mmctx->n_quant_rows_per_thread;
++    const uint32_t ir_first = nrows_per_thread * ith;
++    if (ir_first >= nrows) {
++        return;
++    }
++
++    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
++    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_QUANT, ir_first);
++
++    const uint32_t ir_last       = MIN(ir_first + nrows_per_thread, nrows);
++    const size_t   src_row_size  = src->nb[1];
++    const size_t   dst_row_size  = htp_mm_q8_0_tiled_row_size(ne0);
++    const uint8_t * restrict src_data = (const uint8_t *) src->data + (src_row_size * ir_first);
++    uint8_t * restrict dst_data = (uint8_t *) mmctx->vtcm_src1 + (dst_row_size * ir_first);
++    uint8_t * restrict tmp_data = (uint8_t *) mmctx->vtcm_dst + (mmctx->vtcm_dst_size_per_thread * ith);
++
++    const size_t src_row_size_padded = hex_round_up(src_row_size, QK_Q8_0_TILED * sizeof(float));
++    hvx_splat_f32_a(tmp_data, 0.0f, src_row_size_padded / sizeof(float));
++
++    for (uint32_t ir = ir_first; ir < ir_last; ir++) {
++        hex_l2fetch(src_data, src_row_size, src_row_size, 2);
++        hvx_copy_f32_aa(tmp_data, src_data, ne0);
++        quantize_row_f32_q8_0_tiled_compact((float *) tmp_data, dst_data,
++                                            mmctx->act_compact + (size_t) ir * mmctx->act_compact_stride,
++                                            mmctx->act_bias + (size_t) ir * mmctx->act_bias_stride, ne0);
++        dst_data += dst_row_size;
++        src_data += src_row_size;
++    }
++
++    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_QUANT, ir_first);
++}
++
+ static void quantize_f32_q8_0_tiled_block(unsigned int nth, unsigned int ith, void * data) {
+     struct htp_mm_context * mmctx = data;
+     struct htp_ops_context * octx = mmctx->octx;
+@@ -728,6 +878,9 @@ static void quantize_f32_q8_1_tiled_block(unsigned int nth, unsigned int ith, vo
+     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_QUANT, mmctx->quant_ib_first[ith]);
  }
  
--MATMUL_2D_REPACKED_IMPL(q4_0,       576,  tiled_vec_dot_q4_0_32x2,  tiled_vec_dot_q4_0_32x1)
-+MATMUL_2D_REPACKED_MULTIROW_IMPL(q4_0, 576, tiled_vec_dot_q4_0_32x4, tiled_vec_dot_q4_0_32x3, tiled_vec_dot_q4_0_32x2, tiled_vec_dot_q4_0_32x1)
- MATMUL_2D_REPACKED_IMPL(q4_1,       640,  tiled_vec_dot_q4_1_32x2,  tiled_vec_dot_q4_1_32x1)
- MATMUL_2D_REPACKED_IMPL(q8_0,       1088, tiled_vec_dot_q8_0_32x2,  tiled_vec_dot_q8_0_32x1)
- MATMUL_2D_REPACKED_IMPL(q6_k,       896,  tiled_vec_dot_q6_k_32x2,  tiled_vec_dot_q6_k_32x1)
++MATMUL_2D_REPACKED_MULTIROW_IMPL(q4_0, 576, tiled_vec_dot_q4_0_32x4c, tiled_vec_dot_q4_0_32x3c,
++                                 tiled_vec_dot_q4_0_32x2c, tiled_vec_dot_q4_0_32x1c)
++
+ MATVEC_2D_REPACKED_IMPL(q4_0,       576,  tiled_vec_dot_q4_0_32x1)
+ MATVEC_2D_REPACKED_IMPL(q4_1,       640,  tiled_vec_dot_q4_1_32x1)
+ MATVEC_2D_REPACKED_IMPL(q8_0,       1088, tiled_vec_dot_q8_0_32x1)
+@@ -1562,6 +1715,28 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
+             break;
+     }
+ 
++    // The multi-row Q4_0 decode path: 2 to 4 activation rows over one weight stream. The compact
++    // activation and its bias live in the DDR scratchpad, because the dots read them with scalar
++    // loads, and a scalar load from VTCM is slow.
++    if (src0->type == HTP_TYPE_Q4_0 && src1_nrows >= 2 && src1_nrows <= 4 &&
++        (kparams->kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW || kparams->kernel_type == HTP_MM_KERNEL_HVX_QUANT_BLOCK)) {
++        const size_t compact_row = ne10;
++        const size_t bias_row    = (size_t) (ne10 / 32) * sizeof(int32_t);
++        const size_t need        = (size_t) src1_nrows * (compact_row + bias_row);
++
++        if (octx->ctx->ddr_spad_base && octx->ctx->ddr_spad_size >= need && (compact_row % 128) == 0) {
++            mmctx->act_compact        = (uint8_t *) octx->ctx->ddr_spad_base;
++            mmctx->act_compact_stride = compact_row;
++            mmctx->act_bias           = (int32_t *) ((uint8_t *) octx->ctx->ddr_spad_base + src1_nrows * compact_row);
++            mmctx->act_bias_stride    = ne10 / 32;
++
++            quant_task_func = quantize_f32_q8_0_tiled_compact;
++            n_quant_tasks   = MIN(src1_nrows, octx->n_threads);
++            matmul_job_func = hvx_mm_2d_repacked_q4_0_multirow;
++            src1_row_size   = htp_mm_q8_0_tiled_row_size(ne10);
++        }
++    }
++
+     struct htp_mm_hvx_vtcm_layout L;
+     htp_mm_hvx_vtcm_layout_build(&L, kparams->kernel_type, src0->type, ne10, src1_nrows, octx->n_threads,
+                                  dst_row_size, src0_row_size, src1_row_size, src2 ? src2->nb[1] : 0, kparams->n_prefetch, false, false);
