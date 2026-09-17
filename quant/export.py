@@ -59,17 +59,17 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
             z = np.load(pack)
             q = torch.from_numpy(z["q"])
             d = torch.from_numpy(z["d"].view(np.float16))
-            writer.add_tensor(name, pack_q4_0(q, d), raw_shape=shape, raw_dtype=gguf.GGMLQuantizationType.Q4_0)
+            writer.add_tensor(name, pack_q4_0(q, d), raw_dtype=gguf.GGMLQuantizationType.Q4_0)
             kind = "Q4_0 (solved)"
         elif kind == "Q4_0":
             w = torch.from_numpy(_f32_of(t)).to(device)
             q, d = q4_0_quantize(w, search=True)
-            writer.add_tensor(name, pack_q4_0(q, d), raw_shape=shape, raw_dtype=gguf.GGMLQuantizationType.Q4_0)
+            writer.add_tensor(name, pack_q4_0(q, d), raw_dtype=gguf.GGMLQuantizationType.Q4_0)
             kind = "Q4_0 (rtn)"
         elif kind == "Q8_0":
             w = torch.from_numpy(_f32_of(t)).to(device)
             q, d = q8_0_quantize(w)
-            writer.add_tensor(name, pack_q8_0(q, d), raw_shape=shape, raw_dtype=gguf.GGMLQuantizationType.Q8_0)
+            writer.add_tensor(name, pack_q8_0(q, d), raw_dtype=gguf.GGMLQuantizationType.Q8_0)
         elif kind == "F32":
             writer.add_tensor(name, _f32_of(t).astype(np.float32))
         else:
