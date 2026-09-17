@@ -1,22 +1,29 @@
 Hexagon HTP: the chunked gated delta rule on the HMX for a batch of tokens
 
-Base: llama.cpp commit c6824a9, with patches 0001 thru 0004 applied.
+Base: llama.cpp commit c6824a9 with patches/series applied in order, thru hexagon-host/0003.
+
+This patch is the last entry of patches/series, after hexagon-host/0003.
 
 Files:
     ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c         new: the chunked kernel
     ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c   routes a batch of tokens to the chunked kernel
     ggml/src/ggml-hexagon/htp/htp-ctx.h               the prototype
     ggml/src/ggml-hexagon/htp/CMakeLists.txt          the new source
-    ggml/src/ggml-hexagon/ggml-hexagon.cpp            the switch GGML_HEXAGON_GDN_CHUNK
     tests/test-backend-ops.cpp                        GATED_DELTA_NET cases over batches
+
+The host half of the switch GGML_HEXAGON_GDN_CHUNK is already in the series: patch
+hexagon-host/0001 carries the option, the environment variable, and the line of graph_compute that
+gives the value to the DSP in kernel_params[0] of each GATED_DELTA_NET op. Thus this patch changes
+no host file. On a DSP library without this patch that kernel param is unread, which is why the
+series works today.
 
 How to apply, from the llama.cpp root:
 
     git apply patches/hexagon-fusion/0005-hexagon-htp-gdn-chunked-hmx.patch
     cmake --build build-snapdragon -j
 
-Push to the phone: libggml-htp-v79.so (ggml/src/ggml-hexagon/), libggml-hexagon.so (bin/) and
-test-backend-ops (bin/).
+Push to the phone: libggml-htp-v79.so (ggml/src/ggml-hexagon/) and test-backend-ops (bin/). The
+host library does not change.
 
 This patch does not depend on the op fusion of patches 0002 thru 0004, and the switch
 GGML_HEXAGON_OPFUSION_STATE does not reach it. The kernel is inside the plain GATED_DELTA_NET op,
@@ -1079,44 +1086,8 @@ index ff531e1..3382ca0 100644
      binary-ops.c
      unary-ops.c
      sum-rows-ops.c
-diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-index 8d9ea0f..111dc7b 100644
---- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-+++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-@@ -119,6 +119,11 @@ enum ggml_hexagon_fusion_flags {
- 
- static int opt_opfusion_state = -1; // GGML_HEXAGON_OPFUSION_STATE: -1 = follow GGML_HEXAGON_OPFUSION, 0 = off, 1 = on
- 
-+// GGML_HEXAGON_GDN_CHUNK: 1 = a batch of tokens runs the chunked gated delta rule on the HMX (the
-+// default), 0 = every batch runs the sequential kernel. The host gives the value to the DSP in the
-+// kernel params of each GATED_DELTA_NET op, thus an A/B run needs no other build.
-+static int opt_gdn_chunk = 1;
-+
- // GGML_HEXAGON_BATCHCACHE: 0 = pack the ops of each graph_compute call, 1 = replay the packed batch of a
- // repeated graph when only the input data changed, 2 = replay and compare the replay with a fresh packing
- static int opt_batchcache = 1;
-@@ -6522,6 +6527,9 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
-                     node.node,
-                     (struct htp_rope_kernel_params *)node.kernel_params
-                 );
-+            } else if (node.opcode == HTP_OP_GATED_DELTA_NET) {
-+                // 1 keeps the sequential kernel for a batch of tokens (see GGML_HEXAGON_GDN_CHUNK)
-+                node.kernel_params[0] = opt_gdn_chunk ? 0 : 1;
-             }
-             return node;
-         };
-@@ -7900,6 +7908,9 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
-     opt_oppoll    = str_oppoll   ? strtoul(str_oppoll,  NULL, 0)          : opt_oppoll;
-     opt_opfusion  = str_opfusion ? atoi(str_opfusion)                     : opt_opfusion;
-     opt_opfusion_state = str_opfusion_state ? atoi(str_opfusion_state)    : opt_opfusion_state;
-+
-+    const char * str_gdn_chunk = getenv("GGML_HEXAGON_GDN_CHUNK");
-+    opt_gdn_chunk = str_gdn_chunk ? atoi(str_gdn_chunk) : opt_gdn_chunk;
-     opt_profile   = str_profile  ? atoi(str_profile)                      : 0;
-     opt_etm       = str_etm      ? atoi(str_etm)                          : 0;
-     opt_nhvx      = str_nhvx     ? strtoul(str_nhvx, NULL, 0)             : opt_nhvx;
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 40a19ec..921665a 100644
+index b6409ef..921665a 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -4661,6 +4661,47 @@ struct test_gated_delta_net : public test_case {
@@ -1167,10 +1138,11 @@ index 40a19ec..921665a 100644
  // GET_ROWS + CONCAT + SSM_CONV + SILU + CPY: the conv half of the recurrent state step at one token.
  // The graph is the one that llama.cpp builds for a gated delta net layer (build_conv_state). The output
  // holds the conv output and the new state, thus the CPY into the cache is part of the graph.
-@@ -11069,6 +11110,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11068,6 +11109,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     // KDA (vector gate)
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 1, 1, 1, false, true));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 1, 2, 1, false, true));
- 
++
 +    // Batches of tokens, for a backend that runs them as the chunked delta rule. The first three
 +    // cases are the shapes of Qwen3.5-2B: 16 heads of 128 with 512 tokens is one text prefill batch,
 +    // and 672 tokens is one image. 672, 100, 70, 65, 33 and 66 are not multiples of a 64-token chunk,
