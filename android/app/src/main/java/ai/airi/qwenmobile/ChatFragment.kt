@@ -223,7 +223,13 @@ class ChatFragment : Fragment() {
             try {
                 val (bytes, thumbnail) = withContext(Dispatchers.IO) {
                     val bytes = ImageBytes.load(resolver, uri)
-                    val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    // The thumbnail is small, thus the decode samples the stored image: the header gives the size.
+                    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+                    val options = BitmapFactory.Options().apply {
+                        inSampleSize = ImageGeometry.sampleSize(bounds.outWidth, bounds.outHeight, ImageGeometry.Size(side, side))
+                    }
+                    val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
                     bytes to Bitmap.createScaledBitmap(bitmap, side, side, true)
                 }
                 setPendingImage(bytes, thumbnail)

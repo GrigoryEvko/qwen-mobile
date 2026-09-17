@@ -83,8 +83,16 @@ class ChatMessage(val role: String, content: String, val image: ByteArray? = nul
     /** The choice of the user on the thinking field, null for the default of the phase. */
     var thinkingExpanded: Boolean? = null
 
-    /** The decoded image for the message list, decoded one time. */
-    val bitmap: Bitmap? by lazy { image?.let { BitmapFactory.decodeByteArray(it, 0, it.size) } }
+    /** The image for the message list, decoded one time at [LIST_SAMPLE_SIZE]: 640 px on the long side of a stored image. */
+    val bitmap: Bitmap? by lazy {
+        val options = BitmapFactory.Options().apply { inSampleSize = LIST_SAMPLE_SIZE }
+        image?.let { BitmapFactory.decodeByteArray(it, 0, it.size, options) }
+    }
+
+    companion object {
+        /** The decode sample of the list image. The stored image has [ImageBytes.MAX_SIDE] px on the long side, the list shows less. */
+        const val LIST_SAMPLE_SIZE = 2
+    }
 }
 
 /** One step of a streamed answer. */
