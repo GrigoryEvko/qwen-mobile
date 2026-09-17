@@ -54,20 +54,35 @@ def scale_search(grid: Grid, blocks: torch.Tensor, weights: torch.Tensor | None 
     return best_d
 
 
+ROW_CHUNK = 16384
+
+
 def quantize(grid: Grid, w: torch.Tensor, weights: torch.Tensor | None = None, search: bool = True):
-    """Quantize [rows, cols] to (indices int8 [rows, cols], d float16 [rows, nblocks])."""
-    blocks = blocks_of(w.to(torch.float32))
-    d = scale_search(grid, blocks, weights) if search else grid.scale_rtn(blocks)
-    d = d.to(torch.float16).to(torch.float32)
-    idx = grid.quantize_blocks(blocks, d)
-    return idx.reshape(w.shape).to(torch.int8), d.to(torch.float16)
+    """Quantize [rows, cols] to (indices int8 [rows, cols], d float16 [rows, nblocks]).
+
+    The work runs in row chunks, thus the head (248320 x 2048) needs no
+    multi-gigabyte temporaries.
+    """
+    rows, cols = w.shape
+    idx_out = torch.empty(rows, cols, dtype=torch.int8, device=w.device)
+    d_out = torch.empty(rows, cols // BLOCK, dtype=torch.float16, device=w.device)
+    for r in range(0, rows, ROW_CHUNK):
+        blocks = blocks_of(w[r:r + ROW_CHUNK].to(torch.float32))
+        d = scale_search(grid, blocks, weights) if search else grid.scale_rtn(blocks)
+        d = d.to(torch.float16).to(torch.float32)
+        idx_out[r:r + ROW_CHUNK] = grid.quantize_blocks(blocks, d).reshape(blocks.shape[0], cols).to(torch.int8)
+        d_out[r:r + ROW_CHUNK] = d.to(torch.float16)
+    return idx_out, d_out
 
 
 def dequantize(grid: Grid, idx: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
-    """The float32 values d · level[idx] of a quantized matrix."""
+    """The float32 values d · level[idx] of a quantized matrix, in row chunks."""
     rows, cols = idx.shape
-    values = grid.value(idx.reshape(rows, cols // BLOCK, BLOCK))
-    return (values * d.to(torch.float32)[..., None]).reshape(rows, cols)
+    out = torch.empty(rows, cols, dtype=torch.float32, device=idx.device)
+    for r in range(0, rows, ROW_CHUNK):
+        values = grid.value(idx[r:r + ROW_CHUNK].reshape(-1, cols // BLOCK, BLOCK))
+        out[r:r + ROW_CHUNK] = (values * d[r:r + ROW_CHUNK].to(torch.float32)[..., None]).reshape(-1, cols)
+    return out
 
 
 def dequantize_pack(z, device: torch.device) -> torch.Tensor:

@@ -291,6 +291,7 @@ def optimize_head(step, target: Target, opts: OptOptions) -> Solved:
     d_model = step.cfg.hidden_size
     ref_flat = step.ref_in.view(-1, d_model)
     lin = work.lm_head
+    torch.cuda.empty_cache()
     ste = make_ste(lin, target, opts.head_rank)
     norm = work.model.norm
     norm.weight.requires_grad_(True)

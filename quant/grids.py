@@ -45,12 +45,14 @@ class Grid:
         return torch.where(d == 0, torch.ones_like(d), d)
 
     def round(self, x: torch.Tensor) -> torch.Tensor:
-        """The index of the nearest level of x, which is in units of the scale."""
-        return torch.bucketize(x, self.mid)
+        """The index (int32) of the nearest level of x, which is in units of the scale."""
+        return torch.bucketize(x, self.mid, out_int32=True)
 
     def value(self, idx: torch.Tensor) -> torch.Tensor:
-        """The level of each index, in units of the scale."""
-        return self.levels[idx.to(torch.long)]
+        """The level of each index, in units of the scale. int32 indices index without a copy to int64."""
+        if idx.dtype not in (torch.int32, torch.int64):
+            idx = idx.to(torch.int32)
+        return self.levels[idx]
 
     def quantize_blocks(self, blocks: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
         """Indices [rows, nblocks, 32] for the scales d [rows, nblocks]."""
@@ -72,7 +74,7 @@ class Q4_0Grid(Grid):
         return torch.where(d == 0, torch.ones_like(d), d)
 
     def round(self, x: torch.Tensor) -> torch.Tensor:
-        return (torch.clamp(torch.round(x), -8, 7) + 8).to(torch.long)
+        return (torch.clamp(torch.round(x), -8, 7) + 8).to(torch.int32)
 
 
 class IQ4NLGrid(Grid):
