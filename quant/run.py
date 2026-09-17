@@ -333,7 +333,7 @@ def main() -> None:
     ev = sub.add_parser("eval", parents=[common])
     ev.add_argument("--gguf", required=True)
     ev.add_argument("--ngl", type=int, default=99,
-                    help="the number of layers on the GPU. A model that does not fit in VRAM takes the split of its base")
+                    help="the number of layers on the GPU. A model that does not fit in VRAM uses the number of its base")
 
     args = p.parse_args()
     {"transform": cmd_transform, "verify": cmd_verify, "convert": cmd_convert, "quantize": cmd_quantize,
