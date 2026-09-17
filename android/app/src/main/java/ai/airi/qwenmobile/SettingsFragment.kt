@@ -86,7 +86,7 @@ class SettingsFragment : Fragment() {
         b.noModelsText.visibility = if (models.isEmpty()) View.VISIBLE else View.GONE
         for (file in models) {
             val row = ItemModelBinding.inflate(layoutInflater, b.modelList, true)
-            row.nameText.text = file.name
+            row.nameText.text = ModelFiles.displayName(file)
             row.sizeText.text = formatSize(file.length())
             val select = View.OnClickListener { selectModel(file) }
             row.root.setOnClickListener(select)

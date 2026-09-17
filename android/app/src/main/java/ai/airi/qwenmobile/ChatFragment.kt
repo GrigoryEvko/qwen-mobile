@@ -167,7 +167,7 @@ class ChatFragment : Fragment() {
             }
         }
         val path = loaded?.config?.path ?: settings.state.value.modelPath
-        host.setTitle(path?.let { File(it).nameWithoutExtension } ?: getString(R.string.app_name))
+        host.setTitle(path?.let { ModelFiles.displayName(File(it)) } ?: getString(R.string.app_name))
     }
 
     // --- the attachment ---

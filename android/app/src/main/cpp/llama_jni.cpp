@@ -330,8 +330,9 @@ bool ensure_vision(Engine & e) {
     if (e.mmproj.empty()) {
         return false;
     }
-    // The encoder runs on the prefill device when there is one, else on the device of the model.
-    ggml_backend_dev_t dev = e.device_pf != nullptr ? e.device_pf : e.device;
+    // The encoder runs on the OpenCL GPU. The Hexagon backend lacks operators of the CLIP
+    // graph and gives wrong image features. Without the GPU it runs on the CPU.
+    ggml_backend_dev_t dev = ggml_backend_dev_by_name("GPUOpenCL");
     mtmd_context_params mp = mtmd_context_params_default();
     mp.use_gpu          = dev != nullptr;
     mp.device           = dev;

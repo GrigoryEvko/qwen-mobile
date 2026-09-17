@@ -25,16 +25,49 @@ object ModelFiles {
     }
 
     /**
-     * The vision projector of a model: a projector GGUF in the same directory
-     * whose name starts with the model family, the first two dash-separated
-     * parts of the model name ("Qwen3.5-2B"). F16 comes first.
+     * The vision projector of a model. A projector named after the model
+     * file ("<model>.mmproj.gguf") pairs with it: a rotated model needs the
+     * projector rotated with it. Else the projector of the model family, the
+     * first two dash-separated parts of the name ("Qwen3.5-2B"), F16 first.
      */
     fun mmprojFor(model: File): File? {
+        val paired = File(model.parentFile, model.nameWithoutExtension + ".mmproj.gguf")
+        if (paired.isFile) {
+            return paired
+        }
         val family = model.name.split("-").take(2).joinToString("-")
         return model.parentFile
             ?.listFiles { file -> file.isFile && isGguf(file) && isProjector(file) && file.name.startsWith(family) }
             ?.sortedBy { if (it.name.contains("F16")) 0 else 1 }
             ?.firstOrNull()
+    }
+
+    /** The recipe tags of a file name and their long forms. */
+    private val TAGS = mapOf(
+        "HAD" to "Hadamard",
+        "CS" to "col-scales",
+        "PM" to "MLP-perm",
+        "GPTQ" to "GPTQ",
+        "QR" to "Qronos",
+        "BO" to "block-opt",
+        "NQ" to "NeUQI",
+        "LR" to "low-rank",
+        "CB4" to "codebook",
+    )
+
+    /**
+     * The display name of a model file: the family, then the recipe tags in
+     * long form. "Qwen3.5-2B-Q4_0-HAD-CS-GPTQ-BO.gguf" reads
+     * "Qwen3.5-2B · Q4_0 · Hadamard · col-scales · GPTQ · block-opt".
+     */
+    fun displayName(file: File): String {
+        val parts = file.nameWithoutExtension.removeSuffix(".mmproj").split("-")
+        if (parts.size <= 2) {
+            return file.nameWithoutExtension
+        }
+        val family = parts.take(2).joinToString("-")
+        val tags = parts.drop(2).map { TAGS[it] ?: it }
+        return (listOf(family) + tags).joinToString(" · ")
     }
 
     private fun isGguf(file: File): Boolean = file.name.endsWith(".gguf")
