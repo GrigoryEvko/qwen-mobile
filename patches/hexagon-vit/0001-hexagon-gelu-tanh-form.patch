@@ -1,0 +1,206 @@
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 3f14956..84d4637 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -5709,7 +5709,7 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
+             switch (ggml_get_unary_op(t)) {
+                 case GGML_UNARY_OP_SILU:       return HTP_OP_UNARY_SILU;
+                 case GGML_UNARY_OP_GELU:       return HTP_OP_UNARY_GELU;
+-                case GGML_UNARY_OP_GELU_QUICK: return HTP_OP_UNARY_GELU;
++                case GGML_UNARY_OP_GELU_QUICK: return HTP_OP_UNARY_GELU_QUICK;
+                 case GGML_UNARY_OP_SIGMOID:    return HTP_OP_UNARY_SIGMOID;
+                 case GGML_UNARY_OP_NEG:        return HTP_OP_UNARY_NEG;
+                 case GGML_UNARY_OP_EXP:        return HTP_OP_UNARY_EXP;
+diff --git a/ggml/src/ggml-hexagon/htp/htp-ops.h b/ggml/src/ggml-hexagon/htp/htp-ops.h
+index 98a5f6d..a223c6b 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-ops.h
++++ b/ggml/src/ggml-hexagon/htp/htp-ops.h
+@@ -60,6 +60,7 @@ enum htp_op_code {
+     HTP_OP_RMS_NORM_MUL,
+     HTP_OP_UNARY_SILU,
+     HTP_OP_UNARY_GELU,
++    HTP_OP_UNARY_GELU_QUICK,
+     HTP_OP_UNARY_SIGMOID,
+     HTP_OP_UNARY_EXP,
+     HTP_OP_UNARY_NEG,
+diff --git a/ggml/src/ggml-hexagon/htp/hvx-sigmoid.h b/ggml/src/ggml-hexagon/htp/hvx-sigmoid.h
+index 5520173..feb837f 100644
+--- a/ggml/src/ggml-hexagon/htp/hvx-sigmoid.h
++++ b/ggml/src/ggml-hexagon/htp/hvx-sigmoid.h
+@@ -140,6 +140,63 @@ static inline void hvx_tanh_f32_aa(uint8_t * restrict dst, const uint8_t * restr
+     hvx_tanh_loop_body(HVX_Vector, HVX_Vector, hvx_vec_store_a);
+ }
+ 
++// The GELU of the ggml CPU reference (ggml_gelu_f32 in ggml-cpu/vec.h):
++//   gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * x * (1 + 0.044715 * x^2)))
++// The argument of tanh is clamped to [-10, 10]. tanh is 1.0 to 32-bit precision
++// past 10, thus the clamp only keeps the fast sigmoid in its exact range.
++static inline HVX_Vector hvx_vec_gelu_f32(HVX_Vector x) {
++    const HVX_Vector v_coef_a = hvx_vec_splat_f32(0.044715f);
++    const HVX_Vector v_s2pi   = hvx_vec_splat_f32(0.79788456080286535587989211986876f);
++    const HVX_Vector v_one    = hvx_vec_splat_f32(1.0f);
++    const HVX_Vector v_half   = hvx_vec_splat_f32(0.5f);
++    const HVX_Vector v_umax   = hvx_vec_splat_f32(10.0f);
++    const HVX_Vector v_umin   = hvx_vec_splat_f32(-10.0f);
++
++    HVX_Vector x2 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(x, x));
++    HVX_Vector u  = Q6_Vqf32_vmpy_VsfVsf(x2, v_coef_a);
++    u = Q6_Vqf32_vadd_Vqf32Vsf(u, v_one);
++    u = Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vqf32(u), x);
++    u = Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vqf32(u), v_s2pi);
++
++    HVX_Vector u_sf = Q6_Vsf_equals_Vqf32(u);
++    u_sf = Q6_Vsf_vmin_VsfVsf(u_sf, v_umax);
++    u_sf = Q6_Vsf_vmax_VsfVsf(u_sf, v_umin);
++
++    HVX_Vector th = hvx_vec_tanh_f32(u_sf);
++    HVX_Vector r  = Q6_Vqf32_vadd_VsfVsf(th, v_one);
++    r = Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vqf32(r), x);
++    r = Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vqf32(r), v_half);
++    return Q6_Vsf_equals_Vqf32(r);
++}
++
++#define hvx_gelu_loop_body(dst_type, src_type, vec_store)             \
++    do {                                                              \
++        dst_type * restrict vdst = (dst_type *) dst;                  \
++        src_type * restrict vsrc = (src_type *) src;                  \
++                                                                      \
++        const uint32_t epv  = 128 / sizeof(float);                    \
++        const uint32_t nvec = n / epv;                                \
++        const uint32_t nloe = n % epv;                                \
++                                                                      \
++        uint32_t i = 0;                                               \
++                                                                      \
++        _Pragma("unroll(4)")                                          \
++        for (; i < nvec; i++) {                                       \
++             vdst[i] = hvx_vec_gelu_f32(vsrc[i]);                     \
++        }                                                             \
++        if (nloe) {                                                   \
++             HVX_Vector tmp = hvx_vec_gelu_f32(vsrc[i]);              \
++             vec_store((void *) &vdst[i], nloe * sizeof(float), tmp); \
++        }                                                             \
++    } while(0)
++
++// gelu of n fp32 elements : source and destination are aligned to HVX Vector (128)
++static inline void hvx_gelu_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t n) {
++    assert((unsigned long) dst % 128 == 0);
++    assert((unsigned long) src % 128 == 0);
++    hvx_gelu_loop_body(HVX_Vector, HVX_Vector, hvx_vec_store_a);
++}
++
+ static inline HVX_Vector hvx_vec_fast_sigmoid_f16(HVX_Vector x_v) {
+     const HVX_Vector v_one       = hvx_vec_splat_f16(1.0f);
+     const HVX_Vector v_neg_log2e = hvx_vec_splat_f16(-EXP_LOG2E_F);
+diff --git a/ggml/src/ggml-hexagon/htp/main.c b/ggml/src/ggml-hexagon/htp/main.c
+index 1d291e1..7b3dd10 100644
+--- a/ggml/src/ggml-hexagon/htp/main.c
++++ b/ggml/src/ggml-hexagon/htp/main.c
+@@ -815,6 +815,7 @@ static int execute_op(struct htp_ops_context * octx) {
+         case HTP_OP_UNARY_SIGMOID:
+         case HTP_OP_UNARY_SILU:
+         case HTP_OP_UNARY_GELU:
++        case HTP_OP_UNARY_GELU_QUICK:
+         case HTP_OP_UNARY_NEG:
+         case HTP_OP_UNARY_EXP:
+         case HTP_OP_UNARY_TANH:
+diff --git a/ggml/src/ggml-hexagon/htp/unary-ops.c b/ggml/src/ggml-hexagon/htp/unary-ops.c
+index cb82bfa..f705a32 100644
+--- a/ggml/src/ggml-hexagon/htp/unary-ops.c
++++ b/ggml/src/ggml-hexagon/htp/unary-ops.c
+@@ -449,13 +449,28 @@ static void silu_f32(const float * restrict src,
+     }
+ }
+ 
+-// gelu(x) = x * sigmoid(1.702 * x)  (quick/sigmoid approximation, matches CPU GELU_QUICK reference)
++// gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * x * (1 + 0.044715 * x^2)))  (matches CPU GELU reference)
+ static void gelu_f32(const float * restrict src,
+                      float * restrict dst,
+                      const uint32_t num_rows,
+                      const struct htp_unary_context * uctx) {
+     htp_unary_op_preamble;
+ 
++    for (uint32_t ir = 0; ir < num_rows; ir++) {
++        const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
++        uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
++
++        hvx_gelu_f32_aa(dst_local, src_local, ne0);
++    }
++}
++
++// gelu_quick(x) = x * sigmoid(1.702 * x)  (matches CPU GELU_QUICK reference)
++static void gelu_quick_f32(const float * restrict src,
++                           float * restrict dst,
++                           const uint32_t num_rows,
++                           const struct htp_unary_context * uctx) {
++    htp_unary_op_preamble;
++
+     for (uint32_t ir = 0; ir < num_rows; ir++) {
+         const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
+         uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
+@@ -813,6 +828,7 @@ DEFINE_UNARY_TASK(unary_exp,      false, false, exp_f32(src0_vtcm, dst_vtcm, blo
+ DEFINE_UNARY_TASK(unary_sigmoid,  false, false, sigmoid_f32(src0_vtcm, dst_vtcm, block_size, uctx))
+ DEFINE_UNARY_TASK(unary_silu,     false, false, silu_f32(src0_vtcm, dst_vtcm, block_size, uctx))
+ DEFINE_UNARY_TASK(unary_gelu,     false, false, gelu_f32(src0_vtcm, dst_vtcm, block_size, uctx))
++DEFINE_UNARY_TASK(unary_gelu_quick, false, false, gelu_quick_f32(src0_vtcm, dst_vtcm, block_size, uctx))
+ DEFINE_UNARY_TASK(unary_softplus, false, false, softplus_f32(src0_vtcm, dst_vtcm, block_size, uctx))
+ DEFINE_UNARY_TASK(unary_tanh,     false, false, tanh_f32(src0_vtcm, dst_vtcm, block_size, uctx))
+ DEFINE_UNARY_TASK(unary_abs,      false, false, abs_f32(src0_vtcm, dst_vtcm, block_size, uctx))
+@@ -993,8 +1009,13 @@ static inline void tile_silu_f32(uint8_t * dst_vtcm, const uint8_t * src_vtcm, u
+     hvx_mul_f32_aaa(dst_vtcm, src_vtcm, dst_vtcm, tw);
+ }
+ 
+-// gelu(x) = x * sigmoid(1.702 * x)  (quick/sigmoid approximation, matches CPU GELU_QUICK reference)
++// gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * x * (1 + 0.044715 * x^2)))  (matches CPU GELU reference)
+ static inline void tile_gelu_f32(uint8_t * dst_vtcm, const uint8_t * src_vtcm, uint32_t tw) {
++    hvx_gelu_f32_aa(dst_vtcm, src_vtcm, tw);
++}
++
++// gelu_quick(x) = x * sigmoid(1.702 * x)  (matches CPU GELU_QUICK reference)
++static inline void tile_gelu_quick_f32(uint8_t * dst_vtcm, const uint8_t * src_vtcm, uint32_t tw) {
+     hvx_mul_scalar_f32(dst_vtcm, src_vtcm, 1.702f, tw);
+     hvx_sigmoid_f32_aa(dst_vtcm, dst_vtcm, tw);
+     hvx_mul_f32_aaa(dst_vtcm, src_vtcm, dst_vtcm, tw);
+@@ -1084,6 +1105,7 @@ DEFINE_UNARY_TILED_TASK(unary_exp,      false, hvx_exp_f32(dst_vtcm, src_vtcm, t
+ DEFINE_UNARY_TILED_TASK(unary_sigmoid,  false, hvx_sigmoid_f32_aa(dst_vtcm, src_vtcm, tw))
+ DEFINE_UNARY_TILED_TASK(unary_silu,     false, tile_silu_f32(dst_vtcm, src_vtcm, tw))
+ DEFINE_UNARY_TILED_TASK(unary_gelu,     false, tile_gelu_f32(dst_vtcm, src_vtcm, tw))
++DEFINE_UNARY_TILED_TASK(unary_gelu_quick, false, tile_gelu_quick_f32(dst_vtcm, src_vtcm, tw))
+ DEFINE_UNARY_TILED_TASK(unary_softplus, false, tile_unary_softplus_f32(dst_vtcm, src_vtcm, tw))
+ DEFINE_UNARY_TILED_TASK(unary_tanh,     false, hvx_tanh_f32_aa(dst_vtcm, src_vtcm, tw))
+ DEFINE_UNARY_TILED_TASK(unary_abs,      false, hvx_abs_f32_aa(dst_vtcm, src_vtcm, tw))
+@@ -1115,6 +1137,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
+         case HTP_OP_UNARY_SIGMOID:   op_type = "sigmoid-f32";                                break;
+         case HTP_OP_UNARY_SILU:      op_type = "silu-f32";                                   break;
+         case HTP_OP_UNARY_GELU:      op_type = "gelu-f32";                                   break;
++        case HTP_OP_UNARY_GELU_QUICK: op_type = "gelu-quick-f32";                            break;
+         case HTP_OP_UNARY_SOFTPLUS:  op_type = "softplus-f32";                               break;
+         case HTP_OP_UNARY_TANH:      op_type = "tanh-f32";                                   break;
+         case HTP_OP_UNARY_ABS:       op_type = is_f16 ? "abs-f16"      : "abs-f32";          break;
+@@ -1261,6 +1284,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
+                 case HTP_OP_UNARY_SIGMOID:   task_func = unary_task_f32_tiled_unary_sigmoid;  break;
+                 case HTP_OP_UNARY_SILU:      task_func = unary_task_f32_tiled_unary_silu;     break;
+                 case HTP_OP_UNARY_GELU:      task_func = unary_task_f32_tiled_unary_gelu;     break;
++                case HTP_OP_UNARY_GELU_QUICK: task_func = unary_task_f32_tiled_unary_gelu_quick; break;
+                 case HTP_OP_UNARY_SOFTPLUS:  task_func = unary_task_f32_tiled_unary_softplus; break;
+                 case HTP_OP_UNARY_TANH:      task_func = unary_task_f32_tiled_unary_tanh;     break;
+                 case HTP_OP_UNARY_ABS:       task_func = unary_task_f32_tiled_unary_abs;      break;
+@@ -1297,6 +1321,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
+                 case HTP_OP_UNARY_SIGMOID:   task_func = unary_task_f32_unary_sigmoid;        break;
+                 case HTP_OP_UNARY_SILU:      task_func = unary_task_f32_unary_silu;           break;
+                 case HTP_OP_UNARY_GELU:      task_func = unary_task_f32_unary_gelu;           break;
++                case HTP_OP_UNARY_GELU_QUICK: task_func = unary_task_f32_unary_gelu_quick;    break;
+                 case HTP_OP_UNARY_SOFTPLUS:  task_func = unary_task_f32_unary_softplus;       break;
+                 case HTP_OP_UNARY_TANH:      task_func = unary_task_f32_unary_tanh;           break;
+                 case HTP_OP_UNARY_ABS:       task_func = unary_task_f32_unary_abs;            break;
+diff --git a/ggml/src/ggml-hexagon/htp/unary-ops.h b/ggml/src/ggml-hexagon/htp/unary-ops.h
+index e410d7f..451b822 100644
+--- a/ggml/src/ggml-hexagon/htp/unary-ops.h
++++ b/ggml/src/ggml-hexagon/htp/unary-ops.h
+@@ -54,6 +54,7 @@ static inline bool htp_op_is_unary(uint32_t opcode) {
+         case HTP_OP_UNARY_SIGMOID:
+         case HTP_OP_UNARY_SILU:
+         case HTP_OP_UNARY_GELU:
++        case HTP_OP_UNARY_GELU_QUICK:
+         case HTP_OP_UNARY_SOFTPLUS:
+         case HTP_OP_UNARY_TANH:
+         case HTP_OP_UNARY_ABS:
