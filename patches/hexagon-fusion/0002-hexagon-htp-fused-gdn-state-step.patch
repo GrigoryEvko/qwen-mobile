@@ -1,0 +1,1118 @@
+Hexagon HTP: fuse the recurrent state step of a gated delta net layer at one token
+
+Base: llama.cpp commit c6824a9, with patch 0001 applied (matmul-ops.c). This patch does not
+touch matmul-ops.c.
+
+Files:
+    ggml/src/ggml-hexagon/ggml-hexagon.cpp          the graph match and the switch
+    ggml/src/ggml-hexagon/htp/htp-ops.h             two opcodes
+    ggml/src/ggml-hexagon/htp/htp-ctx.h             two prototypes
+    ggml/src/ggml-hexagon/htp/main.c                the dispatch
+    ggml/src/ggml-hexagon/htp/CMakeLists.txt        the new kernel file
+    ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c the state step (the plain kernel with other pointers)
+    ggml/src/ggml-hexagon/htp/gdn-conv-ops.c        the conv step (new file)
+    tests/test-backend-ops.cpp                      GDN_CONV_STATE_FUSION and GDN_STATE_FUSION
+
+How to apply, from the llama.cpp root:
+
+    git apply patches/hexagon-fusion/0002-hexagon-htp-fused-gdn-state-step.patch
+    cmake --build build-snapdragon -j
+
+Push to the phone: libggml-htp-v79.so (ggml/src/ggml-hexagon/), libggml-hexagon.so (bin/),
+and test-backend-ops (bin/). The host library changes in this patch.
+
+Switch: GGML_HEXAGON_OPFUSION_STATE=0 keeps the unfused path, 1 forces the fusion. When the
+variable is not set, the fusion follows GGML_HEXAGON_OPFUSION (1 = all, or the bit 64 of the
+mask). GGML_HEXAGON_OPFUSION=0 disables it with the other fusions.
+
+What the patch does
+
+At one token, a gated delta net layer reads its two recurrent states with GET_ROWS, updates
+them, and writes them back with CPY. The host matches two chains once per graph and emits one
+op for each:
+
+    GET_ROWS(cache_r, s_copy) -> CONCAT(., x^T) -> SSM_CONV -> SILU, CPY(view, slot of cache_r)
+        -> HTP_OP_GDN_CONV_STEP
+    GET_ROWS(cache_s, s_copy) -> GATED_DELTA_NET(K = 1), CPY(state tail, slot of cache_s)
+        -> HTP_OP_GDN_STATE_STEP
+
+The DSP reads the source slot index from s_copy and writes the destination slot of the CPY.
+When the two slots are the same, the update is in place. The match needs one token, one
+sequence, one CPY, no other reader of the replaced tensors, and no other node that touches
+the cache inside the chain span. Every other case keeps the unfused path. The state_zero
+SCALE of build_rs comes before the chain, thus it stays a separate op and runs first.
+
+Numerics
+
+The state step runs the single-token thread of the plain GATED_DELTA_NET kernel. Only the
+three base pointers differ (state in, state out, attention out). The result is the same as
+the unfused DSP path bit for bit. The conv step adds the d_conv products in F32 in the order
+of the CPU reference, and applies the SiLU with the two HVX routines of the SILU op.
+
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 3f14956..642a4f9 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -113,14 +113,24 @@ enum ggml_hexagon_fusion_flags {
+     GGML_HEXAGON_FUSE_MUL_MAT_ADD   = (1 << 3), // 8
+     GGML_HEXAGON_FUSE_MUL_MAT_NX    = (1 << 4), // 16
+     GGML_HEXAGON_FUSE_MUL_MAT_ID_NX = (1 << 5), // 32
++    GGML_HEXAGON_FUSE_GDN_STATE     = (1 << 6), // 64
+ };
+ 
++static int opt_opfusion_state = -1; // GGML_HEXAGON_OPFUSION_STATE: -1 = follow GGML_HEXAGON_OPFUSION, 0 = off, 1 = on
++
+ static inline bool ggml_hexagon_is_fusion_enabled(int flag) {
+     if (opt_opfusion <= 0) return false;
+     if (opt_opfusion == 1) return true; // 1 enables all
+     return (opt_opfusion & flag) != 0;
+ }
+ 
++// The fused recurrent state step of the gated delta net layers has its own switch for A/B runs.
++static inline bool ggml_hexagon_is_gdn_state_fusion_enabled() {
++    if (opt_opfusion <= 0) return false;
++    if (opt_opfusion_state >= 0) return opt_opfusion_state != 0;
++    return ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_GDN_STATE);
++}
++
+ static std::regex* opt_opfilter = NULL; // regex of ops to not claim
+ 
+ #define HEX_VERBOSE(...) \
+@@ -5849,6 +5859,363 @@ static bool is_mergeable_mul_mat_id_pair(const ggml_tensor * n1, const ggml_tens
+     return true;
+ }
+ 
++// ** fused recurrent state step of a gated delta net layer at one token
++//
++// At one token, the graph of a gated delta net layer (Qwen3.5, Qwen3-Next) reads the two recurrent
++// states with GET_ROWS, updates them, and writes them back with CPY. Two chains become one op each:
++//
++//   GET_ROWS(cache_r, s_copy) -> CONCAT(., x^T) -> SSM_CONV -> SILU, and CPY(view of the CONCAT, slot of cache_r)
++//     -> HTP_OP_GDN_CONV_STEP
++//   GET_ROWS(cache_s, s_copy) -> GATED_DELTA_NET(K = 1), and CPY(state tail, slot of cache_s)
++//     -> HTP_OP_GDN_STATE_STEP
++//
++// The DSP reads the source slot index from s_copy and writes the destination slot of the CPY. When the
++// two slots are the same, the update is in place. The match needs one token, one sequence, one CPY, no
++// other reader of the replaced tensors, and no other node that touches the cache inside the chain span.
++// The state_zero SCALE of build_rs comes before the chain, thus it stays a separate op and runs first.
++
++struct ggml_hexagon_gdn_fusion {
++    std::vector<uint8_t>                skip; // graph index -> the node is replaced by a fused op
++    std::unordered_map<int, htp_opnode> at;   // graph index -> the fused op emitted at that index
++};
++
++static inline ggml_tensor * ggml_hexagon_root(ggml_tensor * t) {
++    return t->view_src ? t->view_src : t;
++}
++
++static inline bool ggml_hexagon_is_view_op(const ggml_tensor * t) {
++    return t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
++}
++
++// A contiguous F32 row of n elements with unit outer dimensions
++static inline bool ggml_hexagon_is_f32_row(const ggml_tensor * t, int64_t n) {
++    return t->type == GGML_TYPE_F32 && t->ne[0] == n && t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1 &&
++           t->nb[0] == sizeof(float);
++}
++
++// The "states" tensor of build_rs: an F32 table [row, n_slots] of the cache with contiguous rows
++static inline bool ggml_hexagon_is_state_table(const ggml_tensor * t, int64_t row) {
++    return t->type == GGML_TYPE_F32 && t->ne[0] == row && t->ne[1] >= 1 &&
++           t->ne[2] == 1 && t->ne[3] == 1 && t->nb[0] == sizeof(float) && t->nb[1] == (size_t) row * sizeof(float);
++}
++
++template <typename T>
++static inline bool ggml_hexagon_contains(const std::vector<T> & v, const T & x) {
++    return std::find(v.begin(), v.end(), x) != v.end();
++}
++
++// True when the node reads or writes the root tensor through any view
++static bool ggml_hexagon_node_touches(ggml_tensor * n, const ggml_tensor * root) {
++    if (ggml_hexagon_root(n) == root) {
++        return true;
++    }
++    for (int i = 0; i < GGML_MAX_SRC; i++) {
++        if (n->src[i] && ggml_hexagon_root(n->src[i]) == root) {
++            return true;
++        }
++    }
++    return false;
++}
++
++// Every node that reads an intermediate (also through a view) must be a member of the chain. A view of
++// `out` is permitted for any node when the view lies in the first `out_head_bytes` bytes of `out`.
++static bool ggml_hexagon_chain_is_private(const ggml_cgraph * gf,
++                                          const std::vector<ggml_tensor *> & intermediates,
++                                          const std::vector<ggml_tensor *> & members,
++                                          const ggml_tensor * out, size_t out_head_bytes) {
++    for (auto * t : intermediates) {
++        if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
++            return false;
++        }
++    }
++    if (out && (out->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++        return false;
++    }
++    for (int i = 0; i < gf->n_nodes; i++) {
++        ggml_tensor * n = gf->nodes[i];
++        for (int s = 0; s < GGML_MAX_SRC; s++) {
++            ggml_tensor * src = n->src[s];
++            if (!src) {
++                continue;
++            }
++            ggml_tensor * root = ggml_hexagon_root(src);
++            if (out && root == out) {
++                if (src != out && src->view_offs + ggml_nbytes(src) <= out_head_bytes) {
++                    continue;
++                }
++                if (ggml_hexagon_contains(members, n)) {
++                    continue;
++                }
++                return false;
++            }
++            if (ggml_hexagon_contains(intermediates, root) && !ggml_hexagon_contains(members, n)) {
++                return false;
++            }
++        }
++    }
++    return true;
++}
++
++// No node in (first, last] outside the chain touches the cache. Empty nodes do nothing and are ignored.
++static bool ggml_hexagon_chain_span_is_clean(const ggml_cgraph * gf, int first, int last, const ggml_tensor * cache,
++                                             const std::vector<ggml_tensor *> & members) {
++    for (int i = first + 1; i <= last; i++) {
++        ggml_tensor * n = gf->nodes[i];
++        if (ggml_is_empty(n) || ggml_hexagon_is_view_op(n) || ggml_hexagon_contains(members, n)) {
++            continue;
++        }
++        if (ggml_hexagon_node_touches(n, cache)) {
++            return false;
++        }
++    }
++    return true;
++}
++
++static bool ggml_hexagon_match_gdn_conv_chain(const ggml_hexagon_session * sess, const ggml_cgraph * gf,
++                                              const std::unordered_map<const ggml_tensor *, int> & index,
++                                              int is, ggml_hexagon_gdn_fusion & fu) {
++    ggml_tensor * S = gf->nodes[is];
++    if (S->op != GGML_OP_UNARY || ggml_get_unary_op(S) != GGML_UNARY_OP_SILU || S->type != GGML_TYPE_F32 ||
++        !ggml_is_contiguous(S)) {
++        return false;
++    }
++    ggml_tensor * C = S->src[0];
++    if (!C || C->op != GGML_OP_SSM_CONV || C->type != GGML_TYPE_F32) {
++        return false;
++    }
++    ggml_tensor * CI = C->src[0];
++    ggml_tensor * W  = C->src[1];
++    if (!CI || !W || CI->op != GGML_OP_CONCAT || ggml_get_op_params_i32(CI, 0) != 0) {
++        return false;
++    }
++    if (CI->type != GGML_TYPE_F32 || !ggml_is_contiguous(CI) || CI->ne[2] != 1 || CI->ne[3] != 1) {
++        return false;
++    }
++    const int64_t d_conv = CI->ne[0];
++    const int64_t n_ch   = CI->ne[1];
++    if (d_conv < 2 || n_ch < 1) {
++        return false;
++    }
++    const int64_t row = (d_conv - 1) * n_ch;
++    if (W->type != GGML_TYPE_F32 || W->ne[0] != d_conv || W->ne[1] != n_ch || W->nb[0] != sizeof(float) ||
++        W->nb[1] != (size_t) d_conv * sizeof(float)) {
++        return false;
++    }
++    if (!ggml_hexagon_is_f32_row(C, n_ch) || !ggml_hexagon_is_f32_row(S, n_ch)) {
++        return false;
++    }
++
++    // the state read: the first CONCAT input is a reshape of GET_ROWS(states, s_copy)
++    ggml_tensor * cs = CI->src[0];
++    if (!cs || !ggml_hexagon_is_view_op(cs) || cs->view_offs != 0 || !ggml_is_contiguous(cs) ||
++        cs->ne[0] != d_conv - 1 || cs->ne[1] != n_ch || cs->ne[2] != 1 || cs->ne[3] != 1) {
++        return false;
++    }
++    ggml_tensor * R = ggml_hexagon_root(cs);
++    if (R->op != GGML_OP_GET_ROWS || !ggml_hexagon_is_f32_row(R, row)) {
++        return false;
++    }
++    ggml_tensor * states = R->src[0];
++    ggml_tensor * idx    = R->src[1];
++    if (!states || !idx || !ggml_hexagon_is_state_table(states, row) || idx->type != GGML_TYPE_I32 ||
++        ggml_nelements(idx) != 1) {
++        return false;
++    }
++    ggml_tensor * cache = ggml_hexagon_root(states);
++
++    // the new column: the second CONCAT input is the transposed projection [1, n_ch]
++    ggml_tensor * xt = CI->src[1];
++    if (!xt || xt->type != GGML_TYPE_F32 || xt->ne[0] != 1 || xt->ne[1] != n_ch || xt->ne[2] != 1 ||
++        xt->ne[3] != 1 || xt->nb[1] != sizeof(float)) {
++        return false;
++    }
++
++    // the state write: the one CPY of the last d_conv - 1 columns of the CONCAT into a slot of the cache
++    ggml_tensor * P = nullptr;
++    for (int i = 0; i < gf->n_nodes; i++) {
++        ggml_tensor * n = gf->nodes[i];
++        if (n->op != GGML_OP_CPY || !n->src[0] || !n->src[1] || ggml_hexagon_root(n->src[0]) != CI) {
++            continue;
++        }
++        if (P) {
++            return false; // more than one write-back (rollback snapshots): keep the unfused path
++        }
++        P = n;
++    }
++    if (!P || P->type != GGML_TYPE_F32) {
++        return false;
++    }
++    ggml_tensor * last = P->src[0];
++    ggml_tensor * slot = P->src[1];
++    if (last->view_offs != sizeof(float) || last->ne[0] != d_conv - 1 || last->ne[1] != n_ch ||
++        last->ne[2] != 1 || last->ne[3] != 1 || last->nb[0] != sizeof(float) || last->nb[1] != CI->nb[1]) {
++        return false;
++    }
++    if (slot == cache || ggml_hexagon_root(slot) != cache || !ggml_hexagon_is_f32_row(slot, row)) {
++        return false;
++    }
++
++    const std::vector<ggml_tensor *> intermediates = { R, CI, C };
++    const std::vector<ggml_tensor *> members       = { cs, CI, C, S, last, P };
++    if (!ggml_hexagon_chain_is_private(gf, intermediates, members, nullptr, 0)) {
++        return false;
++    }
++
++    auto ir = index.find(R);
++    auto ip = index.find(P);
++    if (ir == index.end() || ip == index.end()) {
++        return false;
++    }
++    const int emit     = std::min(is, ip->second);
++    const int last_idx = std::max(is, ip->second);
++    if (ir->second > emit || !ggml_hexagon_chain_span_is_clean(gf, ir->second, last_idx, cache, members)) {
++        return false;
++    }
++
++    htp_opnode node(HTP_OP_GDN_CONV_STEP, S);
++    node.name    = "GDN_CONV_STEP";
++    node.inputs  = { states, idx, xt, W, slot };
++    node.outputs = { S, slot };
++    node.fused   = { R, CI, C, P };
++
++    fu.at.emplace(emit, std::move(node));
++    fu.skip[ir->second] = 1;
++    for (auto * t : members) {
++        auto it = index.find(t);
++        if (it != index.end()) {
++            fu.skip[it->second] = 1;
++        }
++    }
++
++    HEX_VERBOSE("ggml-hex: %s fused GDN_CONV_STEP %s (n_ch %d d_conv %d) at node %d\n",
++                sess->name.c_str(), S->name, (int) n_ch, (int) d_conv, emit);
++    return true;
++}
++
++static bool ggml_hexagon_match_gdn_state_chain(const ggml_hexagon_session * sess, const ggml_cgraph * gf,
++                                               const std::unordered_map<const ggml_tensor *, int> & index,
++                                               int ig, ggml_hexagon_gdn_fusion & fu) {
++    ggml_tensor * G = gf->nodes[ig];
++    if (G->op != GGML_OP_GATED_DELTA_NET || G->type != GGML_TYPE_F32 || !ggml_is_contiguous(G) ||
++        ggml_get_op_params_i32(G, 0) != 1) {
++        return false;
++    }
++    ggml_tensor * q    = G->src[0];
++    ggml_tensor * k    = G->src[1];
++    ggml_tensor * v    = G->src[2];
++    ggml_tensor * g    = G->src[3];
++    ggml_tensor * beta = G->src[4];
++    ggml_tensor * st   = G->src[5];
++    if (!q || !k || !v || !g || !beta || !st) {
++        return false;
++    }
++    const int64_t S_v = v->ne[0];
++    const int64_t H   = v->ne[1];
++    if (v->ne[2] != 1 || v->ne[3] != 1 || q->ne[2] != 1 || q->ne[3] != 1 || k->ne[2] != 1 || k->ne[3] != 1) {
++        return false;
++    }
++    const int64_t D = S_v * S_v * H;
++    if (G->ne[0] != S_v * H || G->ne[1] != 1 + S_v || G->ne[2] != 1 || G->ne[3] != 1) {
++        return false;
++    }
++    const size_t head_bytes = (size_t) S_v * H * sizeof(float);
++
++    // the state read: a reshape of GET_ROWS(states, s_copy)
++    if (!ggml_hexagon_is_view_op(st) || st->view_offs != 0 || !ggml_is_contiguous(st) || ggml_nelements(st) != D) {
++        return false;
++    }
++    ggml_tensor * R = ggml_hexagon_root(st);
++    if (R->op != GGML_OP_GET_ROWS || !ggml_hexagon_is_f32_row(R, D)) {
++        return false;
++    }
++    ggml_tensor * states = R->src[0];
++    ggml_tensor * idx    = R->src[1];
++    if (!states || !idx || !ggml_hexagon_is_state_table(states, D) || idx->type != GGML_TYPE_I32 ||
++        ggml_nelements(idx) != 1) {
++        return false;
++    }
++    ggml_tensor * cache = ggml_hexagon_root(states);
++
++    // the state write: the one CPY of the state tail of the output into a slot of the cache
++    ggml_tensor * P = nullptr;
++    for (int i = 0; i < gf->n_nodes; i++) {
++        ggml_tensor * n = gf->nodes[i];
++        if (n->op != GGML_OP_CPY || !n->src[0] || !n->src[1] || ggml_hexagon_root(n->src[0]) != G) {
++            continue;
++        }
++        if (P) {
++            return false;
++        }
++        P = n;
++    }
++    if (!P || P->type != GGML_TYPE_F32) {
++        return false;
++    }
++    ggml_tensor * tail = P->src[0];
++    ggml_tensor * slot = P->src[1];
++    if (tail == G || tail->view_offs != head_bytes || !ggml_is_contiguous(tail) || ggml_nelements(tail) != D) {
++        return false;
++    }
++    if (slot == cache || ggml_hexagon_root(slot) != cache || slot->type != GGML_TYPE_F32 || slot->ne[0] != D ||
++        ggml_nelements(slot) != D || slot->nb[0] != sizeof(float)) {
++        return false;
++    }
++
++    const std::vector<ggml_tensor *> intermediates = { R };
++    const std::vector<ggml_tensor *> members       = { st, G, tail, P };
++    if (!ggml_hexagon_chain_is_private(gf, intermediates, members, G, head_bytes)) {
++        return false;
++    }
++
++    auto ir = index.find(R);
++    auto ip = index.find(P);
++    if (ir == index.end() || ip == index.end() || ir->second > ig || ip->second < ig) {
++        return false;
++    }
++    if (!ggml_hexagon_chain_span_is_clean(gf, ir->second, ip->second, cache, members)) {
++        return false;
++    }
++
++    htp_opnode node(HTP_OP_GDN_STATE_STEP, G);
++    node.name    = "GDN_STATE_STEP";
++    node.inputs  = { q, k, v, g, beta, states, idx, slot };
++    node.outputs = { G, slot };
++    node.fused   = { R, P };
++
++    fu.at.emplace(ig, std::move(node));
++    fu.skip[ir->second] = 1;
++    for (auto * t : members) {
++        auto it = index.find(t);
++        if (it != index.end()) {
++            fu.skip[it->second] = 1;
++        }
++    }
++
++    HEX_VERBOSE("ggml-hex: %s fused GDN_STATE_STEP %s (S_v %d H %d) at node %d\n",
++                sess->name.c_str(), G->name, (int) S_v, (int) H, ig);
++    return true;
++}
++
++static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, const ggml_cgraph * gf,
++                                           ggml_hexagon_gdn_fusion & fu) {
++    std::unordered_map<const ggml_tensor *, int> index;
++    index.reserve(gf->n_nodes);
++    for (int i = 0; i < gf->n_nodes; i++) {
++        index.emplace(gf->nodes[i], i);
++    }
++    for (int i = 0; i < gf->n_nodes; i++) {
++        if (fu.skip[i]) {
++            continue;
++        }
++        const ggml_tensor * n = gf->nodes[i];
++        if (n->op == GGML_OP_UNARY) {
++            ggml_hexagon_match_gdn_conv_chain(sess, gf, index, i, fu);
++        } else if (n->op == GGML_OP_GATED_DELTA_NET) {
++            ggml_hexagon_match_gdn_state_chain(sess, gf, index, i, fu);
++        }
++    }
++}
++
+ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
+     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
+ 
+@@ -5883,9 +6250,24 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+             }
+         }
+ 
++        // Match the fused recurrent state steps (one op each) before the per-node pass
++        ggml_hexagon_gdn_fusion gdn_fu;
++        gdn_fu.skip.assign(graph->n_nodes, 0);
++        if (ggml_hexagon_is_gdn_state_fusion_enabled() && sess->mdev.count == 1) {
++            ggml_hexagon_match_gdn_fusions(sess, graph, gdn_fu);
++        }
++
+         computed_nodes.reserve(graph->n_nodes);
+ 
+         for (int i = 0; i < graph->n_nodes; ++i) {
++            auto fit = gdn_fu.at.find(i);
++            if (fit != gdn_fu.at.end()) {
++                computed_nodes.push_back(std::move(fit->second));
++            }
++            if (gdn_fu.skip[i]) {
++                continue;
++            }
++
+             ggml_tensor * n = graph->nodes[i];
+             if (!op_is_compute(n)) {
+                 continue;
+@@ -7194,6 +7576,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     const char * str_opqueue  = getenv("GGML_HEXAGON_OPQUEUE");
+     const char * str_oppoll   = getenv("GGML_HEXAGON_OPPOLL");
+     const char * str_opfusion = getenv("GGML_HEXAGON_OPFUSION");
++    const char * str_opfusion_state = getenv("GGML_HEXAGON_OPFUSION_STATE");
+     const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
+     const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
+     const char * str_etm      = getenv("GGML_HEXAGON_ETM");
+@@ -7245,6 +7628,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     opt_optrace   = str_optrace  ? strtoul(str_optrace, NULL, 0)          : (opt_opbatch * 256);
+     opt_oppoll    = str_oppoll   ? strtoul(str_oppoll,  NULL, 0)          : opt_oppoll;
+     opt_opfusion  = str_opfusion ? atoi(str_opfusion)                     : opt_opfusion;
++    opt_opfusion_state = str_opfusion_state ? atoi(str_opfusion_state)    : opt_opfusion_state;
+     opt_profile   = str_profile  ? atoi(str_profile)                      : 0;
+     opt_etm       = str_etm      ? atoi(str_etm)                          : 0;
+     opt_nhvx      = str_nhvx     ? strtoul(str_nhvx, NULL, 0)             : opt_nhvx;
+diff --git a/ggml/src/ggml-hexagon/htp/CMakeLists.txt b/ggml/src/ggml-hexagon/htp/CMakeLists.txt
+index 77f3ee3..ff531e1 100644
+--- a/ggml/src/ggml-hexagon/htp/CMakeLists.txt
++++ b/ggml/src/ggml-hexagon/htp/CMakeLists.txt
+@@ -24,6 +24,7 @@ add_library(${HTP_LIB} SHARED
+     matmul-ops.c
+     flash-attn-ops.c
+     gated-delta-net-ops.c
++    gdn-conv-ops.c
+     binary-ops.c
+     unary-ops.c
+     sum-rows-ops.c
+diff --git a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
+index 0b65295..3a9454c 100644
+--- a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
++++ b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
+@@ -27,6 +27,14 @@ struct htp_gdn_context {
+     size_t   vtcm_per_thread;
+     uint32_t row_start;
+     uint32_t nrows;
++
++    // The single-token kernel reads the state, writes the state, and writes the attention output
++    // through these pointers. The plain op points them at the state input and at the output tensor.
++    // The fused state step points them at the rows of the recurrent cache.
++    const float * state_in_base;
++    float *       state_out_base;
++    float *       attn_base;
++    uint64_t      state_seq_stride; // stride between sequences of the state input, in floats
+ };
+ 
+ static inline HVX_Vector gdn_mul_dot_f32(float * restrict dst, const float * restrict mul, const float * restrict dot, uint32_t n) {
+@@ -850,8 +858,6 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
+     const struct htp_tensor * v     = octx->src[2];
+     const struct htp_tensor * g     = octx->src[3];
+     const struct htp_tensor * beta  = octx->src[4];
+-    const struct htp_tensor * state = octx->src[5];
+-    const struct htp_tensor * dst   = octx->dst;
+ 
+     const uint32_t S_v      = v->ne[0];
+     const uint32_t H        = v->ne[1];
+@@ -867,9 +873,9 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
+     const uint32_t rk3 = n_seqs / k->ne[3];
+     const float scale = 1.0f / sqrtf((float) S_v);
+ 
+-    float * dst_base       = (float *) (uintptr_t) dst->data;
+-    float * state_out_base = dst_base + (uint64_t) S_v * H * n_seqs;
+-    const float * state_in_base = (const float *) (uintptr_t) state->data;
++    float *       dst_base       = gctx->attn_base;
++    float *       state_out_base = gctx->state_out_base;
++    const float * state_in_base  = gctx->state_in_base;
+ 
+     const bool kda = (g->ne[0] == S_v);
+     float local_gate[HTP_GDN_MAX_SV] __attribute__((aligned(128)));
+@@ -890,7 +896,7 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
+     struct fastdiv_values fd_rq3 = init_fastdiv_values(rq3);
+     struct fastdiv_values fd_rk3 = init_fastdiv_values(rk3);
+ 
+-    const uint64_t state_seq_stride = state->nb[3] / sizeof(float);
++    const uint64_t state_seq_stride = gctx->state_seq_stride;
+ 
+     uint32_t ir_prefetch = gctx->row_start + ith;
+     int spad_idx = 0;
+@@ -1170,6 +1176,11 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
+     gctx.vtcm_base = octx->ctx->vtcm_base;
+     gctx.vtcm_per_thread = 2 * state_aligned;
+ 
++    gctx.state_in_base    = (const float *) (uintptr_t) state->data;
++    gctx.state_out_base   = (float *) (uintptr_t) dst->data + (uint64_t) S_v * H * n_seqs;
++    gctx.attn_base        = (float *) (uintptr_t) dst->data;
++    gctx.state_seq_stride = state->nb[3] / sizeof(float);
++
+     FARF(HIGH, "gated-delta-net-f32: q(%ux%ux%ux%u) k(%ux%ux%ux%u) v(%ux%ux%ux%u) state(%ux%ux%ux%u) -> (%ux%ux%ux%u) : "
+          "vtcm-size %zu n_threads %u\n",
+          q->ne[0], q->ne[1], q->ne[2], q->ne[3],
+@@ -1187,3 +1198,110 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
+ 
+     return HTP_STATUS_OK;
+ }
++
++// Fused GET_ROWS + GATED_DELTA_NET (K = 1) + CPY of the new state into the recurrent cache, at one token.
++//
++// Inputs:
++//   src[0..4] q, k, v, g, beta, as in GATED_DELTA_NET
++//   src[5]    states [D, n_slots] F32, D = S_v * S_v * H, contiguous rows
++//   src[6]    s_copy I32 [1], the index of the source slot
++//   src[7]    slot   [D, 1] F32, the destination slot
++// Outputs:
++//   dst[0]    the GATED_DELTA_NET output [S_v * H, 1 + S_v]. The op writes only row 0, the attention output.
++//   dst[1]    slot, the same tensor as src[7], listed for the dirty tracking of the cache
++//
++// The kernel is the single-token thread of the plain op. Only the three base pointers differ. When the
++// source slot and the destination slot are the same, each head reads its state into VTCM before it
++// writes the state back, thus the update in place is safe.
++int op_gdn_state_step(struct htp_ops_context * octx) {
++    const struct htp_tensor * q      = octx->src[0];
++    const struct htp_tensor * k      = octx->src[1];
++    const struct htp_tensor * v      = octx->src[2];
++    const struct htp_tensor * g      = octx->src[3];
++    const struct htp_tensor * beta   = octx->src[4];
++    const struct htp_tensor * states = octx->src[5];
++    const struct htp_tensor * s_copy = octx->src[6];
++    const struct htp_tensor * slot   = octx->src[7];
++    const struct htp_tensor * dst    = octx->dst;
++
++    if (!q || !k || !v || !g || !beta || !states || !s_copy || !slot || !dst) {
++        return HTP_STATUS_INVAL_PARAMS;
++    }
++    if (q->type != HTP_TYPE_F32 || k->type != HTP_TYPE_F32 || v->type != HTP_TYPE_F32 ||
++        g->type != HTP_TYPE_F32 || beta->type != HTP_TYPE_F32 || states->type != HTP_TYPE_F32 ||
++        slot->type != HTP_TYPE_F32 || dst->type != HTP_TYPE_F32 || s_copy->type != HTP_TYPE_I32) {
++        return HTP_STATUS_NO_SUPPORT;
++    }
++    if (octx->ctx->mdev.count > 1) {
++        return HTP_STATUS_NO_SUPPORT;
++    }
++
++    const uint32_t S_v      = v->ne[0];
++    const uint32_t H        = v->ne[1];
++    const uint32_t n_tokens = v->ne[2];
++    const uint32_t n_seqs   = v->ne[3];
++    const uint32_t K        = octx->op_params[0];
++
++    if (S_v == 0 || S_v > HTP_GDN_MAX_SV || H == 0 || n_tokens != 1 || n_seqs != 1 || K != 1) {
++        return HTP_STATUS_NO_SUPPORT;
++    }
++    if ((g->ne[0] != 1 && g->ne[0] != S_v) || beta->ne[0] != 1) {
++        return HTP_STATUS_NO_SUPPORT;
++    }
++    if (q->ne[0] != S_v || k->ne[0] != S_v || q->ne[1] == 0 || k->ne[1] == 0 ||
++        q->ne[2] != 1 || k->ne[2] != 1 || q->ne[3] != 1 || k->ne[3] != 1) {
++        return HTP_STATUS_NO_SUPPORT;
++    }
++
++    const uint32_t D = S_v * S_v * H;
++    if (states->ne[0] != D || states->nb[0] != sizeof(float) || states->nb[1] != D * sizeof(float)) {
++        return HTP_STATUS_INVAL_PARAMS;
++    }
++    if (slot->ne[0] != D || slot->nb[0] != sizeof(float)) {
++        return HTP_STATUS_INVAL_PARAMS;
++    }
++    if (dst->ne[0] != S_v * H || dst->ne[1] != 1 + S_v) {
++        return HTP_STATUS_INVAL_PARAMS;
++    }
++
++    const int32_t src_idx = *(const int32_t *) (uintptr_t) s_copy->data;
++    if (src_idx < 0 || (uint32_t) src_idx >= states->ne[1]) {
++        FARF(ERROR, "gdn-state-step: slot index %d is out of range (%u slots)\n", src_idx, states->ne[1]);
++        return HTP_STATUS_INVAL_PARAMS;
++    }
++
++    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
++        return HTP_STATUS_OK;
++    }
++
++    const uint32_t n_threads = octx->n_threads;
++
++    size_t state_aligned = (size_t) S_v * S_v * sizeof(float);
++    state_aligned = (state_aligned + 127) & ~(size_t) 127;
++
++    if (octx->ctx->vtcm_size < 2 * state_aligned * n_threads) {
++        FARF(ERROR, "gdn-state-step: VTCM reservation %zu is too small, needed %zu\n",
++             octx->ctx->vtcm_size, 2 * state_aligned * n_threads);
++        return HTP_STATUS_VTCM_TOO_SMALL;
++    }
++
++    struct htp_gdn_context gctx;
++    gctx.octx             = octx;
++    gctx.row_start        = 0;
++    gctx.nrows            = H;
++    gctx.rows_per_thread  = fastdiv(H + n_threads - 1, &octx->n_threads_div);
++    gctx.state_bytes      = (size_t) S_v * S_v * sizeof(float);
++    gctx.vtcm_base        = octx->ctx->vtcm_base;
++    gctx.vtcm_per_thread  = 2 * state_aligned;
++    gctx.state_in_base    = (const float *) ((const uint8_t *) (uintptr_t) states->data + (size_t) src_idx * states->nb[1]);
++    gctx.state_out_base   = (float *) (uintptr_t) slot->data;
++    gctx.attn_base        = (float *) (uintptr_t) dst->data;
++    gctx.state_seq_stride = 0;
++
++    FARF(HIGH, "gdn-state-step: S_v %u H %u slot %d -> %p vtcm %zu n_threads %u\n",
++         S_v, H, src_idx, (void *) gctx.state_out_base, gctx.vtcm_per_thread * n_threads, n_threads);
++
++    work_queue_run(octx->ctx->work_queue, gated_delta_net_f32_tg_thread, &gctx, n_threads);
++
++    return HTP_STATUS_OK;
++}
+diff --git a/ggml/src/ggml-hexagon/htp/htp-ctx.h b/ggml/src/ggml-hexagon/htp/htp-ctx.h
+index 3b60c8b..144e7e2 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-ctx.h
++++ b/ggml/src/ggml-hexagon/htp/htp-ctx.h
+@@ -172,6 +172,8 @@ int op_concat(struct htp_ops_context * octx);
+ int op_diag(struct htp_ops_context * octx);
+ int op_solve_tri(struct htp_ops_context * octx);
+ int op_gated_delta_net(struct htp_ops_context * octx);
++int op_gdn_state_step(struct htp_ops_context * octx);
++int op_gdn_conv_step(struct htp_ops_context * octx);
+ int op_pad(struct htp_ops_context * octx);
+ int op_im2col(struct htp_ops_context * octx);
+ int op_allreduce(struct htp_ops_context * octx);
+diff --git a/ggml/src/ggml-hexagon/htp/htp-ops.h b/ggml/src/ggml-hexagon/htp/htp-ops.h
+index 98a5f6d..e6cf9df 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-ops.h
++++ b/ggml/src/ggml-hexagon/htp/htp-ops.h
+@@ -104,6 +105,8 @@ enum htp_op_code {
+     HTP_OP_ALLREDUCE_ADD,
+     HTP_OP_GLU_SWIGLU_CLAMP,
+     HTP_OP_MDEV_GROUP,
++    HTP_OP_GDN_CONV_STEP,   // fused GET_ROWS + CONCAT + SSM_CONV + SILU + CPY of the conv state (one token)
++    HTP_OP_GDN_STATE_STEP,  // fused GET_ROWS + GATED_DELTA_NET + CPY of the delta net state (one token)
+ 
+     HTP_OP_INVALID
+ };
+diff --git a/ggml/src/ggml-hexagon/htp/main.c b/ggml/src/ggml-hexagon/htp/main.c
+index 1d291e1..6b5bfd0 100644
+--- a/ggml/src/ggml-hexagon/htp/main.c
++++ b/ggml/src/ggml-hexagon/htp/main.c
+@@ -885,6 +886,12 @@ static int execute_op(struct htp_ops_context * octx) {
+         case HTP_OP_GATED_DELTA_NET:
+             return op_gated_delta_net(octx);
+ 
++        case HTP_OP_GDN_STATE_STEP:
++            return op_gdn_state_step(octx);
++
++        case HTP_OP_GDN_CONV_STEP:
++            return op_gdn_conv_step(octx);
++
+         case HTP_OP_TRI:
+             return op_unary(octx);
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index dc529a3..b6409ef 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4661,6 +4661,157 @@ struct test_gated_delta_net : public test_case {
+     }
+ };
+ 
++// GET_ROWS + CONCAT + SSM_CONV + SILU + CPY: the conv half of the recurrent state step at one token.
++// The graph is the one that llama.cpp builds for a gated delta net layer (build_conv_state). The output
++// holds the conv output and the new state, thus the CPY into the cache is part of the graph.
++struct test_gdn_conv_state_fusion : public test_case {
++    const int64_t d_conv;
++    const int64_t n_ch;
++    const int64_t n_slots;
++    const int64_t src_slot;
++    const int64_t dst_slot;
++
++    std::string vars() override {
++        return VARS_TO_STR5(d_conv, n_ch, n_slots, src_slot, dst_slot);
++    }
++
++    test_gdn_conv_state_fusion(int64_t d_conv = 4, int64_t n_ch = 96, int64_t n_slots = 1,
++            int64_t src_slot = 0, int64_t dst_slot = 0)
++        : d_conv(d_conv), n_ch(n_ch), n_slots(n_slots), src_slot(src_slot), dst_slot(dst_slot) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        const int64_t row = (d_conv - 1) * n_ch;
++
++        ggml_tensor * states = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row, n_slots);
++        ggml_tensor * s_copy = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_slots);
++        ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ch, 1);
++        ggml_tensor * w      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, n_ch);
++        ggml_set_name(states, "cache_r");
++        ggml_set_name(s_copy, "s_copy");
++        ggml_set_name(x, "qkv");
++        ggml_set_name(w, "conv_w");
++
++        ggml_tensor * idx = ggml_view_1d(ctx, s_copy, 1, 0);
++        ggml_tensor * cs  = ggml_get_rows(ctx, ggml_reshape_2d(ctx, states, row, n_slots), idx);
++        cs = ggml_reshape_3d(ctx, cs, d_conv - 1, n_ch, 1);
++
++        ggml_tensor * ci = ggml_concat(ctx, cs, ggml_transpose(ctx, x), 0);
++        ggml_set_name(ci, "conv_input");
++
++        ggml_tensor * last = ggml_view_3d(ctx, ci, d_conv - 1, n_ch, 1, ci->nb[1], ci->nb[2], ggml_row_size(ci->type, 1));
++        ggml_tensor * upd  = ggml_view_2d(ctx, states, row, 1, states->nb[1], dst_slot * states->nb[1]);
++        ggml_tensor * cpy  = ggml_cpy(ctx, last, upd);
++        ggml_set_name(cpy, "conv_state_update");
++
++        ggml_tensor * y = ggml_silu(ctx, ggml_ssm_conv(ctx, ci, w));
++        ggml_set_name(y, "conv_output_silu");
++
++        ggml_tensor * out = ggml_concat(ctx, y, cpy, 0);
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++            if (ggml_is_view_op(t->op)) { continue; }
++            if (t->type == GGML_TYPE_I32) {
++                std::vector<int32_t> data(ggml_nelements(t), (int32_t) src_slot);
++                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
++            } else {
++                init_tensor_uniform(t);
++            }
++        }
++    }
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "GDN_CONV_STATE_FUSION";
++    }
++
++    bool run_whole_graph() override { return true; }
++};
++
++// GET_ROWS + GATED_DELTA_NET + CPY: the delta net half of the recurrent state step at one token.
++// The graph is the one that llama.cpp builds for a gated delta net layer (build_rs, build_recurrent_attn).
++struct test_gdn_state_fusion : public test_case {
++    const int64_t head_count;
++    const int64_t head_size;
++    const int64_t n_slots;
++    const int64_t src_slot;
++    const int64_t dst_slot;
++
++    std::string vars() override {
++        return VARS_TO_STR5(head_count, head_size, n_slots, src_slot, dst_slot);
++    }
++
++    test_gdn_state_fusion(int64_t head_count = 4, int64_t head_size = 32, int64_t n_slots = 1,
++            int64_t src_slot = 0, int64_t dst_slot = 0)
++        : head_count(head_count), head_size(head_size), n_slots(n_slots), src_slot(src_slot), dst_slot(dst_slot) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        const int64_t S_v = head_size;
++        const int64_t H   = head_count;
++        const int64_t D   = S_v * S_v * H;
++
++        ggml_tensor * states = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_slots);
++        ggml_tensor * s_copy = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_slots);
++        ggml_tensor * q      = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, 1, 1);
++        ggml_tensor * k      = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, 1, 1);
++        ggml_tensor * v      = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, 1, 1);
++        ggml_tensor * g      = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, 1, 1);
++        ggml_tensor * beta   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, 1, 1);
++        ggml_set_name(states, "cache_s");
++        ggml_set_name(s_copy, "s_copy");
++        ggml_set_name(q, "q");
++        ggml_set_name(k, "k");
++        ggml_set_name(v, "v");
++        ggml_set_name(g, "g");
++        ggml_set_name(beta, "beta");
++
++        ggml_tensor * idx = ggml_view_1d(ctx, s_copy, 1, 0);
++        ggml_tensor * st  = ggml_get_rows(ctx, ggml_reshape_2d(ctx, states, D, n_slots), idx);
++        st = ggml_reshape_4d(ctx, st, S_v, S_v, H, 1);
++
++        ggml_tensor * gdn = ggml_gated_delta_net(ctx, q, k, v, g, beta, st, 1);
++        ggml_set_name(gdn, "gdn_out");
++
++        ggml_tensor * attn = ggml_view_2d(ctx, gdn, S_v * H, 1, gdn->nb[1], 0);
++        ggml_tensor * tail = ggml_view_3d(ctx, gdn, D, 1, 1,
++                ggml_row_size(gdn->type, D), ggml_row_size(gdn->type, D), ggml_row_size(gdn->type, S_v * H));
++        ggml_tensor * upd  = ggml_view_3d(ctx, states, D, 1, 1,
++                states->nb[1], (size_t) n_slots * states->nb[1], dst_slot * states->nb[1]);
++        ggml_tensor * cpy  = ggml_cpy(ctx, tail, upd);
++        ggml_set_name(cpy, "state_update");
++
++        ggml_tensor * out = ggml_concat(ctx, attn, cpy, 0);
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++            if (ggml_is_view_op(t->op)) { continue; }
++            if (t->type == GGML_TYPE_I32) {
++                std::vector<int32_t> data(ggml_nelements(t), (int32_t) src_slot);
++                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
++            } else if (strcmp(t->name, "g") == 0) {
++                init_tensor_uniform(t, -20.0f, -1e-4f);
++            } else if (strcmp(t->name, "beta") == 0) {
++                init_tensor_uniform(t, 0.0f, 1.0f);
++            } else if (strcmp(t->name, "v") == 0) {
++                init_tensor_uniform(t, -0.3f, 5.0f);
++            } else {
++                init_tensor_uniform(t);
++            }
++        }
++    }
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "GDN_STATE_FUSION";
++    }
++
++    bool run_whole_graph() override { return true; }
++};
++
+ // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
+ struct test_gated_delta_net_cache_fusion : public test_case {
+     const ggml_type type;
+@@ -10899,6 +11050,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));
++
++    // the fused recurrent state step of a gated delta net layer at one token: the Qwen3.5-2B shapes and small shapes
++    test_cases.emplace_back(new test_gdn_conv_state_fusion(4, 6144, 1, 0, 0));
++    test_cases.emplace_back(new test_gdn_conv_state_fusion(4, 6144, 3, 2, 1));
++    test_cases.emplace_back(new test_gdn_conv_state_fusion(4, 100, 2, 1, 1));
++    test_cases.emplace_back(new test_gdn_conv_state_fusion(3, 64, 2, 0, 1));
++    test_cases.emplace_back(new test_gdn_state_fusion(16, 128, 1, 0, 0));
++    test_cases.emplace_back(new test_gdn_state_fusion(16, 128, 3, 2, 1));
++    test_cases.emplace_back(new test_gdn_state_fusion(4, 32, 2, 1, 1));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2));
+diff --git a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
+new file mode 100644
+index 0000000..9496908
+--- /dev/null
++++ b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
+@@ -0,0 +1,221 @@
++// Fused conv half of the recurrent state step of a gated delta net layer at one token.
++//
++// One op replaces GET_ROWS(cache_r, s_copy), CONCAT, SSM_CONV, SILU, and the CPY of the new
++// conv state into the cache. The op reads the slot that s_copy selects, computes the
++// convolution and the SiLU, and writes the shifted conv state into the destination slot.
++//
++// Inputs:
++//   src[0] states  [row, n_slots] F32, row = (d_conv - 1) * n_ch, contiguous rows
++//   src[1] s_copy  I32 [1], the index of the source slot
++//   src[2] x       [1, n_ch] F32, the new column (nb[1] = 4)
++//   src[3] w       [d_conv, n_ch] F32, the conv weights
++//   src[4] slot    [row, 1] F32, the destination slot
++// Outputs:
++//   dst[0] y       [n_ch, 1] F32, silu(conv)
++//   dst[1] slot    the same tensor as src[4], listed for the dirty tracking of the cache
++//
++// A slot has the layout of the CONCAT input: for each channel, d_conv - 1 floats in time order.
++// The new slot of a channel holds the last d_conv - 2 old values and the new column.
++//
++// Numerics: the sum of the d_conv products is sequential in F32, in the order of the CPU
++// reference (ggml_compute_forward_ssm_conv_f32). The SiLU uses the same two HVX routines as
++// the SILU op of this backend.
++
++#include <HAP_farf.h>
++#include <stdint.h>
++#include <string.h>
++
++#include "hvx-utils.h"
++#include "hex-fastdiv.h"
++#include "hex-common.h"
++#include "hex-profile.h"
++
++#define GGML_COMMON_DECL_C
++#include "ggml-common.h"
++#include "htp-ctx.h"
++#include "htp-tensor.h"
++#include "hvx-arith.h"
++#include "hvx-copy.h"
++#include "hvx-sigmoid.h"
++
++#ifndef MIN
++#define MIN(a, b) ((a) < (b) ? (a) : (b))
++#endif
++
++struct htp_gdn_conv_context {
++    struct htp_ops_context * octx;
++    const float * src_slot;   // source slot, DDR
++    float *       dst_slot;   // destination slot, DDR
++    const float * x;          // new column, DDR
++    const float * w;          // conv weights, DDR
++    float *       y;          // output, DDR
++    uint32_t      n_ch;
++    uint32_t      d_conv;
++    uint32_t      chunk;      // channels per thread, a multiple of VLEN_FP32
++    size_t        vtcm_per_thread;
++    size_t        off_x;      // offsets of the per-thread VTCM arrays, the slot array is at 0
++    size_t        off_w;
++    size_t        off_acc;
++    size_t        off_new;
++    size_t        off_sig;
++};
++
++static void gdn_conv_step_thread(unsigned int nth, unsigned int ith, void * data) {
++    (void) nth;
++    struct htp_gdn_conv_context * cctx = (struct htp_gdn_conv_context *) data;
++    struct htp_ops_context *      octx = cctx->octx;
++
++    const uint32_t d_conv = cctx->d_conv;
++    const uint32_t n_prev = d_conv - 1;
++    const uint32_t c0     = ith * cctx->chunk;
++    if (c0 >= cctx->n_ch) {
++        return;
++    }
++    const uint32_t n = MIN(cctx->chunk, cctx->n_ch - c0);
++
++    uint8_t * base  = (uint8_t *) octx->ctx->vtcm_base + (size_t) ith * cctx->vtcm_per_thread;
++    float *   v_s   = (float *) base;
++    float *   v_x   = (float *) (base + cctx->off_x);
++    float *   v_w   = (float *) (base + cctx->off_w);
++    float *   v_acc = (float *) (base + cctx->off_acc);
++    float *   v_new = (float *) (base + cctx->off_new);
++    float *   v_sig = (float *) (base + cctx->off_sig);
++
++    dma_queue *               dma = octx->ctx->dma[ith];
++    struct htp_thread_trace * tr  = &octx->ctx->trace[ith];
++
++    const size_t s_bytes = (size_t) n * n_prev * sizeof(float);
++    const size_t x_bytes = (size_t) n * sizeof(float);
++    const size_t w_bytes = (size_t) n * d_conv * sizeof(float);
++
++    dma_queue_push(dma, dma_make_ptr(v_s, cctx->src_slot + (size_t) c0 * n_prev), s_bytes, s_bytes, s_bytes, 1);
++    dma_queue_push(dma, dma_make_ptr(v_x, cctx->x + c0), x_bytes, x_bytes, x_bytes, 1);
++    dma_queue_push(dma, dma_make_ptr(v_w, cctx->w + (size_t) c0 * d_conv), w_bytes, w_bytes, w_bytes, 1);
++    dma_queue_pop(dma);
++    dma_queue_pop(dma);
++    dma_queue_pop(dma);
++
++    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c0);
++
++    for (uint32_t c = 0; c < n; c++) {
++        const float * s  = v_s + (size_t) c * n_prev;
++        const float * w  = v_w + (size_t) c * d_conv;
++        float *       ns = v_new + (size_t) c * n_prev;
++        const float   x  = v_x[c];
++
++        float sum = 0.0f;
++        for (uint32_t t = 0; t < n_prev; t++) {
++            sum += s[t] * w[t];
++        }
++        sum += x * w[n_prev];
++        v_acc[c] = sum;
++
++        for (uint32_t t = 0; t + 1 < n_prev; t++) {
++            ns[t] = s[t + 1];
++        }
++        ns[n_prev - 1] = x;
++    }
++
++    hvx_sigmoid_f32_aa((uint8_t *) v_sig, (const uint8_t *) v_acc, n);
++    hvx_mul_f32_aaa((uint8_t *) v_sig, (const uint8_t *) v_acc, (const uint8_t *) v_sig, n);
++    hvx_copy_f32_ua((uint8_t *) (cctx->y + c0), (const uint8_t *) v_sig, n);
++
++    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) (c0 + n));
++
++    dma_queue_push(dma, dma_make_ptr(cctx->dst_slot + (size_t) c0 * n_prev, v_new), s_bytes, s_bytes, s_bytes, 1);
++    dma_queue_flush(dma);
++}
++
++int op_gdn_conv_step(struct htp_ops_context * octx) {
++    const struct htp_tensor * states = octx->src[0];
++    const struct htp_tensor * s_copy = octx->src[1];
++    const struct htp_tensor * x      = octx->src[2];
++    const struct htp_tensor * w      = octx->src[3];
++    const struct htp_tensor * slot   = octx->src[4];
++    const struct htp_tensor * y      = octx->dst;
++
++    if (!states || !s_copy || !x || !w || !slot || !y) {
++        return HTP_STATUS_INVAL_PARAMS;
++    }
++    if (states->type != HTP_TYPE_F32 || x->type != HTP_TYPE_F32 || w->type != HTP_TYPE_F32 ||
++        slot->type != HTP_TYPE_F32 || y->type != HTP_TYPE_F32 || s_copy->type != HTP_TYPE_I32) {
++        return HTP_STATUS_NO_SUPPORT;
++    }
++    if (octx->ctx->mdev.count > 1) {
++        return HTP_STATUS_NO_SUPPORT;
++    }
++
++    const uint32_t d_conv = w->ne[0];
++    const uint32_t n_ch   = w->ne[1];
++    if (d_conv < 2 || n_ch == 0) {
++        return HTP_STATUS_INVAL_PARAMS;
++    }
++    const uint32_t row = (d_conv - 1) * n_ch;
++
++    if (states->ne[0] != row || states->nb[0] != sizeof(float) || states->nb[1] != row * sizeof(float)) {
++        return HTP_STATUS_INVAL_PARAMS;
++    }
++    if (x->ne[0] != 1 || x->ne[1] != n_ch || x->nb[1] != sizeof(float)) {
++        return HTP_STATUS_INVAL_PARAMS;
++    }
++    if (w->nb[0] != sizeof(float) || w->nb[1] != d_conv * sizeof(float)) {
++        return HTP_STATUS_INVAL_PARAMS;
++    }
++    if (slot->ne[0] != row || slot->nb[0] != sizeof(float)) {
++        return HTP_STATUS_INVAL_PARAMS;
++    }
++    if (y->ne[0] != n_ch || y->nb[0] != sizeof(float)) {
++        return HTP_STATUS_INVAL_PARAMS;
++    }
++
++    const int32_t src_idx = *(const int32_t *) (uintptr_t) s_copy->data;
++    if (src_idx < 0 || (uint32_t) src_idx >= states->ne[1]) {
++        FARF(ERROR, "gdn-conv-step: slot index %d is out of range (%u slots)\n", src_idx, states->ne[1]);
++        return HTP_STATUS_INVAL_PARAMS;
++    }
++
++    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
++        return HTP_STATUS_OK;
++    }
++
++    const uint32_t n_threads = octx->n_threads;
++    const uint32_t chunk     = hex_round_up(fastdiv(n_ch + n_threads - 1, &octx->n_threads_div), VLEN_FP32);
++
++    struct htp_gdn_conv_context cctx;
++    memset(&cctx, 0, sizeof(cctx));
++    cctx.octx     = octx;
++    cctx.src_slot = (const float *) ((const uint8_t *) (uintptr_t) states->data + (size_t) src_idx * states->nb[1]);
++    cctx.dst_slot = (float *) (uintptr_t) slot->data;
++    cctx.x        = (const float *) (uintptr_t) x->data;
++    cctx.w        = (const float *) (uintptr_t) w->data;
++    cctx.y        = (float *) (uintptr_t) y->data;
++    cctx.n_ch     = n_ch;
++    cctx.d_conv   = d_conv;
++    cctx.chunk    = chunk;
++
++    size_t off   = hex_align_up((size_t) chunk * (d_conv - 1) * sizeof(float), 128);
++    cctx.off_x   = off;
++    off         += hex_align_up((size_t) chunk * sizeof(float), 128);
++    cctx.off_w   = off;
++    off         += hex_align_up((size_t) chunk * d_conv * sizeof(float), 128);
++    cctx.off_acc = off;
++    off         += hex_align_up((size_t) chunk * sizeof(float), 128);
++    cctx.off_new = off;
++    off         += hex_align_up((size_t) chunk * (d_conv - 1) * sizeof(float), 128);
++    cctx.off_sig = off;
++    off         += hex_align_up((size_t) chunk * sizeof(float), 128);
++    cctx.vtcm_per_thread = off;
++
++    if (cctx.vtcm_per_thread * n_threads > octx->ctx->vtcm_size) {
++        FARF(ERROR, "gdn-conv-step: VTCM reservation %zu is too small, needed %zu\n",
++             octx->ctx->vtcm_size, cctx.vtcm_per_thread * n_threads);
++        return HTP_STATUS_VTCM_TOO_SMALL;
++    }
++
++    FARF(HIGH, "gdn-conv-step: n_ch %u d_conv %u slot %d -> %p chunk %u vtcm %zu n_threads %u\n",
++         n_ch, d_conv, src_idx, (void *) cctx.dst_slot, chunk, cctx.vtcm_per_thread * n_threads, n_threads);
++
++    work_queue_run(octx->ctx->work_queue, gdn_conv_step_thread, &cctx, n_threads);
++
++    return HTP_STATUS_OK;
++}
