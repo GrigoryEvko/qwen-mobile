@@ -29,6 +29,19 @@
             android:textAppearance="@style/TextAppearance.Material3.HeadlineSmall"
             android:textColor="@color/ink" />
 
+        <ImageButton
+            android:id="@+id/jumpButton"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:layout_gravity="bottom|end"
+            android:layout_margin="16dp"
+            android:background="@drawable/bg_round_white"
+            android:contentDescription="@string/jump_to_latest"
+            android:elevation="2dp"
+            android:src="@drawable/ic_arrow_down"
+            android:visibility="gone"
+            app:tint="@color/ink" />
+
         <TextView
             android:id="@+id/grantButton"
             android:layout_width="wrap_content"

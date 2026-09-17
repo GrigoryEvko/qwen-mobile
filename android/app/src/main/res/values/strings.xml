@@ -26,6 +26,7 @@
     <string name="attached_image">Image</string>
     <string name="describe_image">Describe this image.</string>
     <string name="empty_chat">What can I help with?</string>
+    <string name="jump_to_latest">Jump to the latest</string>
     <string name="role_user">You</string>
     <string name="role_assistant">Qwen</string>
     <string name="status_idle">Idle</string>

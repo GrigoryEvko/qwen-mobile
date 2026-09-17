@@ -6,7 +6,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
@@ -41,10 +43,14 @@ object ChatSession {
     /** True while the model loads. */
     val loading: StateFlow<Boolean> get() = loadingFlow
 
+    /** The problems of the automatic loads, for the screen to show. */
+    val problems: SharedFlow<String> get() = problemFlow
+
     private val structureFlow = MutableStateFlow(0L)
     private val revisionFlow = MutableStateFlow(0L)
     private val generatingFlow = MutableStateFlow(false)
     private val loadingFlow = MutableStateFlow(false)
+    private val problemFlow = MutableSharedFlow<String>(extraBufferCapacity = 4)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     private lateinit var app: Context
@@ -52,6 +58,9 @@ object ChatSession {
     private var generation: Job? = null
     private var restored = false
     private var autoLoaded = false
+
+    /** True when the settings changed the model while an answer streams. The reload waits for the end. */
+    private var reloadPending = false
 
     /** The interval between two saves of a streaming answer. */
     private const val SAVE_INTERVAL_MS = 3000L
@@ -73,6 +82,27 @@ object ChatSession {
                 }
                 structureFlow.value += 1
             }
+        }
+        // A model change in the settings is a switch: the messages stay, the engine reloads.
+        scope.launch {
+            SettingsStore.of(app).state.collect { s ->
+                val loaded = LlamaEngine.state.value ?: return@collect
+                val c = loaded.config
+                if (s.modelPath != c.path || s.backend != c.backend || s.threads != c.threads || s.nCtx != c.nCtx) {
+                    reloadPending = true
+                    if (!generatingFlow.value) {
+                        reloadNow()
+                    }
+                }
+            }
+        }
+    }
+
+    /** The queued reload of the settings model. The problems go to [problems]. */
+    private fun reloadNow() {
+        reloadPending = false
+        scope.launch {
+            loadFromSettings()?.let { problemFlow.emit(it) }
         }
     }
 
@@ -193,6 +223,9 @@ object ChatSession {
                 generatingFlow.value = false
                 GenerationService.stop(app)
                 save()
+                if (reloadPending) {
+                    reloadNow()
+                }
             }
         }
     }

@@ -20,6 +20,7 @@ import androidx.core.content.FileProvider
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
 import ai.airi.qwenmobile.databinding.FragmentChatBinding
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collect
@@ -49,6 +50,13 @@ class ChatFragment : Fragment() {
     /** True while a redraw of the last row waits. */
     private var renderScheduled = false
 
+    /**
+     * True when the list shows its end. A streamed answer follows the list
+     * only in that state, thus a user who scrolls up to read keeps the
+     * position. Only a real scroll (dy ≠ 0) changes it, not a relayout.
+     */
+    private var atBottom = true
+
     private val settings by lazy { SettingsStore.of(requireContext()) }
 
     private val pickImage = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
@@ -70,12 +78,21 @@ class ChatFragment : Fragment() {
         session.init(requireContext())
         val b = FragmentChatBinding.inflate(inflater, container, false)
         binding = b
-        b.messages.layoutManager = LinearLayoutManager(requireContext()).apply { stackFromEnd = true }
+        b.messages.layoutManager = LinearLayoutManager(requireContext())
         b.messages.adapter = adapter
         b.messages.itemAnimator = null
+        b.messages.addOnScrollListener(object : RecyclerView.OnScrollListener() {
+            override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
+                if (dy != 0) {
+                    atBottom = !recyclerView.canScrollVertically(1)
+                    updateJumpButton()
+                }
+            }
+        })
 
         b.sendButton.setOnClickListener { onSend() }
         b.stopButton.setOnClickListener { session.stop() }
+        b.jumpButton.setOnClickListener { scrollToEnd() }
         b.attachButton.setOnClickListener { showAttachMenu(it) }
         b.attachmentChip.setOnCloseIconClickListener { setPendingImage(null) }
         b.grantButton.setOnClickListener { startActivity(ModelFiles.allFilesAccessIntent(requireContext())) }
@@ -85,9 +102,7 @@ class ChatFragment : Fragment() {
             session.structure.collect {
                 adapter.notifyDataSetChanged()
                 updateEmptyState()
-                if (session.messages.isNotEmpty()) {
-                    b.messages.scrollToPosition(session.messages.size - 1)
-                }
+                scrollToEnd()
             }
         }
         scope.launch { session.revision.collect { scheduleRender() } }
@@ -95,10 +110,12 @@ class ChatFragment : Fragment() {
             session.generating.collect { active ->
                 b.sendButton.visibility = if (active) View.GONE else View.VISIBLE
                 b.stopButton.visibility = if (active) View.VISIBLE else View.GONE
+                updateJumpButton()
                 publishStatus()
             }
         }
         scope.launch { session.loading.collect { publishStatus() } }
+        scope.launch { session.problems.collect { toast(it) } }
         scope.launch { LlamaEngine.state.collect { publishStatus() } }
         scope.launch { settings.state.collect { publishStatus() } }
         return b.root
@@ -253,16 +270,31 @@ class ChatFragment : Fragment() {
 
     private fun renderLast() {
         renderScheduled = false
-        val b = binding ?: return
-        if (session.messages.isEmpty()) {
+        if (binding == null || session.messages.isEmpty()) {
             return
         }
-        val last = session.messages.size - 1
-        adapter.notifyItemChanged(last, MessageAdapter.PAYLOAD_TEXT)
-        val lm = b.messages.layoutManager as LinearLayoutManager
-        if (lm.findLastVisibleItemPosition() >= last - 1) {
-            b.messages.scrollToPosition(last)
+        // The decision comes before the update: the relayout of a grown row must not change it.
+        val follow = atBottom
+        adapter.notifyItemChanged(session.messages.size - 1, MessageAdapter.PAYLOAD_TEXT)
+        if (follow) {
+            scrollToEnd()
         }
+    }
+
+    /** Show the end of the list after the next layout, and follow the stream again. */
+    private fun scrollToEnd() {
+        val b = binding ?: return
+        b.messages.post {
+            binding?.messages?.scrollBy(0, Int.MAX_VALUE / 2)
+            atBottom = true
+            updateJumpButton()
+        }
+    }
+
+    /** The round arrow above the composer: only while an answer streams and the list is scrolled up. */
+    private fun updateJumpButton() {
+        val b = binding ?: return
+        b.jumpButton.visibility = if (session.generating.value && !atBottom) View.VISIBLE else View.GONE
     }
 
     private fun updateEmptyState() {
