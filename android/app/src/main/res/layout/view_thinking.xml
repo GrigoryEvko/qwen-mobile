@@ -1,30 +1,32 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- The collapsible thinking of an answer. Include it with an id in the message item,
-     then bind it with Thinking.bind(thinkingHeader, thinkingBody, parts). -->
+<!-- The thinking field of an answer: a separate box, closed until the header is tapped.
+     Include it in the message item, then bind it with Thinking.bind(thinkingHeader, thinkingBody, parts). -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
+    android:background="@drawable/bg_thinking"
     android:orientation="vertical">
 
     <LinearLayout
         android:id="@+id/thinkingHeader"
-        android:layout_width="wrap_content"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:background="?attr/selectableItemBackground"
         android:clickable="true"
         android:focusable="true"
         android:gravity="center_vertical"
         android:orientation="horizontal"
-        android:paddingVertical="4dp"
+        android:paddingHorizontal="12dp"
+        android:paddingVertical="8dp"
         android:visibility="gone">
 
         <TextView
             android:id="@+id/thinkingChevron"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginEnd="6dp"
+            android:layout_marginEnd="8dp"
             android:text="@string/thinking_chevron"
-            android:textColor="?android:attr/textColorSecondary"
+            android:textColor="@color/muted"
             android:textSize="13sp" />
 
         <TextView
@@ -32,7 +34,7 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="@string/thinking_in_progress"
-            android:textColor="?android:attr/textColorSecondary"
+            android:textColor="@color/muted"
             android:textSize="13sp"
             android:textStyle="italic" />
     </LinearLayout>
@@ -41,10 +43,9 @@
         android:id="@+id/thinkingBody"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginBottom="8dp"
-        android:paddingStart="12dp"
-        android:paddingEnd="0dp"
-        android:textColor="?android:attr/textColorSecondary"
+        android:paddingHorizontal="12dp"
+        android:paddingBottom="10dp"
+        android:textColor="@color/muted"
         android:textSize="13sp"
         android:visibility="gone" />
 </LinearLayout>

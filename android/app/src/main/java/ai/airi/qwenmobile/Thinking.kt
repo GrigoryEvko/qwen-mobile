@@ -47,9 +47,9 @@ object Thinking {
     /**
      * Show the thinking of [parts] in the header row and the body.
      *
-     * The header shows the state and toggles the body. The body is open while
-     * the thinking is in progress and closed when it is done, until the user
-     * taps. Both views hide when there is no thinking.
+     * The header shows the state and toggles the body. The body is hidden
+     * until the user taps the header, in progress or done. Both views hide
+     * when there is no thinking.
      */
     fun bind(header: View, body: TextView, parts: Parts) {
         val thinking = parts.thinking
@@ -75,7 +75,7 @@ object Thinking {
         header.visibility = View.VISIBLE
         apply(header, body, state, parts.thinkingDone)
         header.setOnClickListener {
-            state.expanded = !(state.expanded ?: !parts.thinkingDone)
+            state.expanded = !(state.expanded ?: false)
             apply(header, body, state, parts.thinkingDone)
         }
     }
@@ -92,7 +92,7 @@ object Thinking {
             }
             else -> context.getString(R.string.thinking_done)
         }
-        val expanded = state.expanded ?: !done
+        val expanded = state.expanded ?: false
         chevron.rotation = if (expanded) 90f else 0f
         body.visibility = if (expanded) View.VISIBLE else View.GONE
         if (expanded) {
