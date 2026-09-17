@@ -197,9 +197,8 @@ layers on the GPU and with all layers on the CPU (`-ngl 0`).
 
 The 4B has a heavy tail. Through chunk 13 the mean KL is 0.0014 to 0.0018, and chunks 14 and 16
 hold the tokens of the tail: the 99.9 % point is 0.17, thus eight tokens have a KL of more than
-0.17, and the maximum is 1.56. The 2B has no such tail (maximum 0.028, 99.9 % point 0.014). The next
-step isolates the class that causes the tail, with `--only` on the 4B export: `token_embd`, the MLP,
-the GDN projections and the attention projections, one file each.
+0.17, and the maximum is 1.56. The 2B has no such tail (maximum 0.028, 99.9 % point 0.014). The
+section "The class that makes the tail of the 4B Q8_0 file" isolates the class.
 
 The checks: `llama-completion` of build-host (temperature 0, 48 tokens) on each of the two files
 gives correct text about the laws of thermodynamics, and `llama-mtmd-cli` of build-host with the 2B
@@ -240,3 +239,65 @@ MTP on the 4B Q8_0 (NPU, llama-server, 2026-09-18, the fused state step on): a f
 step costs 2.1 plain tokens (three draft passes through the 0.67 GB head, a four-row verify at 1.9x a
 single row, four host round trips) and yields 2.27 tokens. The gain needs the multi-row matvec and the
 host gap fix; the draft length must follow the recent acceptance.
+
+## The class that makes the tail of the 4B Q8_0 file (2026-09-18)
+
+The tail is the round-to-nearest Q8_0 of `ssm_out`, the output projection of the GDN block. With
+`ssm_out` in F16 and every other 2-D weight in Q8_0, the maximum KL falls from 1.56 to 0.553 and the
+99.9 % point falls from 0.175 to 0.0369, for 236 MB more. No other class comes near that trade.
+
+Each "only" row comes from one `--only` export on the F16 GGUF of the original 4B: the class takes
+round-to-nearest Q8_0 and every other 2-D weight stays F16. The norms, `ssm_a`, `ssm_dt.bias`,
+`ssm_conv1d`, `ssm_alpha` and `ssm_beta` stay F32, as they do in the full file, thus the row holds
+the error of that class alone. Each "all but" row uses `--invert`: the class stays F16 and all the
+rest takes Q8_0. All the rows ran against the F16 base of the 4B with 16 layers on the laptop GPU.
+
+| Variant | Q8_0 tensors | Bytes | Mean KL | 99.9 % KL | 99.0 % KL | Max KL | Top-1 | PPL (Q) |
+|---|---|---|---|---|---|---|---|---|
+| only `token_embd` | 1 | 8,077,516,608 | 0.000801 | 0.0131 | 0.00306 | 0.455 | 98.04 % | 10.770 |
+| only the MLP (gate, up, down) | 96 | 6,550,118,208 | 0.001228 | 0.0217 | 0.00538 | 0.726 | 97.72 % | 10.779 |
+| only the attention (q, k, v, o) | 32 | 8,398,233,408 | 0.000784 | 0.00922 | 0.00297 | 0.506 | 98.31 % | 10.778 |
+| only the GDN qkv and gate | 48 | 7,965,695,808 | 0.000703 | 0.0124 | 0.00352 | 0.193 | 98.33 % | 10.775 |
+| only `ssm_out` | 24 | 8,437,555,008 | 0.001084 | 0.0442 | 0.00499 | 0.517 | 98.16 % | 10.754 |
+| only `token_embd` and the MLP | 97 | 5,954,150,208 | 0.001008 | 0.0183 | 0.00493 | 0.112 | 97.79 % | 10.775 |
+| all but `ssm_out` (F16 `ssm_out`) | 177 | 4,971,110,208 | 0.001392 | 0.0369 | 0.00593 | 0.553 | 97.77 % | 10.775 |
+| all but `token_embd` | 200 | 5,331,148,608 | 0.001993 | 0.0772 | 0.00877 | 1.272 | 97.28 % | 10.766 |
+| all but the MLP | 105 | 6,858,547,008 | 0.001686 | 0.0907 | 0.00603 | 1.439 | 97.67 % | 10.760 |
+| the full Q8_0 file | 201 | 4,735,180,608 | 0.00202 | 0.175 | 0.0085 | 1.56 | 97.21 % | 10.778 |
+
+The KL does not add over the classes. The five single classes give 0.00465 of mean KL together, and
+the full file gives 0.00202. The pair of `token_embd` and the MLP gives 0.00101, and the two alone
+give 0.00203. Thus an "only" row over-states the share of its class, and the "all but" rows are the
+rows that a recipe must read.
+
+The "all but" rows rank the classes by the tail that each one removes from the full file, per
+megabyte that it adds:
+
+| Class in F16 | Added MiB | 99.9 % KL removed | 99.9 % KL per added MiB | Max KL removed | Mean KL removed |
+|---|---|---|---|---|---|
+| `ssm_out` | 225 | 79 % (0.175 → 0.0369) | 6.1e-4 | 65 % | 31 % |
+| `token_embd` | 568 | 56 % (0.175 → 0.0772) | 1.7e-4 | 18 % | 1 % |
+| the MLP | 2025 | 48 % (0.175 → 0.0907) | 4.2e-5 | 8 % | 17 % |
+
+`ssm_out` removes the tail 3.5 times more efficiently than the embedding and 14 times more
+efficiently than the MLP, per megabyte. The chunk record agrees: the running mean KL of the
+`ssm_out` file rises by 0.00017 at chunk 14, which is the largest rise of any single class, and the
+GDN qkv and gate file rises by 0.00001 at the same chunk. The unsloth per-tensor sweep of the
+35B-A3B ranks `ssm_out` as by far the most sensitive class, and this measurement of the 4B agrees
+with it on a different model and at a different bit width.
+
+The 2B needs no such guard. Its Q8_0 file has a maximum KL of 0.028 and a 99.9 % point of 0.014,
+thus the 4B tail comes from the model and not from the packer. The commands, from the project root:
+
+    for R in '^token_embd\.weight$' 'ffn_(gate|up|down)\.weight' 'attn_(q|k|v|output)\.weight' \
+             'attn_qkv\.weight|attn_gate\.weight' 'ssm_out\.weight'; do
+      .venv/bin/python -m quant.run export --model Qwen3.5-4B --device cpu \
+          --f16 weights/gguf/Qwen3.5-4B-F16.gguf --packs quant-out/empty --bulk Q8_0 --gdn-gate Q8_0 \
+          --only "$R" --tag only
+      llama.cpp/build-cuda/bin/llama-perplexity -m weights/gguf/Qwen3.5-4B-only.gguf -ngl 16 \
+          -f data/wiki.test.raw -c 512 --chunks 16 \
+          --kl-divergence-base eval/Qwen3.5-4B-F16.wiki.c512x16.kld --kl-divergence
+    done
+    .venv/bin/python -m quant.run export --model Qwen3.5-4B --device cpu \
+        --f16 weights/gguf/Qwen3.5-4B-F16.gguf --packs quant-out/empty --bulk Q8_0 --gdn-gate Q8_0 \
+        --only 'ssm_out\.weight' --invert --tag Q8_0-f16-ssmout
