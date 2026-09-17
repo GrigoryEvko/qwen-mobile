@@ -79,24 +79,37 @@ def transform(tensors: "OrderedDict[str, torch.Tensor]", n_layers: int, layer_ty
     def get(name: str) -> torch.Tensor:
         return tensors[name].to(device)
 
+    # Qwen3.5 RMSNorm is zero-centered: y = norm(x) · (1 + w). The effective γ is 1 + w,
+    # and the identity weight after the fold is 0.
+    def gamma(name: str) -> torch.Tensor:
+        return 1.0 + get(name).to(torch.float64)
+
+    zero = torch.zeros(d, dtype=torch.float32)
+
     # The embedding and the untied head. logits = E · diag(γ_f) · Q · norm(h').
     emb = get(LM + "embed_tokens.weight").to(torch.float64)
-    gamma_f = get(LM + "norm.weight").to(torch.float64)
+    gamma_f = gamma(LM + "norm.weight")
     out[LM + "embed_tokens.weight"] = (emb @ q).to(torch.float32).cpu()
     out["lm_head.weight"] = ((emb * gamma_f[None, :]) @ q).to(torch.float32).cpu()
-    out[LM + "norm.weight"] = torch.ones(d, dtype=torch.float32)
+    out[LM + "norm.weight"] = zero.clone()
+
+    # The vision merger writes image features into the residual stream.
+    merger = "model.visual.merger.linear_fc2."
+    if merger + "weight" in tensors:
+        out[merger + "weight"] = _rotate_output(get(merger + "weight"), q).to(torch.float32).cpu()
+        out[merger + "bias"] = (q.T @ get(merger + "bias").to(torch.float64)).to(torch.float32).cpu()
 
     for i in range(n_layers):
         p = f"{LM}layers.{i}."
-        gamma_in = get(p + "input_layernorm.weight")
+        gamma_in = gamma(p + "input_layernorm.weight")
         inputs = GDN_INPUTS if layer_types[i] == "linear_attention" else ATTN_INPUTS
         for name in inputs:
             out[p + name + ".weight"] = _fold_input(get(p + name + ".weight"), gamma_in, q).to(torch.float32).cpu()
-        out[p + "input_layernorm.weight"] = torch.ones(d, dtype=torch.float32)
+        out[p + "input_layernorm.weight"] = zero.clone()
         out_name = "linear_attn.out_proj" if layer_types[i] == "linear_attention" else "self_attn.o_proj"
         out[p + out_name + ".weight"] = _rotate_output(get(p + out_name + ".weight"), q).to(torch.float32).cpu()
 
-        gamma_post = get(p + "post_attention_layernorm.weight")
+        gamma_post = gamma(p + "post_attention_layernorm.weight")
         gate = _fold_input(get(p + "mlp.gate_proj.weight"), gamma_post, q)
         up = _fold_input(get(p + "mlp.up_proj.weight"), gamma_post, q)
         down = _rotate_output(get(p + "mlp.down_proj.weight"), q)
@@ -108,11 +121,15 @@ def transform(tensors: "OrderedDict[str, torch.Tensor]", n_layers: int, layer_ty
         out[p + "mlp.gate_proj.weight"] = gate.to(torch.float32).cpu()
         out[p + "mlp.up_proj.weight"] = up.to(torch.float32).cpu()
         out[p + "mlp.down_proj.weight"] = down.to(torch.float32).cpu()
-        out[p + "post_attention_layernorm.weight"] = torch.ones(d, dtype=torch.float32)
+        out[p + "post_attention_layernorm.weight"] = zero.clone()
 
     # Everything not produced above passes through: the small GDN and attention
     # tensors, the vision tower, and the MTP block.
     for name, tensor in tensors.items():
         if name not in out:
             out[name] = tensor.to(torch.float32) if not name.startswith("model.visual") else tensor
+    # The vision tower keeps its dtype, the rotated merger tensors included.
+    for suffix in ("weight", "bias"):
+        if merger + suffix in tensors:
+            out[merger + suffix] = out[merger + suffix].to(tensors[merger + suffix].dtype)
     return out
