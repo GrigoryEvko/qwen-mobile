@@ -39,8 +39,11 @@ add_subdirectory(${LLAMA_CPP_DIR} llama.cpp EXCLUDE_FROM_ALL)
 find_package(OpenCL REQUIRED)
 
 add_library(qwenmobile SHARED
+    cache_io.cpp
+    image_cache.cpp
     llama_jni.cpp
-    perf_hint.cpp)
+    perf_hint.cpp
+    state_cache.cpp)
 
 target_include_directories(qwenmobile PRIVATE
     ${LLAMA_CPP_DIR}/common
