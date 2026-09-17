@@ -53,6 +53,7 @@ object ModelFiles {
         "NQ" to "NeUQI",
         "LR" to "low-rank",
         "CB4" to "codebook",
+        "TIE" to "tied-head",
     )
 
     /**
