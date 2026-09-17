@@ -43,6 +43,8 @@ object LlamaNative {
      * @param gpuLayers      The number of layers on the device, 0 for the CPU only
      * @param threads        The number of CPU threads
      * @param nCtx           The context length in tokens
+     * @param cacheDir       The cache directory of the app for the prompt states and the encoded
+     *                       images, or null to keep them in RAM only
      * @return The engine handle
      * @throws RuntimeException If a device, the model or a context does not load
      */
@@ -54,6 +56,7 @@ object LlamaNative {
         gpuLayers: Int,
         threads: Int,
         nCtx: Int,
+        cacheDir: String?,
     ): Long
 
     /** Release the engine. The handle is not valid after this call. */
@@ -63,7 +66,9 @@ object LlamaNative {
     @JvmStatic external fun modelInfo(handle: Long): String
 
     /**
-     * Apply the chat template and decode the prompt.
+     * Apply the chat template and decode the prompt. The engine restores
+     * the longest prefix of the prompt that a snapshot of an earlier turn
+     * holds, and decodes only the rest.
      *
      * @param images       One entry per message: the encoded image bytes (JPEG, PNG) or null
      * @param thinking     Enable the thinking mode of the chat template
@@ -86,14 +91,22 @@ object LlamaNative {
      * Sample and decode one token.
      *
      * @return Byte 0 is the kind of the token (0 text, 1 the thinking opens, 2 the thinking closes),
-     *   then the UTF-8 bytes of the complete characters so far. Null at the end of the answer.
+     *   then the UTF-8 bytes of the complete characters so far. Null at the end of the answer. An
+     *   end token inside an open thinking gives the close kind one time, then null.
      */
     @JvmStatic external fun generateNext(handle: Long): ByteArray?
 
-    /** One line with the prefill and generation speed of the current turn. */
+    /**
+     * Ask the answer to stop. Any thread can call this while [generateNext]
+     * runs on the engine thread: the next [generateNext] gives null without
+     * a sample. [chatStart] clears the request.
+     */
+    @JvmStatic external fun requestStop(handle: Long)
+
+    /** One line with the prefill and generation speed of the current turn, and what came from the caches. */
     @JvmStatic external fun stats(handle: Long): String
 
-    /** Clear the model memory and the turn statistics. */
+    /** Clear the model memory, the caches in RAM, and the turn statistics. The files of the caches stay. */
     @JvmStatic external fun resetChat(handle: Long)
 
     /**

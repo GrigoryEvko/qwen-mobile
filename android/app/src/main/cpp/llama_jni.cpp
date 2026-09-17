@@ -6,13 +6,21 @@
  * engine against a second caller.
  *
  * The model memory of Qwen3.5 is a recurrent state plus a KV cache. A
- * recurrent state cannot roll back, thus the engine keeps a snapshot of the
- * state at the end of the prompt without the generation prompt. The chat
- * template renders the previous answer differently from the generated
- * tokens, thus the next prompt extends that snapshot and not the answer.
- * The hybrid backend keeps the snapshot on the prefill context. The other
- * backends keep it in a second sequence of the decode context, which
- * shares its KV cells and copies the recurrent state on the next write.
+ * recurrent state cannot roll back, thus the engine keeps snapshots of the
+ * state: after each prompt, before its generation prompt, the state of
+ * sequence 0 goes as bytes into a store (state_cache.h) with the exact
+ * items that it holds. The chat template renders the previous answer
+ * differently from the generated tokens, thus the next prompt extends the
+ * snapshot of the previous prompt and not the answer: only the rendered
+ * answer and the new message decode. An earlier turn or a repeated
+ * question restores its snapshot without a decode. The hybrid backend
+ * prefills on the prefill context and moves the same bytes to the decode
+ * context.
+ *
+ * The output of the vision encoder goes into a second store
+ * (image_cache.h) by the hash of the image file, in RAM and on disk. A
+ * known image tokenizes as a placeholder, thus its JPEG is not decoded
+ * again.
  */
 
 #include <android/log.h>
@@ -22,6 +30,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -30,6 +39,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #ifndef QWEN_NO_OPENCL_INFO
@@ -37,14 +47,17 @@
 #include <CL/cl.h>
 #endif
 
+#include "cache_io.h"
 #include "chat.h"
 #include "common.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "image_cache.h"
 #include "llama.h"
 #include "mtmd-helper.h"
 #include "mtmd.h"
 #include "perf_hint.h"
+#include "state_cache.h"
 
 #define TAG "QwenMobile"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -61,8 +74,17 @@ constexpr int32_t kPenaltyLastN = 256;
 /** The maximum number of vision tokens of one image. 576 tokens is a 768 x 768 image. */
 constexpr int32_t kImageMaxTokens = 576;
 
-/** The maximum size of the cache of encoded images, in bytes. One image is 4 to 10 MB. */
-constexpr size_t kImageCacheBytes = 32u << 20;
+/** The budgets of the cache of encoded images, in bytes. One image is 2 to 5 MB at 2048 x 576 floats. */
+constexpr size_t kImageRamBytes  = 64u << 20;
+constexpr size_t kImageDiskBytes = 256u << 20;
+
+/**
+ * The budgets of the store of sequence states, in bytes. One snapshot of
+ * the 2B model is 20 MB of recurrent state plus 12 KB for each token in
+ * the KV cache: 44 MB at 2K tokens, thus the RAM holds 5 to 10 of them.
+ */
+constexpr size_t kStateRamBytes  = 256u << 20;
+constexpr size_t kStateDiskBytes = 256u << 20;
 
 /** The nice value of the compute threads. The display thread keeps its priority. */
 constexpr int kComputeNice = 10;
@@ -73,9 +95,10 @@ constexpr int kBatch = 512;
 /** The number of free positions that a prompt must leave in the context. */
 constexpr size_t kContextHeadroom = 8;
 
-/** The sequence of the conversation, and the sequence of the prompt snapshot. */
+/** The sequence of the conversation in each context. */
 constexpr llama_seq_id kSeqMain = 0;
-constexpr llama_seq_id kSeqSnap = 1;
+
+static_assert(kMemTokenNull == LLAMA_TOKEN_NULL, "The null token of the state store must be LLAMA_TOKEN_NULL");
 
 /** Give a thread the compute priority. tid 0 is the calling thread. */
 void lower_priority(int32_t tid) {
@@ -84,19 +107,25 @@ void lower_priority(int32_t tid) {
     }
 }
 
-/** One unit of the model memory: a text token, or an image chunk identified by the hash of its bitmap. */
-struct MemItem {
-    llama_token token = LLAMA_TOKEN_NULL;
-    std::string image_id;
-
-    bool operator==(const MemItem & o) const { return token == o.token && image_id == o.image_id; }
-    bool operator!=(const MemItem & o) const { return !(*this == o); }
-};
-
-/** The output of the vision encoder for one image. */
-struct ImageEmbd {
-    std::string        id;
-    std::vector<float> embd;
+/** The counters of one turn, for the stats line. Times are in microseconds. */
+struct TurnStats {
+    /** The tokens of the prompt that decoded, and the time of these decodes. */
+    int64_t prefill_tokens = 0;
+    int64_t prefill_us     = 0;
+    /** The tokens of the prompt that the memory held already. From a snapshot, or from the live memory. */
+    int64_t reused_tokens  = 0;
+    bool    from_snapshot  = false;
+    /** The restore of a snapshot into the prefill context, the snapshot of the new prompt state, the move to the decode context. */
+    int64_t restore_us     = 0;
+    int64_t snapshot_us    = 0;
+    int64_t transfer_us    = 0;
+    /** The images of the prompt: with a placeholder bitmap, with a cached encoder output, and encoded. */
+    int     images_total   = 0;
+    int     images_known   = 0;
+    int     images_cached  = 0;
+    int     images_encoded = 0;
+    int64_t gen_tokens     = 0;
+    int64_t gen_us         = 0;
 };
 
 struct Engine {
@@ -130,29 +159,28 @@ struct Engine {
     std::vector<MemItem> cache;
     /** The number of positions that the conversation sequence holds. */
     llama_pos n_past = 0;
-    /**
-     * The snapshot: the items of the last prompt without its generation
-     * prompt. The hybrid backend holds this state on the prefill context,
-     * the other backends in sequence kSeqSnap of the decode context.
-     */
-    std::vector<MemItem> snap;
-    llama_pos snap_n_past = 0;
-    /** The encoded images, oldest first. The total is less than kImageCacheBytes. */
-    std::vector<ImageEmbd> image_cache;
-    size_t image_cache_bytes = 0;
+    /** The hybrid backend: the items that sequence 0 of the prefill context holds, and its positions. */
+    std::vector<MemItem> pf_cache;
+    llama_pos pf_n_past = 0;
+    /** The snapshots of the prompt states, and the outputs of the vision encoder. */
+    std::unique_ptr<StateCache> states;
+    std::unique_ptr<ImageCache> images;
+    /** The dimensions of the images that this turn decoded from their bytes, by id. The encoder output of a new image goes into the cache with them. */
+    std::unordered_map<std::string, ImageInfo> turn_images;
     /** Bytes of an incomplete UTF-8 sequence from the last token. */
     std::string utf8_pending;
+    /** Set by requestStop from another thread. generateNext reads it before the sample. */
+    std::atomic<bool> stop_requested{false};
+    /** True while the thinking of the answer is open: the generation prompt or a generated tag opened it. */
+    bool think_open = false;
+    /** True after the end of the answer: the end token, a stop, or the context limit. */
+    bool answer_done = false;
 
     int  n_threads  = 4;
     int  gpu_layers = 0;
     bool thinking   = false;
 
-    // Timings of the current turn, in microseconds.
-    int64_t prefill_tokens = 0;
-    int64_t prefill_us     = 0;
-    int64_t transfer_us    = 0;
-    int64_t gen_tokens     = 0;
-    int64_t gen_us         = 0;
+    TurnStats turn;
 
     Engine() = default;
     Engine(const Engine &) = delete;
@@ -337,7 +365,7 @@ int decode_one(Engine & e, llama_token token) {
     return rc;
 }
 
-/** Empty the model memory of both contexts, the snapshot, and the record of what they hold. */
+/** Empty the model memory of both contexts and the record of what they hold. The snapshot store stays. */
 void clear_all(Engine & e) {
     llama_memory_clear(llama_get_memory(e.ctx), true);
     if (e.ctx_pf != nullptr) {
@@ -345,25 +373,81 @@ void clear_all(Engine & e) {
     }
     e.cache.clear();
     e.n_past = 0;
-    e.snap.clear();
-    e.snap_n_past = 0;
+    e.pf_cache.clear();
+    e.pf_n_past = 0;
 }
 
 /**
- * Copy the sequence state (the KV cache of the attention layers and the
- * recurrent states) from one context to the other. The destination loses
- * its own state first. Returns false with the error text set.
+ * The state of sequence kSeqMain of a context as bytes: the KV cache of
+ * the attention layers and the recurrent states, independent of the
+ * device. Returns null with the error text set.
  */
-bool transfer_state(llama_context * src, llama_context * dst, std::string & error) {
-    const size_t size = llama_state_seq_get_size(src, kSeqMain);
-    // A plain array: a vector would fill tens of megabytes with zeros first.
-    std::unique_ptr<uint8_t[]> buffer(new uint8_t[size]);
-    const size_t got = llama_state_seq_get_data(src, buffer.get(), size, kSeqMain);
-    if (got == 0 || llama_state_seq_set_data(dst, buffer.get(), got, kSeqMain) == 0) {
-        error = "The state transfer between the prefill and the decode context failed (" + std::to_string(size) + " bytes)";
+std::shared_ptr<const cache_io::Blob> take_state(llama_context * lctx, std::string & error) {
+    const size_t size = llama_state_seq_get_size(lctx, kSeqMain);
+    auto blob = std::make_shared<cache_io::Blob>(size);
+    const size_t got = llama_state_seq_get_data(lctx, blob->data.get(), size, kSeqMain);
+    if (got == 0 || got > size) {
+        error = "The state of the sequence did not copy out of the context (" + std::to_string(size) + " bytes)";
+        return nullptr;
+    }
+    blob->size = got;
+    return blob;
+}
+
+/**
+ * Put a state into sequence kSeqMain of a context in the place of what it
+ * holds. Returns false when the bytes do not fit the context, and then the
+ * memory of the context is empty.
+ */
+bool restore_state(llama_context * lctx, const cache_io::Blob & bytes) {
+    llama_memory_t mem = llama_get_memory(lctx);
+    llama_memory_seq_rm(mem, kSeqMain, -1, -1);
+    if (llama_state_seq_set_data(lctx, bytes.data.get(), bytes.size, kSeqMain) == 0) {
+        llama_memory_clear(mem, true);
         return false;
     }
     return true;
+}
+
+/** The namespace of the disk caches: the model and projector files with their sizes and times, and the image token limit. */
+std::string cache_namespace(const std::string & model, const std::string & mmproj) {
+    std::string key;
+    for (const std::string & path : {model, mmproj}) {
+        cache_io::FileStat st;
+        key += path + "|";
+        if (!path.empty() && cache_io::stat_file(path, st)) {
+            key += std::to_string(st.size) + "|" + std::to_string(st.mtime);
+        }
+        key += "|";
+    }
+    key += std::to_string(kImageMaxTokens);
+    return cache_io::hex64(cache_io::fnv1a64(key.data(), key.size()));
+}
+
+/**
+ * Make the two stores. With a cache directory, the files go below
+ * <dir>/engine/<namespace>, and the directories of other namespaces go
+ * away, thus the disk holds the caches of one model.
+ */
+void open_stores(Engine & e, const std::string & cache_dir, const std::string & model_path) {
+    std::string state_dir;
+    std::string image_dir;
+    if (!cache_dir.empty()) {
+        const std::string root = cache_dir + "/engine";
+        const std::string ns   = cache_namespace(model_path, e.mmproj);
+        for (const std::string & name : cache_io::list_dirs(root)) {
+            if (name != ns) {
+                cache_io::remove_tree(root + "/" + name);
+            }
+        }
+        state_dir = root + "/" + ns + "/state";
+        image_dir = root + "/" + ns + "/images";
+    }
+    e.states = std::make_unique<StateCache>(kStateRamBytes, kStateDiskBytes, state_dir);
+    e.images = std::make_unique<ImageCache>(kImageRamBytes, kImageDiskBytes, image_dir);
+    LOGI("caches: %zu snapshots (%.0f MB) and %zu images (%.0f MB) on disk in %s",
+         e.states->count(), e.states->disk_bytes() / 1048576.0, e.images->count(), e.images->disk_bytes() / 1048576.0,
+         cache_dir.empty() ? "no directory" : cache_dir.c_str());
 }
 
 /** Load the vision projector. Returns false with the error text set. */
@@ -397,15 +481,20 @@ bool ensure_vision(Engine & e, std::string & error) {
 
 /**
  * The encoder output of an image chunk: from the cache by the hash of the
- * bitmap, or from one run of the vision encoder. The pointer is valid
+ * image file, or from one run of the vision encoder. The pointer is valid
  * until the next call. Returns nullptr with the error text set.
  */
-float * image_embd(Engine & e, const mtmd_input_chunk * chunk, std::string & error) {
+const float * image_embd(Engine & e, const mtmd_input_chunk * chunk, std::string & error) {
     const std::string id = mtmd_input_chunk_get_id(chunk);
-    for (ImageEmbd & entry : e.image_cache) {
-        if (!id.empty() && entry.id == id) {
-            return entry.embd.data();
-        }
+    if (const float * hit = e.images->get(id)) {
+        e.turn.images_cached += 1;
+        return hit;
+    }
+    const auto known = e.turn_images.find(id);
+    if (known == e.turn_images.end()) {
+        // The bitmap is a placeholder, because the cache knew the image. Its file is gone since.
+        error = "The encoder output of image " + id.substr(0, 12) + " is not in the cache. Send the message again.";
+        return nullptr;
     }
     const int64_t t0 = now_us();
     const int32_t rc = mtmd_encode_chunk(e.mctx, chunk);
@@ -414,18 +503,18 @@ float * image_embd(Engine & e, const mtmd_input_chunk * chunk, std::string & err
         error = "The vision encoder failed with code " + std::to_string(rc);
         return nullptr;
     }
-    const size_t n_floats = mtmd_input_chunk_get_n_tokens(chunk) * (size_t) llama_model_n_embd_inp(e.model);
+    e.turn.images_encoded += 1;
+    ImageInfo info = known->second;
+    info.n_tokens  = (uint32_t) mtmd_input_chunk_get_n_tokens(chunk);
+    info.n_embd    = (uint32_t) llama_model_n_embd_inp(e.model);
     const float * out = mtmd_get_output_embd(e.mctx);
-    const size_t bytes = n_floats * sizeof(float);
-    while (!e.image_cache.empty() && e.image_cache_bytes + bytes > kImageCacheBytes) {
-        e.image_cache_bytes -= e.image_cache.front().embd.size() * sizeof(float);
-        e.image_cache.erase(e.image_cache.begin());
-    }
-    e.image_cache.push_back(ImageEmbd{id, std::vector<float>(out, out + n_floats)});
-    e.image_cache_bytes += bytes;
-    LOGI("image %s encoded in %.0f ms, %zu tokens", id.substr(0, 12).c_str(), (now_us() - t0) / 1000.0,
-         mtmd_input_chunk_get_n_tokens(chunk));
-    return e.image_cache.back().embd.data();
+    e.images->put(id, info, out);
+    LOGI("image %s encoded in %.0f ms, %u tokens, %.1f MB, cache %zu images %.0f MB in RAM, %.0f MB on disk",
+         id.substr(0, 12).c_str(), (now_us() - t0) / 1000.0, info.n_tokens, info.n_floats() * 4 / 1048576.0,
+         e.images->count(), e.images->ram_bytes() / 1048576.0, e.images->disk_bytes() / 1048576.0);
+    // The output buffer of the encoder stays valid until the next encode, thus it serves when the cache did not keep the copy.
+    const float * kept = e.images->get(id);
+    return kept != nullptr ? kept : out;
 }
 
 /**
@@ -461,14 +550,15 @@ bool decode_items(Engine & e, llama_context * lctx, const std::vector<MemItem> &
         if (!flush(false)) {
             return false;
         }
-        float * embd = image_embd(e, chunk, error);
+        const float * embd = image_embd(e, chunk, error);
         if (embd == nullptr) {
             return false;
         }
         llama_pos new_pos = pos;
         const int64_t t0 = now_us();
-        const int32_t rc = mtmd_helper_decode_image_chunk(e.mctx, lctx, chunk, embd, pos, kSeqMain, kBatch, &new_pos,
-                                                          nullptr, nullptr);
+        // The helper takes a non-const pointer and only reads the floats.
+        const int32_t rc = mtmd_helper_decode_image_chunk(e.mctx, lctx, chunk, const_cast<float *>(embd), pos, kSeqMain,
+                                                          kBatch, &new_pos, nullptr, nullptr);
         report_hint(e, t0);
         if (rc != 0) {
             error = "The image did not decode, code " + std::to_string(rc);
@@ -477,11 +567,6 @@ bool decode_items(Engine & e, llama_context * lctx, const std::vector<MemItem> &
         pos = new_pos;
     }
     return flush(logits_last);
-}
-
-/** True when a is a prefix of b. */
-bool is_prefix(const std::vector<MemItem> & a, const std::vector<MemItem> & b) {
-    return a.size() <= b.size() && std::equal(a.begin(), a.end(), b.begin());
 }
 
 /** The number of tokens of the items [start, end): one per text item, the token count of an image chunk. */
@@ -495,80 +580,104 @@ int64_t count_tokens(const std::vector<const mtmd_input_chunk *> & chunk_of, siz
 
 /**
  * Decode a prompt. The items [0, base_len) are the prompt without the
- * generation prompt, the rest is the generation prompt. The longest reusable
- * prefix comes from the snapshot, or on the other backends also from the
- * conversation sequence. The new snapshot is taken before the generation
- * prompt. Returns false with the error text set, and the memory empty.
+ * generation prompt, the rest is the generation prompt. The longest
+ * reusable prefix comes from the live memory of the prefill context, or
+ * from the snapshot store, and only the remaining items decode. The state
+ * before the generation prompt goes into the store, and on the hybrid
+ * backend also into the decode context. Returns false with the error
+ * text set, and the memory empty.
+ *
+ * Exactness: a snapshot holds the state after exactly its items, with the
+ * positions of each KV cell (the M-RoPE x and y of an image token
+ * included) and the count of positions. A restore puts that state back,
+ * and the tail decodes at the same positions as without the store. Thus
+ * the logits after the prompt are the same as after one decode of the
+ * whole prompt on the same device.
  */
 bool prefill(Engine & e, const std::vector<MemItem> & items, const std::vector<const mtmd_input_chunk *> & chunk_of,
              size_t base_len, std::string & error) {
     const bool hybrid = e.ctx_pf != nullptr;
-    llama_memory_t mem = llama_get_memory(e.ctx);
-
-    // The prefix that the memory holds already.
-    size_t start   = 0;
-    bool   restore = false;
-    if (!e.snap.empty() && is_prefix(e.snap, items)) {
-        start   = e.snap.size();
-        restore = true;
-    }
-    if (!hybrid && e.cache.size() > start && is_prefix(e.cache, items)) {
-        start   = e.cache.size();
-        restore = false;
-    }
-    if (start >= items.size() || start > base_len) {
-        // Nothing new gives no logits, and a prefix past the generation prompt cannot keep a snapshot.
-        start   = 0;
-        restore = false;
-    }
-    const size_t reused = start;
-
-    llama_pos pos = 0;
-    if (start == 0) {
-        clear_all(e);
-    } else if (restore) {
-        if (hybrid) {
-            pos = e.snap_n_past;
-        } else {
-            if (!llama_memory_seq_rm(mem, kSeqMain, -1, -1)) {
-                error = "The memory did not release the conversation sequence";
-                clear_all(e);
-                return false;
-            }
-            llama_memory_seq_cp(mem, kSeqSnap, kSeqMain, -1, -1);
-            e.cache  = e.snap;
-            e.n_past = e.snap_n_past;
-            pos      = e.n_past;
-        }
-    } else {
-        pos = e.n_past;
-    }
-
-    const int64_t t0 = now_us();
     llama_context * pctx = hybrid ? e.ctx_pf : e.ctx;
+    // What sequence kSeqMain of the prefill context holds at this time.
+    std::vector<MemItem> & live     = hybrid ? e.pf_cache : e.cache;
+    llama_pos &            live_pos = hybrid ? e.pf_n_past : e.n_past;
+    // At least one item decodes on the decode context, thus it has logits.
+    const size_t limit = std::min(base_len, items.size() - 1);
+    const int64_t t0   = now_us();
+
+    // The longest prefix that exists already: the live memory when it is at least as long as the best snapshot.
+    size_t    start = 0;
+    llama_pos pos   = 0;
+    const Snapshot * snap = e.states->best_prefix(items, limit);
+    const bool live_ok = !live.empty() && live.size() <= limit && is_item_prefix(live, items);
+    if (live_ok && (snap == nullptr || live.size() >= snap->items.size())) {
+        start = live.size();
+        pos   = live_pos;
+    } else if (snap != nullptr) {
+        const size_t    n_items = snap->items.size();
+        const llama_pos n_pos   = snap->n_pos;
+        std::shared_ptr<const cache_io::Blob> bytes = e.states->bytes(snap);
+        if (bytes && restore_state(pctx, *bytes)) {
+            start = n_items;
+            pos   = n_pos;
+            e.turn.from_snapshot = true;
+        } else if (bytes) {
+            LOGE("snapshot of %zu items did not restore (%zu bytes), it is dropped", n_items, bytes->size);
+            e.states->drop(snap);
+        }
+        e.turn.restore_us = now_us() - t0;
+    }
+    if (start == 0) {
+        llama_memory_clear(llama_get_memory(pctx), true);
+        pos = 0;
+    }
+    live.assign(items.begin(), items.begin() + (ptrdiff_t) start);
+    live_pos = pos;
+    e.turn.reused_tokens = count_tokens(chunk_of, 0, start);
+
+    const int64_t t1 = now_us();
     if (!decode_items(e, pctx, items, chunk_of, start, base_len, pos, false, error)) {
         clear_all(e);
         return false;
     }
+    live.assign(items.begin(), items.begin() + (ptrdiff_t) base_len);
+    live_pos = pos;
 
-    // The snapshot before the generation prompt.
-    const bool snap_same = e.snap.size() == base_len && std::equal(e.snap.begin(), e.snap.end(), items.begin());
-    if (!snap_same && base_len > 0) {
-        if (!hybrid) {
-            llama_memory_seq_rm(mem, kSeqSnap, -1, -1);
-            llama_memory_seq_cp(mem, kSeqMain, kSeqSnap, -1, -1);
+    // The state before the generation prompt: into the store when it is not there, and to the decode context.
+    std::shared_ptr<const cache_io::Blob> base_bytes;
+    if (base_len > 0) {
+        std::vector<MemItem> key(items.begin(), items.begin() + (ptrdiff_t) base_len);
+        const Snapshot * have = e.states->find(key);
+        if (have != nullptr && hybrid) {
+            base_bytes = e.states->bytes(have);
         }
-        e.snap.assign(items.begin(), items.begin() + (ptrdiff_t) base_len);
-        e.snap_n_past = pos;
+        if (have == nullptr || (hybrid && !base_bytes)) {
+            const int64_t t2 = now_us();
+            base_bytes = take_state(pctx, error);
+            if (!base_bytes) {
+                clear_all(e);
+                return false;
+            }
+            e.turn.snapshot_us = now_us() - t2;
+            e.states->put(std::move(key), pos, base_bytes);
+            LOGI("snapshot: %zu items, %d positions, %.1f MB in %.0f ms, store %zu snapshots, %.0f MB in RAM, %.0f MB on disk",
+                 base_len, (int) pos, base_bytes->size / 1048576.0, e.turn.snapshot_us / 1000.0, e.states->count(),
+                 e.states->ram_bytes() / 1048576.0, e.states->disk_bytes() / 1048576.0);
+        }
     }
-
     if (hybrid) {
-        const int64_t t1 = now_us();
-        if (!transfer_state(e.ctx_pf, e.ctx, error)) {
+        const int64_t t3 = now_us();
+        if (base_len == 0) {
+            llama_memory_clear(llama_get_memory(e.ctx), true);
+        } else if (!base_bytes || !restore_state(e.ctx, *base_bytes)) {
+            error = "The state did not move from the prefill context to the decode context (" +
+                    std::to_string(base_bytes ? base_bytes->size : 0) + " bytes)";
             clear_all(e);
             return false;
         }
-        e.transfer_us += now_us() - t1;
+        e.turn.transfer_us = now_us() - t3;
+        e.cache.assign(items.begin(), items.begin() + (ptrdiff_t) base_len);
+        e.n_past = pos;
     }
     if (!decode_items(e, e.ctx, items, chunk_of, base_len, items.size(), pos, true, error)) {
         clear_all(e);
@@ -576,12 +685,15 @@ bool prefill(Engine & e, const std::vector<MemItem> & items, const std::vector<c
     }
     e.cache  = items;
     e.n_past = pos;
-    e.prefill_tokens = count_tokens(chunk_of, reused, items.size());
-    e.prefill_us     = now_us() - t0 - e.transfer_us;
-    LOGI("prefill: %zu of %zu items reused, %lld tokens decoded in %.0f ms on %s, transfer %.0f ms, memory %d positions",
-         reused, items.size(), (long long) e.prefill_tokens, e.prefill_us / 1000.0,
+    e.turn.prefill_tokens = count_tokens(chunk_of, start, items.size());
+    e.turn.prefill_us     = now_us() - t1 - e.turn.snapshot_us - e.turn.transfer_us;
+    LOGI("prefill: %zu of %zu items %s (%lld tokens, %.0f ms), %lld tokens decoded in %.0f ms on %s, "
+         "transfer %.0f ms, images %d (%d known, %d cached, %d encoded), memory %d positions",
+         start, items.size(), e.turn.from_snapshot ? "restored" : "kept", (long long) e.turn.reused_tokens,
+         e.turn.restore_us / 1000.0, (long long) e.turn.prefill_tokens, e.turn.prefill_us / 1000.0,
          hybrid ? ggml_backend_dev_name(e.device_pf) : e.device ? ggml_backend_dev_name(e.device) : "CPU",
-         e.transfer_us / 1000.0, (int) e.n_past);
+         e.turn.transfer_us / 1000.0, e.turn.images_total, e.turn.images_known, e.turn.images_cached,
+         e.turn.images_encoded, (int) e.n_past);
     return true;
 }
 
@@ -608,7 +720,13 @@ bool tokenize_prompt(JNIEnv * env, Engine & e, const std::string & prompt, const
     if (!ensure_vision(e, error)) {
         return false;
     }
+    // A known image gives a placeholder bitmap with its dimensions and its
+    // id: the same chunk as its decode gives, without the decode of the JPEG
+    // and its preprocessing. The id is the SHA-256 of the file bytes, the
+    // same value that the helper gives a decoded bitmap.
     mtmd::bitmaps bitmaps;
+    e.turn_images.clear();
+    e.turn.images_total = (int) images.size();
     for (jbyteArray image : images) {
         const jsize len = env->GetArrayLength(image);
         jbyte * bytes = env->GetByteArrayElements(image, nullptr);
@@ -616,15 +734,28 @@ bool tokenize_prompt(JNIEnv * env, Engine & e, const std::string & prompt, const
             error = "The image bytes are not readable";
             return false;
         }
-        const mtmd_helper_bitmap_wrapper w = mtmd_helper_bitmap_init_from_buf(
-            e.mctx, reinterpret_cast<const unsigned char *>(bytes), (size_t) len, false,
-            mtmd_helper_init_opt_default());
+        const std::string id = cache_io::sha256_hex(bytes, (size_t) len);
+        ImageInfo info;
+        mtmd_bitmap * bitmap = nullptr;
+        if (e.images->info(id, info)) {
+            bitmap = mtmd_bitmap_init(info.nx, info.ny, nullptr);
+            mtmd_bitmap_set_id(bitmap, id.c_str());
+            e.turn.images_known += 1;
+        } else {
+            bitmap = mtmd_helper_bitmap_init_from_buf(e.mctx, reinterpret_cast<const unsigned char *>(bytes),
+                                                      (size_t) len, false, mtmd_helper_init_opt_default()).bitmap;
+            if (bitmap != nullptr) {
+                info.nx = mtmd_bitmap_get_nx(bitmap);
+                info.ny = mtmd_bitmap_get_ny(bitmap);
+                e.turn_images[mtmd_bitmap_get_id(bitmap)] = info;
+            }
+        }
         env->ReleaseByteArrayElements(image, bytes, JNI_ABORT);
-        if (w.bitmap == nullptr) {
+        if (bitmap == nullptr) {
             error = "The image did not decode";
             return false;
         }
-        bitmaps.entries.emplace_back(w.bitmap);
+        bitmaps.entries.emplace_back(bitmap);
     }
 
     chunks.ptr.reset(mtmd_input_chunks_init());
@@ -845,10 +976,11 @@ Java_ai_airi_qwenmobile_LlamaNative_devices(JNIEnv * env, jclass) {
 JNIEXPORT jlong JNICALL
 Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, jstring jmmproj,
                                           jstring jdevice, jstring jprefill, jint gpu_layers, jint n_threads,
-                                          jint n_ctx) {
+                                          jint n_ctx, jstring jcache) {
     const std::string path    = jstring_to_std(env, jpath);
     const std::string device  = jstring_to_std(env, jdevice);
     const std::string prefill = jstring_to_std(env, jprefill);
+    const std::string cache   = jstring_to_std(env, jcache);
     if (n_ctx < kBatch) {
         throw_java(env, "The context length must be at least " + std::to_string(kBatch) + " tokens, not " + std::to_string(n_ctx));
         return 0;
@@ -880,14 +1012,12 @@ Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, js
         return 0;
     }
 
-    // The decode context. Without the hybrid backend, a second sequence holds
-    // the prompt snapshot: the KV cache is unified, thus the sequences share
-    // cells, and the recurrent memory has one cell for each sequence.
+    // The decode context. One sequence: the snapshots of the prompt states are bytes in the store.
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx           = (uint32_t) n_ctx;
     cp.n_batch         = kBatch;
     cp.n_ubatch        = kBatch;
-    cp.n_seq_max       = hybrid ? 1 : 2;
+    cp.n_seq_max       = 1;
     cp.kv_unified      = true;
     cp.n_threads       = e->n_threads;
     cp.n_threads_batch = e->n_threads;
@@ -958,6 +1088,7 @@ Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, js
     e->tok_think_open  = single_token(llama_model_get_vocab(e->model), "<think>");
     e->tok_think_close = single_token(llama_model_get_vocab(e->model), "</think>");
     rebuild_sampler(*e, false, 0.7f, 0.8f);
+    open_stores(*e, cache, path);
 
     LOGI("model loaded: %s, device=%s, prefill=%s, gpu_layers=%d, threads=%d, n_ctx=%u, mmproj=%s",
          path.c_str(), device.empty() ? "cpu" : device.c_str(), prefill.empty() ? "same" : prefill.c_str(),
@@ -1041,11 +1172,9 @@ Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass, jlong handle
 
     rebuild_sampler(*e, thinking, temperature, top_p);
     e->utf8_pending.clear();
-    e->prefill_tokens = 0;
-    e->prefill_us     = 0;
-    e->transfer_us    = 0;
-    e->gen_tokens     = 0;
-    e->gen_us         = 0;
+    e->turn           = TurnStats{};
+    e->answer_done    = false;
+    e->stop_requested = false;
 
     std::string error;
     mtmd::input_chunks chunks;
@@ -1069,12 +1198,21 @@ Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass, jlong handle
         throw_java(env, "The prompt ends with an image, thus it gives no logits");
         return -1;
     }
+    // The thinking is open when the last tag of the generation prompt opens it.
+    e->think_open = false;
+    for (size_t i = base_len; i < items.size() && e->tok_think_open != LLAMA_TOKEN_NULL; ++i) {
+        if (items[i].token == e->tok_think_open) {
+            e->think_open = true;
+        } else if (items[i].token == e->tok_think_close) {
+            e->think_open = false;
+        }
+    }
 
     if (!prefill(*e, items, chunk_of, base_len, error)) {
         throw_java(env, error);
         return -1;
     }
-    return (jint) e->prefill_tokens;
+    return (jint) e->turn.prefill_tokens;
 }
 
 JNIEXPORT jbyteArray JNICALL
@@ -1082,7 +1220,15 @@ Java_ai_airi_qwenmobile_LlamaNative_generateNext(JNIEnv * env, jclass, jlong han
     Engine * e = engine_of(handle);
     std::lock_guard<std::mutex> lock(e->mutex);
     const llama_vocab * vocab = llama_model_get_vocab(e->model);
+    if (e->answer_done) {
+        return nullptr;
+    }
+    if (e->stop_requested.exchange(false)) {
+        e->answer_done = true;
+        return nullptr;
+    }
     if ((uint32_t) e->n_past >= llama_n_ctx(e->ctx)) {
+        e->answer_done = true;
         throw_java(env, "The context is full (" + std::to_string(llama_n_ctx(e->ctx)) + " tokens). Start a new chat.");
         return nullptr;
     }
@@ -1092,35 +1238,72 @@ Java_ai_airi_qwenmobile_LlamaNative_generateNext(JNIEnv * env, jclass, jlong han
     if (llama_vocab_is_eog(vocab, token)) {
         // The end token goes into the memory, thus a template that renders it lets the next turn extend this one.
         decode_one(*e, token);
+        e->answer_done = true;
+        if (e->think_open) {
+            // The answer ends inside the thinking: the app gets the close of the thinking one time, then the end.
+            e->think_open = false;
+            e->utf8_pending.clear();
+            return pack_piece(env, *e, 2);
+        }
         return nullptr;
     }
     const int kind = token_kind(*e, token);
     if (kind == 0) {
         append_piece(*e, token);
+    } else {
+        e->think_open = kind == 1;
     }
     const int rc = decode_one(*e, token);
     if (rc != 0) {
+        e->answer_done = true;
         throw_java(env, "llama_decode failed during generation with code " + std::to_string(rc));
         return nullptr;
     }
-    e->gen_tokens += 1;
-    e->gen_us     += now_us() - t0;
+    e->turn.gen_tokens += 1;
+    e->turn.gen_us     += now_us() - t0;
     return pack_piece(env, *e, kind);
+}
+
+/**
+ * Ask the running answer to stop. Any thread can call this: the flag is
+ * atomic and the call takes no lock. The next generateNext gives the end
+ * of the answer without a sample.
+ */
+JNIEXPORT void JNICALL
+Java_ai_airi_qwenmobile_LlamaNative_requestStop(JNIEnv *, jclass, jlong handle) {
+    engine_of(handle)->stop_requested = true;
 }
 
 JNIEXPORT jstring JNICALL
 Java_ai_airi_qwenmobile_LlamaNative_stats(JNIEnv * env, jclass, jlong handle) {
     Engine * e = engine_of(handle);
     std::lock_guard<std::mutex> lock(e->mutex);
-    char line[256];
-    const double pp = e->prefill_us > 0 ? e->prefill_tokens * 1e6 / e->prefill_us : 0.0;
-    const double tg = e->gen_us > 0 ? e->gen_tokens * 1e6 / e->gen_us : 0.0;
-    const llama_pos n_past = llama_memory_seq_pos_max(llama_get_memory(e->ctx), kSeqMain) + 1;
+    const TurnStats & t = e->turn;
+    char line[512];
+    const double pp = t.prefill_us > 0 ? t.prefill_tokens * 1e6 / t.prefill_us : 0.0;
+    const double tg = t.gen_us > 0 ? t.gen_tokens * 1e6 / t.gen_us : 0.0;
     const char * pf_dev = e->device_pf ? ggml_backend_dev_name(e->device_pf) : e->device ? ggml_backend_dev_name(e->device) : "CPU";
-    const std::string transfer = e->device_pf ? ", transfer " + std::to_string(e->transfer_us / 1000) + " ms" : "";
-    snprintf(line, sizeof(line), "prefill %lld tok in %.0f ms (%.1f t/s on %s%s), generate %lld tok (%.1f t/s), memory %d pos",
-             (long long) e->prefill_tokens, e->prefill_us / 1000.0, pp, pf_dev, transfer.c_str(),
-             (long long) e->gen_tokens, tg, (int) n_past);
+    std::string extra;
+    if (t.reused_tokens > 0) {
+        extra += ", " + std::to_string(t.reused_tokens) + " tok " + (t.from_snapshot ? "restored" : "kept");
+        if (t.from_snapshot) {
+            extra += " in " + std::to_string(t.restore_us / 1000) + " ms";
+        }
+    }
+    if (t.snapshot_us > 0) {
+        extra += ", snapshot " + std::to_string(t.snapshot_us / 1000) + " ms";
+    }
+    if (e->device_pf) {
+        extra += ", transfer " + std::to_string(t.transfer_us / 1000) + " ms";
+    }
+    if (t.images_total > 0) {
+        // Known: the JPEG was not decoded. Cached: the encoder output came from the cache. The rest of the prompt images sat in the reused prefix.
+        extra += ", images " + std::to_string(t.images_total) + " (" + std::to_string(t.images_known) + " known, " +
+                 std::to_string(t.images_cached) + " cached, " + std::to_string(t.images_encoded) + " encoded)";
+    }
+    snprintf(line, sizeof(line), "prefill %lld tok in %.0f ms (%.1f t/s on %s)%s, generate %lld tok (%.1f t/s), memory %d pos",
+             (long long) t.prefill_tokens, t.prefill_us / 1000.0, pp, pf_dev, extra.c_str(),
+             (long long) t.gen_tokens, tg, (int) e->n_past);
     return env->NewStringUTF(line);
 }
 
@@ -1129,10 +1312,15 @@ Java_ai_airi_qwenmobile_LlamaNative_resetChat(JNIEnv *, jclass, jlong handle) {
     Engine * e = engine_of(handle);
     std::lock_guard<std::mutex> lock(e->mutex);
     clear_all(*e);
-    e->image_cache.clear();
-    e->image_cache_bytes = 0;
+    // The RAM tiers go, the files stay: a conversation on disk continues after a load of the same model.
+    e->states->clear(false);
+    e->images->clear(false);
+    e->turn_images.clear();
     e->utf8_pending.clear();
-    e->prefill_tokens = e->prefill_us = e->transfer_us = e->gen_tokens = e->gen_us = 0;
+    e->turn           = TurnStats{};
+    e->think_open     = false;
+    e->answer_done    = true;
+    e->stop_requested = false;
 }
 
 /**

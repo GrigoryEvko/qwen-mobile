@@ -144,7 +144,12 @@ object LlamaEngine {
 
     private val engineScope = CoroutineScope(dispatcher + SupervisorJob())
 
+    /** The engine handle. The engine thread writes it, and [stop] reads it from the main thread. */
+    @Volatile
     private var handle = 0L
+
+    /** The cache directory of the app, for the prompt states and the encoded images. */
+    private var cacheDir: String? = null
 
     private val stateFlow = MutableStateFlow<LoadedModel?>(null)
 
@@ -169,9 +174,11 @@ object LlamaEngine {
     /**
      * Initialize the backends on the engine thread. Every native call that
      * follows queues behind it on the same thread. Call one time from the
-     * application.
+     * application. [cacheDir] is the cache directory of the app, where the
+     * engine keeps the prompt states and the encoded images.
      */
-    fun start(libDir: String, workDir: String) {
+    fun start(libDir: String, workDir: String, cacheDir: String) {
+        this.cacheDir = cacheDir
         engineScope.launch {
             LlamaNative.initialize(libDir)
             LlamaNative.setWorkingDirectory(workDir)
@@ -208,6 +215,7 @@ object LlamaEngine {
             if (config.backend == Backend.CPU) 0 else 999,
             threads,
             config.nCtx,
+            cacheDir,
         )
         val loaded = LoadedModel(config, LlamaNative.modelInfo(handle))
         stateFlow.value = loaded
@@ -251,6 +259,18 @@ object LlamaEngine {
                 }
             }
         }.flowOn(dispatcher)
+    }
+
+    /**
+     * Ask the running answer to stop at once. The call takes no lock and
+     * runs on the thread of the caller, thus it does not wait for the
+     * native call in progress. Without a model it does nothing.
+     */
+    fun stop() {
+        val h = handle
+        if (h != 0L) {
+            LlamaNative.requestStop(h)
+        }
     }
 
     /** The speed line of the current turn. */

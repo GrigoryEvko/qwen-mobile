@@ -254,8 +254,11 @@ object ChatSession {
 
     // --- the turn ---
 
-    /** Cancel the running answer, if any. */
+    /** Cancel the running answer, if any. The engine stops before the coroutine cancels, thus the stop is immediate. */
     fun stop() {
+        if (generatingFlow.value) {
+            LlamaEngine.stop()
+        }
         generation?.cancel()
     }
 

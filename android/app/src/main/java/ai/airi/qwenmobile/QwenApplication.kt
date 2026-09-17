@@ -6,6 +6,6 @@ import android.app.Application
 class QwenApplication : Application() {
     override fun onCreate() {
         super.onCreate()
-        LlamaEngine.start(applicationInfo.nativeLibraryDir, filesDir.absolutePath)
+        LlamaEngine.start(applicationInfo.nativeLibraryDir, filesDir.absolutePath, cacheDir.absolutePath)
     }
 }
