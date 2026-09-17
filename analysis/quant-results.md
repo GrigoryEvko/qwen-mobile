@@ -27,6 +27,8 @@ Hadamard R1 on the residual stream, head untied.
 | 7c | Row 7 exported and evaluated on the laptop (RTX 1000 Ada, CUDA 13.1), the control of rows 10 and 11 | 1.62 GiB file | 0.0296 | 0.590 | 7.37 | 91.40 % | 14.43 |
 | 10 | Row 7 with token_embd in Q4_0 (round-to-nearest with the scale search): the price of the 4-bit lookup, laptop | 1.39 GiB file | 0.0309 | 0.788 | 8.07 | 91.18 % | 14.47 |
 | 11 | Tied head: token_embd is the head, Q4_0 by GPTQ on E' with the moments of M·norm(h), then the KL head optimization (frozen latents, 300 steps), layer packs of row 7, output_rot in F16, laptop | 1.13 GiB file | 0.0311 | 0.499 | 6.82 | 90.42 % | 14.46 |
+| 12 | Row 11 plus the MTP block in the rotated basis (F16, two F16 maps of 8.4 MB), the draft of `--spec-type draft-mtp`, laptop | 1.14 GiB file | 0.0311 | 0.499 | 6.82 | 90.42 % | 14.46 |
+| 13 | Row 12 with the eight matrices of the MTP block in round-to-nearest Q8_0 | 1.09 GiB file | as row 12 | | | | |
 
 Rows 7c, 10 and 11 ran on the laptop against the F16 base of the box, with llama.cpp c6824a9 plus
 `patches/llama-tied-head`. The control reproduces row 7 (0.0296 / 91.40 % against 0.0295 / 91.35 %).
@@ -106,6 +108,67 @@ The HF lockstep drift report (analysis/*.drift.md, 16 x 1024 WikiText tokens, fp
 the same ranking with its own numbers: row 3 mean KL 0.0291, row 4 0.0314. The KL attribution
 of row 3 is in analysis/quant-attribution.md: the round-to-nearest head alone is 0.011 of the
 0.037, MLP gate/up 0.009, MLP down 0.007, GDN out 0.005, GDN qkv 0.0025, layers 0-2 0.0075.
+
+## The MTP block of the rotated files (2026-09-18)
+
+The multi-token prediction (MTP) block of Qwen3.5 (`blk.24` of the 2B) drafts the next token
+for the speculative mode `--spec-type draft-mtp` of llama.cpp. The block reads the final-norm
+output x = γ_f ⊙ norm(h) of the main model through `hnorm`, and the embedding of the last token
+through `enorm`. The transformed main model supplies y = norm(h') = Qᵀ·norm(h) in place of x, and
+rms(x) is not rms(y). Thus the block of the rows before row 12 reads the wrong vector. The transform
+(`quant/transform.py`, on by default when the checkpoint has the block) puts the block into the
+rotated basis with two dense maps of d × d in F16, 8.4 MB each for the 2B:
+
+- `blk.24.nextn.hnorm_rot` = diag(γ_f)·Q before `hnorm`, which makes x from y.
+- `blk.24.nextn.shared_head_rot` = Qᵀ·diag(γ_f)⁻¹·diag(γ_s)·Q after the head norm of the block,
+  which becomes the identity. The map puts the normed state of the block into the convention of the
+  main model. Thus the tied head reads it through `output_rot`, as the main graph does. And the next
+  draft step reads it through `hnorm_rot` again, because llama.cpp chains the draft steps on the
+  `h_nextn` of the block.
+
+The embedding half of `fc` folds `enorm` and Q, `fc` writes into the rotated stream, and the layer of
+the block takes the transform of a main layer. The head map is the same for the tied and the untied
+file. The calibration of row 11 moved the output norm by 0.6 %. Thus the export scales the columns
+of `hnorm_rot` and the rows of `shared_head_rot` by the exported norm. The patch
+`patches/llama-tied-head/0002-qwen35-mtp-rotation.patch` (on top of 0001) maps the two tensors in the
+converter, loads them as optional, and applies them in the MTP graph. The main graph does not load
+the block, thus rows 12 and 13 have the KL of row 11. The 321 trunk tensors of row 12 are byte for
+byte those of row 11. The KL run gives 0.031126 / 0.4989 / 6.82 / 90.417 % (row 11: 0.0311 / 0.499 /
+6.82 / 90.42 %).
+
+The exactness test is the draft acceptance of `llama-speculative-simple` on the CPU build, one
+prompt, temperature 0, 256 tokens, 12 threads, draft 3 (the preset). The original F16 file and the
+transformed tied F16 file (`weights/Qwen3.5-2B-tm`) give identical counts and identical text. The
+tied F16 file of row 11 (`-t`, the block untouched) is the control: the target accepts no draft
+token, and the speculation makes the decode slower than no speculation. The checkpoint `-tm` has the
+trunk of `-t` byte for byte (618 tensors), only the block and the two maps are different.
+
+| File | Bytes | Decode, no draft, t/s | Decode, draft-mtp, t/s | Drafted | Accepted | Acceptance |
+|---|---|---|---|---|---|---|
+| Original F16 (`Qwen3.5-2B-F16.gguf`) | 3,897,387,936 | 9.1, 8.0 | 11.3, 14.6 | 278 | 164 | 58.99 % |
+| Transformed tied F16 with the MTP block (`Qwen3.5-2B-tm-F16.gguf`) | 3,922,553,984 | | 11.2, 8.9 | 278 | 164 | 58.99 % |
+| Transformed tied F16, the block untouched (`Qwen3.5-2B-t-F16.gguf`), the control | 3,905,776,640 | | 3.9 | 768 | 0 | 0.00 % |
+| Row 12: row 11 plus the block in F16 | 1,228,565,632 | 16.2, 23.6 | 22.5, 22.7 | 281 | 166 | 59.08 % |
+| Row 13: row 11 plus the block in Q8_0 | 1,171,549,312 | | 21.0, 24.1 | 282 | 165 | 58.51 % |
+
+The counts are the same in the two passes of each file. The speed has two values, one per pass,
+because another tenant used the CPU of the laptop during the runs (load average 9 to 12 on 28
+threads). Thus the speed is an indication only. The rows 12 and 13 give the same text, thus the Q8_0
+block drafts the same tokens on this prompt with 57 MB less. The block adds no cost to the main
+model: llama.cpp loads it only with `--spec-type draft-mtp`. The 4B has the same block structure
+(`blk.32`, the shared embedding, the tied head), thus the same commands apply to it. The commands,
+from the project root with the `.venv`:
+
+    python -m quant.run transform --model Qwen3.5-2B --device cpu --tie-head --suffix tm
+    python -m quant.run convert --model Qwen3.5-2B --source tm
+    python -m quant.run export --model Qwen3.5-2B --device cpu --source tm --packs quant-out/Qwen3.5-2B-tied-bo-gptq-frozen-e2 --embedding Q4_0 --tie-head --tag tied-bo-gptq-frozen-e2-mtp
+    python -m quant.run export --model Qwen3.5-2B --device cpu --source tm --packs quant-out/Qwen3.5-2B-tied-bo-gptq-frozen-e2 --embedding Q4_0 --tie-head --mtp Q8_0 --tag tied-bo-gptq-frozen-e2-mtp-q8
+    python -m quant.run eval --model Qwen3.5-2B --gguf weights/gguf/Qwen3.5-2B-tied-bo-gptq-frozen-e2-mtp.gguf
+    llama.cpp/build-host/bin/llama-speculative-simple -m weights/gguf/<file>.gguf --spec-type draft-mtp -p "<prompt>" -n 256 --temp 0 -t 12 -c 2048
+    llama.cpp/build-host/bin/llama-completion -m weights/gguf/<file>.gguf -p "<prompt>" -n 256 --temp 0 -t 12 -c 2048 -no-cnv --simple-io
+
+The prompt: "Explain how the TCP three-way handshake works, why it is needed, and what happens when
+a packet of the handshake is lost."
 
 ## Q8_0 files of the original checkpoints, 2B and 4B (2026-09-18)
 
