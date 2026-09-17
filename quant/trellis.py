@@ -68,10 +68,14 @@ class Trellis:
         n_states = 1 << L
         s = torch.arange(n_states)
         nibbles = L // k
-        # The trellis bit of nibble j of the window (0 = newest).
-        tb = torch.stack([(s >> (j * k + k - 1)) & 1 for j in range(nibbles)], dim=1)
-        c0 = tb[:, 0] ^ (tb[:, 2] if nibbles > 2 else 0)
-        c1 = (tb[:, 1] if nibbles > 1 else 0) ^ (tb[:, 3] if nibbles > 3 else 0) ^ tb[:, 0]
+        # The trellis bit of nibble j of the window (0 = newest, the input bit of the step).
+        tb = [(s >> (j * k + k - 1)) & 1 for j in range(nibbles)]
+        zero = torch.zeros_like(s)
+        # Set partition: the fine coset bit c0 depends on the state only, thus the two
+        # branches out of a state lie in {D0, D2} or in {D1, D3}. The coarse bit c1 takes
+        # the input bit, and the parity taps spread the paths.
+        c0 = (tb[1] if nibbles > 1 else zero) ^ (tb[2] if nibbles > 2 else zero) ^ (tb[3] if nibbles > 3 else zero)
+        c1 = tb[0] ^ (tb[2] if nibbles > 2 else zero)
         coset = (c1 << 1) | c0
         inner = s & ((1 << (k - 1)) - 1)
         level_index = inner * 4 + coset

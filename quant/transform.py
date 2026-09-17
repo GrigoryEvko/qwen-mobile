@@ -49,7 +49,8 @@ def hadamard(n: int, device: torch.device) -> torch.Tensor:
         return h
     gen = torch.Generator(device="cpu").manual_seed(r)
     q, _ = torch.linalg.qr(torch.randn(r, r, generator=gen, dtype=torch.float64))
-    return torch.kron(h, q.to(device))
+    q = q.to(device)
+    return (h[:, None, :, None] * q[None, :, None, :]).reshape(n, n)
 
 
 def rotation_matrix(n: int, block: int | None, seed: int, device: torch.device) -> torch.Tensor:
