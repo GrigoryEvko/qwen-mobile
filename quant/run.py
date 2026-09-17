@@ -89,6 +89,7 @@ def cmd_quantize(args: argparse.Namespace) -> None:
     """Solve the plan in the quantized flow, save the folded reference, report the drift."""
     from transformers import AutoTokenizer
 
+    from .blockopt import OptOptions
     from .calib import build_calibration
     from .drift import drift_report
     from .flow import Lockstep, Options, Quantizer, state_as_checkpoint
@@ -100,8 +101,10 @@ def cmd_quantize(args: argparse.Namespace) -> None:
     ref = _load_model(src, args.device)
     work = _load_model(src, args.device)
     plan = _plan(args, num_layers(ROOT / "weights" / args.model))
-    opts = Options(solver=args.solver, scale=not args.no_scale, permute_mlp=not args.no_permute,
-                   mismatch=args.mismatch, damp=args.damp, refit_damp=args.refit_damp, batch=args.batch)
+    opts = Options(method=args.method, init=args.init, scale=not args.no_scale, permute_mlp=not args.no_permute,
+                   mismatch=args.mismatch, damp=args.damp, refit_damp=args.refit_damp, batch=args.batch,
+                   opt=OptOptions(epochs=args.epochs, batch=args.opt_batch, lr_weight=args.lr_weight,
+                                  lr_scale=args.lr_scale, lr_other=args.lr_other, head_steps=args.head_steps))
     print(f"quantize {args.model}: {opts}", flush=True)
     Quantizer(Lockstep(ref, work, ids, args.batch), plan, out, opts).run()
     print(f"solved blocks in {out}", flush=True)
@@ -196,7 +199,15 @@ def main() -> None:
     q.add_argument("--batch", type=int, default=8)
     q.add_argument("--damp", type=float, default=0.01, help="rounding damping, relative to the mean diagonal")
     q.add_argument("--refit-damp", type=float, default=1e-6, help="refit damping, relative to the largest eigenvalue")
-    q.add_argument("--solver", choices=("qronos", "gptq"), default="qronos")
+    q.add_argument("--method", choices=("blockopt", "solve"), default="blockopt",
+                   help="block reconstruction by gradient with the quantizer in the loop, or the rounding only")
+    q.add_argument("--init", choices=("rtn", "qronos", "gptq"), default="rtn", help="the rounding before the optimization")
+    q.add_argument("--epochs", type=int, default=8, help="block optimization epochs over the calibration set")
+    q.add_argument("--opt-batch", type=int, default=4, help="sequences per optimization step")
+    q.add_argument("--lr-weight", type=float, default=1e-5)
+    q.add_argument("--lr-scale", type=float, default=1e-4)
+    q.add_argument("--lr-other", type=float, default=1e-4)
+    q.add_argument("--head-steps", type=int, default=300)
     q.add_argument("--no-scale", action="store_true", help="no folded column scales")
     q.add_argument("--no-permute", action="store_true", help="no permutation of the MLP intermediate channels")
     q.add_argument("--mismatch", choices=("model", "layer"), default="model",

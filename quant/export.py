@@ -46,6 +46,13 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
     """
     gguf = _load_gguf_module(llama_dir)
     selector = re.compile(only) if only else None
+    # The small tensors that the calibration moved (norms, gates, Q8 matrices), in GGUF space.
+    folds = np.load(packs / "folds.npz") if (packs / "folds.npz").exists() else None
+
+    def source(t) -> np.ndarray:
+        if folds is not None and t.name in folds.files:
+            return folds[t.name].astype(np.float32).reshape([int(x) for x in reversed(t.shape)])
+        return _f32_of(t)
     reader = gguf.GGUFReader(str(f16_gguf))
     arch = bytes(reader.fields["general.architecture"].parts[-1]).decode()
     writer = gguf.GGUFWriter(str(out_gguf), arch)
@@ -85,11 +92,11 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
             writer.add_tensor(name, pack_nibbles(idx, d), raw_dtype=getattr(gguf.GGMLQuantizationType, GGUF_4BIT[kind]))
             kind = f"{kind} (rtn)"
         elif kind == "Q8_0":
-            w = torch.from_numpy(_f32_of(t)).to(device)
+            w = torch.from_numpy(source(t)).to(device)
             q, d = q8_0_quantize(w)
             writer.add_tensor(name, pack_q8_0(q, d), raw_dtype=gguf.GGMLQuantizationType.Q8_0)
         elif kind == "F32":
-            writer.add_tensor(name, _f32_of(t).astype(np.float32))
+            writer.add_tensor(name, source(t).astype(np.float32))
         else:
             if t.tensor_type not in (gguf.GGMLQuantizationType.F16, gguf.GGMLQuantizationType.F32):
                 raise ValueError(f"{name}: the F16 GGUF holds an unexpected type {t.tensor_type.name}")

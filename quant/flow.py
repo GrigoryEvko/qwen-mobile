@@ -27,7 +27,7 @@ Then the head on the final-norm outputs, with its scales in the final norm.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -35,7 +35,8 @@ import torch
 from torch import nn
 from transformers.models.qwen3_5.modeling_qwen3_5 import create_causal_mask, create_recurrent_attention_mask
 
-from .grid import dequantize, q8_0_dequantize, q8_0_quantize
+from .blockopt import FROZEN, OptOptions, optimize_head, optimize_layer
+from .grid import dequantize, q8_0_dequantize, q8_0_quantize, quantize
 from .grids import Grid, IQ4NLGrid, Q4_0Grid, fit_codebook
 from .names import to_gguf
 from .plan import Plan
@@ -44,19 +45,29 @@ from .solver import solve_grid
 
 GDN_IN = ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_a", "linear_attn.in_proj_b")
 ATTN_IN = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj")
+ZERO_CENTERED = ("attn_norm.weight", "post_attention_norm.weight", "attn_q_norm.weight", "attn_k_norm.weight",
+                 "output_norm.weight")
 
 
 @dataclass
 class Options:
-    """The knobs of one calibration run."""
+    """The knobs of one calibration run.
 
-    solver: str = "qronos"
+    ``method`` is ``blockopt`` (block reconstruction by gradient with the
+    quantizer in the loop) or ``solve`` (the column rounding only).
+    ``init`` is the rounding before the optimization: ``rtn`` with the scale
+    search, ``qronos``, or ``gptq``.
+    """
+
+    method: str = "blockopt"
+    init: str = "rtn"
     scale: bool = True
     permute_mlp: bool = True
     mismatch: str = "model"
     damp: float = 0.01
     refit_damp: float = 1e-6
     batch: int = 8
+    opt: OptOptions = field(default_factory=OptOptions)
 
 
 def q8_round_trip_(w: torch.Tensor) -> None:
@@ -164,13 +175,25 @@ class Lockstep:
         return moments
 
     @torch.no_grad()
-    def advance(self, li: int) -> None:
-        """Replace the cached inputs by the outputs of layer li."""
-        ref_layer, work_layer = self.layers(li)
+    def advance_ref(self, li: int) -> None:
+        """Replace the cached reference inputs by the reference outputs of layer li."""
+        layer = self.ref.model.layers[li]
         for i, tok in self.batches():
             n = tok.shape[0]
-            self.ref_in[i:i + n] = self.run_layer(ref_layer, li, self.ref_in[i:i + n])
-            self.work_in[i:i + n] = self.run_layer(work_layer, li, self.work_in[i:i + n])
+            self.ref_in[i:i + n] = self.run_layer(layer, li, self.ref_in[i:i + n])
+
+    @torch.no_grad()
+    def advance_work(self, li: int) -> None:
+        """Replace the cached working inputs by the working outputs of layer li."""
+        layer = self.work.model.layers[li]
+        for i, tok in self.batches():
+            n = tok.shape[0]
+            self.work_in[i:i + n] = self.run_layer(layer, li, self.work_in[i:i + n])
+
+    def advance(self, li: int) -> None:
+        """Move both caches through layer li."""
+        self.advance_ref(li)
+        self.advance_work(li)
 
     @torch.no_grad()
     def final_norm(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -195,6 +218,9 @@ class Quantizer:
         self.opts = opts
         self.cfg = step.cfg
         self.fixed = {"Q4_0": Q4_0Grid().to(step.device), "IQ4_NL": IQ4NLGrid().to(step.device)}
+        # The grid and the Hessian diagonal of each solved matrix, by (layer, relative name). The head is layer -1.
+        self.grids: dict[tuple[int, str], Grid] = {}
+        self.h_diag: dict[tuple[int, str], torch.Tensor] = {}
         out_dir.mkdir(parents=True, exist_ok=True)
 
     # --- grids ---
@@ -249,25 +275,69 @@ class Quantizer:
 
     # --- solving ---
 
-    def solve(self, name: str, kind: str, lin: nn.Linear, h: torch.Tensor, g: torch.Tensor, tag: str) -> None:
-        t0 = time.time()
-        cross = g if self.opts.solver == "qronos" else None
-        grid = self.grid_for(kind, lin.weight.data, torch.diag(h))
-        idx, d, err, change = solve_grid(lin.weight.data, h, grid, cross, damp=self.opts.damp,
-                                         refit_damp=self.opts.refit_damp)
-        lin.weight.data.copy_(dequantize(grid, idx, d))
+    def save_pack(self, name: str, kind: str, grid: Grid, idx: torch.Tensor, d: torch.Tensor) -> None:
         np.savez(self.out_dir / f"{name}.npz", q=idx.cpu().numpy(), d=d.cpu().numpy().view(np.uint16),
                  levels=grid.levels.cpu().numpy(), kind=np.array(kind))
-        print(f"{tag} {name:30s} {kind:6s} {tuple(lin.weight.shape)} err {err:.3e} refit {change:.3f} "
-              f"solve {time.time() - t0:4.1f}s", flush=True)
+
+    def solve(self, key: tuple[int, str], name: str, kind: str, lin: nn.Linear, h: torch.Tensor, g: torch.Tensor,
+              tag: str) -> None:
+        """The initial rounding of one matrix onto its grid. The block optimization moves it later."""
+        t0 = time.time()
+        grid = self.grid_for(kind, lin.weight.data, torch.diag(h))
+        self.grids[key], self.h_diag[key] = grid, torch.diag(h).clone()
+        if self.opts.init == "rtn":
+            idx, d = quantize(grid, lin.weight.data, weights=torch.diag(h), search=True)
+            err, change = float("nan"), 0.0
+        else:
+            cross = g if self.opts.init == "qronos" else None
+            idx, d, err, change = solve_grid(lin.weight.data, h, grid, cross, damp=self.opts.damp,
+                                             refit_damp=self.opts.refit_damp)
+        lin.weight.data.copy_(dequantize(grid, idx, d))
+        self.save_pack(name, kind, grid, idx, d)
+        print(f"{tag} {name:30s} {kind:6s} {tuple(lin.weight.shape)} {self.opts.init} err {err:.3e} "
+              f"refit {change:.3f} in {time.time() - t0:4.1f}s", flush=True)
 
     def solve_or_round(self, li: int, rel: str, h: torch.Tensor, g: torch.Tensor) -> None:
         kind = self.kind(li, rel)
         lin = self.both(li, rel)[1]
         if kind in self.plan.solved_types():
-            self.solve(self.name(li, rel), kind, lin, h, g, f"layer {li:2d}")
+            self.solve((li, rel), self.name(li, rel), kind, lin, h, g, f"layer {li:2d}")
         elif kind == "Q8_0":
             q8_round_trip_(lin.weight.data)
+
+    def optimize(self, li: int) -> None:
+        """Block reconstruction of layer li, then the Q8 members back on their grid."""
+        self.step.advance_ref(li)
+        targets = {rel: (self.grids[(l, rel)], self.h_diag[(l, rel)]) for (l, rel) in list(self.grids) if l == li}
+        result = optimize_layer(self.step, li, targets, self.opts.opt)
+        for rel, (grid, idx, d) in result.items():
+            self.grids[(li, rel)] = grid
+            self.save_pack(self.name(li, rel), self.kind(li, rel), grid, idx, d)
+        work_layer = self.step.layers(li)[1]
+        for rel, lin in work_layer.named_modules():
+            if isinstance(lin, nn.Linear) and self.kind(li, rel) == "Q8_0":
+                q8_round_trip_(lin.weight.data)
+        self.step.advance_work(li)
+
+    def save_folds(self) -> None:
+        """The GGUF-space values of the small tensors of the working copy, for the export.
+
+        The optimization moves the norms, the gate projections and the Q8
+        matrices. The zero-centered norms get their +1.
+        """
+        folds: dict[str, np.ndarray] = {}
+        for full, p in self.step.work.named_parameters():
+            gguf = to_gguf(full)
+            if gguf is None or gguf == "token_embd.weight" or any(f in full for f in FROZEN):
+                continue
+            if self.plan.type_of(gguf) not in ("F32", "Q8_0"):
+                continue
+            v = p.detach().to("cpu", torch.float32)
+            if gguf.endswith(ZERO_CENTERED):
+                v = v + 1.0
+            folds[gguf] = v.numpy()
+        np.savez(self.out_dir / "folds.npz", **folds)
+        print(f"wrote {len(folds)} small tensors to folds.npz", flush=True)
 
     # --- groups ---
 
@@ -359,7 +429,11 @@ class Quantizer:
             for norm in (self.step.ref.model.norm, self.step.work.model.norm):
                 norm.weight.data.copy_((1.0 + norm.weight.data) / t - 1.0)
             h, g = scaled_moments(h, g, t)
-        self.solve("output.weight", kind, heads[1], h, g, "head    ")
+        key = (-1, "lm_head")
+        self.solve(key, "output.weight", kind, heads[1], h, g, "head    ")
+        if self.opts.method == "blockopt":
+            grid, idx, d = optimize_head(self.step, self.grids[key], self.h_diag[key], self.opts.opt)
+            self.save_pack("output.weight", kind, grid, idx, d)
 
     # --- the run ---
 
@@ -379,9 +453,13 @@ class Quantizer:
                 self.mixer_input(li, ATTN_IN, "input_layernorm", defer=("self_attn.v_proj",))
                 self.attention_output(li)
             self.mlp(li)
-            step.advance(li)
+            if self.opts.method == "blockopt":
+                self.optimize(li)
+            else:
+                step.advance(li)
             print(f"layer {li:2d} done in {time.time() - t0:5.1f}s", flush=True)
         self.head()
+        self.save_folds()
 
 
 def state_as_checkpoint(model, src_tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
