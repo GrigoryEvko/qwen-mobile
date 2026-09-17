@@ -4,6 +4,15 @@
  * One Engine holds one model, one context, one sampler, and one thread pool.
  * All calls for one engine come from one Kotlin thread. A mutex guards the
  * engine against a second caller.
+ *
+ * The model memory of Qwen3.5 is a recurrent state plus a KV cache. A
+ * recurrent state cannot roll back, thus the engine keeps a snapshot of the
+ * state at the end of the prompt without the generation prompt. The chat
+ * template renders the previous answer differently from the generated
+ * tokens, thus the next prompt extends that snapshot and not the answer.
+ * The hybrid backend keeps the snapshot on the prefill context. The other
+ * backends keep it in a second sequence of the decode context, which
+ * shares its KV cells and copies the recurrent state on the next write.
  */
 
 #include <android/log.h>
@@ -12,6 +21,7 @@
 #include <sys/resource.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -48,17 +58,24 @@ constexpr int64_t kHintTargetNs = 40'000'000;
 /** The number of tokens that the presence penalty looks back on. */
 constexpr int32_t kPenaltyLastN = 256;
 
-/** The maximum number of vision tokens of one image. 1024 tokens is a 1024 x 1024 image. */
-constexpr int32_t kImageMaxTokens = 1024;
+/** The maximum number of vision tokens of one image. 576 tokens is a 768 x 768 image. */
+constexpr int32_t kImageMaxTokens = 576;
+
+/** The maximum size of the cache of encoded images, in bytes. One image is 4 to 10 MB. */
+constexpr size_t kImageCacheBytes = 32u << 20;
 
 /** The nice value of the compute threads. The display thread keeps its priority. */
 constexpr int kComputeNice = 10;
 
-/** The number of new prompt tokens from which the hybrid backend uses the prefill context. */
-constexpr int kHybridMinTokens = 128;
+/** The batch of the contexts. The Hexagon backend wants 512. */
+constexpr int kBatch = 512;
 
-/** The batch of the prefill context. The Hexagon backend wants 512. */
-constexpr int kPrefillBatch = 512;
+/** The number of free positions that a prompt must leave in the context. */
+constexpr size_t kContextHeadroom = 8;
+
+/** The sequence of the conversation, and the sequence of the prompt snapshot. */
+constexpr llama_seq_id kSeqMain = 0;
+constexpr llama_seq_id kSeqSnap = 1;
 
 /** Give a thread the compute priority. tid 0 is the calling thread. */
 void lower_priority(int32_t tid) {
@@ -67,15 +84,32 @@ void lower_priority(int32_t tid) {
     }
 }
 
+/** One unit of the model memory: a text token, or an image chunk identified by the hash of its bitmap. */
+struct MemItem {
+    llama_token token = LLAMA_TOKEN_NULL;
+    std::string image_id;
+
+    bool operator==(const MemItem & o) const { return token == o.token && image_id == o.image_id; }
+    bool operator!=(const MemItem & o) const { return !(*this == o); }
+};
+
+/** The output of the vision encoder for one image. */
+struct ImageEmbd {
+    std::string        id;
+    std::vector<float> embd;
+};
+
 struct Engine {
     llama_model *     model = nullptr;
     llama_context *   ctx   = nullptr;
     llama_sampler *   smpl  = nullptr;
     ggml_threadpool * tp    = nullptr;
-    /** The vision projector. It loads on the first image, on the device of the model. */
+    /** The vision projector. It loads on the first image, on the OpenCL GPU. */
     mtmd_context *    mctx  = nullptr;
     std::string       mmproj;
     ggml_backend_dev_t device = nullptr;
+    /** The batch of the text decodes, kBatch tokens, allocated one time. */
+    llama_batch batch = {};
 
     /**
      * The hybrid backend: a second copy of the model on the prefill device
@@ -85,36 +119,63 @@ struct Engine {
     llama_model *      model_pf  = nullptr;
     llama_context *    ctx_pf    = nullptr;
     ggml_backend_dev_t device_pf = nullptr;
-    /** True when the first answer token of the turn was an end token on the prefill context. */
-    bool first_eog = false;
-    /** The kind of the first answer token of a hybrid turn, for the next generateNext. */
-    int first_kind = 0;
     /** The thinking tags of the vocabulary, or LLAMA_TOKEN_NULL. */
     llama_token tok_think_open  = LLAMA_TOKEN_NULL;
     llama_token tok_think_close = LLAMA_TOKEN_NULL;
-    /** The state copies of the current turn, in microseconds. */
-    int64_t transfer_us = 0;
     common_chat_templates_ptr tmpls;
     std::unique_ptr<PerfHintSession> hint;
     std::mutex mutex;
 
-    /** The tokens that the model memory holds, in order. Empty when the memory holds images. */
-    std::vector<llama_token> cache;
-    /** True when the memory holds image chunks. A token prefix cannot extend such a memory. */
-    bool memory_has_media = false;
+    /** The items that the conversation sequence of the decode context holds, in order. */
+    std::vector<MemItem> cache;
+    /** The number of positions that the conversation sequence holds. */
+    llama_pos n_past = 0;
+    /**
+     * The snapshot: the items of the last prompt without its generation
+     * prompt. The hybrid backend holds this state on the prefill context,
+     * the other backends in sequence kSeqSnap of the decode context.
+     */
+    std::vector<MemItem> snap;
+    llama_pos snap_n_past = 0;
+    /** The encoded images, oldest first. The total is less than kImageCacheBytes. */
+    std::vector<ImageEmbd> image_cache;
+    size_t image_cache_bytes = 0;
     /** Bytes of an incomplete UTF-8 sequence from the last token. */
     std::string utf8_pending;
 
     int  n_threads  = 4;
-    int  n_batch    = 512;
     int  gpu_layers = 0;
     bool thinking   = false;
 
     // Timings of the current turn, in microseconds.
     int64_t prefill_tokens = 0;
     int64_t prefill_us     = 0;
+    int64_t transfer_us    = 0;
     int64_t gen_tokens     = 0;
     int64_t gen_us         = 0;
+
+    Engine() = default;
+    Engine(const Engine &) = delete;
+    Engine & operator=(const Engine &) = delete;
+
+    /** Release every native object, in the order of their dependencies. */
+    ~Engine() {
+        hint.reset();
+        if (smpl != nullptr) llama_sampler_free(smpl);
+        if (mctx != nullptr) mtmd_free(mctx);
+        if (ctx_pf != nullptr) {
+            llama_detach_threadpool(ctx_pf);
+            llama_free(ctx_pf);
+        }
+        if (model_pf != nullptr) llama_model_free(model_pf);
+        if (ctx != nullptr) {
+            llama_detach_threadpool(ctx);
+            llama_free(ctx);
+        }
+        if (tp != nullptr) ggml_threadpool_free(tp);
+        if (model != nullptr) llama_model_free(model);
+        if (batch.token != nullptr) llama_batch_free(batch);
+    }
 };
 
 /** Current time in microseconds. */
@@ -188,6 +249,23 @@ size_t utf8_complete_prefix(const std::string & s) {
     return i;
 }
 
+/** Append the text of a token to the pending UTF-8 bytes, without a heap allocation for the usual token. */
+void append_piece(Engine & e, llama_token token) {
+    const llama_vocab * vocab = llama_model_get_vocab(e.model);
+    char buf[128];
+    int32_t n = llama_token_to_piece(vocab, token, buf, sizeof(buf), 0, true);
+    if (n >= 0) {
+        e.utf8_pending.append(buf, (size_t) n);
+        return;
+    }
+    // The piece is longer than the buffer: the negative value is its length.
+    std::string big((size_t) -n, '\0');
+    n = llama_token_to_piece(vocab, token, big.data(), (int32_t) big.size(), 0, true);
+    if (n > 0) {
+        e.utf8_pending.append(big.data(), (size_t) n);
+    }
+}
+
 /**
  * Build the sampler chain. Qwen3.5 recommends temperature 1.0 and top-p 0.95
  * with thinking, 0.7 and 0.8 without. A temperature of 0 is greedy.
@@ -212,20 +290,36 @@ void rebuild_sampler(Engine & e, bool thinking, float temp, float top_p) {
     e.thinking = thinking;
 }
 
+/** Tell the ADPF session the duration of one unit of work that started at t0. */
+void report_hint(Engine & e, int64_t t0) {
+    if (e.hint) {
+        e.hint->report((now_us() - t0) * 1000);
+    }
+}
+
 /**
- * Decode tokens in chunks of n_batch. Each chunk goes to the ADPF session
- * with its measured duration. Returns the llama_decode code, 0 on success.
+ * Decode text tokens into sequence kSeqMain of a context, in chunks of
+ * kBatch, at explicit positions from pos0. Only the last token gives logits,
+ * and only with logits_last. Returns the llama_decode code, 0 on success.
  */
-int decode_tokens(Engine & e, llama_context * ctx, const llama_token * tokens, int n) {
-    const int n_batch = ctx == e.ctx_pf ? kPrefillBatch : e.n_batch;
-    for (int i = 0; i < n; i += n_batch) {
-        const int count = std::min(n_batch, n - i);
-        llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(tokens) + i, count);
-        const int64_t t0 = now_us();
-        const int rc = llama_decode(ctx, batch);
-        if (e.hint) {
-            e.hint->report((now_us() - t0) * 1000);
+int decode_text(Engine & e, llama_context * lctx, const llama_token * tokens, int n, llama_pos pos0, bool logits_last) {
+    llama_batch & b = e.batch;
+    for (int i = 0; i < n; i += kBatch) {
+        const int count = std::min(kBatch, n - i);
+        for (int j = 0; j < count; ++j) {
+            b.token[j]     = tokens[i + j];
+            b.pos[j]       = pos0 + i + j;
+            b.n_seq_id[j]  = 1;
+            b.seq_id[j][0] = kSeqMain;
+            b.logits[j]    = 0;
         }
+        if (logits_last && i + count == n) {
+            b.logits[count - 1] = 1;
+        }
+        b.n_tokens = count;
+        const int64_t t0 = now_us();
+        const int rc = llama_decode(lctx, b);
+        report_hint(e, t0);
         if (rc != 0) {
             return rc;
         }
@@ -233,23 +327,26 @@ int decode_tokens(Engine & e, llama_context * ctx, const llama_token * tokens, i
     return 0;
 }
 
-/** Decode one token on the decode context and append it to the memory cache. */
+/** Decode one token of the answer on the decode context. Returns the llama_decode code. */
 int decode_one(Engine & e, llama_token token) {
-    const int rc = decode_tokens(e, e.ctx, &token, 1);
+    const int rc = decode_text(e, e.ctx, &token, 1, e.n_past, true);
     if (rc == 0) {
-        e.cache.push_back(token);
+        e.cache.push_back(MemItem{token, {}});
+        e.n_past += 1;
     }
     return rc;
 }
 
-/** Empty the model memory of both contexts and the record of what it holds. */
-void clear_memory(Engine & e) {
+/** Empty the model memory of both contexts, the snapshot, and the record of what they hold. */
+void clear_all(Engine & e) {
     llama_memory_clear(llama_get_memory(e.ctx), true);
     if (e.ctx_pf != nullptr) {
         llama_memory_clear(llama_get_memory(e.ctx_pf), true);
     }
     e.cache.clear();
-    e.memory_has_media = false;
+    e.n_past = 0;
+    e.snap.clear();
+    e.snap_n_past = 0;
 }
 
 /**
@@ -258,76 +355,24 @@ void clear_memory(Engine & e) {
  * its own state first. Returns false with the error text set.
  */
 bool transfer_state(llama_context * src, llama_context * dst, std::string & error) {
-    const size_t size = llama_state_seq_get_size(src, 0);
-    std::vector<uint8_t> buffer(size);
-    const size_t got = llama_state_seq_get_data(src, buffer.data(), size, 0);
-    llama_memory_seq_rm(llama_get_memory(dst), 0, -1, -1);
-    if (got == 0 || llama_state_seq_set_data(dst, buffer.data(), got, 0) == 0) {
+    const size_t size = llama_state_seq_get_size(src, kSeqMain);
+    // A plain array: a vector would fill tens of megabytes with zeros first.
+    std::unique_ptr<uint8_t[]> buffer(new uint8_t[size]);
+    const size_t got = llama_state_seq_get_data(src, buffer.get(), size, kSeqMain);
+    if (got == 0 || llama_state_seq_set_data(dst, buffer.get(), got, kSeqMain) == 0) {
         error = "The state transfer between the prefill and the decode context failed (" + std::to_string(size) + " bytes)";
         return false;
     }
     return true;
 }
 
-/**
- * The end of a hybrid prefill: sample the first answer token on the prefill
- * context, move the state to the decode context, and decode that token
- * there. Thus generateNext samples the second token from the decode context.
- */
-bool hybrid_finish(Engine & e, std::string & error) {
-    const llama_token first = llama_sampler_sample(e.smpl, e.ctx_pf, -1);
-    const int64_t t0 = now_us();
-    if (!transfer_state(e.ctx_pf, e.ctx, error)) {
-        return false;
-    }
-    e.transfer_us += now_us() - t0;
-    if (llama_vocab_is_eog(llama_model_get_vocab(e.model), first)) {
-        e.first_eog = true;
-        return true;
-    }
-    e.first_kind = token_kind(e, first);
-    if (e.first_kind == 0) {
-        e.utf8_pending += common_token_to_piece(e.ctx, first, true);
-    }
-    const int64_t t1 = now_us();
-    if (decode_one(e, first) != 0) {
-        error = "llama_decode failed on the first answer token";
-        return false;
-    }
-    e.gen_tokens = 1;
-    e.gen_us     = now_us() - t1;
-    return true;
-}
-
-/**
- * Decode new prompt tokens on the prefill context. With ``extend`` the
- * decode context holds the earlier turns, and its state moves to the
- * prefill context first.
- */
-bool hybrid_prefill_tokens(Engine & e, const llama_token * tokens, int n, bool extend, std::string & error) {
-    const int64_t t0 = now_us();
-    if (extend) {
-        if (!transfer_state(e.ctx, e.ctx_pf, error)) {
-            return false;
-        }
-    } else {
-        llama_memory_clear(llama_get_memory(e.ctx_pf), true);
-    }
-    e.transfer_us = now_us() - t0;
-    const int rc = decode_tokens(e, e.ctx_pf, tokens, n);
-    if (rc != 0) {
-        error = "llama_decode failed on the prompt on the prefill device with code " + std::to_string(rc);
-        return false;
-    }
-    return hybrid_finish(e, error);
-}
-
-/** Load the vision projector. Returns false when the model has none or it does not load. */
-bool ensure_vision(Engine & e) {
+/** Load the vision projector. Returns false with the error text set. */
+bool ensure_vision(Engine & e, std::string & error) {
     if (e.mctx != nullptr) {
         return true;
     }
     if (e.mmproj.empty()) {
+        error = "This model has no vision projector (mmproj) next to it";
         return false;
     }
     // The encoder runs on the OpenCL GPU. The Hexagon backend lacks operators of the CLIP
@@ -343,7 +388,7 @@ bool ensure_vision(Engine & e) {
     const int64_t t0 = now_us();
     e.mctx = mtmd_init_from_file(e.mmproj.c_str(), e.model, mp);
     if (e.mctx == nullptr) {
-        LOGE("the vision projector did not load: %s", e.mmproj.c_str());
+        error = "The vision projector did not load: " + e.mmproj;
         return false;
     }
     LOGI("vision projector loaded in %.0f ms: %s", (now_us() - t0) / 1000.0, e.mmproj.c_str());
@@ -351,82 +396,296 @@ bool ensure_vision(Engine & e) {
 }
 
 /**
- * Decode a prompt that holds images into an empty memory. The prompt has
- * one media marker per image, in order. Returns the number of prompt
- * tokens, or -1 with the error text set.
+ * The encoder output of an image chunk: from the cache by the hash of the
+ * bitmap, or from one run of the vision encoder. The pointer is valid
+ * until the next call. Returns nullptr with the error text set.
  */
-int64_t prefill_with_images(JNIEnv * env, Engine & e, const std::string & prompt,
-                            const std::vector<jbyteArray> & images, std::string & error) {
-    if (!ensure_vision(e)) {
-        error = "This model has no vision projector (mmproj) next to it";
-        return -1;
+float * image_embd(Engine & e, const mtmd_input_chunk * chunk, std::string & error) {
+    const std::string id = mtmd_input_chunk_get_id(chunk);
+    for (ImageEmbd & entry : e.image_cache) {
+        if (!id.empty() && entry.id == id) {
+            return entry.embd.data();
+        }
     }
-    std::vector<mtmd_bitmap *> bitmaps;
-    auto free_bitmaps = [&bitmaps] {
-        for (mtmd_bitmap * b : bitmaps) mtmd_bitmap_free(b);
-        bitmaps.clear();
+    const int64_t t0 = now_us();
+    const int32_t rc = mtmd_encode_chunk(e.mctx, chunk);
+    report_hint(e, t0);
+    if (rc != 0) {
+        error = "The vision encoder failed with code " + std::to_string(rc);
+        return nullptr;
+    }
+    const size_t n_floats = mtmd_input_chunk_get_n_tokens(chunk) * (size_t) llama_model_n_embd_inp(e.model);
+    const float * out = mtmd_get_output_embd(e.mctx);
+    const size_t bytes = n_floats * sizeof(float);
+    while (!e.image_cache.empty() && e.image_cache_bytes + bytes > kImageCacheBytes) {
+        e.image_cache_bytes -= e.image_cache.front().embd.size() * sizeof(float);
+        e.image_cache.erase(e.image_cache.begin());
+    }
+    e.image_cache.push_back(ImageEmbd{id, std::vector<float>(out, out + n_floats)});
+    e.image_cache_bytes += bytes;
+    LOGI("image %s encoded in %.0f ms, %zu tokens", id.substr(0, 12).c_str(), (now_us() - t0) / 1000.0,
+         mtmd_input_chunk_get_n_tokens(chunk));
+    return e.image_cache.back().embd.data();
+}
+
+/**
+ * Decode the items [start, end) into sequence kSeqMain of a context. Text
+ * runs go in batches, an image chunk goes through its encoder output with
+ * the M-RoPE positions of the helper. pos advances. Returns false with the
+ * error text set.
+ */
+bool decode_items(Engine & e, llama_context * lctx, const std::vector<MemItem> & items,
+                  const std::vector<const mtmd_input_chunk *> & chunk_of, size_t start, size_t end,
+                  llama_pos & pos, bool logits_last, std::string & error) {
+    std::vector<llama_token> run;
+    run.reserve(end - start);
+    auto flush = [&](bool last) {
+        if (run.empty()) {
+            return true;
+        }
+        const int rc = decode_text(e, lctx, run.data(), (int) run.size(), pos, last);
+        if (rc != 0) {
+            error = "llama_decode failed on the prompt with code " + std::to_string(rc);
+            return false;
+        }
+        pos += (llama_pos) run.size();
+        run.clear();
+        return true;
     };
+    for (size_t i = start; i < end; ++i) {
+        const mtmd_input_chunk * chunk = chunk_of[i];
+        if (chunk == nullptr) {
+            run.push_back(items[i].token);
+            continue;
+        }
+        if (!flush(false)) {
+            return false;
+        }
+        float * embd = image_embd(e, chunk, error);
+        if (embd == nullptr) {
+            return false;
+        }
+        llama_pos new_pos = pos;
+        const int64_t t0 = now_us();
+        const int32_t rc = mtmd_helper_decode_image_chunk(e.mctx, lctx, chunk, embd, pos, kSeqMain, kBatch, &new_pos,
+                                                          nullptr, nullptr);
+        report_hint(e, t0);
+        if (rc != 0) {
+            error = "The image did not decode, code " + std::to_string(rc);
+            return false;
+        }
+        pos = new_pos;
+    }
+    return flush(logits_last);
+}
+
+/** True when a is a prefix of b. */
+bool is_prefix(const std::vector<MemItem> & a, const std::vector<MemItem> & b) {
+    return a.size() <= b.size() && std::equal(a.begin(), a.end(), b.begin());
+}
+
+/** The number of tokens of the items [start, end): one per text item, the token count of an image chunk. */
+int64_t count_tokens(const std::vector<const mtmd_input_chunk *> & chunk_of, size_t start, size_t end) {
+    int64_t n = 0;
+    for (size_t i = start; i < end; ++i) {
+        n += chunk_of[i] == nullptr ? 1 : (int64_t) mtmd_input_chunk_get_n_tokens(chunk_of[i]);
+    }
+    return n;
+}
+
+/**
+ * Decode a prompt. The items [0, base_len) are the prompt without the
+ * generation prompt, the rest is the generation prompt. The longest reusable
+ * prefix comes from the snapshot, or on the other backends also from the
+ * conversation sequence. The new snapshot is taken before the generation
+ * prompt. Returns false with the error text set, and the memory empty.
+ */
+bool prefill(Engine & e, const std::vector<MemItem> & items, const std::vector<const mtmd_input_chunk *> & chunk_of,
+             size_t base_len, std::string & error) {
+    const bool hybrid = e.ctx_pf != nullptr;
+    llama_memory_t mem = llama_get_memory(e.ctx);
+
+    // The prefix that the memory holds already.
+    size_t start   = 0;
+    bool   restore = false;
+    if (!e.snap.empty() && is_prefix(e.snap, items)) {
+        start   = e.snap.size();
+        restore = true;
+    }
+    if (!hybrid && e.cache.size() > start && is_prefix(e.cache, items)) {
+        start   = e.cache.size();
+        restore = false;
+    }
+    if (start >= items.size() || start > base_len) {
+        // Nothing new gives no logits, and a prefix past the generation prompt cannot keep a snapshot.
+        start   = 0;
+        restore = false;
+    }
+    const size_t reused = start;
+
+    llama_pos pos = 0;
+    if (start == 0) {
+        clear_all(e);
+    } else if (restore) {
+        if (hybrid) {
+            pos = e.snap_n_past;
+        } else {
+            if (!llama_memory_seq_rm(mem, kSeqMain, -1, -1)) {
+                error = "The memory did not release the conversation sequence";
+                clear_all(e);
+                return false;
+            }
+            llama_memory_seq_cp(mem, kSeqSnap, kSeqMain, -1, -1);
+            e.cache  = e.snap;
+            e.n_past = e.snap_n_past;
+            pos      = e.n_past;
+        }
+    } else {
+        pos = e.n_past;
+    }
+
+    const int64_t t0 = now_us();
+    llama_context * pctx = hybrid ? e.ctx_pf : e.ctx;
+    if (!decode_items(e, pctx, items, chunk_of, start, base_len, pos, false, error)) {
+        clear_all(e);
+        return false;
+    }
+
+    // The snapshot before the generation prompt.
+    const bool snap_same = e.snap.size() == base_len && std::equal(e.snap.begin(), e.snap.end(), items.begin());
+    if (!snap_same && base_len > 0) {
+        if (!hybrid) {
+            llama_memory_seq_rm(mem, kSeqSnap, -1, -1);
+            llama_memory_seq_cp(mem, kSeqMain, kSeqSnap, -1, -1);
+        }
+        e.snap.assign(items.begin(), items.begin() + (ptrdiff_t) base_len);
+        e.snap_n_past = pos;
+    }
+
+    if (hybrid) {
+        const int64_t t1 = now_us();
+        if (!transfer_state(e.ctx_pf, e.ctx, error)) {
+            clear_all(e);
+            return false;
+        }
+        e.transfer_us += now_us() - t1;
+    }
+    if (!decode_items(e, e.ctx, items, chunk_of, base_len, items.size(), pos, true, error)) {
+        clear_all(e);
+        return false;
+    }
+    e.cache  = items;
+    e.n_past = pos;
+    e.prefill_tokens = count_tokens(chunk_of, reused, items.size());
+    e.prefill_us     = now_us() - t0 - e.transfer_us;
+    LOGI("prefill: %zu of %zu items reused, %lld tokens decoded in %.0f ms on %s, transfer %.0f ms, memory %d positions",
+         reused, items.size(), (long long) e.prefill_tokens, e.prefill_us / 1000.0,
+         hybrid ? ggml_backend_dev_name(e.device_pf) : e.device ? ggml_backend_dev_name(e.device) : "CPU",
+         e.transfer_us / 1000.0, (int) e.n_past);
+    return true;
+}
+
+/**
+ * Tokenize the prompt. With images, mtmd replaces each media marker with
+ * the chunk of the image in order, and chunk_of points at the image chunks.
+ * Returns false with the error text set.
+ */
+bool tokenize_prompt(JNIEnv * env, Engine & e, const std::string & prompt, const std::vector<jbyteArray> & images,
+                     mtmd::input_chunks & chunks, std::vector<MemItem> & items,
+                     std::vector<const mtmd_input_chunk *> & chunk_of, std::string & error) {
+    items.clear();
+    chunk_of.clear();
+    if (images.empty()) {
+        const std::vector<llama_token> tokens = common_tokenize(llama_model_get_vocab(e.model), prompt, true, true);
+        items.reserve(tokens.size());
+        for (llama_token t : tokens) {
+            items.push_back(MemItem{t, {}});
+        }
+        chunk_of.assign(items.size(), nullptr);
+        return true;
+    }
+
+    if (!ensure_vision(e, error)) {
+        return false;
+    }
+    mtmd::bitmaps bitmaps;
     for (jbyteArray image : images) {
         const jsize len = env->GetArrayLength(image);
         jbyte * bytes = env->GetByteArrayElements(image, nullptr);
+        if (bytes == nullptr) {
+            error = "The image bytes are not readable";
+            return false;
+        }
         const mtmd_helper_bitmap_wrapper w = mtmd_helper_bitmap_init_from_buf(
             e.mctx, reinterpret_cast<const unsigned char *>(bytes), (size_t) len, false,
             mtmd_helper_init_opt_default());
         env->ReleaseByteArrayElements(image, bytes, JNI_ABORT);
         if (w.bitmap == nullptr) {
-            free_bitmaps();
             error = "The image did not decode";
-            return -1;
+            return false;
         }
-        bitmaps.push_back(w.bitmap);
+        bitmaps.entries.emplace_back(w.bitmap);
     }
 
-    mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+    chunks.ptr.reset(mtmd_input_chunks_init());
     mtmd_input_text text;
     text.text          = prompt.c_str();
     text.text_len      = prompt.size();
     text.add_special   = true;
     text.parse_special = true;
-    const int32_t tk = mtmd_tokenize(e.mctx, chunks, &text, bitmaps.data(), bitmaps.size());
-    free_bitmaps();
+    const std::vector<const mtmd_bitmap *> ptrs = bitmaps.c_ptr();
+    const int32_t tk = mtmd_tokenize(e.mctx, chunks.ptr.get(), &text, ptrs.data(), ptrs.size());
     if (tk != 0) {
-        mtmd_input_chunks_free(chunks);
         error = tk == 1 ? "The number of images differs from the number of markers in the prompt"
                         : "The image preprocessing failed";
-        return -1;
+        return false;
     }
-    const llama_pos n_pos = mtmd_helper_get_n_pos(chunks);
-    if ((uint32_t) n_pos + 8 >= llama_n_ctx(e.ctx)) {
-        mtmd_input_chunks_free(chunks);
-        error = "The conversation is longer than the context (" + std::to_string(n_pos) + " positions)";
-        return -1;
+    for (size_t c = 0; c < chunks.size(); ++c) {
+        const mtmd_input_chunk * chunk = chunks[c];
+        switch (mtmd_input_chunk_get_type(chunk)) {
+            case MTMD_INPUT_CHUNK_TYPE_TEXT: {
+                size_t n = 0;
+                const llama_token * tokens = mtmd_input_chunk_get_tokens_text(chunk, &n);
+                for (size_t i = 0; i < n; ++i) {
+                    items.push_back(MemItem{tokens[i], {}});
+                    chunk_of.push_back(nullptr);
+                }
+                break;
+            }
+            case MTMD_INPUT_CHUNK_TYPE_IMAGE:
+                items.push_back(MemItem{LLAMA_TOKEN_NULL, mtmd_input_chunk_get_id(chunk)});
+                chunk_of.push_back(chunk);
+                break;
+            default:
+                error = "The prompt holds a media type that this engine does not decode";
+                return false;
+        }
     }
+    return true;
+}
 
-    clear_memory(e);
-    e.memory_has_media = true;
-    const bool hybrid = e.ctx_pf != nullptr;
-    llama_context * lctx = hybrid ? e.ctx_pf : e.ctx;
-    llama_pos new_n_past = 0;
-    const int64_t t0 = now_us();
-    const int32_t rc = mtmd_helper_eval_chunks(e.mctx, lctx, chunks, 0, 0, hybrid ? kPrefillBatch : e.n_batch, true,
-                                               &new_n_past);
-    if (e.hint) {
-        e.hint->report((now_us() - t0) * 1000);
+/**
+ * The number of items of the prompt without the generation prompt. The
+ * tokens of the generation prompt must be the tail of the items, or the
+ * whole prompt counts as the base.
+ */
+size_t base_length(const Engine & e, const std::string & prompt, const std::string & tail,
+                   const std::vector<MemItem> & items) {
+    if (tail.empty() || prompt.size() < tail.size() ||
+        prompt.compare(prompt.size() - tail.size(), tail.size(), tail) != 0) {
+        return items.size();
     }
-    const size_t n_tokens = mtmd_helper_get_n_tokens(chunks);
-    mtmd_input_chunks_free(chunks);
-    if (rc != 0) {
-        clear_memory(e);
-        error = "The prompt with images did not decode, code " + std::to_string(rc);
-        return -1;
+    const std::vector<llama_token> tail_tokens = common_tokenize(llama_model_get_vocab(e.model), tail, false, true);
+    if (tail_tokens.empty() || tail_tokens.size() > items.size()) {
+        return items.size();
     }
-    if (hybrid && !hybrid_finish(e, error)) {
-        clear_memory(e);
-        return -1;
+    const size_t base = items.size() - tail_tokens.size();
+    for (size_t i = 0; i < tail_tokens.size(); ++i) {
+        if (items[base + i] != MemItem{tail_tokens[i], {}}) {
+            return items.size();
+        }
     }
-    LOGI("image prefill: %zu images, %zu tokens, %d positions, %.0f ms on %s", images.size(), n_tokens, (int) new_n_past,
-         (now_us() - t0) / 1000.0, hybrid ? ggml_backend_dev_name(e.device_pf) : e.device ? ggml_backend_dev_name(e.device) : "CPU");
-    return (int64_t) n_tokens;
+    return base;
 }
 
 /** Mean and sample standard deviation of the values. */
@@ -471,6 +730,16 @@ std::string jstring_to_std(JNIEnv * env, jstring s) {
     const char * chars = env->GetStringUTFChars(s, nullptr);
     std::string out(chars);
     env->ReleaseStringUTFChars(s, chars);
+    return out;
+}
+
+/** The string element i of a Java array, with its local reference released. */
+std::string array_string(JNIEnv * env, jobjectArray array, jsize i) {
+    jstring s = (jstring) env->GetObjectArrayElement(array, i);
+    std::string out = jstring_to_std(env, s);
+    if (s != nullptr) {
+        env->DeleteLocalRef(s);
+    }
     return out;
 }
 
@@ -580,10 +849,16 @@ Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, js
     const std::string path    = jstring_to_std(env, jpath);
     const std::string device  = jstring_to_std(env, jdevice);
     const std::string prefill = jstring_to_std(env, jprefill);
+    if (n_ctx < kBatch) {
+        throw_java(env, "The context length must be at least " + std::to_string(kBatch) + " tokens, not " + std::to_string(n_ctx));
+        return 0;
+    }
+    // The destructor of the engine releases what loaded when a later step fails.
     auto e = std::make_unique<Engine>();
     e->n_threads  = std::max(1, (int) n_threads);
     e->gpu_layers = gpu_layers;
     e->mmproj     = jstring_to_std(env, jmmproj);
+    const bool hybrid = !prefill.empty();
 
     // The device by its ggml name: GPUOpenCL for the Adreno, HTP0 for the Hexagon NPU.
     std::vector<ggml_backend_dev_t> devices;
@@ -605,26 +880,28 @@ Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, js
         return 0;
     }
 
+    // The decode context. Without the hybrid backend, a second sequence holds
+    // the prompt snapshot: the KV cache is unified, thus the sequences share
+    // cells, and the recurrent memory has one cell for each sequence.
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx           = n_ctx;
-    cp.n_batch         = e->n_batch;
-    cp.n_ubatch        = e->n_batch;
+    cp.n_ctx           = (uint32_t) n_ctx;
+    cp.n_batch         = kBatch;
+    cp.n_ubatch        = kBatch;
+    cp.n_seq_max       = hybrid ? 1 : 2;
+    cp.kv_unified      = true;
     cp.n_threads       = e->n_threads;
     cp.n_threads_batch = e->n_threads;
     cp.no_perf         = false;
     e->ctx = llama_init_from_model(e->model, cp);
     if (e->ctx == nullptr) {
-        llama_model_free(e->model);
         throw_java(env, "The context did not initialize (n_ctx=" + std::to_string(n_ctx) + ")");
         return 0;
     }
 
-    // The hybrid backend: the same file again on the prefill device, with the prefill batch.
-    if (!prefill.empty()) {
+    // The hybrid backend: the same file again on the prefill device, one sequence.
+    if (hybrid) {
         e->device_pf = ggml_backend_dev_by_name(prefill.c_str());
         if (e->device_pf == nullptr) {
-            llama_free(e->ctx);
-            llama_model_free(e->model);
             throw_java(env, "The prefill device is not available: " + prefill);
             return 0;
         }
@@ -634,17 +911,14 @@ Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, js
         mp_pf.devices      = devices_pf.data();
         e->model_pf = llama_model_load_from_file(path.c_str(), mp_pf);
         llama_context_params cp_pf = cp;
-        cp_pf.n_batch  = kPrefillBatch;
-        cp_pf.n_ubatch = kPrefillBatch;
+        cp_pf.n_seq_max = 1;
         e->ctx_pf = e->model_pf ? llama_init_from_model(e->model_pf, cp_pf) : nullptr;
         if (e->ctx_pf == nullptr) {
-            if (e->model_pf) llama_model_free(e->model_pf);
-            llama_free(e->ctx);
-            llama_model_free(e->model);
             throw_java(env, "The prefill model did not load on " + prefill);
             return 0;
         }
     }
+    e->batch = llama_batch_init(kBatch, 0, 1);
 
     // The thread pool exists before the first decode, thus its thread ids are
     // known and go into the ADPF session together with the caller thread.
@@ -656,6 +930,10 @@ Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, js
     tpp.poll       = 0;
     tpp.strict_cpu = false;
     e->tp = ggml_threadpool_new(&tpp);
+    if (e->tp == nullptr) {
+        throw_java(env, "The thread pool did not start (" + std::to_string(e->n_threads) + " threads)");
+        return 0;
+    }
     llama_attach_threadpool(e->ctx, e->tp, e->tp);
     if (e->ctx_pf != nullptr) {
         llama_attach_threadpool(e->ctx_pf, e->tp, e->tp);
@@ -671,7 +949,12 @@ Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, js
     tids.push_back(gettid());
     e->hint = std::make_unique<PerfHintSession>(tids, kHintTargetNs);
 
-    e->tmpls = common_chat_templates_init(e->model, "");
+    try {
+        e->tmpls = common_chat_templates_init(e->model, "");
+    } catch (const std::exception & ex) {
+        throw_java(env, std::string("The chat template of the model did not parse: ") + ex.what());
+        return 0;
+    }
     e->tok_think_open  = single_token(llama_model_get_vocab(e->model), "<think>");
     e->tok_think_close = single_token(llama_model_get_vocab(e->model), "</think>");
     rebuild_sampler(*e, false, 0.7f, 0.8f);
@@ -684,28 +967,7 @@ Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, js
 
 JNIEXPORT void JNICALL
 Java_ai_airi_qwenmobile_LlamaNative_free(JNIEnv *, jclass, jlong handle) {
-    Engine * e = engine_of(handle);
-    if (e == nullptr) {
-        return;
-    }
-    {
-        std::lock_guard<std::mutex> lock(e->mutex);
-        e->hint.reset();
-        if (e->smpl) llama_sampler_free(e->smpl);
-        if (e->mctx) mtmd_free(e->mctx);
-        if (e->ctx_pf) {
-            llama_detach_threadpool(e->ctx_pf);
-            llama_free(e->ctx_pf);
-        }
-        if (e->model_pf) llama_model_free(e->model_pf);
-        if (e->ctx) {
-            llama_detach_threadpool(e->ctx);
-            llama_free(e->ctx);
-        }
-        if (e->tp) ggml_threadpool_free(e->tp);
-        if (e->model) llama_model_free(e->model);
-    }
-    delete e;
+    delete engine_of(handle);
 }
 
 JNIEXPORT jstring JNICALL
@@ -731,13 +993,18 @@ Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass, jlong handle
 
     // A message with an image starts with the media marker. mtmd replaces
     // the marker with the vision tokens of that image, in message order.
+    // Each local reference goes away at once: the table holds 512.
     common_chat_templates_inputs inputs;
     std::vector<jbyteArray> image_refs;
     const jsize n = env->GetArrayLength(roles);
+    if (env->GetArrayLength(contents) != n || (images != nullptr && env->GetArrayLength(images) != n)) {
+        throw_java(env, "The roles, contents and images arrays have different lengths");
+        return -1;
+    }
     for (jsize i = 0; i < n; ++i) {
         common_chat_msg msg;
-        msg.role    = jstring_to_std(env, (jstring) env->GetObjectArrayElement(roles, i));
-        msg.content = jstring_to_std(env, (jstring) env->GetObjectArrayElement(contents, i));
+        msg.role    = array_string(env, roles, i);
+        msg.content = array_string(env, contents, i);
         jbyteArray image = images ? (jbyteArray) env->GetObjectArrayElement(images, i) : nullptr;
         if (image != nullptr) {
             msg.content = std::string(mtmd_default_marker()) + "\n" + msg.content;
@@ -749,9 +1016,24 @@ Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass, jlong handle
     inputs.use_jinja             = true;
     inputs.enable_thinking       = thinking;
 
+    // The prompt, and the generation prompt at its end. The template gives
+    // the tail directly, or the render without it gives the common prefix.
     std::string prompt;
+    std::string tail;
     try {
-        prompt = common_chat_templates_apply(e->tmpls.get(), inputs).prompt;
+        common_chat_params params = common_chat_templates_apply(e->tmpls.get(), inputs);
+        prompt = std::move(params.prompt);
+        tail   = std::move(params.generation_prompt);
+        if (tail.empty() || prompt.size() < tail.size() ||
+            prompt.compare(prompt.size() - tail.size(), tail.size(), tail) != 0) {
+            inputs.add_generation_prompt = false;
+            const std::string base = common_chat_templates_apply(e->tmpls.get(), inputs).prompt;
+            size_t k = 0;
+            while (k < base.size() && k < prompt.size() && base[k] == prompt[k]) {
+                ++k;
+            }
+            tail = prompt.substr(k);
+        }
     } catch (const std::exception & ex) {
         throw_java(env, std::string("The chat template failed: ") + ex.what());
         return -1;
@@ -759,70 +1041,39 @@ Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass, jlong handle
 
     rebuild_sampler(*e, thinking, temperature, top_p);
     e->utf8_pending.clear();
-    e->gen_tokens  = 0;
-    e->gen_us      = 0;
-    e->first_eog   = false;
-    e->first_kind  = 0;
-    e->transfer_us = 0;
+    e->prefill_tokens = 0;
+    e->prefill_us     = 0;
+    e->transfer_us    = 0;
+    e->gen_tokens     = 0;
+    e->gen_us         = 0;
 
-    if (!image_refs.empty()) {
-        std::string error;
-        const int64_t t0 = now_us();
-        const int64_t n_tokens = prefill_with_images(env, *e, prompt, image_refs, error);
-        if (n_tokens < 0) {
-            throw_java(env, error);
-            return -1;
-        }
-        e->prefill_us     = now_us() - t0;
-        e->prefill_tokens = n_tokens;
-        return (jint) n_tokens;
-    }
-
-    const std::vector<llama_token> tokens = common_tokenize(llama_model_get_vocab(e->model), prompt, true, true);
-    if (tokens.size() + 8 >= llama_n_ctx(e->ctx)) {
-        throw_java(env, "The conversation is longer than the context (" + std::to_string(tokens.size()) + " tokens)");
-        return -1;
-    }
-
-    // The memory keeps the previous turns when the new prompt extends them.
-    // A recurrent state cannot roll back, thus any other case starts again.
-    if (e->memory_has_media) {
-        clear_memory(*e);
-    }
-    size_t common = 0;
-    while (common < e->cache.size() && common < tokens.size() && e->cache[common] == tokens[common]) {
-        ++common;
-    }
-    size_t start = 0;
-    if (common == e->cache.size() && common < tokens.size()) {
-        start = common;
-    } else {
-        clear_memory(*e);
-    }
-
-    const int64_t t0 = now_us();
-    const int n_new = (int) (tokens.size() - start);
     std::string error;
-    bool ok;
-    if (e->ctx_pf != nullptr && n_new >= kHybridMinTokens) {
-        // Both contexts hold these tokens after the prefill. The first answer token joins the cache.
-        e->cache = tokens;
-        ok = hybrid_prefill_tokens(*e, tokens.data() + start, n_new, start > 0, error);
-    } else {
-        const int rc = decode_tokens(*e, e->ctx, tokens.data() + start, n_new);
-        ok = rc == 0;
-        if (!ok) {
-            error = "llama_decode failed on the prompt with code " + std::to_string(rc);
-        }
-        e->cache = tokens;
-    }
-    if (!ok) {
-        clear_memory(*e);
+    mtmd::input_chunks chunks;
+    std::vector<MemItem> items;
+    std::vector<const mtmd_input_chunk *> chunk_of;
+    if (!tokenize_prompt(env, *e, prompt, image_refs, chunks, items, chunk_of, error)) {
         throw_java(env, error);
         return -1;
     }
-    e->prefill_us     = now_us() - t0;
-    e->prefill_tokens = n_new;
+    const int64_t n_tokens = count_tokens(chunk_of, 0, items.size());
+    if (items.empty() || (uint64_t) n_tokens + kContextHeadroom >= llama_n_ctx(e->ctx)) {
+        throw_java(env, "The conversation is longer than the context (" + std::to_string(n_tokens) + " tokens)");
+        return -1;
+    }
+    size_t base_len = base_length(*e, prompt, tail, items);
+    if (base_len == items.size() && e->ctx_pf != nullptr) {
+        // The decode context must decode the last token itself: the state transfer carries no logits.
+        base_len -= 1;
+    }
+    if (chunk_of.back() != nullptr) {
+        throw_java(env, "The prompt ends with an image, thus it gives no logits");
+        return -1;
+    }
+
+    if (!prefill(*e, items, chunk_of, base_len, error)) {
+        throw_java(env, error);
+        return -1;
+    }
     return (jint) e->prefill_tokens;
 }
 
@@ -831,31 +1082,25 @@ Java_ai_airi_qwenmobile_LlamaNative_generateNext(JNIEnv * env, jclass, jlong han
     Engine * e = engine_of(handle);
     std::lock_guard<std::mutex> lock(e->mutex);
     const llama_vocab * vocab = llama_model_get_vocab(e->model);
-    if (e->first_eog) {
-        // The prefill context sampled the end token as the first answer token.
-        e->first_eog = false;
+    if ((uint32_t) e->n_past >= llama_n_ctx(e->ctx)) {
+        throw_java(env, "The context is full (" + std::to_string(llama_n_ctx(e->ctx)) + " tokens). Start a new chat.");
         return nullptr;
-    }
-    if (e->first_kind != 0) {
-        // The first token of a hybrid turn was a thinking tag: report it before the next sample.
-        const int kind = e->first_kind;
-        e->first_kind = 0;
-        return pack_piece(env, *e, kind);
     }
 
     const int64_t t0 = now_us();
     const llama_token token = llama_sampler_sample(e->smpl, e->ctx, -1);
     if (llama_vocab_is_eog(vocab, token)) {
-        // The end token goes into the memory, thus the next turn extends this one.
+        // The end token goes into the memory, thus a template that renders it lets the next turn extend this one.
         decode_one(*e, token);
         return nullptr;
     }
     const int kind = token_kind(*e, token);
     if (kind == 0) {
-        e->utf8_pending += common_token_to_piece(e->ctx, token, true);
+        append_piece(*e, token);
     }
-    if (decode_one(*e, token) != 0) {
-        throw_java(env, "llama_decode failed during generation");
+    const int rc = decode_one(*e, token);
+    if (rc != 0) {
+        throw_java(env, "llama_decode failed during generation with code " + std::to_string(rc));
         return nullptr;
     }
     e->gen_tokens += 1;
@@ -870,11 +1115,11 @@ Java_ai_airi_qwenmobile_LlamaNative_stats(JNIEnv * env, jclass, jlong handle) {
     char line[256];
     const double pp = e->prefill_us > 0 ? e->prefill_tokens * 1e6 / e->prefill_us : 0.0;
     const double tg = e->gen_us > 0 ? e->gen_tokens * 1e6 / e->gen_us : 0.0;
-    const llama_pos n_past = llama_memory_seq_pos_max(llama_get_memory(e->ctx), 0) + 1;
+    const llama_pos n_past = llama_memory_seq_pos_max(llama_get_memory(e->ctx), kSeqMain) + 1;
     const char * pf_dev = e->device_pf ? ggml_backend_dev_name(e->device_pf) : e->device ? ggml_backend_dev_name(e->device) : "CPU";
+    const std::string transfer = e->device_pf ? ", transfer " + std::to_string(e->transfer_us / 1000) + " ms" : "";
     snprintf(line, sizeof(line), "prefill %lld tok in %.0f ms (%.1f t/s on %s%s), generate %lld tok (%.1f t/s), memory %d pos",
-             (long long) e->prefill_tokens, e->prefill_us / 1000.0, pp, pf_dev,
-             e->device_pf ? (", transfer " + std::to_string(e->transfer_us / 1000) + " ms").c_str() : "",
+             (long long) e->prefill_tokens, e->prefill_us / 1000.0, pp, pf_dev, transfer.c_str(),
              (long long) e->gen_tokens, tg, (int) n_past);
     return env->NewStringUTF(line);
 }
@@ -883,13 +1128,15 @@ JNIEXPORT void JNICALL
 Java_ai_airi_qwenmobile_LlamaNative_resetChat(JNIEnv *, jclass, jlong handle) {
     Engine * e = engine_of(handle);
     std::lock_guard<std::mutex> lock(e->mutex);
-    clear_memory(*e);
+    clear_all(*e);
+    e->image_cache.clear();
+    e->image_cache_bytes = 0;
     e->utf8_pending.clear();
-    e->prefill_tokens = e->prefill_us = e->gen_tokens = e->gen_us = 0;
+    e->prefill_tokens = e->prefill_us = e->transfer_us = e->gen_tokens = e->gen_us = 0;
 }
 
 /**
- * The llama-bench method: pp tokens in batches of n_batch, then tg tokens
+ * The llama-bench method: pp tokens in batches of kBatch, then tg tokens
  * one at a time, each on a clean memory, reps times. The chat memory is
  * empty after the benchmark.
  */
@@ -913,7 +1160,7 @@ Java_ai_airi_qwenmobile_LlamaNative_bench(JNIEnv * env, jclass, jlong handle,
             llama_context * pctx = e->ctx_pf ? e->ctx_pf : e->ctx;
             llama_memory_clear(llama_get_memory(pctx), true);
             const int64_t t0 = now_us();
-            const int rc = decode_tokens(*e, pctx, tokens.data(), pp);
+            const int rc = decode_text(*e, pctx, tokens.data(), pp, 0, true);
             llama_synchronize(pctx);
             const int64_t dt = now_us() - t0;
             if (rc != 0) {
@@ -928,7 +1175,7 @@ Java_ai_airi_qwenmobile_LlamaNative_bench(JNIEnv * env, jclass, jlong handle,
             int rc = 0;
             for (int i = 0; i < tg && rc == 0; ++i) {
                 llama_token t = pick(rng);
-                rc = decode_tokens(*e, e->ctx, &t, 1);
+                rc = decode_text(*e, e->ctx, &t, 1, i, true);
                 llama_synchronize(e->ctx);
             }
             const int64_t dt = now_us() - t0;
@@ -939,7 +1186,7 @@ Java_ai_airi_qwenmobile_LlamaNative_bench(JNIEnv * env, jclass, jlong handle,
             tg_tps.push_back(tg * 1e6 / dt);
         }
     }
-    clear_memory(*e);
+    clear_all(*e);
 
     char desc[128];
     llama_model_desc(e->model, desc, sizeof(desc));
