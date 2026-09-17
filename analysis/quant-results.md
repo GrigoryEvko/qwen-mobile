@@ -349,3 +349,80 @@ than Q4_0. But its block scale is a power of two (E8M0, one byte) and its levels
 table. The gain of this pipeline comes from the fitted F16 scale of each block, from the rotation
 and from the folded column scales. Thus MXFP4 gives up the scale search for 5.6 % of the bytes.
 Measure it before any use.
+
+## The per-class plan on the row-7 packs (2026-09-18)
+
+Which class earns its bytes at 8 bits? Each row takes the solved Q4_0 packs of row 7 and moves one
+class to round-to-nearest Q8_0. The other classes keep their packs, thus the rows differ in one
+class only. Q8_0 is near-lossless, thus round-to-nearest needs no calibration for a moved class.
+
+`ssm_out` wins by a wide margin: 36 MiB removes 15 % of the mean KL and 45 % of the maximum KL. It
+is 2.6 times better per megabyte than `ffn_down`, 3.4 times better than the attention q and o
+pair, and 5.2 times better than the GDN qkv.
+
+| # | Class at Q8_0 | Bytes | Added MiB | Mean KL | 99.9 % KL | Max KL | Top-1 | PPL | Mean KL per added MiB |
+|---|---|---|---|---|---|---|---|---|---|
+| a | none, the row-7 file (control) | 1,743,744,000 | 0 | 0.029588 | 0.590 | 7.370 | 91.397 % | 14.430 | |
+| b | `ssm_out` (GDN out), 18 tensors | 1,781,492,736 | 36 | 0.025223 | 0.461 | 4.079 | 91.250 % | 14.382 | 1.21e-4 |
+| c | `attn_q` and `attn_output`, 12 tensors | 1,781,492,736 | 36 | 0.028311 | 0.583 | 7.504 | 91.250 % | 14.410 | 3.55e-5 |
+| d | b and c together, 30 tensors | 1,819,241,472 | 72 | 0.024027 | 0.441 | 4.333 | 91.716 % | 14.378 | 7.72e-5 |
+| e | `ffn_down` (MLP down), 24 tensors | 1,894,738,944 | 144 | 0.022919 | 0.404 | 7.177 | 91.716 % | 14.347 | 4.63e-5 |
+| f | `attn_qkv` (GDN qkv), 18 tensors | 1,856,990,208 | 108 | 0.027082 | 0.493 | 7.027 | 91.275 % | 14.383 | 2.32e-5 |
+| g | b, c, e and f together, 72 tensors | 2,083,482,624 | 324 | 0.015025 | 0.199 | 2.765 | 93.260 % | 14.220 | 4.49e-5 |
+| h | `token_embd` at Q4_0, not Q8_0 (row 10) | 1,489,464,320 | −242.5 | 0.030870 | 0.788 | 8.073 | 91.176 % | 14.471 | 5.29e-6 |
+
+Row a reproduces row 7c and row h reproduces row 10, thus the harness is the harness of those rows.
+Row h reads in the other direction: the embedding at Q8_0 costs 242.5 MiB and gives 0.00128 of mean
+KL, which is 23 times less KL per megabyte than `ssm_out`. Thus the embedding is the first place to
+take bytes away, and `ssm_out` is the first place to give them.
+
+The rows on the Pareto front, from small to large: h (1.39 GiB), a (1.62 GiB), b (1.66 GiB),
+d (1.69 GiB), e (1.76 GiB), g (1.94 GiB). Row f is the one row that another row dominates: d is
+smaller and its KL is lower. Row g gives a little less than the sum of its parts: it removes
+0.01456 of mean KL, and rows b, c, e and f remove 0.01482 together. It adds 1.9 points of top-1.
+
+`ssm_out` is also the one class that moves the maximum KL. It takes the maximum from 7.37 to 4.08,
+and `ffn_down`, `attn_qkv` and the attention pair leave it at 7.0 to 7.5. The 4B Q8_0 measurement
+of the section above names the same class for its tail. The unsloth per-tensor sweep of the
+35B-A3B ranks `ssm_out` first as well. Three measurements on three models agree.
+
+### How a class moves to Q8_0 without a new calibration
+
+A moved class needs its weight in the coordinates of the calibration, because the folds moved the
+columns of the solved classes, the channel order of the MLP and the norms. The folded reference
+`weights/Qwen3.5-2B-tf` of row 7 is on the box and not on the laptop. Thus `--promote` takes the
+unfolded source (`--source tu`) and `quant/refold.py` makes the folded weight from three sources:
+
+- The norm ratio. The column scales of a class sit in the norm that feeds it, thus the source norm
+  divided by the folded norm gives them. This is exact for the mixer inputs, for `ssm_out`
+  (`ssm_norm`), for the MLP gate and up (`post_attention_norm`) and for the head.
+- The row ratio of the folded `attn_v`, which holds the column scales of `attn_output`.
+- The packs of `ffn_gate` and `ffn_up`, which give the channel permutation by the cosine of each
+  row, and the `ffn_down` column scales by the least-squares ratio of the rows.
+
+Three numbers check the result, because `search_column_scales` makes scales of geometric mean one.
+The recovered `ssm_norm` scales have a geometric mean of 0.9989 to 1.0003, the `attn_v` row scales
+1.0000 to 1.0001, and the `ffn_down` scales 0.9967 to 0.9998 before the correction of their mean.
+The row match of the MLP has a minimum cosine of 0.9935 and a minimum margin of 0.022 over the 24
+layers, and the two packs of a layer always give the same permutation. A moved tensor then holds
+the FP weight of the original checkpoint in the coordinates of the file, which is what 8 bits must
+hold. The tests of `quant/tests/test_refold.py` give the exact classes and the approximate ones.
+
+The numbers of rows b to g are a lower bound of a calibration that knows the plan. The solver chose
+the column scales of the moved class for a 16-level grid, and a calibration with `ssm_out` at Q8_0
+would choose them for 256 levels, and the block optimization would then refine the rest around it.
+The commands, from the project root with the `.venv`:
+
+    .venv/bin/python -m quant.run export --model Qwen3.5-2B --device cuda --source tu \
+        --packs quant-out/Qwen3.5-2B-bo-gptq-frozen-e2 --promote 'ssm_out\.weight' --tag q8-ssm-out
+    .venv/bin/python -m quant.run export --model Qwen3.5-2B --device cuda --source tu \
+        --packs quant-out/Qwen3.5-2B-bo-gptq-frozen-e2 --promote 'attn_q\.weight|attn_output\.weight' --tag q8-attn-qo
+    .venv/bin/python -m quant.run export --model Qwen3.5-2B --device cuda --source tu \
+        --packs quant-out/Qwen3.5-2B-bo-gptq-frozen-e2 --promote 'ffn_down\.weight' --tag q8-ffn-down
+    .venv/bin/python -m quant.run export --model Qwen3.5-2B --device cuda --source tu \
+        --packs quant-out/Qwen3.5-2B-bo-gptq-frozen-e2 --promote 'attn_qkv\.weight' --tag q8-gdn-qkv
+    .venv/bin/python -m quant.run export --model Qwen3.5-2B --device cuda --source tu \
+        --packs quant-out/Qwen3.5-2B-bo-gptq-frozen-e2 \
+        --promote 'ssm_out\.weight|attn_q\.weight|attn_output\.weight|attn_qkv\.weight|ffn_down\.weight' \
+        --tag q8-all-but-mlp-gate-up
+    .venv/bin/python -m quant.run eval --model Qwen3.5-2B --gguf weights/gguf/Qwen3.5-2B-<tag>.gguf
