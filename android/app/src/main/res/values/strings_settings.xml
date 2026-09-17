@@ -11,6 +11,7 @@
     <string name="settings_backend_cpu">CPU</string>
     <string name="settings_backend_gpu">GPU</string>
     <string name="settings_backend_npu">NPU</string>
+    <string name="settings_backend_hybrid">NPU+GPU</string>
     <string name="settings_threads">Threads</string>
     <string name="settings_context">Context length</string>
     <string name="settings_generation">Generation</string>

@@ -23,6 +23,10 @@ Row 5 over-fits: the per-layer training loss halves, the held-out error grows at
 KL 0.0421 against 0.0291 for row 3). The diagnostics (solver start, frozen latent weights, 2 epochs,
 4x data) follow.
 
+Phone speed of row 3 (the GPTQ Q4_0 file, llama-bench, thermal status 0, 2026-09-17, op fusion off on
+the NPU): GPU OpenCL pp512 574 t/s, tg64 30.1 t/s. NPU HTP0 pp512 968 t/s, tg64 31.9 t/s. The F16
+file gives tg 13.6 (GPU) and 13.8 (NPU), thus Q4_0 more than doubles the decode speed.
+
 Grid test on Gaussian weights (256 x 512, block-32 F16 scales with the scale search, 4.5 bits per
 weight, `python -m quant.trellis`): Q4_0 21.8 dB, IQ4_NL 22.2 dB, codebook per matrix 22.3 dB,
 trellis (bit-shift, L = 12) 22.0 dB with a Gaussian table and 21.7 dB with the Ungerboeck cosets.

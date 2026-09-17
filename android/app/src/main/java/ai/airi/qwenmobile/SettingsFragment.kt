@@ -101,11 +101,13 @@ class SettingsFragment : Fragment() {
         b.cpuChip.isEnabled = LlamaEngine.has(Backend.CPU)
         b.gpuChip.isEnabled = LlamaEngine.has(Backend.GPU)
         b.npuChip.isEnabled = LlamaEngine.has(Backend.NPU)
+        b.hybridChip.isEnabled = LlamaEngine.has(Backend.HYBRID)
         b.backendGroup.setOnCheckedStateChangeListener { _, checkedIds ->
             if (applying) return@setOnCheckedStateChangeListener
             val backend = when (checkedIds.firstOrNull()) {
                 b.gpuChip.id -> Backend.GPU
                 b.npuChip.id -> Backend.NPU
+                b.hybridChip.id -> Backend.HYBRID
                 else -> Backend.CPU
             }
             store.update { it.copy(backend = backend) }
@@ -182,6 +184,7 @@ class SettingsFragment : Fragment() {
                     Backend.CPU -> b.cpuChip.id
                     Backend.GPU -> b.gpuChip.id
                     Backend.NPU -> b.npuChip.id
+                    Backend.HYBRID -> b.hybridChip.id
                 },
             )
             b.threadsSlider.value = s.threads.toFloat()
