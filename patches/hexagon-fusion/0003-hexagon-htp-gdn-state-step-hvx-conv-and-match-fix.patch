@@ -1,0 +1,1280 @@
+Hexagon HTP: HVX conv step, and the match of the state step on the real graph
+
+Base: llama.cpp commit c6824a9, with patches 0001 and 0002 applied. This patch changes only
+files of 0002 and adds one header.
+
+Files:
+    ggml/src/ggml-hexagon/htp-gdn-match.h           new: the chain checks, with a reason for each failure
+    ggml/src/ggml-hexagon/ggml-hexagon.cpp          uses the header, logs the first failed condition
+    ggml/src/ggml-hexagon/htp/gdn-conv-ops.c        the conv step in HVX, no DMA and no VTCM
+
+How to apply, from the llama.cpp root:
+
+    git apply patches/hexagon-fusion/0003-hexagon-htp-gdn-state-step-hvx-conv-and-match-fix.patch
+    cmake --build build-snapdragon -j
+
+Push to the phone: libggml-htp-v79.so (ggml/src/ggml-hexagon/), libggml-hexagon.so (bin/),
+and test-backend-ops (bin/).
+
+Problem 1: GDN_CONV_STEP took 350 us per op
+
+The conv step of 0002 ran a scalar loop on data in VTCM. Scalar loads and stores to VTCM are
+slow, and no other kernel of this backend does that. The new kernel is HVX only: it reads DDR
+with unaligned vector loads, keeps a block of 32 channels in registers, and writes DDR with
+unaligned vector stores. The layout change from 3 lanes per channel (the slot) to 4 lanes per
+channel (the taps) uses rotates and masks, four vdeal ops split the block into tap planes, and
+the four products are added in the order of the CPU reference. The SiLU is the sigmoid and the
+multiply of the SILU op. The new slot lanes come back from the 4-lane block with rotates and
+masks. Only d_conv = 4 is fused; another width keeps the unfused path.
+
+Problem 2: GDN_STATE_STEP never matched on the real graph
+
+The check "no reader of the state part of the output outside the chain" looked at the source
+of each reader. A view node has the whole output as its source, thus the attention view of
+the output (the first S_v * H floats) failed the check. The check now judges a view node by
+its own range, and a compute node by the view it reads. A host probe that runs the same
+checks on the one-token graph of Qwen3.5-2B matches 18 of 18 state chains and 18 of 18 conv
+chains after the fix.
+
+With GGML_HEXAGON_VERBOSE=1 the host logs one line for each candidate chain that does not
+match, with the failed condition, for example:
+    ggml-hex: HTP0 GDN_STATE_STEP candidate node_46 (node 46): the state part of the output has a reader outside the chain
+
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 642a4f9..3751b25 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -51,6 +51,7 @@
+ #include "ggml-impl.h"
+ #include "ggml-quants.h"
+ #include "htp-opnode.h"
++#include "htp-gdn-match.h"
+ #include "htp-ops.h"
+ #include "htp/matmul-ops.h"
+ #include "htp/flash-attn-ops.h"
+@@ -5861,357 +5862,71 @@ static bool is_mergeable_mul_mat_id_pair(const ggml_tensor * n1, const ggml_tens
+ 
+ // ** fused recurrent state step of a gated delta net layer at one token
+ //
+-// At one token, the graph of a gated delta net layer (Qwen3.5, Qwen3-Next) reads the two recurrent
+-// states with GET_ROWS, updates them, and writes them back with CPY. Two chains become one op each:
+-//
+-//   GET_ROWS(cache_r, s_copy) -> CONCAT(., x^T) -> SSM_CONV -> SILU, and CPY(view of the CONCAT, slot of cache_r)
+-//     -> HTP_OP_GDN_CONV_STEP
+-//   GET_ROWS(cache_s, s_copy) -> GATED_DELTA_NET(K = 1), and CPY(state tail, slot of cache_s)
+-//     -> HTP_OP_GDN_STATE_STEP
+-//
+-// The DSP reads the source slot index from s_copy and writes the destination slot of the CPY. When the
+-// two slots are the same, the update is in place. The match needs one token, one sequence, one CPY, no
+-// other reader of the replaced tensors, and no other node that touches the cache inside the chain span.
+-// The state_zero SCALE of build_rs comes before the chain, thus it stays a separate op and runs first.
++// The checks are in htp-gdn-match.h (ggml only, thus a host program can run them on a graph). This part
++// builds the fused ops and logs the first failed condition of each candidate chain.
+ 
+ struct ggml_hexagon_gdn_fusion {
+     std::vector<uint8_t>                skip; // graph index -> the node is replaced by a fused op
+     std::unordered_map<int, htp_opnode> at;   // graph index -> the fused op emitted at that index
+ };
+ 
+-static inline ggml_tensor * ggml_hexagon_root(ggml_tensor * t) {
+-    return t->view_src ? t->view_src : t;
+-}
+-
+-static inline bool ggml_hexagon_is_view_op(const ggml_tensor * t) {
+-    return t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
+-}
+-
+-// A contiguous F32 row of n elements with unit outer dimensions
+-static inline bool ggml_hexagon_is_f32_row(const ggml_tensor * t, int64_t n) {
+-    return t->type == GGML_TYPE_F32 && t->ne[0] == n && t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1 &&
+-           t->nb[0] == sizeof(float);
+-}
+-
+-// The "states" tensor of build_rs: an F32 table [row, n_slots] of the cache with contiguous rows
+-static inline bool ggml_hexagon_is_state_table(const ggml_tensor * t, int64_t row) {
+-    return t->type == GGML_TYPE_F32 && t->ne[0] == row && t->ne[1] >= 1 &&
+-           t->ne[2] == 1 && t->ne[3] == 1 && t->nb[0] == sizeof(float) && t->nb[1] == (size_t) row * sizeof(float);
+-}
+-
+-template <typename T>
+-static inline bool ggml_hexagon_contains(const std::vector<T> & v, const T & x) {
+-    return std::find(v.begin(), v.end(), x) != v.end();
+-}
+-
+-// True when the node reads or writes the root tensor through any view
+-static bool ggml_hexagon_node_touches(ggml_tensor * n, const ggml_tensor * root) {
+-    if (ggml_hexagon_root(n) == root) {
+-        return true;
+-    }
+-    for (int i = 0; i < GGML_MAX_SRC; i++) {
+-        if (n->src[i] && ggml_hexagon_root(n->src[i]) == root) {
+-            return true;
+-        }
+-    }
+-    return false;
+-}
++static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, const ggml_cgraph * gf,
++                                           ggml_hexagon_gdn_fusion & fu) {
++    const auto index = ggml_hexagon_gdn_index(gf);
+ 
+-// Every node that reads an intermediate (also through a view) must be a member of the chain. A view of
+-// `out` is permitted for any node when the view lies in the first `out_head_bytes` bytes of `out`.
+-static bool ggml_hexagon_chain_is_private(const ggml_cgraph * gf,
+-                                          const std::vector<ggml_tensor *> & intermediates,
+-                                          const std::vector<ggml_tensor *> & members,
+-                                          const ggml_tensor * out, size_t out_head_bytes) {
+-    for (auto * t : intermediates) {
+-        if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
+-            return false;
+-        }
+-    }
+-    if (out && (out->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+-        return false;
+-    }
+-    for (int i = 0; i < gf->n_nodes; i++) {
+-        ggml_tensor * n = gf->nodes[i];
+-        for (int s = 0; s < GGML_MAX_SRC; s++) {
+-            ggml_tensor * src = n->src[s];
+-            if (!src) {
+-                continue;
++    auto skip_members = [&](const std::vector<ggml_tensor *> & members) {
++        for (auto * t : members) {
++            auto it = index.find(t);
++            if (it != index.end()) {
++                fu.skip[it->second] = 1;
+             }
+-            ggml_tensor * root = ggml_hexagon_root(src);
+-            if (out && root == out) {
+-                if (src != out && src->view_offs + ggml_nbytes(src) <= out_head_bytes) {
+-                    continue;
+-                }
+-                if (ggml_hexagon_contains(members, n)) {
+-                    continue;
+-                }
+-                return false;
+-            }
+-            if (ggml_hexagon_contains(intermediates, root) && !ggml_hexagon_contains(members, n)) {
+-                return false;
+-            }
+-        }
+-    }
+-    return true;
+-}
+-
+-// No node in (first, last] outside the chain touches the cache. Empty nodes do nothing and are ignored.
+-static bool ggml_hexagon_chain_span_is_clean(const ggml_cgraph * gf, int first, int last, const ggml_tensor * cache,
+-                                             const std::vector<ggml_tensor *> & members) {
+-    for (int i = first + 1; i <= last; i++) {
+-        ggml_tensor * n = gf->nodes[i];
+-        if (ggml_is_empty(n) || ggml_hexagon_is_view_op(n) || ggml_hexagon_contains(members, n)) {
+-            continue;
+-        }
+-        if (ggml_hexagon_node_touches(n, cache)) {
+-            return false;
+         }
+-    }
+-    return true;
+-}
+-
+-static bool ggml_hexagon_match_gdn_conv_chain(const ggml_hexagon_session * sess, const ggml_cgraph * gf,
+-                                              const std::unordered_map<const ggml_tensor *, int> & index,
+-                                              int is, ggml_hexagon_gdn_fusion & fu) {
+-    ggml_tensor * S = gf->nodes[is];
+-    if (S->op != GGML_OP_UNARY || ggml_get_unary_op(S) != GGML_UNARY_OP_SILU || S->type != GGML_TYPE_F32 ||
+-        !ggml_is_contiguous(S)) {
+-        return false;
+-    }
+-    ggml_tensor * C = S->src[0];
+-    if (!C || C->op != GGML_OP_SSM_CONV || C->type != GGML_TYPE_F32) {
+-        return false;
+-    }
+-    ggml_tensor * CI = C->src[0];
+-    ggml_tensor * W  = C->src[1];
+-    if (!CI || !W || CI->op != GGML_OP_CONCAT || ggml_get_op_params_i32(CI, 0) != 0) {
+-        return false;
+-    }
+-    if (CI->type != GGML_TYPE_F32 || !ggml_is_contiguous(CI) || CI->ne[2] != 1 || CI->ne[3] != 1) {
+-        return false;
+-    }
+-    const int64_t d_conv = CI->ne[0];
+-    const int64_t n_ch   = CI->ne[1];
+-    if (d_conv < 2 || n_ch < 1) {
+-        return false;
+-    }
+-    const int64_t row = (d_conv - 1) * n_ch;
+-    if (W->type != GGML_TYPE_F32 || W->ne[0] != d_conv || W->ne[1] != n_ch || W->nb[0] != sizeof(float) ||
+-        W->nb[1] != (size_t) d_conv * sizeof(float)) {
+-        return false;
+-    }
+-    if (!ggml_hexagon_is_f32_row(C, n_ch) || !ggml_hexagon_is_f32_row(S, n_ch)) {
+-        return false;
+-    }
+-
+-    // the state read: the first CONCAT input is a reshape of GET_ROWS(states, s_copy)
+-    ggml_tensor * cs = CI->src[0];
+-    if (!cs || !ggml_hexagon_is_view_op(cs) || cs->view_offs != 0 || !ggml_is_contiguous(cs) ||
+-        cs->ne[0] != d_conv - 1 || cs->ne[1] != n_ch || cs->ne[2] != 1 || cs->ne[3] != 1) {
+-        return false;
+-    }
+-    ggml_tensor * R = ggml_hexagon_root(cs);
+-    if (R->op != GGML_OP_GET_ROWS || !ggml_hexagon_is_f32_row(R, row)) {
+-        return false;
+-    }
+-    ggml_tensor * states = R->src[0];
+-    ggml_tensor * idx    = R->src[1];
+-    if (!states || !idx || !ggml_hexagon_is_state_table(states, row) || idx->type != GGML_TYPE_I32 ||
+-        ggml_nelements(idx) != 1) {
+-        return false;
+-    }
+-    ggml_tensor * cache = ggml_hexagon_root(states);
+-
+-    // the new column: the second CONCAT input is the transposed projection [1, n_ch]
+-    ggml_tensor * xt = CI->src[1];
+-    if (!xt || xt->type != GGML_TYPE_F32 || xt->ne[0] != 1 || xt->ne[1] != n_ch || xt->ne[2] != 1 ||
+-        xt->ne[3] != 1 || xt->nb[1] != sizeof(float)) {
+-        return false;
+-    }
++    };
+ 
+-    // the state write: the one CPY of the last d_conv - 1 columns of the CONCAT into a slot of the cache
+-    ggml_tensor * P = nullptr;
+     for (int i = 0; i < gf->n_nodes; i++) {
+-        ggml_tensor * n = gf->nodes[i];
+-        if (n->op != GGML_OP_CPY || !n->src[0] || !n->src[1] || ggml_hexagon_root(n->src[0]) != CI) {
++        if (fu.skip[i]) {
+             continue;
+         }
+-        if (P) {
+-            return false; // more than one write-back (rollback snapshots): keep the unfused path
+-        }
+-        P = n;
+-    }
+-    if (!P || P->type != GGML_TYPE_F32) {
+-        return false;
+-    }
+-    ggml_tensor * last = P->src[0];
+-    ggml_tensor * slot = P->src[1];
+-    if (last->view_offs != sizeof(float) || last->ne[0] != d_conv - 1 || last->ne[1] != n_ch ||
+-        last->ne[2] != 1 || last->ne[3] != 1 || last->nb[0] != sizeof(float) || last->nb[1] != CI->nb[1]) {
+-        return false;
+-    }
+-    if (slot == cache || ggml_hexagon_root(slot) != cache || !ggml_hexagon_is_f32_row(slot, row)) {
+-        return false;
+-    }
+-
+-    const std::vector<ggml_tensor *> intermediates = { R, CI, C };
+-    const std::vector<ggml_tensor *> members       = { cs, CI, C, S, last, P };
+-    if (!ggml_hexagon_chain_is_private(gf, intermediates, members, nullptr, 0)) {
+-        return false;
+-    }
+-
+-    auto ir = index.find(R);
+-    auto ip = index.find(P);
+-    if (ir == index.end() || ip == index.end()) {
+-        return false;
+-    }
+-    const int emit     = std::min(is, ip->second);
+-    const int last_idx = std::max(is, ip->second);
+-    if (ir->second > emit || !ggml_hexagon_chain_span_is_clean(gf, ir->second, last_idx, cache, members)) {
+-        return false;
+-    }
+-
+-    htp_opnode node(HTP_OP_GDN_CONV_STEP, S);
+-    node.name    = "GDN_CONV_STEP";
+-    node.inputs  = { states, idx, xt, W, slot };
+-    node.outputs = { S, slot };
+-    node.fused   = { R, CI, C, P };
+-
+-    fu.at.emplace(emit, std::move(node));
+-    fu.skip[ir->second] = 1;
+-    for (auto * t : members) {
+-        auto it = index.find(t);
+-        if (it != index.end()) {
+-            fu.skip[it->second] = 1;
+-        }
+-    }
+-
+-    HEX_VERBOSE("ggml-hex: %s fused GDN_CONV_STEP %s (n_ch %d d_conv %d) at node %d\n",
+-                sess->name.c_str(), S->name, (int) n_ch, (int) d_conv, emit);
+-    return true;
+-}
+-
+-static bool ggml_hexagon_match_gdn_state_chain(const ggml_hexagon_session * sess, const ggml_cgraph * gf,
+-                                               const std::unordered_map<const ggml_tensor *, int> & index,
+-                                               int ig, ggml_hexagon_gdn_fusion & fu) {
+-    ggml_tensor * G = gf->nodes[ig];
+-    if (G->op != GGML_OP_GATED_DELTA_NET || G->type != GGML_TYPE_F32 || !ggml_is_contiguous(G) ||
+-        ggml_get_op_params_i32(G, 0) != 1) {
+-        return false;
+-    }
+-    ggml_tensor * q    = G->src[0];
+-    ggml_tensor * k    = G->src[1];
+-    ggml_tensor * v    = G->src[2];
+-    ggml_tensor * g    = G->src[3];
+-    ggml_tensor * beta = G->src[4];
+-    ggml_tensor * st   = G->src[5];
+-    if (!q || !k || !v || !g || !beta || !st) {
+-        return false;
+-    }
+-    const int64_t S_v = v->ne[0];
+-    const int64_t H   = v->ne[1];
+-    if (v->ne[2] != 1 || v->ne[3] != 1 || q->ne[2] != 1 || q->ne[3] != 1 || k->ne[2] != 1 || k->ne[3] != 1) {
+-        return false;
+-    }
+-    const int64_t D = S_v * S_v * H;
+-    if (G->ne[0] != S_v * H || G->ne[1] != 1 + S_v || G->ne[2] != 1 || G->ne[3] != 1) {
+-        return false;
+-    }
+-    const size_t head_bytes = (size_t) S_v * H * sizeof(float);
+-
+-    // the state read: a reshape of GET_ROWS(states, s_copy)
+-    if (!ggml_hexagon_is_view_op(st) || st->view_offs != 0 || !ggml_is_contiguous(st) || ggml_nelements(st) != D) {
+-        return false;
+-    }
+-    ggml_tensor * R = ggml_hexagon_root(st);
+-    if (R->op != GGML_OP_GET_ROWS || !ggml_hexagon_is_f32_row(R, D)) {
+-        return false;
+-    }
+-    ggml_tensor * states = R->src[0];
+-    ggml_tensor * idx    = R->src[1];
+-    if (!states || !idx || !ggml_hexagon_is_state_table(states, D) || idx->type != GGML_TYPE_I32 ||
+-        ggml_nelements(idx) != 1) {
+-        return false;
+-    }
+-    ggml_tensor * cache = ggml_hexagon_root(states);
+-
+-    // the state write: the one CPY of the state tail of the output into a slot of the cache
+-    ggml_tensor * P = nullptr;
+-    for (int i = 0; i < gf->n_nodes; i++) {
+         ggml_tensor * n = gf->nodes[i];
+-        if (n->op != GGML_OP_CPY || !n->src[0] || !n->src[1] || ggml_hexagon_root(n->src[0]) != G) {
+-            continue;
+-        }
+-        if (P) {
+-            return false;
+-        }
+-        P = n;
+-    }
+-    if (!P || P->type != GGML_TYPE_F32) {
+-        return false;
+-    }
+-    ggml_tensor * tail = P->src[0];
+-    ggml_tensor * slot = P->src[1];
+-    if (tail == G || tail->view_offs != head_bytes || !ggml_is_contiguous(tail) || ggml_nelements(tail) != D) {
+-        return false;
+-    }
+-    if (slot == cache || ggml_hexagon_root(slot) != cache || slot->type != GGML_TYPE_F32 || slot->ne[0] != D ||
+-        ggml_nelements(slot) != D || slot->nb[0] != sizeof(float)) {
+-        return false;
+-    }
+ 
+-    const std::vector<ggml_tensor *> intermediates = { R };
+-    const std::vector<ggml_tensor *> members       = { st, G, tail, P };
+-    if (!ggml_hexagon_chain_is_private(gf, intermediates, members, G, head_bytes)) {
+-        return false;
+-    }
++        if (ggml_hexagon_gdn_is_conv_candidate(n)) {
++            ggml_hexagon_gdn_conv_match m;
++            const char * reason = ggml_hexagon_gdn_conv_chain_check(gf, index, i, m);
++            if (reason) {
++                HEX_VERBOSE("ggml-hex: %s GDN_CONV_STEP candidate %s (node %d): %s\n", sess->name.c_str(), n->name, i, reason);
++                continue;
++            }
+ 
+-    auto ir = index.find(R);
+-    auto ip = index.find(P);
+-    if (ir == index.end() || ip == index.end() || ir->second > ig || ip->second < ig) {
+-        return false;
+-    }
+-    if (!ggml_hexagon_chain_span_is_clean(gf, ir->second, ip->second, cache, members)) {
+-        return false;
+-    }
++            htp_opnode node(HTP_OP_GDN_CONV_STEP, m.S);
++            node.name    = "GDN_CONV_STEP";
++            node.inputs  = { m.states, m.idx, m.xt, m.W, m.slot };
++            node.outputs = { m.S, m.slot };
++            node.fused   = { m.R, m.CI, m.C, m.P };
+ 
+-    htp_opnode node(HTP_OP_GDN_STATE_STEP, G);
+-    node.name    = "GDN_STATE_STEP";
+-    node.inputs  = { q, k, v, g, beta, states, idx, slot };
+-    node.outputs = { G, slot };
+-    node.fused   = { R, P };
++            fu.at.emplace(m.emit, std::move(node));
++            skip_members(m.members);
+ 
+-    fu.at.emplace(ig, std::move(node));
+-    fu.skip[ir->second] = 1;
+-    for (auto * t : members) {
+-        auto it = index.find(t);
+-        if (it != index.end()) {
+-            fu.skip[it->second] = 1;
+-        }
+-    }
++            HEX_VERBOSE("ggml-hex: %s fused GDN_CONV_STEP %s (n_ch %d d_conv %d) at node %d\n",
++                        sess->name.c_str(), m.S->name, (int) m.n_ch, (int) m.d_conv, m.emit);
++        } else if (n->op == GGML_OP_GATED_DELTA_NET) {
++            ggml_hexagon_gdn_state_match m;
++            const char * reason = ggml_hexagon_gdn_state_chain_check(gf, index, i, m);
++            if (reason) {
++                HEX_VERBOSE("ggml-hex: %s GDN_STATE_STEP candidate %s (node %d): %s\n", sess->name.c_str(), n->name, i, reason);
++                continue;
++            }
+ 
+-    HEX_VERBOSE("ggml-hex: %s fused GDN_STATE_STEP %s (S_v %d H %d) at node %d\n",
+-                sess->name.c_str(), G->name, (int) S_v, (int) H, ig);
+-    return true;
+-}
++            htp_opnode node(HTP_OP_GDN_STATE_STEP, m.G);
++            node.name    = "GDN_STATE_STEP";
++            node.inputs  = { m.q, m.k, m.v, m.g, m.beta, m.states, m.idx, m.slot };
++            node.outputs = { m.G, m.slot };
++            node.fused   = { m.R, m.P };
+ 
+-static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, const ggml_cgraph * gf,
+-                                           ggml_hexagon_gdn_fusion & fu) {
+-    std::unordered_map<const ggml_tensor *, int> index;
+-    index.reserve(gf->n_nodes);
+-    for (int i = 0; i < gf->n_nodes; i++) {
+-        index.emplace(gf->nodes[i], i);
+-    }
+-    for (int i = 0; i < gf->n_nodes; i++) {
+-        if (fu.skip[i]) {
+-            continue;
+-        }
+-        const ggml_tensor * n = gf->nodes[i];
+-        if (n->op == GGML_OP_UNARY) {
+-            ggml_hexagon_match_gdn_conv_chain(sess, gf, index, i, fu);
+-        } else if (n->op == GGML_OP_GATED_DELTA_NET) {
+-            ggml_hexagon_match_gdn_state_chain(sess, gf, index, i, fu);
++            fu.at.emplace(m.emit, std::move(node));
++            skip_members(m.members);
++
++            HEX_VERBOSE("ggml-hex: %s fused GDN_STATE_STEP %s (S_v %d H %d) at node %d\n",
++                        sess->name.c_str(), m.G->name, (int) m.S_v, (int) m.H, m.emit);
+         }
+     }
+ }
+diff --git a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
+index 9496908..01b5da7 100644
+--- a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
++++ b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
+@@ -5,21 +5,30 @@
+ // convolution and the SiLU, and writes the shifted conv state into the destination slot.
+ //
+ // Inputs:
+-//   src[0] states  [row, n_slots] F32, row = (d_conv - 1) * n_ch, contiguous rows
++//   src[0] states  [row, n_slots] F32, row = 3 * n_ch, contiguous rows
+ //   src[1] s_copy  I32 [1], the index of the source slot
+ //   src[2] x       [1, n_ch] F32, the new column (nb[1] = 4)
+-//   src[3] w       [d_conv, n_ch] F32, the conv weights
++//   src[3] w       [4, n_ch] F32, the conv weights
+ //   src[4] slot    [row, 1] F32, the destination slot
+ // Outputs:
+ //   dst[0] y       [n_ch, 1] F32, silu(conv)
+ //   dst[1] slot    the same tensor as src[4], listed for the dirty tracking of the cache
+ //
+-// A slot has the layout of the CONCAT input: for each channel, d_conv - 1 floats in time order.
+-// The new slot of a channel holds the last d_conv - 2 old values and the new column.
++// A slot has the layout of the CONCAT input without the new column: for each channel, 3 floats in
++// time order (s0, s1, s2). The new slot of a channel holds (s1, s2, x).
+ //
+-// Numerics: the sum of the d_conv products is sequential in F32, in the order of the CPU
+-// reference (ggml_compute_forward_ssm_conv_f32). The SiLU uses the same two HVX routines as
+-// the SILU op of this backend.
++// The kernel is HVX only. It reads DDR with unaligned vector loads, keeps everything in registers,
++// and writes DDR with unaligned vector stores. Scalar code never touches the data: scalar access to
++// VTCM is slow, and the layout change from 3 lanes per channel to 4 lanes per channel is done with
++// rotates and masks. For a block of 32 channels:
++//   1. The 96 slot lanes and the 32 column lanes become 4 vectors c[g] with lane 4k + t = tap t of
++//      channel 8g + k (t = 3 is the new column).
++//   2. Four vdeal ops split c[0..3] into the tap planes t0..t3 (lane = channel). The weights get
++//      the same split.
++//   3. acc = t0 * w0, acc += t1 * w1, acc += t2 * w2, acc += t3 * w3: the sum of the CPU reference
++//      (ggml_compute_forward_ssm_conv_f32) in the same order.
++//   4. y = acc * sigmoid(acc) with the two routines of the SILU op of this backend.
++//   5. The new slot lanes (s1, s2, x) of each channel come from c[g] with rotates and masks.
+ 
+ #include <HAP_farf.h>
+ #include <stdint.h>
+@@ -34,14 +43,13 @@
+ #include "ggml-common.h"
+ #include "htp-ctx.h"
+ #include "htp-tensor.h"
+-#include "hvx-arith.h"
+-#include "hvx-copy.h"
+-#include "hvx-sigmoid.h"
+ 
+ #ifndef MIN
+ #define MIN(a, b) ((a) < (b) ? (a) : (b))
+ #endif
+ 
++#define GDN_CONV_D_CONV 4
++
+ struct htp_gdn_conv_context {
+     struct htp_ops_context * octx;
+     const float * src_slot;   // source slot, DDR
+@@ -50,80 +58,221 @@ struct htp_gdn_conv_context {
+     const float * w;          // conv weights, DDR
+     float *       y;          // output, DDR
+     uint32_t      n_ch;
+-    uint32_t      d_conv;
+     uint32_t      chunk;      // channels per thread, a multiple of VLEN_FP32
+-    size_t        vtcm_per_thread;
+-    size_t        off_x;      // offsets of the per-thread VTCM arrays, the slot array is at 0
+-    size_t        off_w;
+-    size_t        off_acc;
+-    size_t        off_new;
+-    size_t        off_sig;
+ };
+ 
++// Lane masks: a lane is 32 bits, a mask lane is all ones or all zeros
++struct gdn_conv_masks {
++    HVX_Vector ms[8];   // lanes [4k, 4k + 3): the three slot taps of channel k in the 4-lane layout
++    HVX_Vector mn[8];   // lanes [3k, 3k + 3): the three taps of channel k in the 3-lane layout
++    HVX_Vector mx;      // lanes 4k + 3: the new column in the 4-lane layout
++    HVX_Vector lt8;     // lanes < 8
++    HVX_Vector lt16;    // lanes < 16
++    HVX_Vector lt24;    // lanes < 24
++};
++
++static void gdn_conv_masks_init(struct gdn_conv_masks * mk) {
++    int32_t buf[VLEN_FP32] __attribute__((aligned(VLEN)));
++
++    for (uint32_t k = 0; k < 8; k++) {
++        for (uint32_t j = 0; j < VLEN_FP32; j++) {
++            buf[j] = (j >= 4 * k && j < 4 * k + 3) ? -1 : 0;
++        }
++        mk->ms[k] = hvx_vmem(buf);
++    }
++    for (uint32_t k = 0; k < 8; k++) {
++        for (uint32_t j = 0; j < VLEN_FP32; j++) {
++            buf[j] = (j >= 3 * k && j < 3 * k + 3) ? -1 : 0;
++        }
++        mk->mn[k] = hvx_vmem(buf);
++    }
++    for (uint32_t j = 0; j < VLEN_FP32; j++) {
++        buf[j] = (j % 4 == 3) ? -1 : 0;
++    }
++    mk->mx = hvx_vmem(buf);
++    for (uint32_t j = 0; j < VLEN_FP32; j++) {
++        buf[j] = (j < 8) ? -1 : 0;
++    }
++    mk->lt8 = hvx_vmem(buf);
++    for (uint32_t j = 0; j < VLEN_FP32; j++) {
++        buf[j] = (j < 16) ? -1 : 0;
++    }
++    mk->lt16 = hvx_vmem(buf);
++    for (uint32_t j = 0; j < VLEN_FP32; j++) {
++        buf[j] = (j < 24) ? -1 : 0;
++    }
++    mk->lt24 = hvx_vmem(buf);
++}
++
++// Lane i moves to lane i + n (wraps)
++static inline HVX_Vector gdn_lane_rot_up(HVX_Vector v, uint32_t n) {
++    return Q6_V_vlalign_VVR(v, v, 4 * n);
++}
++
++// Lane i moves to lane i - n (wraps)
++static inline HVX_Vector gdn_lane_rot_down(HVX_Vector v, uint32_t n) {
++    return Q6_V_vror_VR(v, 4 * n);
++}
++
++// Selects the lanes of a where the mask is set, and the lanes of b elsewhere
++static inline HVX_Vector gdn_lane_select(HVX_Vector mask, HVX_Vector a, HVX_Vector b) {
++    return Q6_V_vor_VV(Q6_V_vand_VV(a, mask), Q6_V_vand_VV(b, Q6_V_vnot_V(mask)));
++}
++
++// One block of 32 channels: s0, s1, s2 hold the 96 slot lanes, x the 32 column lanes, w0..w3 the 128
++// weight lanes. The block gives the 32 outputs and the 96 new slot lanes.
++static inline void gdn_conv_block(const struct gdn_conv_masks * mk,
++                                  HVX_Vector s0, HVX_Vector s1, HVX_Vector s2, HVX_Vector x,
++                                  HVX_Vector w0, HVX_Vector w1, HVX_Vector w2, HVX_Vector w3,
++                                  HVX_Vector * y, HVX_Vector * n0, HVX_Vector * n1, HVX_Vector * n2) {
++    // windows of 8 channels: lanes 0..23 hold the 3 taps of the 8 channels, 3 lanes per channel
++    HVX_Vector sw[4];
++    sw[0] = s0;
++    sw[1] = gdn_lane_select(mk->lt8,  gdn_lane_rot_down(s0, 24), gdn_lane_rot_down(s1, 24));
++    sw[2] = gdn_lane_select(mk->lt16, gdn_lane_rot_down(s1, 16), gdn_lane_rot_down(s2, 16));
++    sw[3] = gdn_lane_rot_down(s2, 8);
++
++    // the new column in the 4-lane layout: xs[g] lane 4k + 3 = x[8g + k]
++    HVX_VectorPair p  = Q6_W_vshuff_VVR(Q6_V_vzero(), x, -4);
++    HVX_VectorPair q0 = Q6_W_vshuff_VVR(Q6_V_vzero(), Q6_V_lo_W(p), -4);
++    HVX_VectorPair q1 = Q6_W_vshuff_VVR(Q6_V_vzero(), Q6_V_hi_W(p), -4);
++    HVX_Vector xs[4];
++    xs[0] = gdn_lane_rot_up(Q6_V_lo_W(q0), 3);
++    xs[1] = gdn_lane_rot_up(Q6_V_hi_W(q0), 3);
++    xs[2] = gdn_lane_rot_up(Q6_V_lo_W(q1), 3);
++    xs[3] = gdn_lane_rot_up(Q6_V_hi_W(q1), 3);
++
++    // the 4-lane layout: c[g] lane 4k + t = tap t of channel 8g + k
++    HVX_Vector c[4];
++    for (uint32_t g = 0; g < 4; g++) {
++        HVX_Vector v = Q6_V_vand_VV(sw[g], mk->ms[0]);
++        for (uint32_t k = 1; k < 8; k++) {
++            v = Q6_V_vor_VV(v, Q6_V_vand_VV(gdn_lane_rot_up(sw[g], k), mk->ms[k]));
++        }
++        c[g] = Q6_V_vor_VV(v, Q6_V_vand_VV(xs[g], mk->mx));
++    }
++
++    // the tap planes: lane = channel
++    HVX_VectorPair d01 = Q6_W_vdeal_VVR(c[1], c[0], -4);
++    HVX_VectorPair d23 = Q6_W_vdeal_VVR(c[3], c[2], -4);
++    HVX_VectorPair e02 = Q6_W_vdeal_VVR(Q6_V_lo_W(d23), Q6_V_lo_W(d01), -4);
++    HVX_VectorPair e13 = Q6_W_vdeal_VVR(Q6_V_hi_W(d23), Q6_V_hi_W(d01), -4);
++    HVX_Vector t0 = Q6_V_lo_W(e02);
++    HVX_Vector t1 = Q6_V_lo_W(e13);
++    HVX_Vector t2 = Q6_V_hi_W(e02);
++    HVX_Vector t3 = Q6_V_hi_W(e13);
++
++    HVX_VectorPair f01 = Q6_W_vdeal_VVR(w1, w0, -4);
++    HVX_VectorPair f23 = Q6_W_vdeal_VVR(w3, w2, -4);
++    HVX_VectorPair g02 = Q6_W_vdeal_VVR(Q6_V_lo_W(f23), Q6_V_lo_W(f01), -4);
++    HVX_VectorPair g13 = Q6_W_vdeal_VVR(Q6_V_hi_W(f23), Q6_V_hi_W(f01), -4);
++    HVX_Vector wt0 = Q6_V_lo_W(g02);
++    HVX_Vector wt1 = Q6_V_lo_W(g13);
++    HVX_Vector wt2 = Q6_V_hi_W(g02);
++    HVX_Vector wt3 = Q6_V_hi_W(g13);
++
++    // the convolution, in the order of the CPU reference. The two functions are the arithmetic of
++    // the ADD and MUL ops of this backend (hvx-base.h, per architecture).
++    HVX_Vector acc = hvx_vec_mul_f32_f32(t0, wt0);
++    acc = hvx_vec_add_f32_f32(acc, hvx_vec_mul_f32_f32(t1, wt1));
++    acc = hvx_vec_add_f32_f32(acc, hvx_vec_mul_f32_f32(t2, wt2));
++    acc = hvx_vec_add_f32_f32(acc, hvx_vec_mul_f32_f32(t3, wt3));
++
++    // the SiLU of the SILU op: x * sigmoid(x)
++    const HVX_Vector one     = hvx_vec_splat_f32(1.f);
++    const HVX_Vector max_exp = hvx_vec_splat_f32(87.f);
++    const HVX_Vector min_exp = hvx_vec_splat_f32(-87.f);
++    HVX_Vector sig = hvx_vec_fast_sigmoid_f32_guard(acc, one, max_exp, min_exp);
++    *y = hvx_vec_mul_f32_f32(acc, sig);
++
++    // the new slot windows: nw[g] lane 3k + t = c[g] lane 4k + 1 + t
++    HVX_Vector nw[4];
++    for (uint32_t g = 0; g < 4; g++) {
++        HVX_Vector v = Q6_V_vand_VV(gdn_lane_rot_down(c[g], 1), mk->mn[0]);
++        for (uint32_t k = 1; k < 8; k++) {
++            v = Q6_V_vor_VV(v, Q6_V_vand_VV(gdn_lane_rot_down(c[g], k + 1), mk->mn[k]));
++        }
++        nw[g] = v;
++    }
++
++    // the 96 new slot lanes: window g goes to lanes 24g .. 24g + 23
++    HVX_Vector r1 = gdn_lane_rot_up(nw[1], 24);
++    HVX_Vector r2 = gdn_lane_rot_up(nw[2], 16);
++    HVX_Vector r3 = gdn_lane_rot_up(nw[3], 8);
++    *n0 = gdn_lane_select(mk->lt24, nw[0], r1);
++    *n1 = gdn_lane_select(mk->lt16, r1, r2);
++    *n2 = gdn_lane_select(mk->lt8,  r2, r3);
++}
++
+ static void gdn_conv_step_thread(unsigned int nth, unsigned int ith, void * data) {
+     (void) nth;
+     struct htp_gdn_conv_context * cctx = (struct htp_gdn_conv_context *) data;
+     struct htp_ops_context *      octx = cctx->octx;
+ 
+-    const uint32_t d_conv = cctx->d_conv;
+-    const uint32_t n_prev = d_conv - 1;
+-    const uint32_t c0     = ith * cctx->chunk;
++    const uint32_t c0 = ith * cctx->chunk;
+     if (c0 >= cctx->n_ch) {
+         return;
+     }
+     const uint32_t n = MIN(cctx->chunk, cctx->n_ch - c0);
+ 
+-    uint8_t * base  = (uint8_t *) octx->ctx->vtcm_base + (size_t) ith * cctx->vtcm_per_thread;
+-    float *   v_s   = (float *) base;
+-    float *   v_x   = (float *) (base + cctx->off_x);
+-    float *   v_w   = (float *) (base + cctx->off_w);
+-    float *   v_acc = (float *) (base + cctx->off_acc);
+-    float *   v_new = (float *) (base + cctx->off_new);
+-    float *   v_sig = (float *) (base + cctx->off_sig);
++    struct gdn_conv_masks mk __attribute__((aligned(VLEN)));
++    gdn_conv_masks_init(&mk);
+ 
+-    dma_queue *               dma = octx->ctx->dma[ith];
+-    struct htp_thread_trace * tr  = &octx->ctx->trace[ith];
++    const float * s_ptr = cctx->src_slot + (size_t) c0 * 3;
++    const float * x_ptr = cctx->x + c0;
++    const float * w_ptr = cctx->w + (size_t) c0 * GDN_CONV_D_CONV;
++    float *       n_ptr = cctx->dst_slot + (size_t) c0 * 3;
++    float *       y_ptr = cctx->y + c0;
+ 
+-    const size_t s_bytes = (size_t) n * n_prev * sizeof(float);
+-    const size_t x_bytes = (size_t) n * sizeof(float);
+-    const size_t w_bytes = (size_t) n * d_conv * sizeof(float);
++    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
++    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c0);
+ 
+-    dma_queue_push(dma, dma_make_ptr(v_s, cctx->src_slot + (size_t) c0 * n_prev), s_bytes, s_bytes, s_bytes, 1);
+-    dma_queue_push(dma, dma_make_ptr(v_x, cctx->x + c0), x_bytes, x_bytes, x_bytes, 1);
+-    dma_queue_push(dma, dma_make_ptr(v_w, cctx->w + (size_t) c0 * d_conv), w_bytes, w_bytes, w_bytes, 1);
+-    dma_queue_pop(dma);
+-    dma_queue_pop(dma);
+-    dma_queue_pop(dma);
++    uint32_t m = 0;
++    for (; m + VLEN_FP32 <= n; m += VLEN_FP32) {
++        HVX_Vector y, n0, n1, n2;
++        gdn_conv_block(&mk,
++                       hvx_vmemu(s_ptr + 3 * m), hvx_vmemu(s_ptr + 3 * m + 32), hvx_vmemu(s_ptr + 3 * m + 64),
++                       hvx_vmemu(x_ptr + m),
++                       hvx_vmemu(w_ptr + 4 * m), hvx_vmemu(w_ptr + 4 * m + 32), hvx_vmemu(w_ptr + 4 * m + 64), hvx_vmemu(w_ptr + 4 * m + 96),
++                       &y, &n0, &n1, &n2);
++        hvx_vmemu(y_ptr + m)          = y;
++        hvx_vmemu(n_ptr + 3 * m)      = n0;
++        hvx_vmemu(n_ptr + 3 * m + 32) = n1;
++        hvx_vmemu(n_ptr + 3 * m + 64) = n2;
++    }
+ 
+-    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c0);
++    // the last block of a chunk that is not a multiple of 32 channels goes through local buffers
++    const uint32_t rem = n - m;
++    if (rem > 0) {
++        float sb[3 * VLEN_FP32] __attribute__((aligned(VLEN)));
++        float xb[VLEN_FP32]     __attribute__((aligned(VLEN)));
++        float wb[4 * VLEN_FP32] __attribute__((aligned(VLEN)));
++        float nb[3 * VLEN_FP32] __attribute__((aligned(VLEN)));
++        float yb[VLEN_FP32]     __attribute__((aligned(VLEN)));
+ 
+-    for (uint32_t c = 0; c < n; c++) {
+-        const float * s  = v_s + (size_t) c * n_prev;
+-        const float * w  = v_w + (size_t) c * d_conv;
+-        float *       ns = v_new + (size_t) c * n_prev;
+-        const float   x  = v_x[c];
++        memset(sb, 0, sizeof(sb));
++        memset(xb, 0, sizeof(xb));
++        memset(wb, 0, sizeof(wb));
++        memcpy(sb, s_ptr + 3 * m, (size_t) rem * 3 * sizeof(float));
++        memcpy(xb, x_ptr + m,     (size_t) rem * sizeof(float));
++        memcpy(wb, w_ptr + 4 * m, (size_t) rem * 4 * sizeof(float));
+ 
+-        float sum = 0.0f;
+-        for (uint32_t t = 0; t < n_prev; t++) {
+-            sum += s[t] * w[t];
+-        }
+-        sum += x * w[n_prev];
+-        v_acc[c] = sum;
++        HVX_Vector y, n0, n1, n2;
++        gdn_conv_block(&mk,
++                       hvx_vmem(sb), hvx_vmem(sb + 32), hvx_vmem(sb + 64),
++                       hvx_vmem(xb),
++                       hvx_vmem(wb), hvx_vmem(wb + 32), hvx_vmem(wb + 64), hvx_vmem(wb + 96),
++                       &y, &n0, &n1, &n2);
++        hvx_vmem(yb)      = y;
++        hvx_vmem(nb)      = n0;
++        hvx_vmem(nb + 32) = n1;
++        hvx_vmem(nb + 64) = n2;
+ 
+-        for (uint32_t t = 0; t + 1 < n_prev; t++) {
+-            ns[t] = s[t + 1];
+-        }
+-        ns[n_prev - 1] = x;
++        memcpy(y_ptr + m,     yb, (size_t) rem * sizeof(float));
++        memcpy(n_ptr + 3 * m, nb, (size_t) rem * 3 * sizeof(float));
+     }
+ 
+-    hvx_sigmoid_f32_aa((uint8_t *) v_sig, (const uint8_t *) v_acc, n);
+-    hvx_mul_f32_aaa((uint8_t *) v_sig, (const uint8_t *) v_acc, (const uint8_t *) v_sig, n);
+-    hvx_copy_f32_ua((uint8_t *) (cctx->y + c0), (const uint8_t *) v_sig, n);
+-
+     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) (c0 + n));
+-
+-    dma_queue_push(dma, dma_make_ptr(cctx->dst_slot + (size_t) c0 * n_prev, v_new), s_bytes, s_bytes, s_bytes, 1);
+-    dma_queue_flush(dma);
+ }
+ 
+ int op_gdn_conv_step(struct htp_ops_context * octx) {
+@@ -147,7 +296,10 @@ int op_gdn_conv_step(struct htp_ops_context * octx) {
+ 
+     const uint32_t d_conv = w->ne[0];
+     const uint32_t n_ch   = w->ne[1];
+-    if (d_conv < 2 || n_ch == 0) {
++    if (d_conv != GDN_CONV_D_CONV) {
++        return HTP_STATUS_NO_SUPPORT;
++    }
++    if (n_ch == 0) {
+         return HTP_STATUS_INVAL_PARAMS;
+     }
+     const uint32_t row = (d_conv - 1) * n_ch;
+@@ -190,30 +342,10 @@ int op_gdn_conv_step(struct htp_ops_context * octx) {
+     cctx.w        = (const float *) (uintptr_t) w->data;
+     cctx.y        = (float *) (uintptr_t) y->data;
+     cctx.n_ch     = n_ch;
+-    cctx.d_conv   = d_conv;
+     cctx.chunk    = chunk;
+ 
+-    size_t off   = hex_align_up((size_t) chunk * (d_conv - 1) * sizeof(float), 128);
+-    cctx.off_x   = off;
+-    off         += hex_align_up((size_t) chunk * sizeof(float), 128);
+-    cctx.off_w   = off;
+-    off         += hex_align_up((size_t) chunk * d_conv * sizeof(float), 128);
+-    cctx.off_acc = off;
+-    off         += hex_align_up((size_t) chunk * sizeof(float), 128);
+-    cctx.off_new = off;
+-    off         += hex_align_up((size_t) chunk * (d_conv - 1) * sizeof(float), 128);
+-    cctx.off_sig = off;
+-    off         += hex_align_up((size_t) chunk * sizeof(float), 128);
+-    cctx.vtcm_per_thread = off;
+-
+-    if (cctx.vtcm_per_thread * n_threads > octx->ctx->vtcm_size) {
+-        FARF(ERROR, "gdn-conv-step: VTCM reservation %zu is too small, needed %zu\n",
+-             octx->ctx->vtcm_size, cctx.vtcm_per_thread * n_threads);
+-        return HTP_STATUS_VTCM_TOO_SMALL;
+-    }
+-
+-    FARF(HIGH, "gdn-conv-step: n_ch %u d_conv %u slot %d -> %p chunk %u vtcm %zu n_threads %u\n",
+-         n_ch, d_conv, src_idx, (void *) cctx.dst_slot, chunk, cctx.vtcm_per_thread * n_threads, n_threads);
++    FARF(HIGH, "gdn-conv-step: n_ch %u slot %d -> %p chunk %u n_threads %u\n",
++         n_ch, src_idx, (void *) cctx.dst_slot, chunk, n_threads);
+ 
+     work_queue_run(octx->ctx->work_queue, gdn_conv_step_thread, &cctx, n_threads);
+ 
+diff --git a/ggml/src/ggml-hexagon/htp-gdn-match.h b/ggml/src/ggml-hexagon/htp-gdn-match.h
+new file mode 100644
+index 0000000..be1dca2
+--- /dev/null
++++ b/ggml/src/ggml-hexagon/htp-gdn-match.h
+@@ -0,0 +1,440 @@
++// The graph match of the fused recurrent state step of a gated delta net layer (host side).
++//
++// At one token, a gated delta net layer (Qwen3.5, Qwen3-Next) reads its two recurrent states with
++// GET_ROWS, updates them, and writes them back with CPY. Two chains become one op each:
++//
++//   GET_ROWS(cache_r, s_copy) -> CONCAT(., x^T) -> SSM_CONV -> SILU, and CPY(view of the CONCAT, slot of cache_r)
++//     -> HTP_OP_GDN_CONV_STEP
++//   GET_ROWS(cache_s, s_copy) -> GATED_DELTA_NET(K = 1), and CPY(state tail, slot of cache_s)
++//     -> HTP_OP_GDN_STATE_STEP
++//
++// The DSP reads the source slot index from s_copy and writes the destination slot of the CPY. When the
++// two slots are the same, the update is in place. The match needs one token, one sequence, one CPY, no
++// other reader of the replaced tensors, and no other node that touches the cache inside the chain span.
++// The state_zero SCALE of build_rs comes before the chain, thus it stays a separate op and runs first.
++//
++// This header depends on ggml only. A host program can run the same checks on a graph. Each check
++// returns nullptr when the chain matches, or a short text for the first failed condition.
++
++#ifndef HTP_GDN_MATCH_H
++#define HTP_GDN_MATCH_H
++
++#include "ggml.h"
++#include "ggml-impl.h"
++
++#include <algorithm>
++#include <unordered_map>
++#include <vector>
++
++struct ggml_hexagon_gdn_conv_match {
++    ggml_tensor * S      = nullptr; // SILU, the output
++    ggml_tensor * C      = nullptr; // SSM_CONV
++    ggml_tensor * CI     = nullptr; // CONCAT
++    ggml_tensor * W      = nullptr; // the conv weights [d_conv, n_ch]
++    ggml_tensor * R      = nullptr; // GET_ROWS of the conv state
++    ggml_tensor * states = nullptr; // the state table [row, n_slots]
++    ggml_tensor * idx    = nullptr; // the s_copy view [1]
++    ggml_tensor * xt     = nullptr; // the transposed projection [1, n_ch]
++    ggml_tensor * P      = nullptr; // CPY into the slot
++    ggml_tensor * slot   = nullptr; // the destination slot view [row, 1]
++    std::vector<ggml_tensor *> members; // every node the fused op replaces
++    int     emit   = -1;                // graph index where the fused op goes
++    int64_t d_conv = 0;
++    int64_t n_ch   = 0;
++};
++
++struct ggml_hexagon_gdn_state_match {
++    ggml_tensor * G      = nullptr; // GATED_DELTA_NET, the output
++    ggml_tensor * q      = nullptr;
++    ggml_tensor * k      = nullptr;
++    ggml_tensor * v      = nullptr;
++    ggml_tensor * g      = nullptr;
++    ggml_tensor * beta   = nullptr;
++    ggml_tensor * R      = nullptr; // GET_ROWS of the delta net state
++    ggml_tensor * states = nullptr; // the state table [D, n_slots]
++    ggml_tensor * idx    = nullptr; // the s_copy view [1]
++    ggml_tensor * P      = nullptr; // CPY into the slot
++    ggml_tensor * slot   = nullptr; // the destination slot view [D, 1]
++    std::vector<ggml_tensor *> members; // every node the fused op replaces
++    int     emit = -1;
++    int64_t S_v  = 0;
++    int64_t H    = 0;
++};
++
++static inline ggml_tensor * ggml_hexagon_gdn_root(ggml_tensor * t) {
++    return t->view_src ? t->view_src : t;
++}
++
++static inline bool ggml_hexagon_gdn_is_view_op(const ggml_tensor * t) {
++    return t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
++}
++
++// A contiguous F32 row of n elements with unit outer dimensions
++static inline bool ggml_hexagon_gdn_is_f32_row(const ggml_tensor * t, int64_t n) {
++    return t->type == GGML_TYPE_F32 && t->ne[0] == n && t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1 &&
++           t->nb[0] == sizeof(float);
++}
++
++// The "states" tensor of build_rs: an F32 table [row, n_slots] of the cache with contiguous rows
++static inline bool ggml_hexagon_gdn_is_state_table(const ggml_tensor * t, int64_t row) {
++    return t->type == GGML_TYPE_F32 && t->ne[0] == row && t->ne[1] >= 1 && t->ne[2] == 1 && t->ne[3] == 1 &&
++           t->nb[0] == sizeof(float) && t->nb[1] == (size_t) row * sizeof(float);
++}
++
++template <typename T>
++static inline bool ggml_hexagon_gdn_contains(const std::vector<T> & v, const T & x) {
++    return std::find(v.begin(), v.end(), x) != v.end();
++}
++
++// True when the node reads or writes the root tensor through any view
++static inline bool ggml_hexagon_gdn_node_touches(ggml_tensor * n, const ggml_tensor * root) {
++    if (ggml_hexagon_gdn_root(n) == root) {
++        return true;
++    }
++    for (int i = 0; i < GGML_MAX_SRC; i++) {
++        if (n->src[i] && ggml_hexagon_gdn_root(n->src[i]) == root) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static inline std::unordered_map<const ggml_tensor *, int> ggml_hexagon_gdn_index(const ggml_cgraph * gf) {
++    std::unordered_map<const ggml_tensor *, int> index;
++    index.reserve(gf->n_nodes);
++    for (int i = 0; i < gf->n_nodes; i++) {
++        index.emplace(gf->nodes[i], i);
++    }
++    return index;
++}
++
++// Every node that reads an intermediate (also through a view) must be a member of the chain. A view of
++// `out` is permitted for any node when the view lies in the first `out_head_bytes` bytes of `out`.
++static inline const char * ggml_hexagon_gdn_chain_is_private(const ggml_cgraph * gf,
++                                                             const std::vector<ggml_tensor *> & intermediates,
++                                                             const std::vector<ggml_tensor *> & members,
++                                                             const ggml_tensor * out, size_t out_head_bytes) {
++    for (auto * t : intermediates) {
++        if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
++            return "an intermediate is a graph output";
++        }
++    }
++    if (out && (out->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++        return "the output is a graph output";
++    }
++    for (int i = 0; i < gf->n_nodes; i++) {
++        ggml_tensor * n = gf->nodes[i];
++        for (int s = 0; s < GGML_MAX_SRC; s++) {
++            ggml_tensor * src = n->src[s];
++            if (!src) {
++                continue;
++            }
++            ggml_tensor * root = ggml_hexagon_gdn_root(src);
++            if (out && root == out) {
++                // The region that the reader touches: the view node itself when n is a view of out
++                // (its src is the whole tensor), else the view that n reads.
++                const ggml_tensor * region = (src == out && ggml_hexagon_gdn_is_view_op(n)) ? n : src;
++                if (region != out && region->view_offs + ggml_nbytes(region) <= out_head_bytes) {
++                    continue;
++                }
++                if (ggml_hexagon_gdn_contains(members, n)) {
++                    continue;
++                }
++                return "the state part of the output has a reader outside the chain";
++            }
++            if (ggml_hexagon_gdn_contains(intermediates, root) && !ggml_hexagon_gdn_contains(members, n)) {
++                return "an intermediate has a reader outside the chain";
++            }
++        }
++    }
++    return nullptr;
++}
++
++// No node in (first, last] outside the chain touches the cache. Empty nodes do nothing and are ignored.
++static inline bool ggml_hexagon_gdn_chain_span_is_clean(const ggml_cgraph * gf, int first, int last,
++                                                        const ggml_tensor * cache,
++                                                        const std::vector<ggml_tensor *> & members) {
++    for (int i = first + 1; i <= last; i++) {
++        ggml_tensor * n = gf->nodes[i];
++        if (ggml_is_empty(n) || ggml_hexagon_gdn_is_view_op(n) || ggml_hexagon_gdn_contains(members, n)) {
++            continue;
++        }
++        if (ggml_hexagon_gdn_node_touches(n, cache)) {
++            return false;
++        }
++    }
++    return true;
++}
++
++// The one CPY whose source is a view of `src_root`. Two of them (rollback snapshots) give nullptr and set `n_found`.
++static inline ggml_tensor * ggml_hexagon_gdn_find_cpy(const ggml_cgraph * gf, const ggml_tensor * src_root, int & n_found) {
++    ggml_tensor * P = nullptr;
++    n_found = 0;
++    for (int i = 0; i < gf->n_nodes; i++) {
++        ggml_tensor * n = gf->nodes[i];
++        if (n->op != GGML_OP_CPY || !n->src[0] || !n->src[1] || ggml_hexagon_gdn_root(n->src[0]) != src_root) {
++            continue;
++        }
++        n_found++;
++        P = n;
++    }
++    return n_found == 1 ? P : nullptr;
++}
++
++// True for the node that ends the conv chain: SILU of an SSM_CONV
++static inline bool ggml_hexagon_gdn_is_conv_candidate(const ggml_tensor * t) {
++    return t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_SILU && t->src[0] &&
++           t->src[0]->op == GGML_OP_SSM_CONV;
++}
++
++static inline const char * ggml_hexagon_gdn_conv_chain_check(const ggml_cgraph * gf,
++                                                             const std::unordered_map<const ggml_tensor *, int> & index,
++                                                             int is, ggml_hexagon_gdn_conv_match & m) {
++    ggml_tensor * S = gf->nodes[is];
++    if (!ggml_hexagon_gdn_is_conv_candidate(S)) {
++        return "not a SILU of an SSM_CONV";
++    }
++    if (S->type != GGML_TYPE_F32 || !ggml_is_contiguous(S)) {
++        return "the SILU output is not contiguous F32";
++    }
++    ggml_tensor * C = S->src[0];
++    if (C->type != GGML_TYPE_F32) {
++        return "the SSM_CONV output is not F32";
++    }
++    ggml_tensor * CI = C->src[0];
++    ggml_tensor * W  = C->src[1];
++    if (!CI || !W || CI->op != GGML_OP_CONCAT || ggml_get_op_params_i32(CI, 0) != 0) {
++        return "the SSM_CONV input is not a CONCAT on dim 0";
++    }
++    if (CI->type != GGML_TYPE_F32 || !ggml_is_contiguous(CI) || CI->ne[2] != 1 || CI->ne[3] != 1) {
++        return "the CONCAT is not one contiguous F32 sequence";
++    }
++    const int64_t d_conv = CI->ne[0];
++    const int64_t n_ch   = CI->ne[1];
++    if (d_conv != 4) {
++        return "the conv kernel is not 4 wide (the DSP kernel is for d_conv = 4)";
++    }
++    if (n_ch < 1) {
++        return "no channels";
++    }
++    const int64_t row = (d_conv - 1) * n_ch;
++    if (W->type != GGML_TYPE_F32 || W->ne[0] != d_conv || W->ne[1] != n_ch || W->nb[0] != sizeof(float) ||
++        W->nb[1] != (size_t) d_conv * sizeof(float)) {
++        return "the conv weights are not a contiguous F32 [d_conv, n_ch]";
++    }
++    if (!ggml_hexagon_gdn_is_f32_row(C, n_ch) || !ggml_hexagon_gdn_is_f32_row(S, n_ch)) {
++        return "the conv output is not one token";
++    }
++
++    // the state read: the first CONCAT input is a reshape of GET_ROWS(states, s_copy)
++    ggml_tensor * cs = CI->src[0];
++    if (!cs || !ggml_hexagon_gdn_is_view_op(cs) || cs->view_offs != 0 || !ggml_is_contiguous(cs)) {
++        return "the first CONCAT input is not a contiguous view at offset 0";
++    }
++    if (cs->ne[0] != d_conv - 1 || cs->ne[1] != n_ch || cs->ne[2] != 1 || cs->ne[3] != 1) {
++        return "the first CONCAT input is not [d_conv - 1, n_ch, 1, 1]";
++    }
++    ggml_tensor * R = ggml_hexagon_gdn_root(cs);
++    if (R->op != GGML_OP_GET_ROWS) {
++        return "the conv state does not come from GET_ROWS";
++    }
++    if (!ggml_hexagon_gdn_is_f32_row(R, row)) {
++        return "the GET_ROWS of the conv state is not one row";
++    }
++    ggml_tensor * states = R->src[0];
++    ggml_tensor * idx    = R->src[1];
++    if (!states || !ggml_hexagon_gdn_is_state_table(states, row)) {
++        return "the conv state table is not [row, n_slots] with contiguous rows";
++    }
++    if (!idx || idx->type != GGML_TYPE_I32 || ggml_nelements(idx) != 1) {
++        return "s_copy is not one I32 index";
++    }
++    ggml_tensor * cache = ggml_hexagon_gdn_root(states);
++
++    // the new column: the second CONCAT input is the transposed projection [1, n_ch]
++    ggml_tensor * xt = CI->src[1];
++    if (!xt || xt->type != GGML_TYPE_F32 || xt->ne[0] != 1 || xt->ne[1] != n_ch || xt->ne[2] != 1 ||
++        xt->ne[3] != 1 || xt->nb[1] != sizeof(float)) {
++        return "the second CONCAT input is not a transposed contiguous column [1, n_ch]";
++    }
++
++    // the state write: the one CPY of the last d_conv - 1 columns of the CONCAT into a slot of the cache
++    int n_cpy = 0;
++    ggml_tensor * P = ggml_hexagon_gdn_find_cpy(gf, CI, n_cpy);
++    if (!P) {
++        return n_cpy == 0 ? "no CPY of the CONCAT into the cache" : "more than one CPY of the CONCAT (rollback snapshots)";
++    }
++    if (P->type != GGML_TYPE_F32) {
++        return "the CPY is not F32";
++    }
++    ggml_tensor * last = P->src[0];
++    ggml_tensor * slot = P->src[1];
++    if (last->view_offs != sizeof(float) || last->ne[0] != d_conv - 1 || last->ne[1] != n_ch ||
++        last->ne[2] != 1 || last->ne[3] != 1 || last->nb[0] != sizeof(float) || last->nb[1] != CI->nb[1]) {
++        return "the CPY source is not the last d_conv - 1 columns of the CONCAT";
++    }
++    if (slot == cache || ggml_hexagon_gdn_root(slot) != cache) {
++        return "the CPY destination is not a view of the conv cache";
++    }
++    if (!ggml_hexagon_gdn_is_f32_row(slot, row)) {
++        return "the CPY destination is not one contiguous row";
++    }
++
++    const std::vector<ggml_tensor *> intermediates = { R, CI, C };
++    const std::vector<ggml_tensor *> members       = { R, cs, CI, C, S, last, P };
++    if (const char * reason = ggml_hexagon_gdn_chain_is_private(gf, intermediates, members, nullptr, 0)) {
++        return reason;
++    }
++
++    auto ir = index.find(R);
++    auto ip = index.find(P);
++    if (ir == index.end() || ip == index.end()) {
++        return "GET_ROWS or CPY is not a node of the graph";
++    }
++    const int emit     = std::min(is, ip->second);
++    const int last_idx = std::max(is, ip->second);
++    if (ir->second > emit) {
++        return "the GET_ROWS comes after the SILU or the CPY";
++    }
++    if (!ggml_hexagon_gdn_chain_span_is_clean(gf, ir->second, last_idx, cache, members)) {
++        return "another node touches the conv cache inside the chain span";
++    }
++
++    m.S      = S;
++    m.C      = C;
++    m.CI     = CI;
++    m.W      = W;
++    m.R      = R;
++    m.states = states;
++    m.idx    = idx;
++    m.xt     = xt;
++    m.P      = P;
++    m.slot   = slot;
++    m.members = members;
++    m.emit   = emit;
++    m.d_conv = d_conv;
++    m.n_ch   = n_ch;
++    return nullptr;
++}
++
++static inline const char * ggml_hexagon_gdn_state_chain_check(const ggml_cgraph * gf,
++                                                              const std::unordered_map<const ggml_tensor *, int> & index,
++                                                              int ig, ggml_hexagon_gdn_state_match & m) {
++    ggml_tensor * G = gf->nodes[ig];
++    if (G->op != GGML_OP_GATED_DELTA_NET) {
++        return "not a GATED_DELTA_NET";
++    }
++    if (G->type != GGML_TYPE_F32 || !ggml_is_contiguous(G)) {
++        return "the output is not contiguous F32";
++    }
++    if (ggml_get_op_params_i32(G, 0) != 1) {
++        return "K is not 1";
++    }
++    ggml_tensor * q    = G->src[0];
++    ggml_tensor * k    = G->src[1];
++    ggml_tensor * v    = G->src[2];
++    ggml_tensor * g    = G->src[3];
++    ggml_tensor * beta = G->src[4];
++    ggml_tensor * st   = G->src[5];
++    if (!q || !k || !v || !g || !beta || !st) {
++        return "an input is missing";
++    }
++    const int64_t S_v = v->ne[0];
++    const int64_t H   = v->ne[1];
++    if (v->ne[2] != 1 || v->ne[3] != 1) {
++        return "not one token of one sequence";
++    }
++    if (q->ne[2] != 1 || q->ne[3] != 1 || k->ne[2] != 1 || k->ne[3] != 1) {
++        return "q or k is not one token of one sequence";
++    }
++    const int64_t D = S_v * S_v * H;
++    if (G->ne[0] != S_v * H || G->ne[1] != 1 + S_v || G->ne[2] != 1 || G->ne[3] != 1) {
++        return "the output is not [S_v * H, 1 + S_v]";
++    }
++    const size_t head_bytes = (size_t) S_v * H * sizeof(float);
++
++    // the state read: a reshape of GET_ROWS(states, s_copy)
++    if (!ggml_hexagon_gdn_is_view_op(st)) {
++        return "the state input is not a view";
++    }
++    if (st->view_offs != 0 || !ggml_is_contiguous(st) || ggml_nelements(st) != D) {
++        return "the state input is not a contiguous view of D elements at offset 0";
++    }
++    ggml_tensor * R = ggml_hexagon_gdn_root(st);
++    if (R->op != GGML_OP_GET_ROWS) {
++        return "the state does not come from GET_ROWS";
++    }
++    if (!ggml_hexagon_gdn_is_f32_row(R, D)) {
++        return "the GET_ROWS of the state is not one row of D";
++    }
++    ggml_tensor * states = R->src[0];
++    ggml_tensor * idx    = R->src[1];
++    if (!states || !ggml_hexagon_gdn_is_state_table(states, D)) {
++        return "the state table is not [D, n_slots] with contiguous rows";
++    }
++    if (!idx || idx->type != GGML_TYPE_I32 || ggml_nelements(idx) != 1) {
++        return "s_copy is not one I32 index";
++    }
++    ggml_tensor * cache = ggml_hexagon_gdn_root(states);
++
++    // the state write: the one CPY of the state tail of the output into a slot of the cache
++    int n_cpy = 0;
++    ggml_tensor * P = ggml_hexagon_gdn_find_cpy(gf, G, n_cpy);
++    if (!P) {
++        return n_cpy == 0 ? "no CPY of the output into the cache" : "more than one CPY of the output (rollback snapshots)";
++    }
++    if (P->type != GGML_TYPE_F32) {
++        return "the CPY is not F32";
++    }
++    ggml_tensor * tail = P->src[0];
++    ggml_tensor * slot = P->src[1];
++    if (tail == G) {
++        return "the CPY source is the whole output";
++    }
++    if (tail->view_offs != head_bytes || !ggml_is_contiguous(tail) || ggml_nelements(tail) != D) {
++        return "the CPY source is not the contiguous state tail of the output";
++    }
++    if (slot == cache || ggml_hexagon_gdn_root(slot) != cache) {
++        return "the CPY destination is not a view of the state cache";
++    }
++    if (slot->type != GGML_TYPE_F32 || slot->ne[0] != D || ggml_nelements(slot) != D || slot->nb[0] != sizeof(float)) {
++        return "the CPY destination is not one contiguous row of D";
++    }
++
++    const std::vector<ggml_tensor *> intermediates = { R };
++    const std::vector<ggml_tensor *> members       = { R, st, G, tail, P };
++    if (const char * reason = ggml_hexagon_gdn_chain_is_private(gf, intermediates, members, G, head_bytes)) {
++        return reason;
++    }
++
++    auto ir = index.find(R);
++    auto ip = index.find(P);
++    if (ir == index.end() || ip == index.end()) {
++        return "GET_ROWS or CPY is not a node of the graph";
++    }
++    if (ir->second > ig || ip->second < ig) {
++        return "the GET_ROWS or the CPY is not around the GATED_DELTA_NET";
++    }
++    if (!ggml_hexagon_gdn_chain_span_is_clean(gf, ir->second, ip->second, cache, members)) {
++        return "another node touches the state cache inside the chain span";
++    }
++
++    m.G      = G;
++    m.q      = q;
++    m.k      = k;
++    m.v      = v;
++    m.g      = g;
++    m.beta   = beta;
++    m.R      = R;
++    m.states = states;
++    m.idx    = idx;
++    m.P      = P;
++    m.slot   = slot;
++    m.members = members;
++    m.emit   = ig;
++    m.S_v    = S_v;
++    m.H      = H;
++    return nullptr;
++}
++
++#endif // HTP_GDN_MATCH_H
