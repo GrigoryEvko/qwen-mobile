@@ -49,6 +49,8 @@ object LlamaNative {
      * @param threads        The number of CPU threads
      * @param nCtx           The context length in tokens
      * @param imageMaxTokens The maximum number of vision tokens of one image, between 64 and 768
+     * @param speculative    Load the MTP block of the file and draft with it. The engine ignores it
+     *                       when the model holds no MTP block, or with a prefill device
      * @param cacheDir       The cache directory of the app for the prompt states and the encoded
      *                       images, or null to keep them in RAM only
      * @return The engine handle
@@ -64,8 +66,16 @@ object LlamaNative {
         threads: Int,
         nCtx: Int,
         imageMaxTokens: Int,
+        speculative: Boolean,
         cacheDir: String?,
     ): Long
+
+    /**
+     * True when the model file holds the MTP tensors (blk.&lt;n_layer&gt;.nextn.*)
+     * and the compute unit of this engine can draft with them. The speculative
+     * switch of the settings screen is available only then.
+     */
+    @JvmStatic external fun hasMtp(handle: Long): Boolean
 
     /**
      * The pixels of an image file for the vision encoder. The engine calls

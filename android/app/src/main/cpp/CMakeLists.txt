@@ -43,6 +43,7 @@ add_library(qwenmobile SHARED
     image_cache.cpp
     llama_jni.cpp
     perf_hint.cpp
+    spec_policy.cpp
     state_cache.cpp
     trace.cpp)
 

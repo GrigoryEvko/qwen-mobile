@@ -141,13 +141,27 @@ data class EngineConfig(
     val visionOnGpu: Boolean = false,
     /** The maximum number of vision tokens of one image. */
     val imageMaxTokens: Int = ImageDetail.DEFAULT.tokens,
+    /**
+     * Load the MTP block of the file and draft the answer with it. The engine
+     * ignores it for a model without an MTP block and for the hybrid backend,
+     * whose prompt runs on a second model.
+     */
+    val speculative: Boolean = false,
 ) {
     /** The ggml device of the image encoder, or null for the GPU when it is present. */
     val visionDeviceName: String? get() = if (visionOnGpu) Backend.GPU.deviceName else backend.visionDeviceName
+
+    /** True when the engine of this configuration makes the MTP draft context. */
+    val speculativeReady: Boolean get() = speculative && backend.prefillDeviceName == null
 }
 
-/** A loaded model with the description line from the native side. */
-data class LoadedModel(val config: EngineConfig, val info: String)
+/**
+ * A loaded model with the description line from the native side.
+ *
+ * @param hasMtp True when the file holds the MTP tensors and this compute
+ *   unit can draft with them. The speculative switch follows it.
+ */
+data class LoadedModel(val config: EngineConfig, val info: String, val hasMtp: Boolean = false)
 
 /**
  * The single owner of the native engine. Every native call runs on one
@@ -240,9 +254,10 @@ object LlamaEngine {
             threads,
             config.nCtx,
             config.imageMaxTokens,
+            config.speculative,
             cacheDir,
         )
-        val loaded = LoadedModel(config, LlamaNative.modelInfo(handle))
+        val loaded = LoadedModel(config, LlamaNative.modelInfo(handle), LlamaNative.hasMtp(handle))
         stateFlow.value = loaded
         loaded
     }

@@ -23,6 +23,18 @@
  * again. A new image decodes in the app (LlamaNative.decodeImage) at the
  * size that the preprocessor selects, thus mtmd gets RGB pixels and
  * copies them without a resize.
+ *
+ * With speculative decoding (load with speculative = true), the engine
+ * holds a second context on the same model with the graph of the MTP
+ * block (common/speculative.h, type draft-mtp). One step drafts up to
+ * kSpecDraftMax tokens there, decodes the drafted tokens together with
+ * the last sampled token on the target context, and gives the tokens that
+ * the target sampler also selects. The draft length follows the measured
+ * acceptance (spec_policy.h). The step rolls the rejected tokens back with
+ * llama_memory_seq_rm: the target context holds n_rs_seq recurrent state
+ * snapshots, one for each position of the verified batch, thus the
+ * rollback needs no state copy. The model memory holds exactly the tokens
+ * that the answer gives, thus the snapshot store stays exact.
  */
 
 #include <android/log.h>
@@ -59,6 +71,8 @@
 #include "mtmd-helper.h"
 #include "mtmd.h"
 #include "perf_hint.h"
+#include "spec_policy.h"
+#include "speculative.h"
 #include "state_cache.h"
 #include "trace.h"
 
@@ -107,6 +121,14 @@ constexpr size_t kContextHeadroom = 8;
 /** The sequence of the conversation in each context. */
 constexpr llama_seq_id kSeqMain = 0;
 
+/**
+ * The maximum number of tokens that one step drafts. The target context
+ * keeps this number of recurrent state snapshots, thus a step that accepts
+ * no drafted token rolls its state back without a state copy. The policy
+ * (spec_policy.h) selects the length of each step between 0 and this value.
+ */
+constexpr int32_t kSpecDraftMax = SpecPolicy::kDraftMax;
+
 static_assert(kMemTokenNull == LLAMA_TOKEN_NULL, "The null token of the state store must be LLAMA_TOKEN_NULL");
 
 /** Give a thread the compute priority. tid 0 is the calling thread. */
@@ -137,6 +159,9 @@ struct TurnStats {
     int64_t image_tokens   = 0;
     int64_t gen_tokens     = 0;
     int64_t gen_us         = 0;
+    /** The tokens that the MTP draft context proposed, and the ones that the target sampler accepted. */
+    int64_t drafted        = 0;
+    int64_t accepted       = 0;
 };
 
 struct Engine {
@@ -163,6 +188,24 @@ struct Engine {
     llama_model *      model_pf  = nullptr;
     llama_context *    ctx_pf    = nullptr;
     ggml_backend_dev_t device_pf = nullptr;
+    /**
+     * Speculative decoding. The draft context runs the graph of the MTP
+     * block of the same model, thus it holds no second copy of the weights:
+     * it adds the KV cache of one attention layer and the compute buffers of
+     * that graph. spec_init owns the context, spec owns the driver.
+     */
+    common_speculative_init_result_ptr spec_init;
+    llama_context *      ctx_dft = nullptr;
+    common_speculative * spec    = nullptr;
+    /** True when the model holds the MTP tensors and the backend can use them. The app asks with hasMtp. */
+    bool mtp_ready = false;
+    /** False while the benchmark runs: the draft context must not follow those decodes. */
+    bool spec_feed = false;
+    /** The draft of the step that runs, and the tokens that the target context holds (text only). */
+    llama_tokens draft;
+    llama_tokens spec_prompt;
+    /** The draft length policy of this answer. */
+    SpecPolicy policy;
     /** The thinking tags of the vocabulary, or LLAMA_TOKEN_NULL. */
     llama_token tok_think_open  = LLAMA_TOKEN_NULL;
     llama_token tok_think_close = LLAMA_TOKEN_NULL;
@@ -190,6 +233,21 @@ struct Engine {
     bool think_open = false;
     /** True after the end of the answer: the end token, a stop, or the context limit. */
     bool answer_done = false;
+    /**
+     * The tokens of the answer that the app did not receive, and the next of
+     * them. One speculative step gives up to kSpecDraftMax + 1 tokens, and
+     * generateNext gives one token for each call.
+     */
+    std::vector<llama_token> out_queue;
+    size_t                   out_next = 0;
+    /**
+     * The token that a step sampled last: the app received it, and the next
+     * step decodes it together with its draft. LLAMA_TOKEN_NULL before the
+     * first step of an answer.
+     */
+    llama_token id_last = LLAMA_TOKEN_NULL;
+    /** True when the queue holds the last tokens of the answer. */
+    bool answer_ends = false;
 
     int  n_threads  = 4;
     int  gpu_layers = 0;
@@ -204,6 +262,11 @@ struct Engine {
     /** Release every native object, in the order of their dependencies. */
     ~Engine() {
         hint.reset();
+        // The driver releases the backend samplers of the draft context, thus it goes first.
+        if (spec != nullptr) common_speculative_free(spec);
+        if (ctx_dft != nullptr) llama_detach_threadpool(ctx_dft);
+        spec_init.reset();
+        ctx_dft = nullptr;
         if (smpl != nullptr) llama_sampler_free(smpl);
         if (mctx != nullptr) mtmd_free(mctx);
         if (ctx_pf != nullptr) {
@@ -343,6 +406,37 @@ void report_hint(Engine & e, int64_t t0) {
 }
 
 /**
+ * Let the MTP draft context follow a batch that the target context decoded.
+ * The draft block reads the hidden state of each token of the batch from the
+ * target context and writes its own KV cells at the same positions, thus the
+ * next draft starts from the state of the answer. Returns false when the
+ * draft context failed: the caller then decodes without a draft.
+ */
+bool spec_follow(Engine & e, const llama_batch & b) {
+    if (e.spec == nullptr || !e.spec_feed) {
+        return true;
+    }
+    TraceSection trace("spec-follow");
+    if (common_speculative_process(e.spec, b)) {
+        return true;
+    }
+    LOGE("the MTP draft context did not follow a batch of %d tokens, the answer continues without a draft", b.n_tokens);
+    return false;
+}
+
+/**
+ * Stop the speculative decoding of this engine after a failure of the draft
+ * context. The target context and the answer are not affected.
+ */
+void spec_disable(Engine & e) {
+    if (e.spec != nullptr) {
+        common_speculative_free(e.spec);
+        e.spec = nullptr;
+    }
+    e.draft.clear();
+}
+
+/**
  * Decode text tokens into sequence kSeqMain of a context, in chunks of
  * kBatch, at explicit positions from pos0. Only the last token gives logits,
  * and only with logits_last. Returns the llama_decode code, 0 on success.
@@ -368,8 +462,22 @@ int decode_text(Engine & e, llama_context * lctx, const llama_token * tokens, in
         if (rc != 0) {
             return rc;
         }
+        // Only the decode context holds the answer. The prefill context of the
+        // hybrid backend has its own model, thus the draft block cannot read it.
+        if (lctx == e.ctx && !spec_follow(e, b)) {
+            spec_disable(e);
+        }
     }
     return 0;
+}
+
+/** Record a token that the decode context holds at the end of its sequence. */
+void commit_token(Engine & e, llama_token token) {
+    e.cache.push_back(MemItem{token, {}});
+    e.n_past += 1;
+    if (e.spec != nullptr) {
+        e.spec_prompt.push_back(token);
+    }
 }
 
 /** Decode one token of the answer on the decode context. Returns the llama_decode code. */
@@ -377,22 +485,25 @@ int decode_one(Engine & e, llama_token token) {
     TraceSection trace("decode-step");
     const int rc = decode_text(e, e.ctx, &token, 1, e.n_past, true);
     if (rc == 0) {
-        e.cache.push_back(MemItem{token, {}});
-        e.n_past += 1;
+        commit_token(e, token);
     }
     return rc;
 }
 
-/** Empty the model memory of both contexts and the record of what they hold. The snapshot store stays. */
+/** Empty the model memory of every context and the record of what they hold. The snapshot store stays. */
 void clear_all(Engine & e) {
     llama_memory_clear(llama_get_memory(e.ctx), true);
     if (e.ctx_pf != nullptr) {
         llama_memory_clear(llama_get_memory(e.ctx_pf), true);
     }
+    if (e.ctx_dft != nullptr) {
+        llama_memory_clear(llama_get_memory(e.ctx_dft), false);
+    }
     e.cache.clear();
     e.n_past = 0;
     e.pf_cache.clear();
     e.pf_n_past = 0;
+    e.spec_prompt.clear();
 }
 
 /**
@@ -471,6 +582,75 @@ void open_stores(Engine & e, const std::string & cache_dir, const std::string & 
     LOGI("caches: %zu snapshots (%.0f MB) and %zu images (%.0f MB) on disk in %s",
          e.states->count(), e.states->disk_bytes() / 1048576.0, e.images->count(), e.images->disk_bytes() / 1048576.0,
          cache_dir.empty() ? "no directory" : cache_dir.c_str());
+}
+
+/**
+ * Make the MTP draft context and the driver of the speculative decoding.
+ * The context runs the graph of the MTP block on the weights of the loaded
+ * model, thus it adds the KV cache of one attention layer and the compute
+ * buffers of that graph, and no second copy of the weights.
+ *
+ * Returns false with the reason in the log. The engine then decodes one
+ * token at a time, and the answers are the same.
+ */
+bool setup_speculative(Engine & e, const std::string & model_path) {
+    // A rejected draft token rolls the recurrent state back by one position
+    // for each rejected token. Without the snapshots the step would have to
+    // copy the whole state of the sequence, which is 20 MB and more.
+    if (llama_n_rs_seq(e.ctx) < (uint32_t) kSpecDraftMax) {
+        LOGE("the context keeps %u recurrent state snapshots of the %d that a draft needs, thus the engine does not draft",
+             llama_n_rs_seq(e.ctx), kSpecDraftMax);
+        return false;
+    }
+    common_params params;
+    params.model.path                = model_path;
+    params.n_ctx                     = (int32_t) llama_n_ctx(e.ctx);
+    params.n_batch                   = kBatch;
+    params.n_ubatch                  = kBatch;
+    params.n_parallel                = 1;
+    params.kv_unified                = true;
+    params.no_perf                   = true;
+    params.cpuparams.n_threads       = e.n_threads;
+    params.cpuparams_batch.n_threads = e.n_threads;
+    params.speculative.types         = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    params.speculative.draft.n_max   = kSpecDraftMax;
+
+    const int64_t t0 = now_us();
+    try {
+        // The context of the draft comes from the target model: the same
+        // weights, the graph of the MTP block, and its own memory.
+        common_params params_dft = common_base_params_to_speculative(params);
+        e.spec_init = common_speculative_init_from_params(params_dft, e.model, e.ctx);
+    } catch (const std::exception & ex) {
+        LOGE("the MTP draft context did not initialize: %s", ex.what());
+        e.spec_init.reset();
+        return false;
+    }
+    e.ctx_dft = e.spec_init ? e.spec_init->context() : nullptr;
+    if (e.ctx_dft == nullptr) {
+        LOGE("the MTP draft context did not initialize");
+        e.spec_init.reset();
+        return false;
+    }
+    params.speculative.draft.ctx_tgt = e.ctx;
+    params.speculative.draft.ctx_dft = e.ctx_dft;
+    try {
+        e.spec = common_speculative_init(params.speculative, 1);
+    } catch (const std::exception & ex) {
+        LOGE("the speculative driver did not initialize: %s", ex.what());
+        e.spec = nullptr;
+    }
+    if (e.spec == nullptr) {
+        e.spec_init.reset();
+        e.ctx_dft = nullptr;
+        return false;
+    }
+    if (e.tp != nullptr) {
+        llama_attach_threadpool(e.ctx_dft, e.tp, e.tp);
+    }
+    LOGI("speculative decoding on: %d MTP layers, draft of %d tokens, %u state snapshots, ready in %.0f ms",
+         llama_model_n_layer_nextn(e.model), kSpecDraftMax, llama_n_rs_seq(e.ctx), (now_us() - t0) / 1000.0);
+    return true;
 }
 
 /** Load the vision projector. Returns false with the error text set. */
@@ -635,6 +815,14 @@ int64_t count_tokens(const std::vector<const mtmd_input_chunk *> & chunk_of, siz
 bool prefill(Engine & e, const std::vector<MemItem> & items, const std::vector<const mtmd_input_chunk *> & chunk_of,
              size_t base_len, std::string & error) {
     TraceSection trace("prefill");
+    // The draft context cannot follow a prompt that a snapshot restores or
+    // that an image gives, because it reads the hidden state of each token
+    // from a decode of the target context. Thus it starts each turn empty and
+    // follows the decodes of this turn: its attention then reads only cells
+    // that hold tokens of this conversation.
+    if (e.ctx_dft != nullptr) {
+        llama_memory_clear(llama_get_memory(e.ctx_dft), false);
+    }
     const bool hybrid = e.ctx_pf != nullptr;
     llama_context * pctx = hybrid ? e.ctx_pf : e.ctx;
     // What sequence kSeqMain of the prefill context holds at this time.
@@ -733,6 +921,200 @@ bool prefill(Engine & e, const std::vector<MemItem> & items, const std::vector<c
          hybrid ? ggml_backend_dev_name(e.device_pf) : e.device ? ggml_backend_dev_name(e.device) : "CPU",
          e.turn.transfer_us / 1000.0, e.turn.images_total, e.turn.images_known, e.turn.images_cached,
          e.turn.images_encoded, (int) e.n_past);
+    return true;
+}
+
+/**
+ * Sample the token of each position of a verified batch, and accept the
+ * drafted tokens that the sampler selects itself. The result holds at least
+ * one token: the tokens that the draft got right, and then the token of the
+ * sampler. The sampler accepts each token that it returns, thus its
+ * penalties see the same answer as a decode of one token at a time. O(n) in
+ * the length of the draft.
+ */
+std::vector<llama_token> sample_and_accept(Engine & e, const llama_tokens & draft) {
+    std::vector<llama_token> out;
+    out.reserve(draft.size() + 1);
+    size_t i = 0;
+    for (; i < draft.size(); ++i) {
+        const llama_token id = llama_sampler_sample(e.smpl, e.ctx, (int32_t) i);
+        out.push_back(id);
+        if (draft[i] != id) {
+            break;
+        }
+    }
+    if (i == draft.size()) {
+        out.push_back(llama_sampler_sample(e.smpl, e.ctx, (int32_t) i));
+    }
+    return out;
+}
+
+/**
+ * One step of the answer without a draft: sample the next token from the
+ * logits of the context, decode it, and put it in the queue. Returns false
+ * with the error text set.
+ */
+bool plain_step(Engine & e, std::string & error) {
+    const llama_vocab * vocab = llama_model_get_vocab(e.model);
+    llama_token token = LLAMA_TOKEN_NULL;
+    {
+        TraceSection trace("sample");
+        token = llama_sampler_sample(e.smpl, e.ctx, -1);
+    }
+    if (llama_vocab_is_eog(vocab, token)) {
+        // The end token goes into the memory, thus a template that renders it lets the next turn extend this one.
+        decode_one(e, token);
+        e.answer_ends = true;
+        return true;
+    }
+    const int rc = decode_one(e, token);
+    if (rc != 0) {
+        error = "llama_decode failed during generation with code " + std::to_string(rc);
+        return false;
+    }
+    e.out_queue.push_back(token);
+    e.policy.record(0, 0, 1);
+    return true;
+}
+
+/**
+ * One step of the answer with a draft. The MTP block proposes up to
+ * n_draft tokens, and one decode of the target context verifies all of
+ * them: the sampler of the engine samples each position, and a drafted
+ * token that it selects itself is part of the answer. The step gives 1 to
+ * n_draft + 1 tokens.
+ *
+ * Exactness: the tokens come from the same sampler chain in the same order
+ * as a decode of one token at a time. The positions of the rejected draft
+ * go away before the step returns, thus the model memory holds exactly the
+ * tokens of the answer and the snapshot of the next turn is exact.
+ *
+ * Returns false with the error text set.
+ */
+bool spec_step(Engine & e, std::string & error) {
+    TraceSection trace("spec-step");
+    const llama_vocab * vocab   = llama_model_get_vocab(e.model);
+    llama_memory_t      mem     = llama_get_memory(e.ctx);
+    llama_memory_t      mem_dft = llama_get_memory(e.ctx_dft);
+
+    // The first step of an answer samples from the logits of the prompt.
+    if (e.id_last == LLAMA_TOKEN_NULL) {
+        llama_token first = LLAMA_TOKEN_NULL;
+        {
+            TraceSection sample("sample");
+            first = llama_sampler_sample(e.smpl, e.ctx, -1);
+        }
+        if (llama_vocab_is_eog(vocab, first)) {
+            decode_one(e, first);
+            e.answer_ends = true;
+            return true;
+        }
+        e.out_queue.push_back(first);
+        e.id_last = first;
+    }
+
+    const llama_pos pos0 = e.n_past;
+    // The token of the last step and its draft must fit in the context.
+    const int room    = (int) llama_n_ctx(e.ctx) - (int) pos0 - 2;
+    const int n_draft = std::min(e.policy.next_draft(), std::max(0, room));
+    e.draft.clear();
+    if (n_draft > 0) {
+        TraceSection draft_trace("spec-draft");
+        common_speculative_get_draft_params(e.spec, kSeqMain) = {
+            /* .drafting = */ true,
+            /* .n_max    = */ n_draft,
+            /* .pos0     = */ pos0,
+            /* .id_last  = */ e.id_last,
+            /* .prompt   = */ &e.spec_prompt,
+            /* .result   = */ &e.draft,
+        };
+        common_speculative_draft(e.spec);
+        // The draft wrote its own cells from pos0. They go away, thus the
+        // step that follows writes each of these positions one time.
+        llama_memory_seq_rm(mem_dft, kSeqMain, pos0, -1);
+    }
+
+    // The verified batch: the token of the last step, then the draft. Each
+    // position gives logits, thus the sampler reads each of them.
+    llama_batch & b = e.batch;
+    b.n_tokens = 1 + (int) e.draft.size();
+    for (int i = 0; i < b.n_tokens; ++i) {
+        b.token[i]     = i == 0 ? e.id_last : e.draft[i - 1];
+        b.pos[i]       = pos0 + i;
+        b.n_seq_id[i]  = 1;
+        b.seq_id[i][0] = kSeqMain;
+        b.logits[i]    = 1;
+    }
+    const int64_t t0 = now_us();
+    const int rc = llama_decode(e.ctx, b);
+    report_hint(e, t0);
+    if (rc != 0) {
+        error = "llama_decode failed during generation with code " + std::to_string(rc);
+        return false;
+    }
+    const bool followed = spec_follow(e, b);
+
+    const std::vector<llama_token> ids = sample_and_accept(e, e.draft);
+    const int accepted = (int) ids.size() - 1;
+    common_speculative_accept(e.spec, kSeqMain, (uint16_t) accepted);
+    e.turn.drafted  += (int64_t) e.draft.size();
+    e.turn.accepted += accepted;
+    e.policy.record((int) e.draft.size(), accepted, (int) ids.size());
+
+    // The memory holds the token of the last step at pos0, and each accepted
+    // token after it. The last token of ids is the token of the next step.
+    commit_token(e, e.id_last);
+    for (int i = 0; i < accepted; ++i) {
+        commit_token(e, ids[i]);
+    }
+
+    // An end token stops the answer. It gives no text, and the tokens after it are not part of the answer.
+    int eog_at = -1;
+    for (int i = 0; i < (int) ids.size(); ++i) {
+        if (llama_vocab_is_eog(vocab, ids[i])) {
+            eog_at = i;
+            break;
+        }
+    }
+    const int n_emit = eog_at >= 0 ? eog_at : (int) ids.size();
+    for (int i = 0; i < n_emit; ++i) {
+        e.out_queue.push_back(ids[i]);
+    }
+    if (eog_at < 0) {
+        e.id_last = ids.back();
+    } else {
+        e.answer_ends = true;
+        e.id_last     = LLAMA_TOKEN_NULL;
+        // The end token is in the memory: the positions after it go away with the rejected draft.
+        if (eog_at < accepted) {
+            const size_t drop = (size_t) (accepted - eog_at - 1);
+            e.cache.resize(e.cache.size() - drop);
+            e.spec_prompt.resize(e.spec_prompt.size() - drop);
+            e.n_past -= (llama_pos) drop;
+        }
+    }
+
+    // One call removes every position that the answer does not hold. A
+    // recurrent rollback is single use, thus the step calls it one time.
+    if (e.n_past <= pos0 + (llama_pos) e.draft.size()) {
+        if (!llama_memory_seq_rm(mem, kSeqMain, e.n_past, -1)) {
+            error = "The rejected draft did not roll back at position " + std::to_string(e.n_past);
+            return false;
+        }
+    }
+    // The end token that the draft did not hold decodes now, after the rollback.
+    if (eog_at >= 0 && eog_at == accepted) {
+        const int rc_eog = decode_one(e, ids.back());
+        if (rc_eog != 0) {
+            error = "llama_decode failed on the end token with code " + std::to_string(rc_eog);
+            return false;
+        }
+    }
+    if (followed) {
+        llama_memory_seq_rm(mem_dft, kSeqMain, e.n_past, -1);
+    } else {
+        spec_disable(e);
+    }
     return true;
 }
 
@@ -986,6 +1368,28 @@ jbyteArray pack_piece(JNIEnv * env, Engine & e, int kind) {
     return out;
 }
 
+/**
+ * The last result of an answer: the close of the thinking one time when the
+ * answer ended inside it, else null.
+ */
+jbyteArray finish_answer(JNIEnv * env, Engine & e) {
+    e.answer_done = true;
+    e.id_last     = LLAMA_TOKEN_NULL;
+    if (e.think_open) {
+        // The answer ends inside the thinking: the app gets the close of the thinking one time, then the end.
+        e.think_open = false;
+        e.utf8_pending.clear();
+        return pack_piece(env, e, 2);
+    }
+    return nullptr;
+}
+
+/** Forget the tokens of the answer that the app did not receive. */
+void clear_queue(Engine & e) {
+    e.out_queue.clear();
+    e.out_next = 0;
+}
+
 std::string jstring_to_std(JNIEnv * env, jstring s) {
     if (s == nullptr) {
         return {};
@@ -1111,7 +1515,8 @@ Java_ai_airi_qwenmobile_LlamaNative_devices(JNIEnv * env, jclass) {
 JNIEXPORT jlong JNICALL
 Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, jstring jmmproj,
                                           jstring jdevice, jstring jprefill, jstring jvision, jint gpu_layers,
-                                          jint n_threads, jint n_ctx, jint image_max_tokens, jstring jcache) {
+                                          jint n_threads, jint n_ctx, jint image_max_tokens, jboolean jspeculative,
+                                          jstring jcache) {
     const std::string path    = jstring_to_std(env, jpath);
     const std::string device  = jstring_to_std(env, jdevice);
     const std::string prefill = jstring_to_std(env, jprefill);
@@ -1136,10 +1541,17 @@ Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, js
     e->image_max_tokens = image_max_tokens;
     const bool hybrid = !prefill.empty();
 
+    // The MTP block of the file loads only for a speculative engine: it is one
+    // decoder layer more, and no other path of the engine reads it. The hybrid
+    // backend prefills on a second model, whose hidden states the draft block
+    // cannot read, thus it decodes one token at a time.
+    const bool want_spec = jspeculative == JNI_TRUE && !hybrid;
+
     // The device by its ggml name: GPUOpenCL for the Adreno, HTP0 for the Hexagon NPU.
     std::vector<ggml_backend_dev_t> devices;
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = gpu_layers;
+    mp.load_mtp     = want_spec;
     if (!device.empty()) {
         ggml_backend_dev_t dev = ggml_backend_dev_by_name(device.c_str());
         if (dev == nullptr) {
@@ -1152,7 +1564,9 @@ Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, js
     }
     e->model = llama_model_load_from_file(path.c_str(), mp);
     if (e->model == nullptr) {
-        throw_java(env, "The model did not load: " + path);
+        // A file that names MTP layers but holds no MTP tensors fails only with want_spec.
+        throw_java(env, "The model did not load: " + path +
+                            (want_spec ? " (with its MTP block. Set the speculative switch to off for this file.)" : ""));
         return 0;
     }
 
@@ -1166,6 +1580,13 @@ Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, js
     cp.n_threads       = e->n_threads;
     cp.n_threads_batch = e->n_threads;
     cp.no_perf         = false;
+    // The recurrent layers keep one state snapshot for each drafted position
+    // of a verified batch, thus a rejected draft rolls back without a copy of
+    // the state. The architecture must support the rollback, and
+    // setup_speculative reads the value that the context gave.
+    if (want_spec) {
+        cp.n_rs_seq = (uint32_t) kSpecDraftMax;
+    }
     e->ctx = llama_init_from_model(e->model, cp);
     if (e->ctx == nullptr) {
         throw_java(env, "The context did not initialize (n_ctx=" + std::to_string(n_ctx) + ")");
@@ -1223,6 +1644,13 @@ Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, js
     tids.push_back(gettid());
     e->hint = std::make_unique<PerfHintSession>(tids, kHintTargetNs);
 
+    // The MTP tensors of the file, and a backend that can use them. The app
+    // asks with hasMtp, thus its switch is available for this model.
+    e->mtp_ready = llama_model_n_layer_nextn(e->model) > 0 && !hybrid;
+    if (want_spec && e->mtp_ready && !setup_speculative(*e, path)) {
+        LOGE("the engine decodes without a draft");
+    }
+
     try {
         e->tmpls = common_chat_templates_init(e->model, "");
     } catch (const std::exception & ex) {
@@ -1234,10 +1662,10 @@ Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, js
     rebuild_sampler(*e, false, 0.7f, 0.8f);
     open_stores(*e, cache, path);
 
-    LOGI("model loaded: %s, device=%s, prefill=%s, gpu_layers=%d, threads=%d, n_ctx=%u, mmproj=%s, image tokens %d",
+    LOGI("model loaded: %s, device=%s, prefill=%s, gpu_layers=%d, threads=%d, n_ctx=%u, mmproj=%s, image tokens %d, draft %s",
          path.c_str(), device.empty() ? "cpu" : device.c_str(), prefill.empty() ? "same" : prefill.c_str(),
          gpu_layers, e->n_threads, llama_n_ctx(e->ctx), e->mmproj.empty() ? "none" : e->mmproj.c_str(),
-         e->image_max_tokens);
+         e->image_max_tokens, e->spec != nullptr ? "on" : e->mtp_ready ? "off" : "absent");
     return reinterpret_cast<jlong>(e.release());
 }
 
@@ -1252,11 +1680,23 @@ Java_ai_airi_qwenmobile_LlamaNative_modelInfo(JNIEnv * env, jclass, jlong handle
     char desc[256];
     llama_model_desc(e->model, desc, sizeof(desc));
     char line[512];
-    snprintf(line, sizeof(line), "%s, %.2f GiB, %.2f B params, n_ctx %u, gpu layers %d, threads %d, ADPF %s, vision %s, %d image tokens",
+    snprintf(line, sizeof(line),
+             "%s, %.2f GiB, %.2f B params, n_ctx %u, gpu layers %d, threads %d, ADPF %s, vision %s, %d image tokens, MTP %s",
              desc, llama_model_size(e->model) / 1073741824.0, llama_model_n_params(e->model) / 1e9,
              llama_n_ctx(e->ctx), e->gpu_layers, e->n_threads, e->hint && e->hint->ok() ? "on" : "off",
-             e->mmproj.empty() ? "none" : (e->mctx ? "loaded" : "ready"), e->image_max_tokens);
+             e->mmproj.empty() ? "none" : (e->mctx ? "loaded" : "ready"), e->image_max_tokens,
+             e->spec != nullptr ? "on" : e->mtp_ready ? "off" : "absent");
     return env->NewStringUTF(line);
+}
+
+/**
+ * True when the model file holds the MTP tensors and the backend of this
+ * engine can draft with them. The app enables its switch with this answer,
+ * and a change of the switch loads the model again.
+ */
+JNIEXPORT jboolean JNICALL
+Java_ai_airi_qwenmobile_LlamaNative_hasMtp(JNIEnv *, jclass, jlong handle) {
+    return engine_of(handle)->mtp_ready ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jint JNICALL
@@ -1319,7 +1759,13 @@ Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass native_class,
     e->utf8_pending.clear();
     e->turn           = TurnStats{};
     e->answer_done    = false;
+    e->answer_ends    = false;
     e->stop_requested = false;
+    e->id_last        = LLAMA_TOKEN_NULL;
+    e->spec_feed      = true;
+    e->draft.clear();
+    e->policy.reset();
+    clear_queue(*e);
 
     std::string error;
     mtmd::input_chunks chunks;
@@ -1358,6 +1804,17 @@ Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass native_class,
         throw_java(env, error);
         return -1;
     }
+    if (e->spec != nullptr) {
+        // The text tokens of the context, for the draft implementations that read them.
+        e->spec_prompt.clear();
+        e->spec_prompt.reserve(items.size());
+        for (const MemItem & item : items) {
+            if (item.token != kMemTokenNull) {
+                e->spec_prompt.push_back(item.token);
+            }
+        }
+        common_speculative_begin(e->spec, kSeqMain, e->spec_prompt);
+    }
     return (jint) e->turn.prefill_tokens;
 }
 
@@ -1365,12 +1822,16 @@ JNIEXPORT jbyteArray JNICALL
 Java_ai_airi_qwenmobile_LlamaNative_generateNext(JNIEnv * env, jclass, jlong handle) {
     Engine * e = engine_of(handle);
     std::lock_guard<std::mutex> lock(e->mutex);
-    const llama_vocab * vocab = llama_model_get_vocab(e->model);
     if (e->answer_done) {
         return nullptr;
     }
     if (e->stop_requested.exchange(false)) {
+        // The answer stops here. A speculative step can hold tokens that the
+        // app did not receive: they stay in the model memory, which the
+        // snapshot of the next prompt does not read.
+        clear_queue(*e);
         e->answer_done = true;
+        e->id_last     = LLAMA_TOKEN_NULL;
         return nullptr;
     }
     if ((uint32_t) e->n_past >= llama_n_ctx(e->ctx)) {
@@ -1379,38 +1840,35 @@ Java_ai_airi_qwenmobile_LlamaNative_generateNext(JNIEnv * env, jclass, jlong han
         return nullptr;
     }
 
-    const int64_t t0 = now_us();
-    llama_token token = LLAMA_TOKEN_NULL;
-    {
-        TraceSection trace("sample");
-        token = llama_sampler_sample(e->smpl, e->ctx, -1);
-    }
-    if (llama_vocab_is_eog(vocab, token)) {
-        // The end token goes into the memory, thus a template that renders it lets the next turn extend this one.
-        decode_one(*e, token);
-        e->answer_done = true;
-        if (e->think_open) {
-            // The answer ends inside the thinking: the app gets the close of the thinking one time, then the end.
-            e->think_open = false;
-            e->utf8_pending.clear();
-            return pack_piece(env, *e, 2);
+    if (e->out_next == e->out_queue.size()) {
+        clear_queue(*e);
+        if (e->answer_ends) {
+            return finish_answer(env, *e);
         }
-        return nullptr;
+        // One step gives one token, or up to kSpecDraftMax + 1 tokens with a draft.
+        const int64_t t0 = now_us();
+        std::string error;
+        const bool ok = e->spec != nullptr ? spec_step(*e, error) : plain_step(*e, error);
+        e->turn.gen_us += now_us() - t0;
+        if (!ok) {
+            e->answer_done = true;
+            throw_java(env, error);
+            return nullptr;
+        }
+        if (e->out_queue.empty()) {
+            return finish_answer(env, *e);
+        }
     }
+
+    const llama_token token = e->out_queue[e->out_next];
+    e->out_next += 1;
     const int kind = token_kind(*e, token);
     if (kind == 0) {
         append_piece(*e, token);
     } else {
         e->think_open = kind == 1;
     }
-    const int rc = decode_one(*e, token);
-    if (rc != 0) {
-        e->answer_done = true;
-        throw_java(env, "llama_decode failed during generation with code " + std::to_string(rc));
-        return nullptr;
-    }
     e->turn.gen_tokens += 1;
-    e->turn.gen_us     += now_us() - t0;
     return pack_piece(env, *e, kind);
 }
 
@@ -1452,6 +1910,11 @@ Java_ai_airi_qwenmobile_LlamaNative_stats(JNIEnv * env, jclass, jlong handle) {
                  std::to_string(t.images_cached) + " cached, " + std::to_string(t.images_encoded) + " encoded, " +
                  std::to_string(t.image_tokens) + " tok)";
     }
+    if (e->spec != nullptr || t.drafted > 0) {
+        const int percent = t.drafted > 0 ? (int) ((t.accepted * 100 + t.drafted / 2) / t.drafted) : 0;
+        extra += ", drafted " + std::to_string(t.drafted) + ", accepted " + std::to_string(t.accepted) +
+                 " (" + std::to_string(percent) + " %)";
+    }
     snprintf(line, sizeof(line), "prefill %lld tok in %.0f ms (%.1f t/s on %s)%s, generate %lld tok (%.1f t/s), memory %d pos",
              (long long) t.prefill_tokens, t.prefill_us / 1000.0, pp, pf_dev, extra.c_str(),
              (long long) t.gen_tokens, tg, (int) e->n_past);
@@ -1471,7 +1934,12 @@ Java_ai_airi_qwenmobile_LlamaNative_resetChat(JNIEnv *, jclass, jlong handle) {
     e->turn           = TurnStats{};
     e->think_open     = false;
     e->answer_done    = true;
+    e->answer_ends    = false;
     e->stop_requested = false;
+    e->id_last        = LLAMA_TOKEN_NULL;
+    e->draft.clear();
+    e->policy.reset();
+    clear_queue(*e);
 }
 
 /**
@@ -1488,6 +1956,9 @@ Java_ai_airi_qwenmobile_LlamaNative_bench(JNIEnv * env, jclass, jlong handle,
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(e->model));
     std::mt19937 rng(42);
     std::uniform_int_distribution<int> pick(0, n_vocab - 1);
+    // The benchmark measures the target model. The draft context must not
+    // follow these decodes: it would add its own graph to each of them.
+    e->spec_feed = false;
 
     std::vector<double> pp_tps, tg_tps;
     std::string log;
