@@ -139,6 +139,18 @@ class SettingsFragment : Fragment() {
             if (applying) return@setOnCheckedChangeListener
             store.update { it.copy(visionOnGpu = checked) }
         }
+        for (detail in ImageDetail.entries) {
+            val chip = layoutInflater.inflate(R.layout.item_choice_chip, b.imageDetailGroup, false) as Chip
+            chip.id = View.generateViewId()
+            chip.text = getString(R.string.settings_image_detail_chip, getString(detailLabel(detail)), detail.tokens)
+            chip.tag = detail
+            b.imageDetailGroup.addView(chip)
+        }
+        b.imageDetailGroup.setOnCheckedStateChangeListener { group, checkedIds ->
+            if (applying) return@setOnCheckedStateChangeListener
+            val chip = checkedIds.firstOrNull()?.let { group.findViewById<Chip>(it) } ?: return@setOnCheckedStateChangeListener
+            store.update { it.copy(imageDetail = chip.tag as ImageDetail) }
+        }
         b.threadsSlider.valueFrom = SettingsStore.MIN_THREADS.toFloat()
         b.threadsSlider.valueTo = SettingsStore.MAX_THREADS.toFloat()
         b.threadsSlider.stepSize = 1f
@@ -160,6 +172,13 @@ class SettingsFragment : Fragment() {
             val chip = checkedIds.firstOrNull()?.let { group.findViewById<Chip>(it) } ?: return@setOnCheckedStateChangeListener
             store.update { it.copy(nCtx = chip.tag as Int) }
         }
+    }
+
+    /** The label of an image detail level. */
+    private fun detailLabel(detail: ImageDetail): Int = when (detail) {
+        ImageDetail.FAST -> R.string.settings_image_detail_fast
+        ImageDetail.STANDARD -> R.string.settings_image_detail_standard
+        ImageDetail.DETAILED -> R.string.settings_image_detail_detailed
     }
 
     // --- Generation ---
@@ -214,6 +233,12 @@ class SettingsFragment : Fragment() {
                 },
             )
             b.visionGpuSwitch.isChecked = s.visionOnGpu
+            for (i in 0 until b.imageDetailGroup.childCount) {
+                val chip = b.imageDetailGroup.getChildAt(i) as Chip
+                if (chip.tag == s.imageDetail) {
+                    b.imageDetailGroup.check(chip.id)
+                }
+            }
             b.threadsSlider.value = s.threads.toFloat()
             b.threadsValue.text = s.threads.toString()
             for (i in 0 until b.contextGroup.childCount) {

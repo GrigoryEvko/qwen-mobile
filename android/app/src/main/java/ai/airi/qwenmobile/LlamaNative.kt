@@ -45,10 +45,11 @@ object LlamaNative {
      * @param gpuLayers      The number of layers on the device, 0 for the CPU only
      * @param threads        The number of CPU threads
      * @param nCtx           The context length in tokens
+     * @param imageMaxTokens The maximum number of vision tokens of one image, between 64 and 768
      * @param cacheDir       The cache directory of the app for the prompt states and the encoded
      *                       images, or null to keep them in RAM only
      * @return The engine handle
-     * @throws RuntimeException If a device, the model or a context does not load
+     * @throws RuntimeException If a device, the model or a context does not load, or a limit is out of range
      */
     @JvmStatic external fun load(
         path: String,
@@ -59,6 +60,7 @@ object LlamaNative {
         gpuLayers: Int,
         threads: Int,
         nCtx: Int,
+        imageMaxTokens: Int,
         cacheDir: String?,
     ): Long
 

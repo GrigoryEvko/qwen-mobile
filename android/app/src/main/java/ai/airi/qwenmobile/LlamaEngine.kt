@@ -131,6 +131,8 @@ data class EngineConfig(
     val mmproj: String? = null,
     /** Keep the image encoder on the GPU also when the prompt runs on the NPU. */
     val visionOnGpu: Boolean = false,
+    /** The maximum number of vision tokens of one image. */
+    val imageMaxTokens: Int = ImageDetail.DEFAULT.tokens,
 ) {
     /** The ggml device of the image encoder, or null for the GPU when it is present. */
     val visionDeviceName: String? get() = if (visionOnGpu) Backend.GPU.deviceName else backend.visionDeviceName
@@ -229,6 +231,7 @@ object LlamaEngine {
             if (config.backend == Backend.CPU) 0 else 999,
             threads,
             config.nCtx,
+            config.imageMaxTokens,
             cacheDir,
         )
         val loaded = LoadedModel(config, LlamaNative.modelInfo(handle))

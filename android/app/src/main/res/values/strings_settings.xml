@@ -14,6 +14,12 @@
     <string name="settings_backend_hybrid">NPU+GPU</string>
     <string name="settings_vision_gpu">Encode images on the GPU</string>
     <string name="settings_vision_gpu_hint">Off: the image encoder runs on the compute unit of the prompt. The NPU encodes a photo in less than one second, the GPU in some seconds.</string>
+    <string name="settings_image_detail">Image detail</string>
+    <string name="settings_image_detail_hint">The number of vision tokens of one image. More tokens read small text better. The encoder and the prompt grow with the count, and a change reloads the model.</string>
+    <string name="settings_image_detail_fast">Fast</string>
+    <string name="settings_image_detail_standard">Standard</string>
+    <string name="settings_image_detail_detailed">Detailed</string>
+    <string name="settings_image_detail_chip">%1$s · %2$d</string>
     <string name="settings_threads">Threads</string>
     <string name="settings_context">Context length</string>
     <string name="settings_generation">Generation</string>

@@ -9,6 +9,24 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
+/**
+ * The token budget of one image. More tokens read small text better. The
+ * encoder and the prompt grow with the count: the encode is quadratic in
+ * the patches, the prefill is linear in the tokens.
+ */
+enum class ImageDetail(val tokens: Int) {
+    FAST(256),
+    STANDARD(576),
+
+    /** 768 is the ceiling until the encoder is correct on the NPU at 1024 tokens. */
+    DETAILED(768);
+
+    companion object {
+        /** The budget of a fresh install. */
+        val DEFAULT = STANDARD
+    }
+}
+
 /** The user settings. The model path is null until the user selects a model. */
 data class AppSettings(
     val modelPath: String?,
@@ -17,6 +35,7 @@ data class AppSettings(
     val nCtx: Int = 8192,
     /** Keep the image encoder on the GPU also when the prompt runs on the NPU. */
     val visionOnGpu: Boolean = false,
+    val imageDetail: ImageDetail = ImageDetail.DEFAULT,
     val thinking: Boolean = false,
     val temperature: Float = 0.7f,
     val topP: Float = 0.8f,
@@ -61,6 +80,9 @@ class SettingsStore private constructor(context: Context) {
             threads = prefs.getInt(KEY_THREADS, 4),
             nCtx = prefs.getInt(KEY_N_CTX, 8192),
             visionOnGpu = prefs.getBoolean(KEY_VISION_GPU, false),
+            imageDetail = prefs.getString(KEY_IMAGE_DETAIL, null)?.let { name ->
+                ImageDetail.entries.firstOrNull { it.name == name }
+            } ?: ImageDetail.DEFAULT,
             thinking = prefs.getBoolean(KEY_THINKING, false),
             temperature = prefs.getFloat(KEY_TEMPERATURE, 0.7f),
             topP = prefs.getFloat(KEY_TOP_P, 0.8f),
@@ -74,6 +96,7 @@ class SettingsStore private constructor(context: Context) {
             .putInt(KEY_THREADS, s.threads)
             .putInt(KEY_N_CTX, s.nCtx)
             .putBoolean(KEY_VISION_GPU, s.visionOnGpu)
+            .putString(KEY_IMAGE_DETAIL, s.imageDetail.name)
             .putBoolean(KEY_THINKING, s.thinking)
             .putFloat(KEY_TEMPERATURE, s.temperature)
             .putFloat(KEY_TOP_P, s.topP)
@@ -87,6 +110,7 @@ class SettingsStore private constructor(context: Context) {
         private const val KEY_THREADS = "threads"
         private const val KEY_N_CTX = "n_ctx"
         private const val KEY_VISION_GPU = "vision_on_gpu"
+        private const val KEY_IMAGE_DETAIL = "image_detail"
         private const val KEY_THINKING = "thinking"
         private const val KEY_TEMPERATURE = "temperature"
         private const val KEY_TOP_P = "top_p"

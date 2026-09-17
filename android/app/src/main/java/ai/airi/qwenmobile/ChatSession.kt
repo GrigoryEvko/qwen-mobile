@@ -120,7 +120,9 @@ object ChatSession {
         scope.launch {
             SettingsStore.of(app).state.collect { s ->
                 val c = wantedConfig ?: LlamaEngine.state.value?.config ?: return@collect
-                if (s.modelPath != c.path || s.backend != c.backend || s.threads != c.threads || s.nCtx != c.nCtx) {
+                if (s.modelPath != c.path || s.backend != c.backend || s.threads != c.threads || s.nCtx != c.nCtx ||
+                    s.visionOnGpu != c.visionOnGpu || s.imageDetail.tokens != c.imageMaxTokens
+                ) {
                     scheduleReload()
                 }
             }
@@ -195,7 +197,10 @@ object ChatSession {
             if (!file.isFile) {
                 null
             } else {
-                EngineConfig(path, s.backend, s.threads, s.nCtx, ModelFiles.mmprojFor(file)?.absolutePath, s.visionOnGpu)
+                EngineConfig(
+                    path, s.backend, s.threads, s.nCtx, ModelFiles.mmprojFor(file)?.absolutePath, s.visionOnGpu,
+                    s.imageDetail.tokens,
+                )
             }
         } ?: return app.getString(R.string.no_model_selected)
         wantedConfig = config

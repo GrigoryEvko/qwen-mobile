@@ -72,10 +72,16 @@ constexpr int64_t kHintTargetNs = 40'000'000;
 /** The number of tokens that the presence penalty looks back on. */
 constexpr int32_t kPenaltyLastN = 256;
 
-/** The maximum number of vision tokens of one image. 576 tokens is a 768 x 768 image. */
-constexpr int32_t kImageMaxTokens = 576;
+/**
+ * The range of the token limit of one image, which the app sets for each
+ * load. 576 tokens is a 768 x 768 image. 768 tokens (3072 patches) is the
+ * ceiling until the encoder is correct on the NPU at 4096 patches: a
+ * 1024-token photo gave an empty answer there.
+ */
+constexpr int32_t kImageTokensMin = 64;
+constexpr int32_t kImageTokensMax = 768;
 
-/** The budgets of the cache of encoded images, in bytes. One image is 2 to 5 MB at 2048 x 576 floats. */
+/** The budgets of the cache of encoded images, in bytes. One image is 2 to 6 MB at 2048 floats for each of up to 768 tokens. */
 constexpr size_t kImageRamBytes  = 64u << 20;
 constexpr size_t kImageDiskBytes = 256u << 20;
 
@@ -125,6 +131,8 @@ struct TurnStats {
     int     images_known   = 0;
     int     images_cached  = 0;
     int     images_encoded = 0;
+    /** The vision tokens of all images of the prompt. */
+    int64_t image_tokens   = 0;
     int64_t gen_tokens     = 0;
     int64_t gen_us         = 0;
 };
@@ -139,6 +147,8 @@ struct Engine {
     std::string       mmproj;
     /** The ggml device name of the image encoder. Empty takes the OpenCL GPU when it is present, else the CPU. */
     std::string       vision_device;
+    /** The token limit of one image, from the load, in [kImageTokensMin, kImageTokensMax]. */
+    int32_t           image_max_tokens = 0;
     ggml_backend_dev_t device = nullptr;
     /** The batch of the text decodes, kBatch tokens, allocated one time. */
     llama_batch batch = {};
@@ -413,8 +423,13 @@ bool restore_state(llama_context * lctx, const cache_io::Blob & bytes) {
     return true;
 }
 
-/** The namespace of the disk caches: the model and projector files with their sizes and times, and the image token limit. */
-std::string cache_namespace(const std::string & model, const std::string & mmproj) {
+/**
+ * The namespace of the disk caches: the model and projector files with
+ * their sizes and times, and the image token limit. The limit is part of
+ * the key because the state after an image depends on its token count,
+ * and the items of a snapshot name the image only by its file hash.
+ */
+std::string cache_namespace(const std::string & model, const std::string & mmproj, int32_t image_max_tokens) {
     std::string key;
     for (const std::string & path : {model, mmproj}) {
         cache_io::FileStat st;
@@ -424,7 +439,7 @@ std::string cache_namespace(const std::string & model, const std::string & mmpro
         }
         key += "|";
     }
-    key += std::to_string(kImageMaxTokens);
+    key += std::to_string(image_max_tokens);
     return cache_io::hex64(cache_io::fnv1a64(key.data(), key.size()));
 }
 
@@ -438,7 +453,7 @@ void open_stores(Engine & e, const std::string & cache_dir, const std::string & 
     std::string image_dir;
     if (!cache_dir.empty()) {
         const std::string root = cache_dir + "/engine";
-        const std::string ns   = cache_namespace(model_path, e.mmproj);
+        const std::string ns   = cache_namespace(model_path, e.mmproj, e.image_max_tokens);
         for (const std::string & name : cache_io::list_dirs(root)) {
             if (name != ns) {
                 cache_io::remove_tree(root + "/" + name);
@@ -482,7 +497,7 @@ bool ensure_vision(Engine & e, std::string & error) {
     mp.n_threads        = e.n_threads;
     mp.print_timings    = false;
     mp.warmup           = false;
-    mp.image_max_tokens = kImageMaxTokens;
+    mp.image_max_tokens = e.image_max_tokens;
     const int64_t t0 = now_us();
     e.mctx = mtmd_init_from_file(e.mmproj.c_str(), e.model, mp);
     if (e.mctx == nullptr) {
@@ -999,7 +1014,7 @@ Java_ai_airi_qwenmobile_LlamaNative_devices(JNIEnv * env, jclass) {
 JNIEXPORT jlong JNICALL
 Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, jstring jmmproj,
                                           jstring jdevice, jstring jprefill, jstring jvision, jint gpu_layers,
-                                          jint n_threads, jint n_ctx, jstring jcache) {
+                                          jint n_threads, jint n_ctx, jint image_max_tokens, jstring jcache) {
     const std::string path    = jstring_to_std(env, jpath);
     const std::string device  = jstring_to_std(env, jdevice);
     const std::string prefill = jstring_to_std(env, jprefill);
@@ -1009,12 +1024,19 @@ Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, js
         throw_java(env, "The context length must be at least " + std::to_string(kBatch) + " tokens, not " + std::to_string(n_ctx));
         return 0;
     }
+    // The limit is a hard range of the engine: the encoder is not correct at 4096 patches on the NPU.
+    if (image_max_tokens < kImageTokensMin || image_max_tokens > kImageTokensMax) {
+        throw_java(env, "The image token limit must be between " + std::to_string(kImageTokensMin) + " and " +
+                            std::to_string(kImageTokensMax) + ", not " + std::to_string(image_max_tokens));
+        return 0;
+    }
     // The destructor of the engine releases what loaded when a later step fails.
     auto e = std::make_unique<Engine>();
     e->n_threads  = std::max(1, (int) n_threads);
     e->gpu_layers = gpu_layers;
     e->mmproj     = jstring_to_std(env, jmmproj);
-    e->vision_device = vision;
+    e->vision_device    = vision;
+    e->image_max_tokens = image_max_tokens;
     const bool hybrid = !prefill.empty();
 
     // The device by its ggml name: GPUOpenCL for the Adreno, HTP0 for the Hexagon NPU.
@@ -1115,9 +1137,10 @@ Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, js
     rebuild_sampler(*e, false, 0.7f, 0.8f);
     open_stores(*e, cache, path);
 
-    LOGI("model loaded: %s, device=%s, prefill=%s, gpu_layers=%d, threads=%d, n_ctx=%u, mmproj=%s",
+    LOGI("model loaded: %s, device=%s, prefill=%s, gpu_layers=%d, threads=%d, n_ctx=%u, mmproj=%s, image tokens %d",
          path.c_str(), device.empty() ? "cpu" : device.c_str(), prefill.empty() ? "same" : prefill.c_str(),
-         gpu_layers, e->n_threads, llama_n_ctx(e->ctx), e->mmproj.empty() ? "none" : e->mmproj.c_str());
+         gpu_layers, e->n_threads, llama_n_ctx(e->ctx), e->mmproj.empty() ? "none" : e->mmproj.c_str(),
+         e->image_max_tokens);
     return reinterpret_cast<jlong>(e.release());
 }
 
@@ -1132,10 +1155,10 @@ Java_ai_airi_qwenmobile_LlamaNative_modelInfo(JNIEnv * env, jclass, jlong handle
     char desc[256];
     llama_model_desc(e->model, desc, sizeof(desc));
     char line[512];
-    snprintf(line, sizeof(line), "%s, %.2f GiB, %.2f B params, n_ctx %u, gpu layers %d, threads %d, ADPF %s, vision %s",
+    snprintf(line, sizeof(line), "%s, %.2f GiB, %.2f B params, n_ctx %u, gpu layers %d, threads %d, ADPF %s, vision %s, %d image tokens",
              desc, llama_model_size(e->model) / 1073741824.0, llama_model_n_params(e->model) / 1e9,
              llama_n_ctx(e->ctx), e->gpu_layers, e->n_threads, e->hint && e->hint->ok() ? "on" : "off",
-             e->mmproj.empty() ? "none" : (e->mctx ? "loaded" : "ready"));
+             e->mmproj.empty() ? "none" : (e->mctx ? "loaded" : "ready"), e->image_max_tokens);
     return env->NewStringUTF(line);
 }
 
@@ -1214,6 +1237,7 @@ Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass, jlong handle
         throw_java(env, "The conversation is longer than the context (" + std::to_string(n_tokens) + " tokens)");
         return -1;
     }
+    e->turn.image_tokens = n_tokens - (int64_t) std::count(chunk_of.begin(), chunk_of.end(), nullptr);
     size_t base_len = base_length(*e, prompt, tail, items);
     if (base_len == items.size() && e->ctx_pf != nullptr) {
         // The decode context must decode the last token itself: the state transfer carries no logits.
@@ -1326,9 +1350,10 @@ Java_ai_airi_qwenmobile_LlamaNative_stats(JNIEnv * env, jclass, jlong handle) {
         extra += ", transfer " + std::to_string(t.transfer_us / 1000) + " ms";
     }
     if (t.images_total > 0) {
-        // Known: the JPEG was not decoded. Cached: the encoder output came from the cache. The rest of the prompt images sat in the reused prefix.
+        // Known: the file was not decoded. Cached: the encoder output came from the cache. The rest of the prompt images sat in the reused prefix.
         extra += ", images " + std::to_string(t.images_total) + " (" + std::to_string(t.images_known) + " known, " +
-                 std::to_string(t.images_cached) + " cached, " + std::to_string(t.images_encoded) + " encoded)";
+                 std::to_string(t.images_cached) + " cached, " + std::to_string(t.images_encoded) + " encoded, " +
+                 std::to_string(t.image_tokens) + " tok)";
     }
     snprintf(line, sizeof(line), "prefill %lld tok in %.0f ms (%.1f t/s on %s)%s, generate %lld tok (%.1f t/s), memory %d pos",
              (long long) t.prefill_tokens, t.prefill_us / 1000.0, pp, pf_dev, extra.c_str(),
