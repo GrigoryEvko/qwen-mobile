@@ -49,7 +49,14 @@
 #   The simulator needs libncurses.so.5. The script makes a shim from libncurses.so.6 of the image.
 #   The program reads the cycle counter through s31:30 (PCYCLE), which counts without setup in the
 #   standalone runtime. The user counter c15:14 counts only after SSR bit 23 and SYSCFG bit 6 are set.
-#   The HMX needs SSR bit 26 (XE2) for the thread. Refer to lab/lab.c.
+#   The HMX needs SSR bit 26 (XE2) for the thread. Refer to lab/lab.c. Without that bit an HMX
+#   instruction raises the exception 0x18.
+#
+# The limit of this SDK: the simulator runs the HMX instructions in functional mode, but the timing
+# model does not retire them. After the store of the accumulator the first read of the result never
+# completes: the thread stalls in DUNCACHED_DEMAND_MISS_CYCLES until the cycle limit. The v79na_1
+# stats have no HMX counter. Thus the hmx target runs in functional mode for the correctness result,
+# and its timing run needs --plimit and gives no cycle number.
 #
 # The comparison of each kernel against its scalar reference runs inside the program: the
 # "lab: check" lines report the number of elements outside the tolerance.
