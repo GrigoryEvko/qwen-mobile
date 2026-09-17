@@ -1,0 +1,56 @@
+diff --git a/tools/mtmd/models/qwen3vl.cpp b/tools/mtmd/models/qwen3vl.cpp
+index 67674dd..823624f 100644
+--- a/tools/mtmd/models/qwen3vl.cpp
++++ b/tools/mtmd/models/qwen3vl.cpp
+@@ -88,32 +88,38 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
+             cur = build_mm(layer.qkv_w, cur);
+             cur = ggml_add(ctx0, cur, layer.qkv_b);
+ 
+-            ggml_tensor * Qcur = ggml_view_3d(ctx0, cur, d_head, n_head, n_pos,
++            // Q and K are adjacent in the QKV output, and the rotation of an
++            // element depends on its position and its index in the head, not
++            // on the head. Thus one rope over the two gives the same values
++            // with half the ops, and each token gives one segment of 2 x n_embd.
++            GGML_ASSERT(n_head * d_head == n_embd);
++            ggml_tensor * QKcur = ggml_view_3d(ctx0, cur, d_head, 2 * n_head, n_pos,
+                     /* nb1    */ ggml_row_size(cur->type, d_head),
+                     /* nb2    */ cur->nb[1],
+                     /* offset */ 0);
+ 
+-            ggml_tensor * Kcur = ggml_view_3d(ctx0, cur, d_head, n_head, n_pos,
+-                    /* nb1    */ ggml_row_size(cur->type, d_head),
+-                    /* nb2    */ cur->nb[1],
+-                    /* offset */ ggml_row_size(cur->type, n_embd));
+-
+             ggml_tensor * Vcur = ggml_view_3d(ctx0, cur, d_head, n_head, n_pos,
+                     /* nb1    */ ggml_row_size(cur->type, d_head),
+                     /* nb2    */ cur->nb[1],
+                     /* offset */ ggml_row_size(cur->type, 2 * n_embd));
+ 
+-            cb(Qcur, "Qcur", il);
+-            cb(Kcur, "Kcur", il);
++            cb(QKcur, "QKcur", il);
+             cb(Vcur, "Vcur", il);
+ 
+             // apply M-RoPE
+-            Qcur = ggml_rope_multi(
+-                ctx0, Qcur, positions, nullptr,
+-                d_head/2, mrope_sections, GGML_ROPE_TYPE_VISION, 32768, 10000, 1, 0, 1, 32, 1);
+-            Kcur = ggml_rope_multi(
+-                ctx0, Kcur, positions, nullptr,
++            QKcur = ggml_rope_multi(
++                ctx0, QKcur, positions, nullptr,
+                 d_head/2, mrope_sections, GGML_ROPE_TYPE_VISION, 32768, 10000, 1, 0, 1, 32, 1);
++            cb(QKcur, "QKcur_rope", il);
++
++            ggml_tensor * Qcur = ggml_view_3d(ctx0, QKcur, d_head, n_head, n_pos,
++                    /* nb1    */ QKcur->nb[1],
++                    /* nb2    */ QKcur->nb[2],
++                    /* offset */ 0);
++            ggml_tensor * Kcur = ggml_view_3d(ctx0, QKcur, d_head, n_head, n_pos,
++                    /* nb1    */ QKcur->nb[1],
++                    /* nb2    */ QKcur->nb[2],
++                    /* offset */ (size_t) n_head * QKcur->nb[1]);
+ 
+             cb(Qcur, "Qcur_rope", il);
+             cb(Kcur, "Kcur_rope", il);

@@ -1,0 +1,153 @@
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index 04b401e..92bd960 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -16,6 +16,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <fstream>
++#include <list>
+ #include <map>
+ #include <random>
+ #include <stdexcept>
+@@ -174,6 +175,12 @@ struct clip_ctx {
+ 
+     bool support_batch = false;
+ 
++    // The learned position embedding of Qwen3-VL for the last image sizes:
++    // resized to the patch grid and put in the merge order on the CPU
++    // (clip_pos_embd_merged), keyed by the grid (width, height). The most
++    // recently used size is first.
++    std::list<std::pair<std::pair<int, int>, std::vector<float>>> pos_embd_merged_cache;
++
+     // for audio gen, reseeded only when the caller asks for another seed
+     std::mt19937 rng{std::random_device{}()};
+     uint32_t rng_seed = UINT32_MAX;
+@@ -4446,6 +4453,85 @@ static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hpa
+     }
+ }
+ 
++// The learned position embedding of Qwen3-VL for a patch grid of width x
++// height, in the order of the spatial merge: the same ops that the graph ran
++// (the interpolate with align corners, the transposed copy, the merge
++// reorder), as a small graph on the CPU backend. Thus the values are those of
++// the CPU kernel bit for bit. The result goes to the graph as one input, thus
++// the device does no upscale, no strided copy and no merge copy of the
++// embedding. The last sizes stay in a cache of the context.
++static const std::vector<float> & clip_pos_embd_merged(clip_ctx * ctx, int width, int height) {
++    constexpr size_t n_cache = 4;
++    auto & cache = ctx->pos_embd_merged_cache;
++    const std::pair<int, int> key(width, height);
++    for (auto it = cache.begin(); it != cache.end(); ++it) {
++        if (it->first == key) {
++            cache.splice(cache.begin(), cache, it);
++            return cache.front().second;
++        }
++    }
++
++    ggml_tensor * table = ctx->model.position_embeddings;
++    GGML_ASSERT(table != nullptr);
++    GGML_ASSERT(width > 0 && height > 0 && width % 2 == 0 && height % 2 == 0);
++    const int64_t n_embd     = table->ne[0];
++    const int     n_per_side = (int) std::sqrt((double) table->ne[1]);
++    GGML_ASSERT((int64_t) n_per_side * n_per_side == table->ne[1]);
++
++    ggml_init_params ip = {
++        /*.mem_size   =*/ ggml_tensor_overhead() * 16 + ggml_graph_overhead(),
++        /*.mem_buffer =*/ nullptr,
++        /*.no_alloc   =*/ true,
++    };
++    ggml_context_ptr gctx(ggml_init(ip));
++    ggml_context * g = gctx.get();
++    ggml_tensor * src = ggml_new_tensor_2d(g, GGML_TYPE_F32, n_embd, table->ne[1]);
++    ggml_set_input(src);
++    ggml_tensor * cur = src;
++    if (width != n_per_side || height != n_per_side) {
++        cur = ggml_reshape_3d(g, cur, n_embd, n_per_side, n_per_side);   // -> (n_embd, n_per_side, n_per_side)
++        cur = ggml_permute(g, cur, 2, 0, 1, 3);                           // -> (n_per_side, n_per_side, n_embd)
++        cur = ggml_interpolate(g, cur, width, height, n_embd, 1,
++                               GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ALIGN_CORNERS); // -> (width, height, n_embd)
++        cur = ggml_permute(g, cur, 1, 2, 0, 3);                           // -> (n_embd, width, height)
++        cur = ggml_cont_2d(g, cur, n_embd, width * height);               // -> (n_embd, width * height)
++    }
++    // the spatial merge: two adjacent columns of two adjacent rows make one group of four tokens
++    cur = ggml_cont_4d(g, cur, n_embd * 2, width / 2, height, 1);
++    cur = ggml_reshape_4d(g, cur, n_embd * 2, width / 2, 2, height / 2);
++    cur = ggml_permute(g, cur, 0, 2, 1, 3);
++    cur = ggml_cont_3d(g, cur, n_embd, width * height, 1);
++    ggml_set_output(cur);
++    ggml_cgraph * gf = ggml_new_graph(g);
++    ggml_build_forward_expand(gf, cur);
++
++    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(g, ctx->backend_cpu));
++    GGML_ASSERT(buf != nullptr);
++
++    // the table as F32 on the host: the model buffer can be on a device
++    std::vector<float> table_f32(ggml_nelements(table));
++    if (table->type == GGML_TYPE_F32) {
++        ggml_backend_tensor_get(table, table_f32.data(), 0, ggml_nbytes(table));
++    } else if (table->type == GGML_TYPE_F16) {
++        std::vector<ggml_fp16_t> table_f16(ggml_nelements(table));
++        ggml_backend_tensor_get(table, table_f16.data(), 0, ggml_nbytes(table));
++        ggml_fp16_to_fp32_row(table_f16.data(), table_f32.data(), (int64_t) table_f16.size());
++    } else {
++        GGML_ABORT("the position embedding has type %s, F32 or F16 expected", ggml_type_name(table->type));
++    }
++    ggml_backend_tensor_set(src, table_f32.data(), 0, ggml_nbytes(src));
++    const ggml_status status = ggml_backend_graph_compute(ctx->backend_cpu, gf);
++    GGML_ASSERT(status == GGML_STATUS_SUCCESS);
++
++    std::vector<float> out(ggml_nelements(cur));
++    ggml_backend_tensor_get(cur, out.data(), 0, ggml_nbytes(cur));
++    cache.emplace_front(key, std::move(out));
++    while (cache.size() > n_cache) {
++        cache.pop_back();
++    }
++    return cache.front().second;
++}
++
+ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+     const clip_image_f32_batch & imgs = *params->imgs;
+     int n_batch_cur = imgs.entries.size();
+@@ -4835,6 +4921,11 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+ 
+                 set_input_i32("positions", positions);
+ 
++                // the learned position embedding of Qwen3-VL, resized and reordered on the CPU
++                if (ggml_graph_get_tensor(gf, "pos_embd_merged") != nullptr) {
++                    set_input_f32("pos_embd_merged", clip_pos_embd_merged(ctx, pw, ph));
++                }
++
+                 // the optional all-zero attention mask of the Qwen3-VL graph
+                 if (ggml_graph_get_tensor(gf, "vit_kq_mask") != nullptr) {
+                     std::vector<float> zero_mask((size_t) n_pos * n_pos, 0.0f);
+diff --git a/tools/mtmd/models/qwen3vl.cpp b/tools/mtmd/models/qwen3vl.cpp
+index db8040a..67674dd 100644
+--- a/tools/mtmd/models/qwen3vl.cpp
++++ b/tools/mtmd/models/qwen3vl.cpp
+@@ -38,18 +38,13 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
+         cb(inp, "patch_bias", -1);
+     }
+ 
+-    // calculate absolute position embedding and apply
+-    ggml_tensor * learned_pos_embd = resize_position_embeddings(GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ALIGN_CORNERS);
+-    learned_pos_embd = ggml_cont_4d(
+-        ctx0, learned_pos_embd,
+-        n_embd * 2, n_patches_x / 2, n_patches_y, batch_size);
+-    learned_pos_embd = ggml_reshape_4d(
+-        ctx0, learned_pos_embd,
+-        n_embd * 2, n_patches_x / 2, 2, batch_size * (n_patches_y / 2));
+-    learned_pos_embd = ggml_permute(ctx0, learned_pos_embd, 0, 2, 1, 3);
+-    learned_pos_embd = ggml_cont_3d(
+-        ctx0, learned_pos_embd,
+-        n_embd, n_patches_x * n_patches_y, batch_size);
++    // The learned position embedding, resized to the patch grid and put in
++    // the merge order, comes as one input from the CPU (clip_pos_embd_merged
++    // in clip.cpp), thus the graph has no interpolate, no transposed copy and
++    // no merge copy of it.
++    ggml_tensor * learned_pos_embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_patches_x * n_patches_y);
++    ggml_set_name(learned_pos_embd, "pos_embd_merged");
++    ggml_set_input(learned_pos_embd);
+     inp = ggml_add(ctx0, inp, learned_pos_embd);
+     cb(inp, "inp_pos_emb", -1);
+ 
