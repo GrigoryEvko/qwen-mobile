@@ -1,0 +1,593 @@
+Hexagon HTP: one weight stream for the 2 to 4 rows of a verify step (Q4_0 and Q8_0)
+
+Base: llama.cpp commit c6824a9, with the patches of the series before this one applied.
+
+Files:
+    ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h  the compact activation and the multi-row dots
+    ggml/src/ggml-hexagon/htp/matmul-ops.h            the kernel type and its VTCM layout
+    ggml/src/ggml-hexagon/htp/matmul-ops.c            the multi-row job, its quantizer, the selection
+    ggml/src/ggml-hexagon/ggml-hexagon.cpp            GGML_HEXAGON_MULTIROW and the kernel type
+    tests/test-backend-ops.cpp                        MUL_MAT of 1 to 4 rows at the shapes of the models
+
+A decode step of one token reads every weight of the model from DDR, thus the two product models
+run at the bandwidth limit. A verify step of speculative decoding computes 1 + n_draft tokens, and
+it must read the weights once for all of them.
+
+The matmul operator had a kernel for one activation row and a kernel for a row pair. Three rows
+cost a row pair and a row, and four rows cost two row pairs, because each call reads the weight
+tile again from VTCM and prepares it again. The lab of tools/htp-lab measures a Q4_0 tile of 32
+rows by 32 k values at 70.8 cycles for one row, 100.7 for two, 171.4 for three and 201.3 for four.
+
+This patch adds a dot for 1 to 4 rows that prepares the weights of a k-tile once and keeps one
+accumulator per row. The rows take their activation from a compact copy in DDR through scalar
+registers, with vrmpy(Vu.ub, Rt.b), thus each more row costs the vrmpy instructions only and no
+activation vector load. That form of vrmpy takes an unsigned vector, thus the dot makes the
+weights unsigned and subtracts the sum of the k-tile with the offset of the format: 8 for the
+nibbles of Q4_0, and 128 for the bytes of Q8_0. The integer sums stay exact, thus a row gives the
+result of the kernel of one row. The quantizer of the operator writes the compact copy and the
+sums next to the tiled blocks, in the DDR scratchpad of the context.
+
+The measurement of the lab, in cycles for one tile of 32 weight rows:
+
+    rows        Q4_0 before   Q4_0 after    Q8_0 before   Q8_0 after
+    1           70.8          51.1          ---           ---
+    2           100.7         83.0          ---           ---
+    3           171.4         89.4          ---           ---
+    4           201.3         101.6         ---           ---
+
+GGML_HEXAGON_MULTIROW=0 gives the operator the row-pair path of the checkout, thus one build
+measures both. The operator keeps the row-pair path when the DDR scratchpad is too small for the
+compact activation, and for every weight format other than Q4_0 and Q8_0.
+
+diff --git a/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h b/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
+index c889538..04123b1 100644
+--- a/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
++++ b/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
+@@ -121,7 +121,24 @@ static inline void quantize_block_f32_q8_1_tiled(float * restrict x, uint8_t * r
+     }
+ }
+ 
+-static inline void quantize_block_f32_q8_0_tiled(float * restrict x, uint8_t * restrict y_block) {
++// The compact activation. A tiled block replicates each group of 4 quants across a full vector,
++// thus a tiled dot loads 8 vectors of activation for each k-tile and each row. The compact copy
++// holds the 128 quants of the block as 128 bytes, in the order of the input, and y_sum holds the
++// sum of the 32 quants of each k-tile of the block. The compact dots read 4 quants into a scalar
++// register and use vrmpy(Vu.ub, Rt.b), which broadcasts the register to every lane: no activation
++// vector loads, thus each more row costs the vrmpy instructions only.
++//
++// That form of vrmpy takes an unsigned vector, thus each dot makes its weights unsigned and
++// subtracts the sum of the tile with the offset of the weight format:
++//   Q4_0: sum over k of (q[k] - 8) * a[k]   = sum of q[k] * a[k]   - 8 * sum of a[k]
++//   Q8_0: sum over k of (w[k] + 128 - 128) * a[k] = sum of (w[k] + 128) * a[k] - 128 * sum of a[k]
++// The integer sums are exact in both forms, thus a compact dot gives the result of the 32x1 dot.
++//
++// Give y_compact and y_sum as NULL when only the tiled block is necessary.
++static inline void quantize_block_f32_q8_0_tiled_ex(float * restrict x,
++                                                    uint8_t * restrict y_block,
++                                                    uint8_t * restrict y_compact,
++                                                    int32_t * restrict y_sum) {
+     assert((unsigned long) x % 128 == 0);
+     assert((unsigned long) y_block % 128 == 0);
+ 
+@@ -150,6 +167,24 @@ static inline void quantize_block_f32_q8_0_tiled(float * restrict x, uint8_t * r
+     HVX_Vector vx23_i16 = hvx_vec_i16_from_hf_rnd_sat(vx23_hf);
+     HVX_Vector vx_i8    = Q6_Vb_vpack_VhVh_sat(vx23_i16, vx01_i16);
+ 
++    if (y_compact) {
++        hvx_vmem(y_compact) = vx_i8;
++
++        // the sum of each k-tile: vrmpy with ones sums the 4 bytes of a lane, then three rotate
++        // and add steps sum the 8 lanes of a tile. Lane 8t holds the sum of k-tile t.
++        HVX_Vector v_sums = Q6_Vw_vrmpy_VbVb(vx_i8, Q6_Vb_vsplat_R(1));
++        v_sums = Q6_Vw_vadd_VwVw(v_sums, Q6_V_vror_VR(v_sums, 4));
++        v_sums = Q6_Vw_vadd_VwVw(v_sums, Q6_V_vror_VR(v_sums, 8));
++        v_sums = Q6_Vw_vadd_VwVw(v_sums, Q6_V_vror_VR(v_sums, 16));
++
++        int32_t sums[VLEN_FP32] __attribute__((aligned(VLEN)));
++        hvx_vmem(sums) = v_sums;
++        y_sum[0] = sums[0];
++        y_sum[1] = sums[8];
++        y_sum[2] = sums[16];
++        y_sum[3] = sums[24];
++    }
++
+     HVX_Vector r_scale = hvx_vec_repl_f16(vd_hf);
+ 
+     static const uint8_t __attribute__((aligned(128))) repl[128] = {
+@@ -189,6 +224,24 @@ static inline void quantize_block_f32_q8_0_tiled(float * restrict x, uint8_t * r
+     }
+ }
+ 
++static inline void quantize_block_f32_q8_0_tiled(float * restrict x, uint8_t * restrict y_block) {
++    quantize_block_f32_q8_0_tiled_ex(x, y_block, NULL, NULL);
++}
++
++// The compact copy holds k bytes, and the sum array one int32 per k-tile. Both belong in DDR: the
++// compact dots read them with scalar loads, and a scalar load from VTCM is slow.
++static void quantize_row_f32_q8_0_tiled_compact(float * restrict x, uint8_t * restrict y,
++                                                uint8_t * restrict y_compact, int32_t * restrict y_sum,
++                                                uint32_t k) {
++    assert(k % 32 == 0);
++    const uint32_t qk = QK_Q8_0_TILED;
++    const uint32_t nb = (k + qk - 1) / qk;
++
++    for (uint32_t i = 0; i < nb; i++) {
++        quantize_block_f32_q8_0_tiled_ex(x + i * qk, y + i * 4 * 1152, y_compact + i * qk, y_sum + i * 4);
++    }
++}
++
+ static void quantize_row_f32_q8_0_tiled(float * restrict x, uint8_t * restrict y, uint32_t k) {
+     assert(k % 32 == 0);
+     const uint32_t qk = QK_Q8_0_TILED;
+@@ -568,6 +621,159 @@ static void tiled_vec_dot_q4_0_32x2(const uint32_t n, float * restrict s0, float
+     }
+ }
+ 
++// The compact multi-row dots of Q4_0 and Q8_0. One weight stream serves 1 to 4 activation rows:
++// the kernel prepares the weights of a k-tile once, and each row keeps its own accumulator. The
++// scale arithmetic of a row is the one of the 32x1 dot, thus a row gives the result of a 32x1 call.
++//
++// ya[r] is the compact activation of row r as 32-bit words, yb[r] the sum of each of its k-tiles,
++// and vy[r] its tiled row, from which the kernel reads the scale of each 128-block only.
++//
++// The decode step of speculative decoding uses these dots. Without them the operator calls the
++// 32x2 dot per row pair and the 32x1 dot for the last row, thus 3 and 4 rows read and prepare
++// every weight tile twice.
++#define HTP_MM_HAVE_MULTIROW 1
++
++// The body of a compact dot. TILE is the stride of a weight tile, SHIFT the log2 of the offset of
++// the weight format, and PREP the block that gives the weight vectors of one k-tile.
++#define TILED_VEC_DOT_COMPACT_BODY(NR, TILE, SHIFT, PREP_BLOCK)                                    \
++    const uint8_t * restrict tile_ptr = vx;                                                        \
++    const HVX_Vector mask_h4  = Q6_Vb_vsplat_R(0x0F);                                              \
++    const HVX_Vector v_bias_b = Q6_Vb_vsplat_R(0x80);                                              \
++    HVX_Vector v_sum_float[NR];                                                                    \
++    _Pragma("unroll")                                                                              \
++    for (int r = 0; r < NR; r++) {                                                                 \
++        v_sum_float[r] = Q6_V_vzero();                                                             \
++    }                                                                                              \
++    (void) mask_h4;                                                                                \
++    (void) v_bias_b;                                                                               \
++    const uint32_t n_k_tiles = n / 32;                                                             \
++    for (uint32_t kt = 0; kt < n_k_tiles; kt++) {                                                  \
++        const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * (TILE));          \
++        HVX_Vector acc[NR];                                                                        \
++        _Pragma("unroll")                                                                          \
++        for (int r = 0; r < NR; r++) {                                                             \
++            acc[r] = Q6_V_vzero();                                                                 \
++        }                                                                                          \
++        PREP_BLOCK                                                                                 \
++        _Pragma("unroll")                                                                          \
++        for (int r = 0; r < NR; r++) {                                                             \
++            HVX_Vector v_sum = Q6_Vw_vsub_VwVw(acc[r], Q6_V_vsplat_R(yb[r][kt] << (SHIFT)));       \
++            HVX_Vector v_act_scale = ((const HVX_Vector *) ((const uint8_t *) vy[r] + kt * 1152))[8]; \
++            HVX_Vector v_scale_comb = hvx_vec_mul_f16_f16_to_f32_lower32(v_scale_w, v_act_scale);  \
++            HVX_Vector v_sum_scaled = hvx_vec_mul_f32_f32(Q6_Vsf_equals_Vw(v_sum), v_scale_comb);  \
++            v_sum_float[r] = hvx_vec_add_f32_f32(v_sum_float[r], v_sum_scaled);                    \
++        }                                                                                          \
++    }                                                                                              \
++    _Pragma("unroll")                                                                              \
++    for (int r = 0; r < NR; r++) {                                                                 \
++        if (sz[r]) {                                                                               \
++            hvx_vec_store_u(s[r], valid_rows * sizeof(float), hvx_vec_add_f32_f32(v_sum_float[r], hvx_vmemu(sz[r]))); \
++        } else {                                                                                   \
++            hvx_vec_store_u(s[r], valid_rows * sizeof(float), v_sum_float[r]);                     \
++        }                                                                                          \
++    }
++
++// The four nibble pairs of a Q4_0 k-tile, and the scales of the tile at vector 4
++#define MULTIROW_Q4_0_TILE(NR)                                                                     \
++    _Pragma("unroll")                                                                              \
++    for (int i = 0; i < 4; i++) {                                                                  \
++        HVX_VectorPair v_W_pair = unpack_and_interleave_4bit_x2(vptr[i], mask_h4);                 \
++        HVX_Vector v_W0 = Q6_V_lo_W(v_W_pair);                                                     \
++        HVX_Vector v_W1 = Q6_V_hi_W(v_W_pair);                                                     \
++        _Pragma("unroll")                                                                          \
++        for (int r = 0; r < NR; r++) {                                                             \
++            acc[r] = Q6_Vw_vrmpyacc_VwVubRb(acc[r], v_W0, (int32_t) ya[r][kt * 8 + 2 * i + 0]);    \
++            acc[r] = Q6_Vw_vrmpyacc_VwVubRb(acc[r], v_W1, (int32_t) ya[r][kt * 8 + 2 * i + 1]);    \
++        }                                                                                          \
++    }                                                                                              \
++    const HVX_Vector v_scale_w = vptr[4];
++
++// The eight byte groups of a Q8_0 k-tile, and the scales of the tile at vector 8
++#define MULTIROW_Q8_0_TILE(NR)                                                                     \
++    _Pragma("unroll")                                                                              \
++    for (int g = 0; g < 8; g++) {                                                                  \
++        HVX_Vector v_rot = Q6_V_vror_VR(vptr[g], 64);                                              \
++        HVX_Vector v_W   = Q6_V_vxor_VV(Q6_V_lo_W(Q6_W_vshuff_VVR(v_rot, vptr[g], -2)), v_bias_b); \
++        _Pragma("unroll")                                                                          \
++        for (int r = 0; r < NR; r++) {                                                             \
++            acc[r] = Q6_Vw_vrmpyacc_VwVubRb(acc[r], v_W, (int32_t) ya[r][kt * 8 + g]);             \
++        }                                                                                          \
++    }                                                                                              \
++    const HVX_Vector v_scale_w = vptr[8];
++
++// The argument lists of the compact dots. NR outputs, one weight tile, NR tiled rows, NR compact
++// rows, NR sum arrays, the valid rows of the tile, and NR fused-add rows.
++#define TILED_VEC_DOT_COMPACT_1(NAME, TILE, SHIFT, TILE_BLOCK)                                     \
++static void NAME(const uint32_t n, float * restrict s0, const void * restrict vx,                  \
++                 const void * restrict vy0, const uint32_t * restrict ya0,                         \
++                 const int32_t * restrict yb0, uint32_t valid_rows, const float * restrict sz0) {  \
++    float * const          s[1]  = { s0 };                                                         \
++    const void * const     vy[1] = { vy0 };                                                        \
++    const uint32_t * const ya[1] = { ya0 };                                                        \
++    const int32_t * const  yb[1] = { yb0 };                                                        \
++    const float * const    sz[1] = { sz0 };                                                        \
++    TILED_VEC_DOT_COMPACT_BODY(1, TILE, SHIFT, TILE_BLOCK(1))                                      \
++}
++
++#define TILED_VEC_DOT_COMPACT_2(NAME, TILE, SHIFT, TILE_BLOCK)                                     \
++static void NAME(const uint32_t n, float * restrict s0, float * restrict s1,                       \
++                 const void * restrict vx, const void * restrict vy0, const void * restrict vy1,   \
++                 const uint32_t * restrict ya0, const uint32_t * restrict ya1,                     \
++                 const int32_t * restrict yb0, const int32_t * restrict yb1,                       \
++                 uint32_t valid_rows, const float * restrict sz0, const float * restrict sz1) {    \
++    float * const          s[2]  = { s0, s1 };                                                     \
++    const void * const     vy[2] = { vy0, vy1 };                                                   \
++    const uint32_t * const ya[2] = { ya0, ya1 };                                                   \
++    const int32_t * const  yb[2] = { yb0, yb1 };                                                   \
++    const float * const    sz[2] = { sz0, sz1 };                                                   \
++    TILED_VEC_DOT_COMPACT_BODY(2, TILE, SHIFT, TILE_BLOCK(2))                                      \
++}
++
++#define TILED_VEC_DOT_COMPACT_3(NAME, TILE, SHIFT, TILE_BLOCK)                                     \
++static void NAME(const uint32_t n, float * restrict s0, float * restrict s1, float * restrict s2,  \
++                 const void * restrict vx, const void * restrict vy0, const void * restrict vy1,   \
++                 const void * restrict vy2,                                                        \
++                 const uint32_t * restrict ya0, const uint32_t * restrict ya1, const uint32_t * restrict ya2, \
++                 const int32_t * restrict yb0, const int32_t * restrict yb1, const int32_t * restrict yb2,    \
++                 uint32_t valid_rows,                                                              \
++                 const float * restrict sz0, const float * restrict sz1, const float * restrict sz2) { \
++    float * const          s[3]  = { s0, s1, s2 };                                                 \
++    const void * const     vy[3] = { vy0, vy1, vy2 };                                              \
++    const uint32_t * const ya[3] = { ya0, ya1, ya2 };                                              \
++    const int32_t * const  yb[3] = { yb0, yb1, yb2 };                                              \
++    const float * const    sz[3] = { sz0, sz1, sz2 };                                              \
++    TILED_VEC_DOT_COMPACT_BODY(3, TILE, SHIFT, TILE_BLOCK(3))                                      \
++}
++
++#define TILED_VEC_DOT_COMPACT_4(NAME, TILE, SHIFT, TILE_BLOCK)                                     \
++static void NAME(const uint32_t n, float * restrict s0, float * restrict s1, float * restrict s2,  \
++                 float * restrict s3, const void * restrict vx,                                    \
++                 const void * restrict vy0, const void * restrict vy1, const void * restrict vy2,  \
++                 const void * restrict vy3,                                                        \
++                 const uint32_t * restrict ya0, const uint32_t * restrict ya1,                     \
++                 const uint32_t * restrict ya2, const uint32_t * restrict ya3,                     \
++                 const int32_t * restrict yb0, const int32_t * restrict yb1,                       \
++                 const int32_t * restrict yb2, const int32_t * restrict yb3,                       \
++                 uint32_t valid_rows, const float * restrict sz0, const float * restrict sz1,      \
++                 const float * restrict sz2, const float * restrict sz3) {                         \
++    float * const          s[4]  = { s0, s1, s2, s3 };                                             \
++    const void * const     vy[4] = { vy0, vy1, vy2, vy3 };                                         \
++    const uint32_t * const ya[4] = { ya0, ya1, ya2, ya3 };                                         \
++    const int32_t * const  yb[4] = { yb0, yb1, yb2, yb3 };                                         \
++    const float * const    sz[4] = { sz0, sz1, sz2, sz3 };                                         \
++    TILED_VEC_DOT_COMPACT_BODY(4, TILE, SHIFT, TILE_BLOCK(4))                                      \
++}
++
++TILED_VEC_DOT_COMPACT_1(tiled_vec_dot_q4_0_32x1c, 640, 3, MULTIROW_Q4_0_TILE)
++TILED_VEC_DOT_COMPACT_2(tiled_vec_dot_q4_0_32x2c, 640, 3, MULTIROW_Q4_0_TILE)
++TILED_VEC_DOT_COMPACT_3(tiled_vec_dot_q4_0_32x3c, 640, 3, MULTIROW_Q4_0_TILE)
++TILED_VEC_DOT_COMPACT_4(tiled_vec_dot_q4_0_32x4c, 640, 3, MULTIROW_Q4_0_TILE)
++
++TILED_VEC_DOT_COMPACT_1(tiled_vec_dot_q8_0_32x1c, 1152, 7, MULTIROW_Q8_0_TILE)
++TILED_VEC_DOT_COMPACT_2(tiled_vec_dot_q8_0_32x2c, 1152, 7, MULTIROW_Q8_0_TILE)
++TILED_VEC_DOT_COMPACT_3(tiled_vec_dot_q8_0_32x3c, 1152, 7, MULTIROW_Q8_0_TILE)
++TILED_VEC_DOT_COMPACT_4(tiled_vec_dot_q8_0_32x4c, 1152, 7, MULTIROW_Q8_0_TILE)
++
+ static void tiled_vec_dot_q4_1_32x1(const uint32_t n, float * restrict s, const void * restrict vx, const void * restrict vy, uint32_t valid_rows, const float * restrict sz) {
+     const uint8_t * restrict tile_ptr = vx;
+     const uint8_t * restrict y_q = vy;
+diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.h b/ggml/src/ggml-hexagon/htp/matmul-ops.h
+index 1df8c29..4953592 100644
+--- a/ggml/src/ggml-hexagon/htp/matmul-ops.h
++++ b/ggml/src/ggml-hexagon/htp/matmul-ops.h
+@@ -73,6 +73,7 @@ enum htp_mm_kernel_type {
+     HTP_MM_KERNEL_HVX_QUANT_ROW,      // standard row-wise parallel quantization
+     HTP_MM_KERNEL_HVX_QUANT_BLOCK,    // parallel block-wise quantization
+     HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT, // row-wise fallback flat quantization
++    HTP_MM_KERNEL_HVX_QUANT_MULTIROW, // 2 to 4 activation rows over one weight stream (Q4_0, Q8_0)
+ };
+ 
+ // Op-specific struct for precomputed matmul params
+@@ -576,6 +577,7 @@ static inline void htp_mm_hvx_vtcm_layout_build(
+                 break;
+             }
+             case HTP_MM_KERNEL_HVX_QUANT_BLOCK:
++            case HTP_MM_KERNEL_HVX_QUANT_MULTIROW:
+             case HTP_MM_KERNEL_HVX_QUANT_ROW: {
+                 size_t q_src1_row_size = (wtype == HTP_TYPE_Q4_1 || wtype == HTP_TYPE_Q4_K) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
+ 
+diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
+index 1457a9a..f7f2cd0 100644
+--- a/ggml/src/ggml-hexagon/htp/matmul-ops.c
++++ b/ggml/src/ggml-hexagon/htp/matmul-ops.c
+@@ -117,6 +117,12 @@ struct htp_mm_context {
+     const struct mmid_row_mapping * matrix_rows;
+     uint32_t mapping_stride;
+ 
++    // The compact activation of the multi-row decode path, in DDR. NULL when that path is off.
++    uint8_t * act_compact;
++    int32_t * act_sum;
++    uint32_t  act_compact_stride;  // bytes between the rows of act_compact
++    uint32_t  act_sum_stride;      // int32 values between the rows of act_sum
++
+     // Dynamic VTCM pointers allocated sequentially
+     uint8_t * vtcm_src0;
+     uint8_t * vtcm_src1;
+@@ -433,6 +439,101 @@ static void hvx_mm_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
+     }                                                                                                                             \
+ }
+ 
++// The pointers of activation row I for the multi-row job: the tiled row in VTCM, from which the
++// dot reads the scale of each block, the compact row and its sums in DDR, the output row at the
++// current column tile, and the fused-add row (NULL without src2)
++#define MM_MULTIROW_PTRS(I)                                                                                                       \
++    const uint8_t *  src1_col##I = (const uint8_t *) (src1_data + (I) * src1_stride);                                             \
++    const uint32_t * act_c##I    = (const uint32_t *) (mmctx->act_compact + (I) * mmctx->act_compact_stride);                     \
++    const int32_t *  act_s##I    = mmctx->act_sum + (I) * mmctx->act_sum_stride;                                                  \
++    float *          dst_ptr##I  = (float *) (dst->data + ((I) * dst_row_size)) + ct * 32;                                        \
++    const float *    src2_ptr##I = src2 ? (const float *) ((const uint8_t *) src2->data + ((I) * src2_stride)) + ct * 32 : NULL;
++
++// The decode step of 2 to 4 activation rows. The job streams each weight tile from DDR once and
++// computes every row from it, thus a verify step of speculative decoding costs one weight stream.
++#define MATMUL_2D_REPACKED_MULTIROW_IMPL(SUFFIX, TILE_SIZE, DOT_4, DOT_3, DOT_2)                                                  \
++static void hvx_mm_2d_repacked_##SUFFIX##_multirow(unsigned int nth, unsigned int ith, void * data) {                             \
++    htp_matmul_preamble;                                                                                                          \
++                                                                                                                                  \
++    const uint32_t src1_nrows = ne11 * ne12 * ne13;                                                                               \
++                                                                                                                                  \
++    const uint32_t src0_start_row  = mmctx->src0_row_start + src0_nrows_per_thread * ith;                                         \
++    const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, mmctx->src0_row_end);                            \
++                                                                                                                                  \
++    struct htp_thread_trace * tr = &octx->ctx->trace[ith];                                                                        \
++                                                                                                                                  \
++    const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;                      \
++    const uint32_t n_prefetch = kparams->n_prefetch;                                                                              \
++    assert(n_prefetch >= 2 && n_prefetch <= HTP_MM_MAX_PREFETCH && (n_prefetch & (n_prefetch - 1)) == 0);                         \
++    assert(src1_nrows >= 2 && src1_nrows <= 4);                                                                                   \
++                                                                                                                                  \
++    const size_t dst_row_size = nb1;                                                                                              \
++    const size_t src1_stride  = mmctx->vtcm_src1_stride;                                                                          \
++    const size_t src2_stride  = src2 ? ((src2->ne[1] == 1) ? 0 : src2->nb[1]) : 0;                                                \
++                                                                                                                                  \
++    uint8_t * restrict vtcm_src0_ptr = mmctx->vtcm_src0 + mmctx->vtcm_src0_size_per_thread * ith;                                 \
++    uint8_t * restrict src1_data     = mmctx->vtcm_src1;                                                                          \
++                                                                                                                                  \
++    const uint8_t * restrict src0_row = (const uint8_t *) src0->data;                                                             \
++                                                                                                                                  \
++    const uint32_t tile_size         = TILE_SIZE;                                                                                 \
++    const uint32_t aligned_tile_size = hex_align_up(tile_size, 128);                                                              \
++                                                                                                                                  \
++    uint32_t n_k_tiles_w = ne00 / 32;                                                                                             \
++    uint32_t n_k_tiles_a = ne10 / 32;                                                                                             \
++    uint32_t tile_row_stride = n_k_tiles_w * tile_size;                                                                           \
++    uint32_t tile_row_transfer_size_aligned = n_k_tiles_a * aligned_tile_size;                                                    \
++                                                                                                                                  \
++    uint32_t ct_start = src0_start_row / 32;                                                                                      \
++    uint32_t ct_end   = (src0_end_row + 31) / 32;                                                                                 \
++                                                                                                                                  \
++    uint32_t push_ct = ct_start;                                                                                                  \
++    if (src0_start_row < src0_end_row) {                                                                                          \
++        for (uint32_t d = 0; d < n_prefetch && push_ct < ct_end; d++, push_ct++) {                                                \
++            dma_queue_push(dma_queue, dma_make_ptr(vtcm_src0_ptr + d * tile_row_transfer_size_aligned,                            \
++                           src0_row + push_ct * tile_row_stride), aligned_tile_size, tile_size, tile_size, n_k_tiles_a);          \
++        }                                                                                                                         \
++    }                                                                                                                             \
++                                                                                                                                  \
++    hvx_mm_run_quant_task(mmctx, ith);                                                                                            \
++                                                                                                                                  \
++    if (src0_start_row >= src0_end_row) {                                                                                         \
++        return;                                                                                                                   \
++    }                                                                                                                             \
++                                                                                                                                  \
++    for (uint32_t ct = ct_start; ct < ct_end; ct++) {                                                                             \
++        const uint8_t * w_tile = dma_queue_pop(dma_queue).dst;                                                                    \
++                                                                                                                                  \
++        int valid_rows = (int) ne0 - (int) (ct * 32);                                                                             \
++        valid_rows = MIN(32, MAX(0, valid_rows));                                                                                 \
++                                                                                                                                  \
++        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);                                                                    \
++        MM_MULTIROW_PTRS(0)                                                                                                       \
++        MM_MULTIROW_PTRS(1)                                                                                                       \
++        if (src1_nrows == 4) {                                                                                                    \
++            MM_MULTIROW_PTRS(2)                                                                                                   \
++            MM_MULTIROW_PTRS(3)                                                                                                   \
++            DOT_4(ne10, dst_ptr0, dst_ptr1, dst_ptr2, dst_ptr3, w_tile,                                                           \
++                  src1_col0, src1_col1, src1_col2, src1_col3, act_c0, act_c1, act_c2, act_c3,                                     \
++                  act_s0, act_s1, act_s2, act_s3, valid_rows, src2_ptr0, src2_ptr1, src2_ptr2, src2_ptr3);                        \
++        } else if (src1_nrows == 3) {                                                                                             \
++            MM_MULTIROW_PTRS(2)                                                                                                   \
++            DOT_3(ne10, dst_ptr0, dst_ptr1, dst_ptr2, w_tile, src1_col0, src1_col1, src1_col2,                                    \
++                  act_c0, act_c1, act_c2, act_s0, act_s1, act_s2, valid_rows, src2_ptr0, src2_ptr1, src2_ptr2);                   \
++        } else {                                                                                                                  \
++            DOT_2(ne10, dst_ptr0, dst_ptr1, w_tile, src1_col0, src1_col1, act_c0, act_c1,                                         \
++                  act_s0, act_s1, valid_rows, src2_ptr0, src2_ptr1);                                                              \
++        }                                                                                                                         \
++        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);                                                                     \
++                                                                                                                                  \
++        if (push_ct < ct_end) {                                                                                                   \
++            dma_queue_push(dma_queue, dma_make_ptr((uint8_t *) w_tile, src0_row + push_ct * tile_row_stride),                     \
++                           aligned_tile_size, tile_size, tile_size, n_k_tiles_a);                                                 \
++            push_ct++;                                                                                                            \
++        }                                                                                                                         \
++    }                                                                                                                             \
++}
++
+ #define MATVEC_2D_REPACKED_IMPL(SUFFIX, TILE_SIZE, DOT_2X1)                                                                       \
+ static void hvx_mv_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void * data) {                                        \
+     htp_matmul_preamble;                                                                                                          \
+@@ -680,6 +781,49 @@ QUANTIZE_IMPL(quantize_f32_f32_flat,   "quantize-f32-f32",        quantize_f32_f
+ QUANTIZE_IMPL(quantize_f32_f16_flat,   "quantize-f32-f16",        quantize_f32_f16_flat_kernel,   mmctx->vtcm_src1_stride)
+ QUANTIZE_IMPL(quantize_f16_f16_flat,   "quantize-f16-f16",        quantize_f16_f16_flat_kernel,   mmctx->vtcm_src1_stride)
+ 
++// The row-parallel quantizer of the multi-row decode path. It writes the tiled blocks in VTCM, as
++// the other quantizers do, and the compact copy and the sums of each row in DDR.
++static void quantize_f32_q8_0_tiled_compact(unsigned int nth, unsigned int ith, void * data) {
++    (void) nth;
++    struct htp_mm_context *   mmctx = data;
++    struct htp_ops_context *  octx  = mmctx->octx;
++    const struct htp_tensor * src   = mmctx->act;
++
++    const uint32_t ne0   = src->ne[0];
++    const uint32_t nrows = src->ne[1] * src->ne[2] * src->ne[3];
++    const uint32_t nrows_per_thread = mmctx->n_quant_rows_per_thread;
++    const uint32_t ir_first = nrows_per_thread * ith;
++    if (ir_first >= nrows) {
++        return;
++    }
++
++    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
++    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_QUANT, ir_first);
++
++    const uint32_t ir_last      = MIN(ir_first + nrows_per_thread, nrows);
++    const size_t   src_row_size = src->nb[1];
++    const size_t   dst_row_size = htp_mm_q8_0_tiled_row_size(ne0);
++
++    const uint8_t * restrict src_data = (const uint8_t *) src->data + (src_row_size * ir_first);
++    uint8_t * restrict dst_data = (uint8_t *) mmctx->vtcm_src1 + (dst_row_size * ir_first);
++    uint8_t * restrict tmp_data = (uint8_t *) mmctx->vtcm_dst + (mmctx->vtcm_dst_size_per_thread * ith);
++
++    const size_t src_row_size_padded = hex_round_up(src_row_size, QK_Q8_0_TILED * sizeof(float));
++    hvx_splat_f32_a(tmp_data, 0.0f, src_row_size_padded / sizeof(float));
++
++    for (uint32_t ir = ir_first; ir < ir_last; ir++) {
++        hex_l2fetch(src_data, src_row_size, src_row_size, 2);
++        hvx_copy_f32_aa(tmp_data, src_data, ne0);
++        quantize_row_f32_q8_0_tiled_compact((float *) tmp_data, dst_data,
++                                            mmctx->act_compact + (size_t) ir * mmctx->act_compact_stride,
++                                            mmctx->act_sum + (size_t) ir * mmctx->act_sum_stride, ne0);
++        dst_data += dst_row_size;
++        src_data += src_row_size;
++    }
++
++    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_QUANT, ir_first);
++}
++
+ static void quantize_f32_q8_0_tiled_block(unsigned int nth, unsigned int ith, void * data) {
+     struct htp_mm_context * mmctx = data;
+     struct htp_ops_context * octx = mmctx->octx;
+@@ -728,6 +872,9 @@ static void quantize_f32_q8_1_tiled_block(unsigned int nth, unsigned int ith, vo
+     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_QUANT, mmctx->quant_ib_first[ith]);
+ }
+ 
++MATMUL_2D_REPACKED_MULTIROW_IMPL(q4_0, 576, tiled_vec_dot_q4_0_32x4c, tiled_vec_dot_q4_0_32x3c, tiled_vec_dot_q4_0_32x2c)
++MATMUL_2D_REPACKED_MULTIROW_IMPL(q8_0, 1088, tiled_vec_dot_q8_0_32x4c, tiled_vec_dot_q8_0_32x3c, tiled_vec_dot_q8_0_32x2c)
++
+ MATVEC_2D_REPACKED_IMPL(q4_0,       576,  tiled_vec_dot_q4_0_32x1)
+ MATVEC_2D_REPACKED_IMPL(q4_1,       640,  tiled_vec_dot_q4_1_32x1)
+ MATVEC_2D_REPACKED_IMPL(q8_0,       1088, tiled_vec_dot_q8_0_32x1)
+@@ -1562,6 +1709,36 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
+             break;
+     }
+ 
++    // The multi-row decode path: 2 to 4 activation rows over one weight stream. The compact
++    // activation and its sums live in the DDR scratchpad, because the dots read them with scalar
++    // loads, and a scalar load from VTCM is slow. The host selects the path. When the scratchpad
++    // is too small, or the shape does not fit, the operator keeps the row-pair path.
++    if (kparams->kernel_type == HTP_MM_KERNEL_HVX_QUANT_MULTIROW && src1_nrows >= 2 && src1_nrows <= 4) {
++        const size_t compact_row = ne10;
++        const size_t sum_row     = (size_t) (ne10 / 32) * sizeof(int32_t);
++        const size_t need        = (size_t) src1_nrows * (compact_row + sum_row);
++
++        worker_callback_t multirow_job = NULL;
++        switch (src0->type) {
++            case HTP_TYPE_Q4_0: multirow_job = hvx_mm_2d_repacked_q4_0_multirow; break;
++            case HTP_TYPE_Q8_0: multirow_job = hvx_mm_2d_repacked_q8_0_multirow; break;
++            default:            break;
++        }
++
++        if (multirow_job && octx->ctx->ddr_spad_base && octx->ctx->ddr_spad_size >= need &&
++            (compact_row % 128) == 0) {
++            mmctx->act_compact        = (uint8_t *) octx->ctx->ddr_spad_base;
++            mmctx->act_compact_stride = compact_row;
++            mmctx->act_sum            = (int32_t *) ((uint8_t *) octx->ctx->ddr_spad_base + src1_nrows * compact_row);
++            mmctx->act_sum_stride     = ne10 / 32;
++
++            quant_task_func = quantize_f32_q8_0_tiled_compact;
++            n_quant_tasks   = MIN(src1_nrows, octx->n_threads);
++            matmul_job_func = multirow_job;
++            need_quant      = true;
++        }
++    }
++
+     struct htp_mm_hvx_vtcm_layout L;
+     htp_mm_hvx_vtcm_layout_build(&L, kparams->kernel_type, src0->type, ne10, src1_nrows, octx->n_threads,
+                                  dst_row_size, src0_row_size, src1_row_size, src2 ? src2->nb[1] : 0, kparams->n_prefetch, false, false);
+@@ -1569,6 +1746,7 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
+     if (kparams->kernel_type == HTP_MM_KERNEL_HVX_F16_F16_VTCM ||
+         kparams->kernel_type == HTP_MM_KERNEL_HVX_F32_F32_VTCM ||
+         kparams->kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW ||
++        kparams->kernel_type == HTP_MM_KERNEL_HVX_QUANT_MULTIROW ||
+         kparams->kernel_type == HTP_MM_KERNEL_HVX_QUANT_BLOCK) {
+         mmctx->vtcm_src1_size_per_thread = L.src1_bytes;
+     } else {
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index b14d31e..c095652 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -107,6 +107,7 @@ static int opt_opqueue  = 32;   // max number of pending batches
+ static int opt_optrace  = 0;    // trace buffer size per thread (0 means default)
+ static int opt_oppoll   = 0;    // polling for batch completions
+ static int opt_opfusion = 1;    // enable/disable op fusion
++static int opt_multirow = 1;    // GGML_HEXAGON_MULTIROW: 1 = one weight stream for 2 to 4 rows, 0 = row pairs
+ 
+ enum ggml_hexagon_fusion_flags {
+     GGML_HEXAGON_FUSE_ALLREDUCE_ADD = (1 << 1), // 2
+@@ -4930,6 +4931,13 @@ static void ggml_hexagon_precompute_hvx_mm_params(
+                     kparams->kernel_type = HTP_MM_KERNEL_HVX_QUANT_ROW;
+                 }
+ 
++                // A decode step of 2 to 4 rows reads every weight tile once. A verify step of
++                // speculative decoding takes this path. GGML_HEXAGON_MULTIROW=0 turns it off.
++                if (opt_multirow && src1_nrows >= 2 && src1_nrows <= 4 &&
++                    (wtype == GGML_TYPE_Q4_0 || wtype == GGML_TYPE_Q8_0)) {
++                    kparams->kernel_type = HTP_MM_KERNEL_HVX_QUANT_MULTIROW;
++                }
++
+                 struct htp_mm_hvx_vtcm_layout L;
+                 uint32_t max_prefetch = (src1_nrows > HTP_MM_HMX_MIN_NROWS) ? 2 : 16;
+                 uint32_t best_n_prefetch = 2;
+@@ -7853,6 +7861,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     const char * str_oppoll   = getenv("GGML_HEXAGON_OPPOLL");
+     const char * str_opfusion = getenv("GGML_HEXAGON_OPFUSION");
+     const char * str_opfusion_state = getenv("GGML_HEXAGON_OPFUSION_STATE");
++    const char * str_multirow = getenv("GGML_HEXAGON_MULTIROW");
+     const char * str_gdn_chunk = getenv("GGML_HEXAGON_GDN_CHUNK");
+     const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
+     const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
+@@ -7908,6 +7917,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     opt_optrace   = str_optrace  ? strtoul(str_optrace, NULL, 0)          : (opt_opbatch * 256);
+     opt_oppoll    = str_oppoll   ? strtoul(str_oppoll,  NULL, 0)          : opt_oppoll;
+     opt_opfusion  = str_opfusion ? atoi(str_opfusion)                     : opt_opfusion;
++    opt_multirow  = str_multirow ? atoi(str_multirow)                     : opt_multirow;
+     opt_opfusion_state = str_opfusion_state ? atoi(str_opfusion_state)    : opt_opfusion_state;
+     opt_gdn_chunk = str_gdn_chunk ? atoi(str_gdn_chunk)                   : opt_gdn_chunk;
+     opt_profile   = str_profile  ? atoi(str_profile)                      : 0;
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index b6409ef..9c4b440 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9969,6 +9969,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
+ #endif
+ 
++    // The decode step of a verify step of speculative decoding: 1 to 4 activation rows against the
++    // weight shapes of Qwen3.5-2B (2048 wide, 6144 in the feed forward network) and of Qwen3.5-4B
++    // (2560 wide, 9216). The Hexagon backend reads every weight tile once for these shapes, thus
++    // the cases cover the kernel of one row, of a row pair, and of 3 and 4 rows.
++    for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
++        for (int n_rows = 1; n_rows <= 4; ++n_rows) {
++            for (auto shape : { std::make_pair(2048, 2048), std::make_pair(6144, 2048),
++                                std::make_pair(2048, 6144), std::make_pair(2560, 2560),
++                                std::make_pair(9216, 2560), std::make_pair(2560, 9216) }) {
++                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,
++                                                         shape.first, n_rows, shape.second, {1, 1}, {1, 1}));
++            }
++        }
++    }
++
+     for (ggml_type type_a : all_types) {
+         for (int i = 1; i < 10; ++i) {
+             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 1*256, { 1,  1}, {1, 1}));
