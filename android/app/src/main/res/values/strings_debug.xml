@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="debug_benchmark">Benchmark</string>
+    <string name="debug_pp">Prompt tokens</string>
+    <string name="debug_tg">Generated tokens</string>
+    <string name="debug_reps">Repetitions</string>
+    <string name="debug_run">Run</string>
+    <string name="debug_clear">Clear</string>
+    <string name="debug_no_model">No model is loaded. Load one on the Chat tab.</string>
+    <string name="debug_devices">Devices</string>
+    <string name="debug_no_devices">No ggml device is visible.</string>
+    <string name="debug_system">System</string>
+    <string name="debug_thermal">Thermal status</string>
+    <string name="debug_thermal_warning">%1$d %2$s, not 0, wait before a measurement</string>
+    <string name="debug_battery">Battery</string>
+    <string name="debug_charging">Charging</string>
+    <string name="debug_cpu">CPU clocks</string>
+    <string name="debug_memory">Memory</string>
+    <string name="debug_mode">Game mode, ADPF</string>
+    <string name="debug_engine">Engine</string>
+    <string name="debug_model">Model</string>
+    <string name="debug_turn">Last turn</string>
+    <string name="debug_no_engine">No model is loaded.</string>
+    <string name="debug_profiling">Profiling</string>
+    <string name="debug_profiling_note">A build with -Pprofiling=true records each OpenCL kernel and writes cl_profiling.csv into the app files directory when the model unloads.</string>
+    <string name="debug_share">Export CSV</string>
+    <string name="debug_exported">Exported to %1$s</string>
+    <string name="debug_export_failed">The export failed: %1$s</string>
+</resources>
