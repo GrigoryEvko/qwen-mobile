@@ -20,7 +20,8 @@ import torch
 
 BLOCK = 32
 
-IQ4_NL_TABLE = (-127, -104, -83, -65, -49, -35, -22, -10, 6, 17, 29, 44, 58, 77, 97, 127)
+# The kvalues_iq4nl table of ggml-common.h. The two halves are not symmetric.
+IQ4_NL_TABLE = (-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113)
 
 
 class Grid:
@@ -31,17 +32,26 @@ class Grid:
     def __init__(self, levels: torch.Tensor) -> None:
         self.levels = levels.to(torch.float32).sort().values
         self.mid = (self.levels[1:] + self.levels[:-1]) / 2
-        self.amax = self.levels.abs().max()
+        # The level of the largest magnitude. The reference scale maps the signed maximum of a block onto it.
+        self.top = self.levels[0] if abs(self.levels[0]) >= abs(self.levels[-1]) else self.levels[-1]
 
     def to(self, device: torch.device) -> "Grid":
         out = self.__class__.__new__(self.__class__)
         out.name = self.name
-        out.levels, out.mid, out.amax = self.levels.to(device), self.mid.to(device), self.amax.to(device)
+        out.levels, out.mid, out.top = self.levels.to(device), self.mid.to(device), self.top.to(device)
         return out
 
     def scale_rtn(self, blocks: torch.Tensor) -> torch.Tensor:
-        """The reference scale per block [rows, nblocks]: the largest magnitude maps to the largest level."""
-        d = blocks.abs().amax(dim=-1) / self.amax
+        """The reference scale per block [rows, nblocks]: the signed maximum maps to the level of largest magnitude.
+
+        The scale carries the sign of the maximum. Every ggml block format
+        stores a signed F16 scale, and the ggml quantizers select the sign
+        in the same way, thus an asymmetric grid (Q4_0: −8 … 7, IQ4_NL:
+        −127 … 113) keeps its full range on the side of the maximum.
+        """
+        idx = blocks.abs().argmax(dim=-1, keepdim=True)
+        m = torch.gather(blocks, -1, idx).squeeze(-1)
+        d = m / self.top
         return torch.where(d == 0, torch.ones_like(d), d)
 
     def round(self, x: torch.Tensor) -> torch.Tensor:
@@ -67,13 +77,8 @@ class Q4_0Grid(Grid):
     def __init__(self) -> None:
         super().__init__(torch.arange(-8, 8, dtype=torch.float32))
 
-    def scale_rtn(self, blocks: torch.Tensor) -> torch.Tensor:
-        idx = blocks.abs().argmax(dim=-1, keepdim=True)
-        m = torch.gather(blocks, -1, idx).squeeze(-1)
-        d = m / -8.0
-        return torch.where(d == 0, torch.ones_like(d), d)
-
     def round(self, x: torch.Tensor) -> torch.Tensor:
+        """The uniform grid rounds directly, without the search over the midpoints."""
         return (torch.clamp(torch.round(x), -8, 7) + 8).to(torch.int32)
 
 
@@ -90,20 +95,6 @@ class CodebookGrid(Grid):
     """A table per matrix with integer levels in −127 … 127."""
 
     name = "CB4"
-
-
-def gaussian_lloyd_max(n: int = 16, iters: int = 200) -> torch.Tensor:
-    """The Lloyd–Max levels of a standard Gaussian, from a fine sample."""
-    x = torch.linspace(-4.5, 4.5, 90_001, dtype=torch.float64)
-    p = torch.exp(-0.5 * x * x)
-    levels = torch.linspace(-2.5, 2.5, n, dtype=torch.float64)
-    for _ in range(iters):
-        mid = (levels[1:] + levels[:-1]) / 2
-        cell = torch.bucketize(x, mid)
-        mass = torch.zeros(n, dtype=torch.float64).index_add_(0, cell, p)
-        first = torch.zeros(n, dtype=torch.float64).index_add_(0, cell, p * x)
-        levels = first / mass.clamp_min(1e-30)
-    return levels.to(torch.float32)
 
 
 def fit_codebook(w: torch.Tensor, col_weights: torch.Tensor | None = None, iters: int = 30) -> CodebookGrid:

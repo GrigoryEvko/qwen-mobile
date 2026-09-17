@@ -37,9 +37,12 @@ the NPU): GPU OpenCL pp512 574 t/s, tg64 30.1 t/s. NPU HTP0 pp512 968 t/s, tg64 
 file gives tg 13.6 (GPU) and 13.8 (NPU), thus Q4_0 more than doubles the decode speed.
 
 Grid test on Gaussian weights (256 x 512, block-32 F16 scales with the scale search, 4.5 bits per
-weight, `python -m quant.trellis`): Q4_0 21.8 dB, IQ4_NL 22.2 dB, codebook per matrix 22.3 dB,
-trellis (bit-shift, L = 12) 22.0 dB with a Gaussian table and 21.7 dB with the Ungerboeck cosets.
-The codebook grid is the best 4-bit grid at equal bytes on this test.
+weight, `python -m quant.trellis 12`): Q4_0 21.8 dB, IQ4_NL 22.5 dB, codebook per matrix 22.3 dB,
+trellis (bit-shift, L = 12) 22.1 dB with a Gaussian table and 21.8 dB with the Ungerboeck cosets.
+IQ4_NL is the best 4-bit grid at equal bytes on this test: the scale of a block carries the sign of
+its maximum, thus the maximum lands on −127 and the asymmetric table (−127 … 113) spends its levels
+where the values are. The numbers before 2026-09-17 came from a wrong positive half of the IQ4_NL
+table (6 … 127 in place of 1 … 113) and a positive scale, which clipped every positive maximum.
 
 The HF lockstep drift report (analysis/*.drift.md, 16 x 1024 WikiText tokens, fp32 on CUDA) gives
 the same ranking with its own numbers: row 3 mean KL 0.0291, row 4 0.0314. The KL attribution

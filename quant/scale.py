@@ -14,16 +14,23 @@ from __future__ import annotations
 
 import torch
 
-from .grid import dequantize, quantize
+from .grid import ROW_CHUNK, block_error
 from .grids import Grid
 
 EXPONENTS = (0.0, 0.25, 0.5, 0.75, 1.0)
 
 
-def weighted_block_error(grid: Grid, w: torch.Tensor, col_weights: torch.Tensor) -> torch.Tensor:
-    """The diagonal-Hessian error of the block-RTN quantization of ``w`` with the scale search."""
-    idx, d = quantize(grid, w, weights=col_weights, search=True)
-    return ((dequantize(grid, idx, d) - w).pow(2) * col_weights[None, :]).sum()
+def column_rms(ws: list[torch.Tensor]) -> torch.Tensor:
+    """The root mean square of each column over all the rows of all the matrices, in row chunks."""
+    total: torch.Tensor | None = None
+    rows = 0
+    for w in ws:
+        for r in range(0, w.shape[0], ROW_CHUNK):
+            part = w[r:r + ROW_CHUNK].to(torch.float32).pow(2).sum(0)
+            total = part if total is None else total + part
+        rows += w.shape[0]
+    assert total is not None, "no matrices"
+    return (total / rows).clamp_min(1e-12).sqrt()
 
 
 def search_column_scales(grid: Grid, ws: list[torch.Tensor], h_diag: torch.Tensor,
@@ -36,11 +43,10 @@ def search_column_scales(grid: Grid, ws: list[torch.Tensor], h_diag: torch.Tenso
     matrices, and α, γ from ``exponents``. The winner minimizes the weighted
     block-RTN error summed over the matrices. ``share`` [cols] gives a group
     id per column, and the columns of a group take one scale (one value per
-    within-head channel). Complexity is O(|exponents|² · Σ rows · cols · 40).
+    within-head channel). Complexity is O(|exponents|² · Σ rows · cols · 41).
     """
     a = h_diag.to(torch.float32).clamp_min(1e-12).sqrt()
-    r = torch.cat([w.to(torch.float32) for w in ws], 0).pow(2).mean(0).clamp_min(1e-12).sqrt()
-    log_a, log_r = a.log(), r.log()
+    log_a, log_r = a.log(), column_rms(ws).log()
     best_t = torch.ones_like(a)
     best_err = None
     for alpha in exponents:
@@ -49,7 +55,7 @@ def search_column_scales(grid: Grid, ws: list[torch.Tensor], h_diag: torch.Tenso
             if share is not None:
                 log_t = group_mean(log_t, share)
             t = (log_t - log_t.mean()).exp()
-            err = sum(weighted_block_error(grid, w.to(torch.float32) * t[None, :], h_diag / t.pow(2)) for w in ws)
+            err = sum(block_error(grid, w, h_diag / t.pow(2), col_scale=t) for w in ws)
             if best_err is None or err < best_err:
                 best_err, best_t = err, t
     return best_t
@@ -61,6 +67,29 @@ def group_mean(x: torch.Tensor, group: torch.Tensor) -> torch.Tensor:
     total = torch.zeros(n, device=x.device, dtype=x.dtype).index_add_(0, group, x)
     count = torch.zeros(n, device=x.device, dtype=x.dtype).index_add_(0, group, torch.ones_like(x))
     return (total / count.clamp_min(1))[group]
+
+
+def kv_group_share(cols: int, heads: int, kv_heads: int, dim: int, device: torch.device) -> torch.Tensor:
+    """The group id of each o_proj column: the KV head that supplies it and the channel in the head.
+
+    The attention heads h·group … h·group + group − 1 read KV head h, thus
+    the columns of those heads must take one scale per channel, because
+    one v_proj row supplies them all.
+    """
+    group = heads // kv_heads
+    j = torch.arange(cols, device=device)
+    return (j // dim // group) * dim + j % dim
+
+
+def kv_group_rows(t: torch.Tensor, heads: int, kv_heads: int, dim: int) -> torch.Tensor:
+    """The v_proj row divisor [kv_heads · dim] of the o_proj column scales t [heads · dim], one head per group."""
+    group = heads // kv_heads
+    return t.view(heads, dim)[::group].reshape(-1)
+
+
+def head_channel_share(cols: int, v_dim: int, device: torch.device) -> torch.Tensor:
+    """The group id of each GDN out_proj column: the channel in the value head, shared by all the heads."""
+    return torch.arange(cols, device=device) % v_dim
 
 
 def scaled_moments(h: torch.Tensor, g: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
