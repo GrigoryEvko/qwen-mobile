@@ -20,9 +20,15 @@ val llamaDir: String = localProperties.getProperty("llama.dir")
 // snapdragon/build.sh, and does not run the CMake build of llama.cpp.
 val prebuilt: Boolean = project.findProperty("prebuilt") == "true"
 
+// ./gradlew assembleRelease -Punsigned=true writes app-release-unsigned.apk, the
+// reproducible artifact. Without it, the debug key of this machine signs the release.
+val unsigned: Boolean = project.findProperty("unsigned") == "true"
+
 android {
     namespace = "ai.airi.qwenmobile"
     compileSdk = 36
+    // The pins of the SDK components. ci/Containerfile installs these versions.
+    buildToolsVersion = "36.0.0"
     ndkVersion = "30.0.16248370"
 
     defaultConfig {
@@ -76,7 +82,7 @@ android {
             // Debuggable, thus simpleperf and run-as reach the process. The native code stays -O3.
             isDebuggable = true
             // The debug key lets adb install the release build without a keystore.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = if (unsigned) null else signingConfigs.getByName("debug")
         }
     }
 
@@ -103,6 +109,13 @@ android {
             keepDebugSymbols += "**/libggml-htp-*.so"
         }
     }
+}
+
+// app/gradle.lockfile pins the resolved graph of every configuration. After a
+// change of a dependency, write it again with:
+//   ./gradlew :app:dependencies --write-locks -Pprebuilt=true
+dependencyLocking {
+    lockAllConfigurations()
 }
 
 dependencies {
