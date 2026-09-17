@@ -1,0 +1,1122 @@
+# Structure of Qwen3.5-2B
+
+== Text config ==
+  model_type: qwen3_5_text
+  hidden_size: 2048
+  num_hidden_layers: 24
+  intermediate_size: 6144
+  vocab_size: 248320
+  tie_word_embeddings: True
+  num_attention_heads: 8
+  num_key_value_heads: 2
+  head_dim: 256
+  attn_output_gate: True
+  full_attention_interval: 4
+  linear_num_value_heads: 16
+  linear_num_key_heads: 16
+  linear_key_head_dim: 128
+  linear_value_head_dim: 128
+  linear_conv_kernel_dim: 4
+  rms_norm_eps: 1e-06
+  rope_parameters: {'mrope_interleaved': True, 'mrope_section': [11, 11, 10], 'rope_type': 'default', 'rope_theta': 10000000, 'partial_rotary_factor': 0.25}
+  max_position_embeddings: 262144
+  hidden_act: silu
+  attention_bias: False
+  mlp_only_layers: []
+  layer_types: {'linear_attention': 18, 'full_attention': 6}
+  layer pattern: G G G A G G G A G G G A G G G A G G G A G G G A
+== Vision config ==
+  model_type: qwen3_5_vision
+  depth: 24
+  hidden_size: 1024
+  num_heads: 16
+  patch_size: 16
+  out_hidden_size: 2048
+  spatial_merge_size: 2
+  temporal_patch_size: 2
+  intermediate_size: 4096
+
+== Module tree (meta device) ==
+Qwen3_5ForConditionalGeneration(
+  (model): Qwen3_5Model(
+    (visual): Qwen3_5VisionModel(
+      (patch_embed): Qwen3_5VisionPatchEmbed(
+        (proj): Conv3d(3, 1024, kernel_size=(2, 16, 16), stride=(2, 16, 16))
+      )
+      (pos_embed): Embedding(2304, 1024)
+      (rotary_pos_emb): Qwen3_5VisionRotaryEmbedding()
+      (blocks): ModuleList(
+        (0-23): 24 x Qwen3_5VisionBlock(
+          (norm1): LayerNorm((1024,), eps=1e-06, elementwise_affine=True, bias=True)
+          (norm2): LayerNorm((1024,), eps=1e-06, elementwise_affine=True, bias=True)
+          (attn): Qwen3_5VisionAttention(
+            (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+            (proj): Linear(in_features=1024, out_features=1024, bias=True)
+          )
+          (mlp): Qwen3_5VisionMLP(
+            (linear_fc1): Linear(in_features=1024, out_features=4096, bias=True)
+            (linear_fc2): Linear(in_features=4096, out_features=1024, bias=True)
+            (act_fn): GELUTanh()
+          )
+        )
+      )
+      (merger): Qwen3_5VisionPatchMerger(
+        (norm): LayerNorm((1024,), eps=1e-06, elementwise_affine=True, bias=True)
+        (linear_fc1): Linear(in_features=4096, out_features=4096, bias=True)
+        (act_fn): GELU(approximate='none')
+        (linear_fc2): Linear(in_features=4096, out_features=2048, bias=True)
+      )
+    )
+    (language_model): Qwen3_5TextModel(
+      (embed_tokens): Embedding(248320, 2048)
+      (layers): ModuleList(
+        (0-2): 3 x Qwen3_5DecoderLayer(
+          (linear_attn): Qwen3_5GatedDeltaNet(
+            (conv1d): Conv1d(6144, 6144, kernel_size=(4,), stride=(1,), padding=(3,), groups=6144, bias=False)
+            (norm): Qwen3_5RMSNormGated()
+            (out_proj): Linear(in_features=2048, out_features=2048, bias=False)
+            (in_proj_qkv): Linear(in_features=2048, out_features=6144, bias=False)
+            (in_proj_z): Linear(in_features=2048, out_features=2048, bias=False)
+            (in_proj_b): Linear(in_features=2048, out_features=16, bias=False)
+            (in_proj_a): Linear(in_features=2048, out_features=16, bias=False)
+          )
+          (mlp): Qwen3_5MLP(
+            (gate_proj): Linear(in_features=2048, out_features=6144, bias=False)
+            (up_proj): Linear(in_features=2048, out_features=6144, bias=False)
+            (down_proj): Linear(in_features=6144, out_features=2048, bias=False)
+            (act_fn): SiLUActivation()
+          )
+          (input_layernorm): Qwen3_5RMSNorm((2048,), eps=1e-06)
+          (post_attention_layernorm): Qwen3_5RMSNorm((2048,), eps=1e-06)
+        )
+        (3): Qwen3_5DecoderLayer(
+          (self_attn): Qwen3_5Attention(
+            (q_proj): Linear(in_features=2048, out_features=4096, bias=False)
+            (k_proj): Linear(in_features=2048, out_features=512, bias=False)
+            (v_proj): Linear(in_features=2048, out_features=512, bias=False)
+            (o_proj): Linear(in_features=2048, out_features=2048, bias=False)
+            (q_norm): Qwen3_5RMSNorm((256,), eps=1e-06)
+            (k_norm): Qwen3_5RMSNorm((256,), eps=1e-06)
+          )
+          (mlp): Qwen3_5MLP(
+            (gate_proj): Linear(in_features=2048, out_features=6144, bias=False)
+            (up_proj): Linear(in_features=2048, out_features=6144, bias=False)
+            (down_proj): Linear(in_features=6144, out_features=2048, bias=False)
+            (act_fn): SiLUActivation()
+          )
+          (input_layernorm): Qwen3_5RMSNorm((2048,), eps=1e-06)
+          (post_attention_layernorm): Qwen3_5RMSNorm((2048,), eps=1e-06)
+        )
+        (4-6): 3 x Qwen3_5DecoderLayer(
+          (linear_attn): Qwen3_5GatedDeltaNet(
+            (conv1d): Conv1d(6144, 6144, kernel_size=(4,), stride=(1,), padding=(3,), groups=6144, bias=False)
+            (norm): Qwen3_5RMSNormGated()
+            (out_proj): Linear(in_features=2048, out_features=2048, bias=False)
+            (in_proj_qkv): Linear(in_features=2048, out_features=6144, bias=False)
+            (in_proj_z): Linear(in_features=2048, out_features=2048, bias=False)
+            (in_proj_b): Linear(in_features=2048, out_features=16, bias=False)
+            (in_proj_a): Linear(in_features=2048, out_features=16, bias=False)
+          )
+          (mlp): Qwen3_5MLP(
+            (gate_proj): Linear(in_features=2048, out_features=6144, bias=False)
+            (up_proj): Linear(in_features=2048, out_features=6144, bias=False)
+            (down_proj): Linear(in_features=6144, out_features=2048, bias=False)
+            (act_fn): SiLUActivation()
+          )
+          (input_layernorm): Qwen3_5RMSNorm((2048,), eps=1e-06)
+          (post_attention_layernorm): Qwen3_5RMSNorm((2048,), eps=1e-06)
+        )
+        (7): Qwen3_5DecoderLayer(
+          (self_attn): Qwen3_5Attention(
+            (q_proj): Linear(in_features=2048, out_features=4096, bias=False)
+            (k_proj): Linear(in_features=2048, out_features=512, bias=False)
+            (v_proj): Linear(in_features=2048, out_features=512, bias=False)
+            (o_proj): Linear(in_features=2048, out_features=2048, bias=False)
+            (q_norm): Qwen3_5RMSNorm((256,), eps=1e-06)
+            (k_norm): Qwen3_5RMSNorm((256,), eps=1e-06)
+          )
+          (mlp): Qwen3_5MLP(
+            (gate_proj): Linear(in_features=2048, out_features=6144, bias=False)
+            (up_proj): Linear(in_features=2048, out_features=6144, bias=False)
+            (down_proj): Linear(in_features=6144, out_features=2048, bias=False)
+            (act_fn): SiLUActivation()
+          )
+          (input_layernorm): Qwen3_5RMSNorm((2048,), eps=1e-06)
+          (post_attention_layernorm): Qwen3_5RMSNorm((2048,), eps=1e-06)
+        )
+        (8-10): 3 x Qwen3_5DecoderLayer(
+          (linear_attn): Qwen3_5GatedDeltaNet(
+            (conv1d): Conv1d(6144, 6144, kernel_size=(4,), stride=(1,), padding=(3,), groups=6144, bias=False)
+            (norm): Qwen3_5RMSNormGated()
+            (out_proj): Linear(in_features=2048, out_features=2048, bias=False)
+            (in_proj_qkv): Linear(in_features=2048, out_features=6144, bias=False)
+            (in_proj_z): Linear(in_features=2048, out_features=2048, bias=False)
+            (in_proj_b): Linear(in_features=2048, out_features=16, bias=False)
+            (in_proj_a): Linear(in_features=2048, out_features=16, bias=False)
+          )
+          (mlp): Qwen3_5MLP(
+            (gate_proj): Linear(in_features=2048, out_features=6144, bias=False)
+            (up_proj): Linear(in_features=2048, out_features=6144, bias=False)
+            (down_proj): Linear(in_features=6144, out_features=2048, bias=False)
+            (act_fn): SiLUActivation()
+          )
+          (input_layernorm): Qwen3_5RMSNorm((2048,), eps=1e-06)
+          (post_attention_layernorm): Qwen3_5RMSNorm((2048,), eps=1e-06)
+        )
+        (11): Qwen3_5DecoderLayer(
+          (self_attn): Qwen3_5Attention(
+            (q_proj): Linear(in_features=2048, out_features=4096, bias=False)
+            (k_proj): Linear(in_features=2048, out_features=512, bias=False)
+            (v_proj): Linear(in_features=2048, out_features=512, bias=False)
+            (o_proj): Linear(in_features=2048, out_features=2048, bias=False)
+            (q_norm): Qwen3_5RMSNorm((256,), eps=1e-06)
+            (k_norm): Qwen3_5RMSNorm((256,), eps=1e-06)
+          )
+          (mlp): Qwen3_5MLP(
+            (gate_proj): Linear(in_features=2048, out_features=6144, bias=False)
+            (up_proj): Linear(in_features=2048, out_features=6144, bias=False)
+            (down_proj): Linear(in_features=6144, out_features=2048, bias=False)
+            (act_fn): SiLUActivation()
+          )
+          (input_layernorm): Qwen3_5RMSNorm((2048,), eps=1e-06)
+          (post_attention_layernorm): Qwen3_5RMSNorm((2048,), eps=1e-06)
+        )
+        (12-14): 3 x Qwen3_5DecoderLayer(
+          (linear_attn): Qwen3_5GatedDeltaNet(
+            (conv1d): Conv1d(6144, 6144, kernel_size=(4,), stride=(1,), padding=(3,), groups=6144, bias=False)
+            (norm): Qwen3_5RMSNormGated()
+            (out_proj): Linear(in_features=2048, out_features=2048, bias=False)
+            (in_proj_qkv): Linear(in_features=2048, out_features=6144, bias=False)
+            (in_proj_z): Linear(in_features=2048, out_features=2048, bias=False)
+            (in_proj_b): Linear(in_features=2048, out_features=16, bias=False)
+            (in_proj_a): Linear(in_features=2048, out_features=16, bias=False)
+          )
+          (mlp): Qwen3_5MLP(
+            (gate_proj): Linear(in_features=2048, out_features=6144, bias=False)
+            (up_proj): Linear(in_features=2048, out_features=6144, bias=False)
+            (down_proj): Linear(in_features=6144, out_features=2048, bias=False)
+            (act_fn): SiLUActivation()
+          )
+          (input_layernorm): Qwen3_5RMSNorm((2048,), eps=1e-06)
+          (post_attention_layernorm): Qwen3_5RMSNorm((2048,), eps=1e-06)
+        )
+        (15): Qwen3_5DecoderLayer(
+          (self_attn): Qwen3_5Attention(
+            (q_proj): Linear(in_features=2048, out_features=4096, bias=False)
+            (k_proj): Linear(in_features=2048, out_features=512, bias=False)
+            (v_proj): Linear(in_features=2048, out_features=512, bias=False)
+            (o_proj): Linear(in_features=2048, out_features=2048, bias=False)
+            (q_norm): Qwen3_5RMSNorm((256,), eps=1e-06)
+            (k_norm): Qwen3_5RMSNorm((256,), eps=1e-06)
+          )
+          (mlp): Qwen3_5MLP(
+            (gate_proj): Linear(in_features=2048, out_features=6144, bias=False)
+            (up_proj): Linear(in_features=2048, out_features=6144, bias=False)
+            (down_proj): Linear(in_features=6144, out_features=2048, bias=False)
+            (act_fn): SiLUActivation()
+          )
+          (input_layernorm): Qwen3_5RMSNorm((2048,), eps=1e-06)
+          (post_attention_layernorm): Qwen3_5RMSNorm((2048,), eps=1e-06)
+        )
+        (16-18): 3 x Qwen3_5DecoderLayer(
+          (linear_attn): Qwen3_5GatedDeltaNet(
+            (conv1d): Conv1d(6144, 6144, kernel_size=(4,), stride=(1,), padding=(3,), groups=6144, bias=False)
+            (norm): Qwen3_5RMSNormGated()
+            (out_proj): Linear(in_features=2048, out_features=2048, bias=False)
+            (in_proj_qkv): Linear(in_features=2048, out_features=6144, bias=False)
+            (in_proj_z): Linear(in_features=2048, out_features=2048, bias=False)
+            (in_proj_b): Linear(in_features=2048, out_features=16, bias=False)
+            (in_proj_a): Linear(in_features=2048, out_features=16, bias=False)
+          )
+          (mlp): Qwen3_5MLP(
+            (gate_proj): Linear(in_features=2048, out_features=6144, bias=False)
+            (up_proj): Linear(in_features=2048, out_features=6144, bias=False)
+            (down_proj): Linear(in_features=6144, out_features=2048, bias=False)
+            (act_fn): SiLUActivation()
+          )
+          (input_layernorm): Qwen3_5RMSNorm((2048,), eps=1e-06)
+          (post_attention_layernorm): Qwen3_5RMSNorm((2048,), eps=1e-06)
+        )
+        (19): Qwen3_5DecoderLayer(
+          (self_attn): Qwen3_5Attention(
+            (q_proj): Linear(in_features=2048, out_features=4096, bias=False)
+            (k_proj): Linear(in_features=2048, out_features=512, bias=False)
+            (v_proj): Linear(in_features=2048, out_features=512, bias=False)
+            (o_proj): Linear(in_features=2048, out_features=2048, bias=False)
+            (q_norm): Qwen3_5RMSNorm((256,), eps=1e-06)
+            (k_norm): Qwen3_5RMSNorm((256,), eps=1e-06)
+          )
+          (mlp): Qwen3_5MLP(
+            (gate_proj): Linear(in_features=2048, out_features=6144, bias=False)
+            (up_proj): Linear(in_features=2048, out_features=6144, bias=False)
+            (down_proj): Linear(in_features=6144, out_features=2048, bias=False)
+            (act_fn): SiLUActivation()
+          )
+          (input_layernorm): Qwen3_5RMSNorm((2048,), eps=1e-06)
+          (post_attention_layernorm): Qwen3_5RMSNorm((2048,), eps=1e-06)
+        )
+        (20-22): 3 x Qwen3_5DecoderLayer(
+          (linear_attn): Qwen3_5GatedDeltaNet(
+            (conv1d): Conv1d(6144, 6144, kernel_size=(4,), stride=(1,), padding=(3,), groups=6144, bias=False)
+            (norm): Qwen3_5RMSNormGated()
+            (out_proj): Linear(in_features=2048, out_features=2048, bias=False)
+            (in_proj_qkv): Linear(in_features=2048, out_features=6144, bias=False)
+            (in_proj_z): Linear(in_features=2048, out_features=2048, bias=False)
+            (in_proj_b): Linear(in_features=2048, out_features=16, bias=False)
+            (in_proj_a): Linear(in_features=2048, out_features=16, bias=False)
+          )
+          (mlp): Qwen3_5MLP(
+            (gate_proj): Linear(in_features=2048, out_features=6144, bias=False)
+            (up_proj): Linear(in_features=2048, out_features=6144, bias=False)
+            (down_proj): Linear(in_features=6144, out_features=2048, bias=False)
+            (act_fn): SiLUActivation()
+          )
+          (input_layernorm): Qwen3_5RMSNorm((2048,), eps=1e-06)
+          (post_attention_layernorm): Qwen3_5RMSNorm((2048,), eps=1e-06)
+        )
+        (23): Qwen3_5DecoderLayer(
+          (self_attn): Qwen3_5Attention(
+            (q_proj): Linear(in_features=2048, out_features=4096, bias=False)
+            (k_proj): Linear(in_features=2048, out_features=512, bias=False)
+            (v_proj): Linear(in_features=2048, out_features=512, bias=False)
+            (o_proj): Linear(in_features=2048, out_features=2048, bias=False)
+            (q_norm): Qwen3_5RMSNorm((256,), eps=1e-06)
+            (k_norm): Qwen3_5RMSNorm((256,), eps=1e-06)
+          )
+          (mlp): Qwen3_5MLP(
+            (gate_proj): Linear(in_features=2048, out_features=6144, bias=False)
+            (up_proj): Linear(in_features=2048, out_features=6144, bias=False)
+            (down_proj): Linear(in_features=6144, out_features=2048, bias=False)
+            (act_fn): SiLUActivation()
+          )
+          (input_layernorm): Qwen3_5RMSNorm((2048,), eps=1e-06)
+          (post_attention_layernorm): Qwen3_5RMSNorm((2048,), eps=1e-06)
+        )
+      )
+      (norm): Qwen3_5RMSNorm((2048,), eps=1e-06)
+      (rotary_emb): Qwen3_5TextRotaryEmbedding()
+    )
+  )
+  (lm_head): Linear(in_features=2048, out_features=248320, bias=False)
+)
+
+== Parameters as stored in safetensors ==
+name                                                                   dtype shape                           numel        bytes
+model.language_model.embed_tokens.weight                               BF16  [248320, 2048]            508,559,360 1,017,118,720
+model.language_model.layers.0.input_layernorm.weight                   BF16  [2048]                          2,048        4,096
+model.language_model.layers.0.linear_attn.A_log                        F32   [16]                               16           64
+model.language_model.layers.0.linear_attn.conv1d.weight                BF16  [6144, 1, 4]                   24,576       49,152
+model.language_model.layers.0.linear_attn.dt_bias                      BF16  [16]                               16           32
+model.language_model.layers.0.linear_attn.in_proj_a.weight             BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.0.linear_attn.in_proj_b.weight             BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.0.linear_attn.in_proj_qkv.weight           BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.0.linear_attn.in_proj_z.weight             BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.0.linear_attn.norm.weight                  F32   [128]                             128          512
+model.language_model.layers.0.linear_attn.out_proj.weight              BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.0.mlp.down_proj.weight                     BF16  [2048, 6144]               12,582,912   25,165,824
+model.language_model.layers.0.mlp.gate_proj.weight                     BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.0.mlp.up_proj.weight                       BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.0.post_attention_layernorm.weight          BF16  [2048]                          2,048        4,096
+model.language_model.layers.1.input_layernorm.weight                   BF16  [2048]                          2,048        4,096
+model.language_model.layers.1.linear_attn.A_log                        F32   [16]                               16           64
+model.language_model.layers.1.linear_attn.conv1d.weight                BF16  [6144, 1, 4]                   24,576       49,152
+model.language_model.layers.1.linear_attn.dt_bias                      BF16  [16]                               16           32
+model.language_model.layers.1.linear_attn.in_proj_a.weight             BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.1.linear_attn.in_proj_b.weight             BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.1.linear_attn.in_proj_qkv.weight           BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.1.linear_attn.in_proj_z.weight             BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.1.linear_attn.norm.weight                  F32   [128]                             128          512
+model.language_model.layers.1.linear_attn.out_proj.weight              BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.1.mlp.down_proj.weight                     BF16  [2048, 6144]               12,582,912   25,165,824
+model.language_model.layers.1.mlp.gate_proj.weight                     BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.1.mlp.up_proj.weight                       BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.1.post_attention_layernorm.weight          BF16  [2048]                          2,048        4,096
+model.language_model.layers.10.input_layernorm.weight                  BF16  [2048]                          2,048        4,096
+model.language_model.layers.10.linear_attn.A_log                       F32   [16]                               16           64
+model.language_model.layers.10.linear_attn.conv1d.weight               BF16  [6144, 1, 4]                   24,576       49,152
+model.language_model.layers.10.linear_attn.dt_bias                     BF16  [16]                               16           32
+model.language_model.layers.10.linear_attn.in_proj_a.weight            BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.10.linear_attn.in_proj_b.weight            BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.10.linear_attn.in_proj_qkv.weight          BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.10.linear_attn.in_proj_z.weight            BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.10.linear_attn.norm.weight                 F32   [128]                             128          512
+model.language_model.layers.10.linear_attn.out_proj.weight             BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.10.mlp.down_proj.weight                    BF16  [2048, 6144]               12,582,912   25,165,824
+model.language_model.layers.10.mlp.gate_proj.weight                    BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.10.mlp.up_proj.weight                      BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.10.post_attention_layernorm.weight         BF16  [2048]                          2,048        4,096
+model.language_model.layers.11.input_layernorm.weight                  BF16  [2048]                          2,048        4,096
+model.language_model.layers.11.mlp.down_proj.weight                    BF16  [2048, 6144]               12,582,912   25,165,824
+model.language_model.layers.11.mlp.gate_proj.weight                    BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.11.mlp.up_proj.weight                      BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.11.post_attention_layernorm.weight         BF16  [2048]                          2,048        4,096
+model.language_model.layers.11.self_attn.k_norm.weight                 BF16  [256]                             256          512
+model.language_model.layers.11.self_attn.k_proj.weight                 BF16  [512, 2048]                 1,048,576    2,097,152
+model.language_model.layers.11.self_attn.o_proj.weight                 BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.11.self_attn.q_norm.weight                 BF16  [256]                             256          512
+model.language_model.layers.11.self_attn.q_proj.weight                 BF16  [4096, 2048]                8,388,608   16,777,216
+model.language_model.layers.11.self_attn.v_proj.weight                 BF16  [512, 2048]                 1,048,576    2,097,152
+model.language_model.layers.12.input_layernorm.weight                  BF16  [2048]                          2,048        4,096
+model.language_model.layers.12.linear_attn.A_log                       F32   [16]                               16           64
+model.language_model.layers.12.linear_attn.conv1d.weight               BF16  [6144, 1, 4]                   24,576       49,152
+model.language_model.layers.12.linear_attn.dt_bias                     BF16  [16]                               16           32
+model.language_model.layers.12.linear_attn.in_proj_a.weight            BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.12.linear_attn.in_proj_b.weight            BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.12.linear_attn.in_proj_qkv.weight          BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.12.linear_attn.in_proj_z.weight            BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.12.linear_attn.norm.weight                 F32   [128]                             128          512
+model.language_model.layers.12.linear_attn.out_proj.weight             BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.12.mlp.down_proj.weight                    BF16  [2048, 6144]               12,582,912   25,165,824
+model.language_model.layers.12.mlp.gate_proj.weight                    BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.12.mlp.up_proj.weight                      BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.12.post_attention_layernorm.weight         BF16  [2048]                          2,048        4,096
+model.language_model.layers.13.input_layernorm.weight                  BF16  [2048]                          2,048        4,096
+model.language_model.layers.13.linear_attn.A_log                       F32   [16]                               16           64
+model.language_model.layers.13.linear_attn.conv1d.weight               BF16  [6144, 1, 4]                   24,576       49,152
+model.language_model.layers.13.linear_attn.dt_bias                     BF16  [16]                               16           32
+model.language_model.layers.13.linear_attn.in_proj_a.weight            BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.13.linear_attn.in_proj_b.weight            BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.13.linear_attn.in_proj_qkv.weight          BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.13.linear_attn.in_proj_z.weight            BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.13.linear_attn.norm.weight                 F32   [128]                             128          512
+model.language_model.layers.13.linear_attn.out_proj.weight             BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.13.mlp.down_proj.weight                    BF16  [2048, 6144]               12,582,912   25,165,824
+model.language_model.layers.13.mlp.gate_proj.weight                    BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.13.mlp.up_proj.weight                      BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.13.post_attention_layernorm.weight         BF16  [2048]                          2,048        4,096
+model.language_model.layers.14.input_layernorm.weight                  BF16  [2048]                          2,048        4,096
+model.language_model.layers.14.linear_attn.A_log                       F32   [16]                               16           64
+model.language_model.layers.14.linear_attn.conv1d.weight               BF16  [6144, 1, 4]                   24,576       49,152
+model.language_model.layers.14.linear_attn.dt_bias                     BF16  [16]                               16           32
+model.language_model.layers.14.linear_attn.in_proj_a.weight            BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.14.linear_attn.in_proj_b.weight            BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.14.linear_attn.in_proj_qkv.weight          BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.14.linear_attn.in_proj_z.weight            BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.14.linear_attn.norm.weight                 F32   [128]                             128          512
+model.language_model.layers.14.linear_attn.out_proj.weight             BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.14.mlp.down_proj.weight                    BF16  [2048, 6144]               12,582,912   25,165,824
+model.language_model.layers.14.mlp.gate_proj.weight                    BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.14.mlp.up_proj.weight                      BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.14.post_attention_layernorm.weight         BF16  [2048]                          2,048        4,096
+model.language_model.layers.15.input_layernorm.weight                  BF16  [2048]                          2,048        4,096
+model.language_model.layers.15.mlp.down_proj.weight                    BF16  [2048, 6144]               12,582,912   25,165,824
+model.language_model.layers.15.mlp.gate_proj.weight                    BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.15.mlp.up_proj.weight                      BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.15.post_attention_layernorm.weight         BF16  [2048]                          2,048        4,096
+model.language_model.layers.15.self_attn.k_norm.weight                 BF16  [256]                             256          512
+model.language_model.layers.15.self_attn.k_proj.weight                 BF16  [512, 2048]                 1,048,576    2,097,152
+model.language_model.layers.15.self_attn.o_proj.weight                 BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.15.self_attn.q_norm.weight                 BF16  [256]                             256          512
+model.language_model.layers.15.self_attn.q_proj.weight                 BF16  [4096, 2048]                8,388,608   16,777,216
+model.language_model.layers.15.self_attn.v_proj.weight                 BF16  [512, 2048]                 1,048,576    2,097,152
+model.language_model.layers.16.input_layernorm.weight                  BF16  [2048]                          2,048        4,096
+model.language_model.layers.16.linear_attn.A_log                       F32   [16]                               16           64
+model.language_model.layers.16.linear_attn.conv1d.weight               BF16  [6144, 1, 4]                   24,576       49,152
+model.language_model.layers.16.linear_attn.dt_bias                     BF16  [16]                               16           32
+model.language_model.layers.16.linear_attn.in_proj_a.weight            BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.16.linear_attn.in_proj_b.weight            BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.16.linear_attn.in_proj_qkv.weight          BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.16.linear_attn.in_proj_z.weight            BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.16.linear_attn.norm.weight                 F32   [128]                             128          512
+model.language_model.layers.16.linear_attn.out_proj.weight             BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.16.mlp.down_proj.weight                    BF16  [2048, 6144]               12,582,912   25,165,824
+model.language_model.layers.16.mlp.gate_proj.weight                    BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.16.mlp.up_proj.weight                      BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.16.post_attention_layernorm.weight         BF16  [2048]                          2,048        4,096
+model.language_model.layers.17.input_layernorm.weight                  BF16  [2048]                          2,048        4,096
+model.language_model.layers.17.linear_attn.A_log                       F32   [16]                               16           64
+model.language_model.layers.17.linear_attn.conv1d.weight               BF16  [6144, 1, 4]                   24,576       49,152
+model.language_model.layers.17.linear_attn.dt_bias                     BF16  [16]                               16           32
+model.language_model.layers.17.linear_attn.in_proj_a.weight            BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.17.linear_attn.in_proj_b.weight            BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.17.linear_attn.in_proj_qkv.weight          BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.17.linear_attn.in_proj_z.weight            BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.17.linear_attn.norm.weight                 F32   [128]                             128          512
+model.language_model.layers.17.linear_attn.out_proj.weight             BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.17.mlp.down_proj.weight                    BF16  [2048, 6144]               12,582,912   25,165,824
+model.language_model.layers.17.mlp.gate_proj.weight                    BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.17.mlp.up_proj.weight                      BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.17.post_attention_layernorm.weight         BF16  [2048]                          2,048        4,096
+model.language_model.layers.18.input_layernorm.weight                  BF16  [2048]                          2,048        4,096
+model.language_model.layers.18.linear_attn.A_log                       F32   [16]                               16           64
+model.language_model.layers.18.linear_attn.conv1d.weight               BF16  [6144, 1, 4]                   24,576       49,152
+model.language_model.layers.18.linear_attn.dt_bias                     BF16  [16]                               16           32
+model.language_model.layers.18.linear_attn.in_proj_a.weight            BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.18.linear_attn.in_proj_b.weight            BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.18.linear_attn.in_proj_qkv.weight          BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.18.linear_attn.in_proj_z.weight            BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.18.linear_attn.norm.weight                 F32   [128]                             128          512
+model.language_model.layers.18.linear_attn.out_proj.weight             BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.18.mlp.down_proj.weight                    BF16  [2048, 6144]               12,582,912   25,165,824
+model.language_model.layers.18.mlp.gate_proj.weight                    BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.18.mlp.up_proj.weight                      BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.18.post_attention_layernorm.weight         BF16  [2048]                          2,048        4,096
+model.language_model.layers.19.input_layernorm.weight                  BF16  [2048]                          2,048        4,096
+model.language_model.layers.19.mlp.down_proj.weight                    BF16  [2048, 6144]               12,582,912   25,165,824
+model.language_model.layers.19.mlp.gate_proj.weight                    BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.19.mlp.up_proj.weight                      BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.19.post_attention_layernorm.weight         BF16  [2048]                          2,048        4,096
+model.language_model.layers.19.self_attn.k_norm.weight                 BF16  [256]                             256          512
+model.language_model.layers.19.self_attn.k_proj.weight                 BF16  [512, 2048]                 1,048,576    2,097,152
+model.language_model.layers.19.self_attn.o_proj.weight                 BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.19.self_attn.q_norm.weight                 BF16  [256]                             256          512
+model.language_model.layers.19.self_attn.q_proj.weight                 BF16  [4096, 2048]                8,388,608   16,777,216
+model.language_model.layers.19.self_attn.v_proj.weight                 BF16  [512, 2048]                 1,048,576    2,097,152
+model.language_model.layers.2.input_layernorm.weight                   BF16  [2048]                          2,048        4,096
+model.language_model.layers.2.linear_attn.A_log                        F32   [16]                               16           64
+model.language_model.layers.2.linear_attn.conv1d.weight                BF16  [6144, 1, 4]                   24,576       49,152
+model.language_model.layers.2.linear_attn.dt_bias                      BF16  [16]                               16           32
+model.language_model.layers.2.linear_attn.in_proj_a.weight             BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.2.linear_attn.in_proj_b.weight             BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.2.linear_attn.in_proj_qkv.weight           BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.2.linear_attn.in_proj_z.weight             BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.2.linear_attn.norm.weight                  F32   [128]                             128          512
+model.language_model.layers.2.linear_attn.out_proj.weight              BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.2.mlp.down_proj.weight                     BF16  [2048, 6144]               12,582,912   25,165,824
+model.language_model.layers.2.mlp.gate_proj.weight                     BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.2.mlp.up_proj.weight                       BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.2.post_attention_layernorm.weight          BF16  [2048]                          2,048        4,096
+model.language_model.layers.20.input_layernorm.weight                  BF16  [2048]                          2,048        4,096
+model.language_model.layers.20.linear_attn.A_log                       F32   [16]                               16           64
+model.language_model.layers.20.linear_attn.conv1d.weight               BF16  [6144, 1, 4]                   24,576       49,152
+model.language_model.layers.20.linear_attn.dt_bias                     BF16  [16]                               16           32
+model.language_model.layers.20.linear_attn.in_proj_a.weight            BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.20.linear_attn.in_proj_b.weight            BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.20.linear_attn.in_proj_qkv.weight          BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.20.linear_attn.in_proj_z.weight            BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.20.linear_attn.norm.weight                 F32   [128]                             128          512
+model.language_model.layers.20.linear_attn.out_proj.weight             BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.20.mlp.down_proj.weight                    BF16  [2048, 6144]               12,582,912   25,165,824
+model.language_model.layers.20.mlp.gate_proj.weight                    BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.20.mlp.up_proj.weight                      BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.20.post_attention_layernorm.weight         BF16  [2048]                          2,048        4,096
+model.language_model.layers.21.input_layernorm.weight                  BF16  [2048]                          2,048        4,096
+model.language_model.layers.21.linear_attn.A_log                       F32   [16]                               16           64
+model.language_model.layers.21.linear_attn.conv1d.weight               BF16  [6144, 1, 4]                   24,576       49,152
+model.language_model.layers.21.linear_attn.dt_bias                     BF16  [16]                               16           32
+model.language_model.layers.21.linear_attn.in_proj_a.weight            BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.21.linear_attn.in_proj_b.weight            BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.21.linear_attn.in_proj_qkv.weight          BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.21.linear_attn.in_proj_z.weight            BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.21.linear_attn.norm.weight                 F32   [128]                             128          512
+model.language_model.layers.21.linear_attn.out_proj.weight             BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.21.mlp.down_proj.weight                    BF16  [2048, 6144]               12,582,912   25,165,824
+model.language_model.layers.21.mlp.gate_proj.weight                    BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.21.mlp.up_proj.weight                      BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.21.post_attention_layernorm.weight         BF16  [2048]                          2,048        4,096
+model.language_model.layers.22.input_layernorm.weight                  BF16  [2048]                          2,048        4,096
+model.language_model.layers.22.linear_attn.A_log                       F32   [16]                               16           64
+model.language_model.layers.22.linear_attn.conv1d.weight               BF16  [6144, 1, 4]                   24,576       49,152
+model.language_model.layers.22.linear_attn.dt_bias                     BF16  [16]                               16           32
+model.language_model.layers.22.linear_attn.in_proj_a.weight            BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.22.linear_attn.in_proj_b.weight            BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.22.linear_attn.in_proj_qkv.weight          BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.22.linear_attn.in_proj_z.weight            BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.22.linear_attn.norm.weight                 F32   [128]                             128          512
+model.language_model.layers.22.linear_attn.out_proj.weight             BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.22.mlp.down_proj.weight                    BF16  [2048, 6144]               12,582,912   25,165,824
+model.language_model.layers.22.mlp.gate_proj.weight                    BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.22.mlp.up_proj.weight                      BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.22.post_attention_layernorm.weight         BF16  [2048]                          2,048        4,096
+model.language_model.layers.23.input_layernorm.weight                  BF16  [2048]                          2,048        4,096
+model.language_model.layers.23.mlp.down_proj.weight                    BF16  [2048, 6144]               12,582,912   25,165,824
+model.language_model.layers.23.mlp.gate_proj.weight                    BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.23.mlp.up_proj.weight                      BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.23.post_attention_layernorm.weight         BF16  [2048]                          2,048        4,096
+model.language_model.layers.23.self_attn.k_norm.weight                 BF16  [256]                             256          512
+model.language_model.layers.23.self_attn.k_proj.weight                 BF16  [512, 2048]                 1,048,576    2,097,152
+model.language_model.layers.23.self_attn.o_proj.weight                 BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.23.self_attn.q_norm.weight                 BF16  [256]                             256          512
+model.language_model.layers.23.self_attn.q_proj.weight                 BF16  [4096, 2048]                8,388,608   16,777,216
+model.language_model.layers.23.self_attn.v_proj.weight                 BF16  [512, 2048]                 1,048,576    2,097,152
+model.language_model.layers.3.input_layernorm.weight                   BF16  [2048]                          2,048        4,096
+model.language_model.layers.3.mlp.down_proj.weight                     BF16  [2048, 6144]               12,582,912   25,165,824
+model.language_model.layers.3.mlp.gate_proj.weight                     BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.3.mlp.up_proj.weight                       BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.3.post_attention_layernorm.weight          BF16  [2048]                          2,048        4,096
+model.language_model.layers.3.self_attn.k_norm.weight                  BF16  [256]                             256          512
+model.language_model.layers.3.self_attn.k_proj.weight                  BF16  [512, 2048]                 1,048,576    2,097,152
+model.language_model.layers.3.self_attn.o_proj.weight                  BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.3.self_attn.q_norm.weight                  BF16  [256]                             256          512
+model.language_model.layers.3.self_attn.q_proj.weight                  BF16  [4096, 2048]                8,388,608   16,777,216
+model.language_model.layers.3.self_attn.v_proj.weight                  BF16  [512, 2048]                 1,048,576    2,097,152
+model.language_model.layers.4.input_layernorm.weight                   BF16  [2048]                          2,048        4,096
+model.language_model.layers.4.linear_attn.A_log                        F32   [16]                               16           64
+model.language_model.layers.4.linear_attn.conv1d.weight                BF16  [6144, 1, 4]                   24,576       49,152
+model.language_model.layers.4.linear_attn.dt_bias                      BF16  [16]                               16           32
+model.language_model.layers.4.linear_attn.in_proj_a.weight             BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.4.linear_attn.in_proj_b.weight             BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.4.linear_attn.in_proj_qkv.weight           BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.4.linear_attn.in_proj_z.weight             BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.4.linear_attn.norm.weight                  F32   [128]                             128          512
+model.language_model.layers.4.linear_attn.out_proj.weight              BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.4.mlp.down_proj.weight                     BF16  [2048, 6144]               12,582,912   25,165,824
+model.language_model.layers.4.mlp.gate_proj.weight                     BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.4.mlp.up_proj.weight                       BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.4.post_attention_layernorm.weight          BF16  [2048]                          2,048        4,096
+model.language_model.layers.5.input_layernorm.weight                   BF16  [2048]                          2,048        4,096
+model.language_model.layers.5.linear_attn.A_log                        F32   [16]                               16           64
+model.language_model.layers.5.linear_attn.conv1d.weight                BF16  [6144, 1, 4]                   24,576       49,152
+model.language_model.layers.5.linear_attn.dt_bias                      BF16  [16]                               16           32
+model.language_model.layers.5.linear_attn.in_proj_a.weight             BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.5.linear_attn.in_proj_b.weight             BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.5.linear_attn.in_proj_qkv.weight           BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.5.linear_attn.in_proj_z.weight             BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.5.linear_attn.norm.weight                  F32   [128]                             128          512
+model.language_model.layers.5.linear_attn.out_proj.weight              BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.5.mlp.down_proj.weight                     BF16  [2048, 6144]               12,582,912   25,165,824
+model.language_model.layers.5.mlp.gate_proj.weight                     BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.5.mlp.up_proj.weight                       BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.5.post_attention_layernorm.weight          BF16  [2048]                          2,048        4,096
+model.language_model.layers.6.input_layernorm.weight                   BF16  [2048]                          2,048        4,096
+model.language_model.layers.6.linear_attn.A_log                        F32   [16]                               16           64
+model.language_model.layers.6.linear_attn.conv1d.weight                BF16  [6144, 1, 4]                   24,576       49,152
+model.language_model.layers.6.linear_attn.dt_bias                      BF16  [16]                               16           32
+model.language_model.layers.6.linear_attn.in_proj_a.weight             BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.6.linear_attn.in_proj_b.weight             BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.6.linear_attn.in_proj_qkv.weight           BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.6.linear_attn.in_proj_z.weight             BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.6.linear_attn.norm.weight                  F32   [128]                             128          512
+model.language_model.layers.6.linear_attn.out_proj.weight              BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.6.mlp.down_proj.weight                     BF16  [2048, 6144]               12,582,912   25,165,824
+model.language_model.layers.6.mlp.gate_proj.weight                     BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.6.mlp.up_proj.weight                       BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.6.post_attention_layernorm.weight          BF16  [2048]                          2,048        4,096
+model.language_model.layers.7.input_layernorm.weight                   BF16  [2048]                          2,048        4,096
+model.language_model.layers.7.mlp.down_proj.weight                     BF16  [2048, 6144]               12,582,912   25,165,824
+model.language_model.layers.7.mlp.gate_proj.weight                     BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.7.mlp.up_proj.weight                       BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.7.post_attention_layernorm.weight          BF16  [2048]                          2,048        4,096
+model.language_model.layers.7.self_attn.k_norm.weight                  BF16  [256]                             256          512
+model.language_model.layers.7.self_attn.k_proj.weight                  BF16  [512, 2048]                 1,048,576    2,097,152
+model.language_model.layers.7.self_attn.o_proj.weight                  BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.7.self_attn.q_norm.weight                  BF16  [256]                             256          512
+model.language_model.layers.7.self_attn.q_proj.weight                  BF16  [4096, 2048]                8,388,608   16,777,216
+model.language_model.layers.7.self_attn.v_proj.weight                  BF16  [512, 2048]                 1,048,576    2,097,152
+model.language_model.layers.8.input_layernorm.weight                   BF16  [2048]                          2,048        4,096
+model.language_model.layers.8.linear_attn.A_log                        F32   [16]                               16           64
+model.language_model.layers.8.linear_attn.conv1d.weight                BF16  [6144, 1, 4]                   24,576       49,152
+model.language_model.layers.8.linear_attn.dt_bias                      BF16  [16]                               16           32
+model.language_model.layers.8.linear_attn.in_proj_a.weight             BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.8.linear_attn.in_proj_b.weight             BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.8.linear_attn.in_proj_qkv.weight           BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.8.linear_attn.in_proj_z.weight             BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.8.linear_attn.norm.weight                  F32   [128]                             128          512
+model.language_model.layers.8.linear_attn.out_proj.weight              BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.8.mlp.down_proj.weight                     BF16  [2048, 6144]               12,582,912   25,165,824
+model.language_model.layers.8.mlp.gate_proj.weight                     BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.8.mlp.up_proj.weight                       BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.8.post_attention_layernorm.weight          BF16  [2048]                          2,048        4,096
+model.language_model.layers.9.input_layernorm.weight                   BF16  [2048]                          2,048        4,096
+model.language_model.layers.9.linear_attn.A_log                        F32   [16]                               16           64
+model.language_model.layers.9.linear_attn.conv1d.weight                BF16  [6144, 1, 4]                   24,576       49,152
+model.language_model.layers.9.linear_attn.dt_bias                      BF16  [16]                               16           32
+model.language_model.layers.9.linear_attn.in_proj_a.weight             BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.9.linear_attn.in_proj_b.weight             BF16  [16, 2048]                     32,768       65,536
+model.language_model.layers.9.linear_attn.in_proj_qkv.weight           BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.9.linear_attn.in_proj_z.weight             BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.9.linear_attn.norm.weight                  F32   [128]                             128          512
+model.language_model.layers.9.linear_attn.out_proj.weight              BF16  [2048, 2048]                4,194,304    8,388,608
+model.language_model.layers.9.mlp.down_proj.weight                     BF16  [2048, 6144]               12,582,912   25,165,824
+model.language_model.layers.9.mlp.gate_proj.weight                     BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.9.mlp.up_proj.weight                       BF16  [6144, 2048]               12,582,912   25,165,824
+model.language_model.layers.9.post_attention_layernorm.weight          BF16  [2048]                          2,048        4,096
+model.language_model.norm.weight                                       BF16  [2048]                          2,048        4,096
+model.visual.blocks.0.attn.proj.bias                                   BF16  [1024]                          1,024        2,048
+model.visual.blocks.0.attn.proj.weight                                 BF16  [1024, 1024]                1,048,576    2,097,152
+model.visual.blocks.0.attn.qkv.bias                                    BF16  [3072]                          3,072        6,144
+model.visual.blocks.0.attn.qkv.weight                                  BF16  [3072, 1024]                3,145,728    6,291,456
+model.visual.blocks.0.mlp.linear_fc1.bias                              BF16  [4096]                          4,096        8,192
+model.visual.blocks.0.mlp.linear_fc1.weight                            BF16  [4096, 1024]                4,194,304    8,388,608
+model.visual.blocks.0.mlp.linear_fc2.bias                              BF16  [1024]                          1,024        2,048
+model.visual.blocks.0.mlp.linear_fc2.weight                            BF16  [1024, 4096]                4,194,304    8,388,608
+model.visual.blocks.0.norm1.bias                                       BF16  [1024]                          1,024        2,048
+model.visual.blocks.0.norm1.weight                                     BF16  [1024]                          1,024        2,048
+model.visual.blocks.0.norm2.bias                                       BF16  [1024]                          1,024        2,048
+model.visual.blocks.0.norm2.weight                                     BF16  [1024]                          1,024        2,048
+model.visual.blocks.1.attn.proj.bias                                   BF16  [1024]                          1,024        2,048
+model.visual.blocks.1.attn.proj.weight                                 BF16  [1024, 1024]                1,048,576    2,097,152
+model.visual.blocks.1.attn.qkv.bias                                    BF16  [3072]                          3,072        6,144
+model.visual.blocks.1.attn.qkv.weight                                  BF16  [3072, 1024]                3,145,728    6,291,456
+model.visual.blocks.1.mlp.linear_fc1.bias                              BF16  [4096]                          4,096        8,192
+model.visual.blocks.1.mlp.linear_fc1.weight                            BF16  [4096, 1024]                4,194,304    8,388,608
+model.visual.blocks.1.mlp.linear_fc2.bias                              BF16  [1024]                          1,024        2,048
+model.visual.blocks.1.mlp.linear_fc2.weight                            BF16  [1024, 4096]                4,194,304    8,388,608
+model.visual.blocks.1.norm1.bias                                       BF16  [1024]                          1,024        2,048
+model.visual.blocks.1.norm1.weight                                     BF16  [1024]                          1,024        2,048
+model.visual.blocks.1.norm2.bias                                       BF16  [1024]                          1,024        2,048
+model.visual.blocks.1.norm2.weight                                     BF16  [1024]                          1,024        2,048
+model.visual.blocks.10.attn.proj.bias                                  BF16  [1024]                          1,024        2,048
+model.visual.blocks.10.attn.proj.weight                                BF16  [1024, 1024]                1,048,576    2,097,152
+model.visual.blocks.10.attn.qkv.bias                                   BF16  [3072]                          3,072        6,144
+model.visual.blocks.10.attn.qkv.weight                                 BF16  [3072, 1024]                3,145,728    6,291,456
+model.visual.blocks.10.mlp.linear_fc1.bias                             BF16  [4096]                          4,096        8,192
+model.visual.blocks.10.mlp.linear_fc1.weight                           BF16  [4096, 1024]                4,194,304    8,388,608
+model.visual.blocks.10.mlp.linear_fc2.bias                             BF16  [1024]                          1,024        2,048
+model.visual.blocks.10.mlp.linear_fc2.weight                           BF16  [1024, 4096]                4,194,304    8,388,608
+model.visual.blocks.10.norm1.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.10.norm1.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.10.norm2.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.10.norm2.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.11.attn.proj.bias                                  BF16  [1024]                          1,024        2,048
+model.visual.blocks.11.attn.proj.weight                                BF16  [1024, 1024]                1,048,576    2,097,152
+model.visual.blocks.11.attn.qkv.bias                                   BF16  [3072]                          3,072        6,144
+model.visual.blocks.11.attn.qkv.weight                                 BF16  [3072, 1024]                3,145,728    6,291,456
+model.visual.blocks.11.mlp.linear_fc1.bias                             BF16  [4096]                          4,096        8,192
+model.visual.blocks.11.mlp.linear_fc1.weight                           BF16  [4096, 1024]                4,194,304    8,388,608
+model.visual.blocks.11.mlp.linear_fc2.bias                             BF16  [1024]                          1,024        2,048
+model.visual.blocks.11.mlp.linear_fc2.weight                           BF16  [1024, 4096]                4,194,304    8,388,608
+model.visual.blocks.11.norm1.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.11.norm1.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.11.norm2.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.11.norm2.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.12.attn.proj.bias                                  BF16  [1024]                          1,024        2,048
+model.visual.blocks.12.attn.proj.weight                                BF16  [1024, 1024]                1,048,576    2,097,152
+model.visual.blocks.12.attn.qkv.bias                                   BF16  [3072]                          3,072        6,144
+model.visual.blocks.12.attn.qkv.weight                                 BF16  [3072, 1024]                3,145,728    6,291,456
+model.visual.blocks.12.mlp.linear_fc1.bias                             BF16  [4096]                          4,096        8,192
+model.visual.blocks.12.mlp.linear_fc1.weight                           BF16  [4096, 1024]                4,194,304    8,388,608
+model.visual.blocks.12.mlp.linear_fc2.bias                             BF16  [1024]                          1,024        2,048
+model.visual.blocks.12.mlp.linear_fc2.weight                           BF16  [1024, 4096]                4,194,304    8,388,608
+model.visual.blocks.12.norm1.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.12.norm1.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.12.norm2.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.12.norm2.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.13.attn.proj.bias                                  BF16  [1024]                          1,024        2,048
+model.visual.blocks.13.attn.proj.weight                                BF16  [1024, 1024]                1,048,576    2,097,152
+model.visual.blocks.13.attn.qkv.bias                                   BF16  [3072]                          3,072        6,144
+model.visual.blocks.13.attn.qkv.weight                                 BF16  [3072, 1024]                3,145,728    6,291,456
+model.visual.blocks.13.mlp.linear_fc1.bias                             BF16  [4096]                          4,096        8,192
+model.visual.blocks.13.mlp.linear_fc1.weight                           BF16  [4096, 1024]                4,194,304    8,388,608
+model.visual.blocks.13.mlp.linear_fc2.bias                             BF16  [1024]                          1,024        2,048
+model.visual.blocks.13.mlp.linear_fc2.weight                           BF16  [1024, 4096]                4,194,304    8,388,608
+model.visual.blocks.13.norm1.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.13.norm1.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.13.norm2.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.13.norm2.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.14.attn.proj.bias                                  BF16  [1024]                          1,024        2,048
+model.visual.blocks.14.attn.proj.weight                                BF16  [1024, 1024]                1,048,576    2,097,152
+model.visual.blocks.14.attn.qkv.bias                                   BF16  [3072]                          3,072        6,144
+model.visual.blocks.14.attn.qkv.weight                                 BF16  [3072, 1024]                3,145,728    6,291,456
+model.visual.blocks.14.mlp.linear_fc1.bias                             BF16  [4096]                          4,096        8,192
+model.visual.blocks.14.mlp.linear_fc1.weight                           BF16  [4096, 1024]                4,194,304    8,388,608
+model.visual.blocks.14.mlp.linear_fc2.bias                             BF16  [1024]                          1,024        2,048
+model.visual.blocks.14.mlp.linear_fc2.weight                           BF16  [1024, 4096]                4,194,304    8,388,608
+model.visual.blocks.14.norm1.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.14.norm1.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.14.norm2.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.14.norm2.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.15.attn.proj.bias                                  BF16  [1024]                          1,024        2,048
+model.visual.blocks.15.attn.proj.weight                                BF16  [1024, 1024]                1,048,576    2,097,152
+model.visual.blocks.15.attn.qkv.bias                                   BF16  [3072]                          3,072        6,144
+model.visual.blocks.15.attn.qkv.weight                                 BF16  [3072, 1024]                3,145,728    6,291,456
+model.visual.blocks.15.mlp.linear_fc1.bias                             BF16  [4096]                          4,096        8,192
+model.visual.blocks.15.mlp.linear_fc1.weight                           BF16  [4096, 1024]                4,194,304    8,388,608
+model.visual.blocks.15.mlp.linear_fc2.bias                             BF16  [1024]                          1,024        2,048
+model.visual.blocks.15.mlp.linear_fc2.weight                           BF16  [1024, 4096]                4,194,304    8,388,608
+model.visual.blocks.15.norm1.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.15.norm1.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.15.norm2.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.15.norm2.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.16.attn.proj.bias                                  BF16  [1024]                          1,024        2,048
+model.visual.blocks.16.attn.proj.weight                                BF16  [1024, 1024]                1,048,576    2,097,152
+model.visual.blocks.16.attn.qkv.bias                                   BF16  [3072]                          3,072        6,144
+model.visual.blocks.16.attn.qkv.weight                                 BF16  [3072, 1024]                3,145,728    6,291,456
+model.visual.blocks.16.mlp.linear_fc1.bias                             BF16  [4096]                          4,096        8,192
+model.visual.blocks.16.mlp.linear_fc1.weight                           BF16  [4096, 1024]                4,194,304    8,388,608
+model.visual.blocks.16.mlp.linear_fc2.bias                             BF16  [1024]                          1,024        2,048
+model.visual.blocks.16.mlp.linear_fc2.weight                           BF16  [1024, 4096]                4,194,304    8,388,608
+model.visual.blocks.16.norm1.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.16.norm1.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.16.norm2.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.16.norm2.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.17.attn.proj.bias                                  BF16  [1024]                          1,024        2,048
+model.visual.blocks.17.attn.proj.weight                                BF16  [1024, 1024]                1,048,576    2,097,152
+model.visual.blocks.17.attn.qkv.bias                                   BF16  [3072]                          3,072        6,144
+model.visual.blocks.17.attn.qkv.weight                                 BF16  [3072, 1024]                3,145,728    6,291,456
+model.visual.blocks.17.mlp.linear_fc1.bias                             BF16  [4096]                          4,096        8,192
+model.visual.blocks.17.mlp.linear_fc1.weight                           BF16  [4096, 1024]                4,194,304    8,388,608
+model.visual.blocks.17.mlp.linear_fc2.bias                             BF16  [1024]                          1,024        2,048
+model.visual.blocks.17.mlp.linear_fc2.weight                           BF16  [1024, 4096]                4,194,304    8,388,608
+model.visual.blocks.17.norm1.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.17.norm1.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.17.norm2.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.17.norm2.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.18.attn.proj.bias                                  BF16  [1024]                          1,024        2,048
+model.visual.blocks.18.attn.proj.weight                                BF16  [1024, 1024]                1,048,576    2,097,152
+model.visual.blocks.18.attn.qkv.bias                                   BF16  [3072]                          3,072        6,144
+model.visual.blocks.18.attn.qkv.weight                                 BF16  [3072, 1024]                3,145,728    6,291,456
+model.visual.blocks.18.mlp.linear_fc1.bias                             BF16  [4096]                          4,096        8,192
+model.visual.blocks.18.mlp.linear_fc1.weight                           BF16  [4096, 1024]                4,194,304    8,388,608
+model.visual.blocks.18.mlp.linear_fc2.bias                             BF16  [1024]                          1,024        2,048
+model.visual.blocks.18.mlp.linear_fc2.weight                           BF16  [1024, 4096]                4,194,304    8,388,608
+model.visual.blocks.18.norm1.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.18.norm1.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.18.norm2.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.18.norm2.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.19.attn.proj.bias                                  BF16  [1024]                          1,024        2,048
+model.visual.blocks.19.attn.proj.weight                                BF16  [1024, 1024]                1,048,576    2,097,152
+model.visual.blocks.19.attn.qkv.bias                                   BF16  [3072]                          3,072        6,144
+model.visual.blocks.19.attn.qkv.weight                                 BF16  [3072, 1024]                3,145,728    6,291,456
+model.visual.blocks.19.mlp.linear_fc1.bias                             BF16  [4096]                          4,096        8,192
+model.visual.blocks.19.mlp.linear_fc1.weight                           BF16  [4096, 1024]                4,194,304    8,388,608
+model.visual.blocks.19.mlp.linear_fc2.bias                             BF16  [1024]                          1,024        2,048
+model.visual.blocks.19.mlp.linear_fc2.weight                           BF16  [1024, 4096]                4,194,304    8,388,608
+model.visual.blocks.19.norm1.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.19.norm1.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.19.norm2.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.19.norm2.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.2.attn.proj.bias                                   BF16  [1024]                          1,024        2,048
+model.visual.blocks.2.attn.proj.weight                                 BF16  [1024, 1024]                1,048,576    2,097,152
+model.visual.blocks.2.attn.qkv.bias                                    BF16  [3072]                          3,072        6,144
+model.visual.blocks.2.attn.qkv.weight                                  BF16  [3072, 1024]                3,145,728    6,291,456
+model.visual.blocks.2.mlp.linear_fc1.bias                              BF16  [4096]                          4,096        8,192
+model.visual.blocks.2.mlp.linear_fc1.weight                            BF16  [4096, 1024]                4,194,304    8,388,608
+model.visual.blocks.2.mlp.linear_fc2.bias                              BF16  [1024]                          1,024        2,048
+model.visual.blocks.2.mlp.linear_fc2.weight                            BF16  [1024, 4096]                4,194,304    8,388,608
+model.visual.blocks.2.norm1.bias                                       BF16  [1024]                          1,024        2,048
+model.visual.blocks.2.norm1.weight                                     BF16  [1024]                          1,024        2,048
+model.visual.blocks.2.norm2.bias                                       BF16  [1024]                          1,024        2,048
+model.visual.blocks.2.norm2.weight                                     BF16  [1024]                          1,024        2,048
+model.visual.blocks.20.attn.proj.bias                                  BF16  [1024]                          1,024        2,048
+model.visual.blocks.20.attn.proj.weight                                BF16  [1024, 1024]                1,048,576    2,097,152
+model.visual.blocks.20.attn.qkv.bias                                   BF16  [3072]                          3,072        6,144
+model.visual.blocks.20.attn.qkv.weight                                 BF16  [3072, 1024]                3,145,728    6,291,456
+model.visual.blocks.20.mlp.linear_fc1.bias                             BF16  [4096]                          4,096        8,192
+model.visual.blocks.20.mlp.linear_fc1.weight                           BF16  [4096, 1024]                4,194,304    8,388,608
+model.visual.blocks.20.mlp.linear_fc2.bias                             BF16  [1024]                          1,024        2,048
+model.visual.blocks.20.mlp.linear_fc2.weight                           BF16  [1024, 4096]                4,194,304    8,388,608
+model.visual.blocks.20.norm1.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.20.norm1.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.20.norm2.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.20.norm2.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.21.attn.proj.bias                                  BF16  [1024]                          1,024        2,048
+model.visual.blocks.21.attn.proj.weight                                BF16  [1024, 1024]                1,048,576    2,097,152
+model.visual.blocks.21.attn.qkv.bias                                   BF16  [3072]                          3,072        6,144
+model.visual.blocks.21.attn.qkv.weight                                 BF16  [3072, 1024]                3,145,728    6,291,456
+model.visual.blocks.21.mlp.linear_fc1.bias                             BF16  [4096]                          4,096        8,192
+model.visual.blocks.21.mlp.linear_fc1.weight                           BF16  [4096, 1024]                4,194,304    8,388,608
+model.visual.blocks.21.mlp.linear_fc2.bias                             BF16  [1024]                          1,024        2,048
+model.visual.blocks.21.mlp.linear_fc2.weight                           BF16  [1024, 4096]                4,194,304    8,388,608
+model.visual.blocks.21.norm1.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.21.norm1.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.21.norm2.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.21.norm2.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.22.attn.proj.bias                                  BF16  [1024]                          1,024        2,048
+model.visual.blocks.22.attn.proj.weight                                BF16  [1024, 1024]                1,048,576    2,097,152
+model.visual.blocks.22.attn.qkv.bias                                   BF16  [3072]                          3,072        6,144
+model.visual.blocks.22.attn.qkv.weight                                 BF16  [3072, 1024]                3,145,728    6,291,456
+model.visual.blocks.22.mlp.linear_fc1.bias                             BF16  [4096]                          4,096        8,192
+model.visual.blocks.22.mlp.linear_fc1.weight                           BF16  [4096, 1024]                4,194,304    8,388,608
+model.visual.blocks.22.mlp.linear_fc2.bias                             BF16  [1024]                          1,024        2,048
+model.visual.blocks.22.mlp.linear_fc2.weight                           BF16  [1024, 4096]                4,194,304    8,388,608
+model.visual.blocks.22.norm1.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.22.norm1.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.22.norm2.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.22.norm2.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.23.attn.proj.bias                                  BF16  [1024]                          1,024        2,048
+model.visual.blocks.23.attn.proj.weight                                BF16  [1024, 1024]                1,048,576    2,097,152
+model.visual.blocks.23.attn.qkv.bias                                   BF16  [3072]                          3,072        6,144
+model.visual.blocks.23.attn.qkv.weight                                 BF16  [3072, 1024]                3,145,728    6,291,456
+model.visual.blocks.23.mlp.linear_fc1.bias                             BF16  [4096]                          4,096        8,192
+model.visual.blocks.23.mlp.linear_fc1.weight                           BF16  [4096, 1024]                4,194,304    8,388,608
+model.visual.blocks.23.mlp.linear_fc2.bias                             BF16  [1024]                          1,024        2,048
+model.visual.blocks.23.mlp.linear_fc2.weight                           BF16  [1024, 4096]                4,194,304    8,388,608
+model.visual.blocks.23.norm1.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.23.norm1.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.23.norm2.bias                                      BF16  [1024]                          1,024        2,048
+model.visual.blocks.23.norm2.weight                                    BF16  [1024]                          1,024        2,048
+model.visual.blocks.3.attn.proj.bias                                   BF16  [1024]                          1,024        2,048
+model.visual.blocks.3.attn.proj.weight                                 BF16  [1024, 1024]                1,048,576    2,097,152
+model.visual.blocks.3.attn.qkv.bias                                    BF16  [3072]                          3,072        6,144
+model.visual.blocks.3.attn.qkv.weight                                  BF16  [3072, 1024]                3,145,728    6,291,456
+model.visual.blocks.3.mlp.linear_fc1.bias                              BF16  [4096]                          4,096        8,192
+model.visual.blocks.3.mlp.linear_fc1.weight                            BF16  [4096, 1024]                4,194,304    8,388,608
+model.visual.blocks.3.mlp.linear_fc2.bias                              BF16  [1024]                          1,024        2,048
+model.visual.blocks.3.mlp.linear_fc2.weight                            BF16  [1024, 4096]                4,194,304    8,388,608
+model.visual.blocks.3.norm1.bias                                       BF16  [1024]                          1,024        2,048
+model.visual.blocks.3.norm1.weight                                     BF16  [1024]                          1,024        2,048
+model.visual.blocks.3.norm2.bias                                       BF16  [1024]                          1,024        2,048
+model.visual.blocks.3.norm2.weight                                     BF16  [1024]                          1,024        2,048
+model.visual.blocks.4.attn.proj.bias                                   BF16  [1024]                          1,024        2,048
+model.visual.blocks.4.attn.proj.weight                                 BF16  [1024, 1024]                1,048,576    2,097,152
+model.visual.blocks.4.attn.qkv.bias                                    BF16  [3072]                          3,072        6,144
+model.visual.blocks.4.attn.qkv.weight                                  BF16  [3072, 1024]                3,145,728    6,291,456
+model.visual.blocks.4.mlp.linear_fc1.bias                              BF16  [4096]                          4,096        8,192
+model.visual.blocks.4.mlp.linear_fc1.weight                            BF16  [4096, 1024]                4,194,304    8,388,608
+model.visual.blocks.4.mlp.linear_fc2.bias                              BF16  [1024]                          1,024        2,048
+model.visual.blocks.4.mlp.linear_fc2.weight                            BF16  [1024, 4096]                4,194,304    8,388,608
+model.visual.blocks.4.norm1.bias                                       BF16  [1024]                          1,024        2,048
+model.visual.blocks.4.norm1.weight                                     BF16  [1024]                          1,024        2,048
+model.visual.blocks.4.norm2.bias                                       BF16  [1024]                          1,024        2,048
+model.visual.blocks.4.norm2.weight                                     BF16  [1024]                          1,024        2,048
+model.visual.blocks.5.attn.proj.bias                                   BF16  [1024]                          1,024        2,048
+model.visual.blocks.5.attn.proj.weight                                 BF16  [1024, 1024]                1,048,576    2,097,152
+model.visual.blocks.5.attn.qkv.bias                                    BF16  [3072]                          3,072        6,144
+model.visual.blocks.5.attn.qkv.weight                                  BF16  [3072, 1024]                3,145,728    6,291,456
+model.visual.blocks.5.mlp.linear_fc1.bias                              BF16  [4096]                          4,096        8,192
+model.visual.blocks.5.mlp.linear_fc1.weight                            BF16  [4096, 1024]                4,194,304    8,388,608
+model.visual.blocks.5.mlp.linear_fc2.bias                              BF16  [1024]                          1,024        2,048
+model.visual.blocks.5.mlp.linear_fc2.weight                            BF16  [1024, 4096]                4,194,304    8,388,608
+model.visual.blocks.5.norm1.bias                                       BF16  [1024]                          1,024        2,048
+model.visual.blocks.5.norm1.weight                                     BF16  [1024]                          1,024        2,048
+model.visual.blocks.5.norm2.bias                                       BF16  [1024]                          1,024        2,048
+model.visual.blocks.5.norm2.weight                                     BF16  [1024]                          1,024        2,048
+model.visual.blocks.6.attn.proj.bias                                   BF16  [1024]                          1,024        2,048
+model.visual.blocks.6.attn.proj.weight                                 BF16  [1024, 1024]                1,048,576    2,097,152
+model.visual.blocks.6.attn.qkv.bias                                    BF16  [3072]                          3,072        6,144
+model.visual.blocks.6.attn.qkv.weight                                  BF16  [3072, 1024]                3,145,728    6,291,456
+model.visual.blocks.6.mlp.linear_fc1.bias                              BF16  [4096]                          4,096        8,192
+model.visual.blocks.6.mlp.linear_fc1.weight                            BF16  [4096, 1024]                4,194,304    8,388,608
+model.visual.blocks.6.mlp.linear_fc2.bias                              BF16  [1024]                          1,024        2,048
+model.visual.blocks.6.mlp.linear_fc2.weight                            BF16  [1024, 4096]                4,194,304    8,388,608
+model.visual.blocks.6.norm1.bias                                       BF16  [1024]                          1,024        2,048
+model.visual.blocks.6.norm1.weight                                     BF16  [1024]                          1,024        2,048
+model.visual.blocks.6.norm2.bias                                       BF16  [1024]                          1,024        2,048
+model.visual.blocks.6.norm2.weight                                     BF16  [1024]                          1,024        2,048
+model.visual.blocks.7.attn.proj.bias                                   BF16  [1024]                          1,024        2,048
+model.visual.blocks.7.attn.proj.weight                                 BF16  [1024, 1024]                1,048,576    2,097,152
+model.visual.blocks.7.attn.qkv.bias                                    BF16  [3072]                          3,072        6,144
+model.visual.blocks.7.attn.qkv.weight                                  BF16  [3072, 1024]                3,145,728    6,291,456
+model.visual.blocks.7.mlp.linear_fc1.bias                              BF16  [4096]                          4,096        8,192
+model.visual.blocks.7.mlp.linear_fc1.weight                            BF16  [4096, 1024]                4,194,304    8,388,608
+model.visual.blocks.7.mlp.linear_fc2.bias                              BF16  [1024]                          1,024        2,048
+model.visual.blocks.7.mlp.linear_fc2.weight                            BF16  [1024, 4096]                4,194,304    8,388,608
+model.visual.blocks.7.norm1.bias                                       BF16  [1024]                          1,024        2,048
+model.visual.blocks.7.norm1.weight                                     BF16  [1024]                          1,024        2,048
+model.visual.blocks.7.norm2.bias                                       BF16  [1024]                          1,024        2,048
+model.visual.blocks.7.norm2.weight                                     BF16  [1024]                          1,024        2,048
+model.visual.blocks.8.attn.proj.bias                                   BF16  [1024]                          1,024        2,048
+model.visual.blocks.8.attn.proj.weight                                 BF16  [1024, 1024]                1,048,576    2,097,152
+model.visual.blocks.8.attn.qkv.bias                                    BF16  [3072]                          3,072        6,144
+model.visual.blocks.8.attn.qkv.weight                                  BF16  [3072, 1024]                3,145,728    6,291,456
+model.visual.blocks.8.mlp.linear_fc1.bias                              BF16  [4096]                          4,096        8,192
+model.visual.blocks.8.mlp.linear_fc1.weight                            BF16  [4096, 1024]                4,194,304    8,388,608
+model.visual.blocks.8.mlp.linear_fc2.bias                              BF16  [1024]                          1,024        2,048
+model.visual.blocks.8.mlp.linear_fc2.weight                            BF16  [1024, 4096]                4,194,304    8,388,608
+model.visual.blocks.8.norm1.bias                                       BF16  [1024]                          1,024        2,048
+model.visual.blocks.8.norm1.weight                                     BF16  [1024]                          1,024        2,048
+model.visual.blocks.8.norm2.bias                                       BF16  [1024]                          1,024        2,048
+model.visual.blocks.8.norm2.weight                                     BF16  [1024]                          1,024        2,048
+model.visual.blocks.9.attn.proj.bias                                   BF16  [1024]                          1,024        2,048
+model.visual.blocks.9.attn.proj.weight                                 BF16  [1024, 1024]                1,048,576    2,097,152
+model.visual.blocks.9.attn.qkv.bias                                    BF16  [3072]                          3,072        6,144
+model.visual.blocks.9.attn.qkv.weight                                  BF16  [3072, 1024]                3,145,728    6,291,456
+model.visual.blocks.9.mlp.linear_fc1.bias                              BF16  [4096]                          4,096        8,192
+model.visual.blocks.9.mlp.linear_fc1.weight                            BF16  [4096, 1024]                4,194,304    8,388,608
+model.visual.blocks.9.mlp.linear_fc2.bias                              BF16  [1024]                          1,024        2,048
+model.visual.blocks.9.mlp.linear_fc2.weight                            BF16  [1024, 4096]                4,194,304    8,388,608
+model.visual.blocks.9.norm1.bias                                       BF16  [1024]                          1,024        2,048
+model.visual.blocks.9.norm1.weight                                     BF16  [1024]                          1,024        2,048
+model.visual.blocks.9.norm2.bias                                       BF16  [1024]                          1,024        2,048
+model.visual.blocks.9.norm2.weight                                     BF16  [1024]                          1,024        2,048
+model.visual.merger.linear_fc1.bias                                    BF16  [4096]                          4,096        8,192
+model.visual.merger.linear_fc1.weight                                  BF16  [4096, 4096]               16,777,216   33,554,432
+model.visual.merger.linear_fc2.bias                                    BF16  [2048]                          2,048        4,096
+model.visual.merger.linear_fc2.weight                                  BF16  [2048, 4096]                8,388,608   16,777,216
+model.visual.merger.norm.bias                                          BF16  [1024]                          1,024        2,048
+model.visual.merger.norm.weight                                        BF16  [1024]                          1,024        2,048
+model.visual.patch_embed.proj.bias                                     BF16  [1024]                          1,024        2,048
+model.visual.patch_embed.proj.weight                                   BF16  [1024, 3, 2, 16, 16]        1,572,864    3,145,728
+model.visual.pos_embed.weight                                          BF16  [2304, 1024]                2,359,296    4,718,592
+mtp.fc.weight                                                          BF16  [2048, 4096]                8,388,608   16,777,216
+mtp.layers.0.input_layernorm.weight                                    BF16  [2048]                          2,048        4,096
+mtp.layers.0.mlp.down_proj.weight                                      BF16  [2048, 6144]               12,582,912   25,165,824
+mtp.layers.0.mlp.gate_proj.weight                                      BF16  [6144, 2048]               12,582,912   25,165,824
+mtp.layers.0.mlp.up_proj.weight                                        BF16  [6144, 2048]               12,582,912   25,165,824
+mtp.layers.0.post_attention_layernorm.weight                           BF16  [2048]                          2,048        4,096
+mtp.layers.0.self_attn.k_norm.weight                                   BF16  [256]                             256          512
+mtp.layers.0.self_attn.k_proj.weight                                   BF16  [512, 2048]                 1,048,576    2,097,152
+mtp.layers.0.self_attn.o_proj.weight                                   BF16  [2048, 2048]                4,194,304    8,388,608
+mtp.layers.0.self_attn.q_norm.weight                                   BF16  [256]                             256          512
+mtp.layers.0.self_attn.q_proj.weight                                   BF16  [4096, 2048]                8,388,608   16,777,216
+mtp.layers.0.self_attn.v_proj.weight                                   BF16  [512, 2048]                 1,048,576    2,097,152
+mtp.norm.weight                                                        BF16  [2048]                          2,048        4,096
+mtp.pre_fc_norm_embedding.weight                                       BF16  [2048]                          2,048        4,096
+mtp.pre_fc_norm_hidden.weight                                          BF16  [2048]                          2,048        4,096
+TOTAL                                                                                                 2,274,069,824 4,548,144,832
+
+== Byte budget of one decode token, language model only ==
+Category: parameters, bytes at F16, bytes at Q4_0 for the 2-D linear weights (others F16), share at Q4_0
+category                             params      F16 bytes     Q4_0 bytes   share
+embed_tokens (tied lm_head)     508,559,360  1,017,118,720    286,064,640   26.1%
+mlp.down_proj                   314,572,800    629,145,600    176,947,200   16.2%
+mlp.gate_proj                   314,572,800    629,145,600    176,947,200   16.2%
+mlp.up_proj                     314,572,800    629,145,600    176,947,200   16.2%
+gdn.in_proj_qkv                 226,492,416    452,984,832    127,401,984   11.6%
+gdn.in_proj_z                    75,497,472    150,994,944     42,467,328    3.9%
+gdn.out_proj                     75,497,472    150,994,944     42,467,328    3.9%
+attn.q_proj                      58,720,256    117,440,512     33,030,144    3.0%
+attn.o_proj                      29,360,128     58,720,256     16,515,072    1.5%
+other                             8,388,608     16,777,216      4,718,592    0.4%
+attn.k_proj                       7,340,032     14,680,064      4,128,768    0.4%
+attn.v_proj                       7,340,032     14,680,064      4,128,768    0.4%
+gdn.in_proj_a                       589,824      1,179,648      1,179,648    0.1%
+gdn.in_proj_b                       589,824      1,179,648      1,179,648    0.1%
+gdn.conv1d                          442,368        884,736        884,736    0.1%
+norms                               110,592        221,184        221,184    0.0%
+gdn.norm                              2,304          4,608          4,608    0.0%
+attn.k_norm                           1,792          3,584          3,584    0.0%
+attn.q_norm                           1,792          3,584          3,584    0.0%
+gdn.A_log                               288            576            576    0.0%
+gdn.dt_bias                             288            576            576    0.0%
+TOTAL language model          1,942,653,248  3,885,306,496  1,095,242,368  100.0%
+vision (not read in decode)     331,416,576    662,833,152               
+
+Decode reads every language-model weight once per token. At ~60 GB/s DRAM:
+  F16:    64.8 ms per token of weight reads
+  Q4_0:   18.3 ms per token of weight reads
+
+== Full config JSON ==
+{
+  "transformers_version": "5.17.0",
+  "architectures": [
+    "Qwen3_5ForConditionalGeneration"
+  ],
+  "output_hidden_states": false,
+  "return_dict": true,
+  "dtype": "bfloat16",
+  "chunk_size_feed_forward": 0,
+  "is_encoder_decoder": false,
+  "id2label": {
+    "0": "LABEL_0",
+    "1": "LABEL_1"
+  },
+  "label2id": {
+    "LABEL_0": 0,
+    "LABEL_1": 1
+  },
+  "problem_type": null,
+  "text_config": {
+    "architectures": null,
+    "output_hidden_states": false,
+    "return_dict": true,
+    "dtype": "bfloat16",
+    "chunk_size_feed_forward": 0,
+    "is_encoder_decoder": false,
+    "id2label": {
+      "0": "LABEL_0",
+      "1": "LABEL_1"
+    },
+    "label2id": {
+      "LABEL_0": 0,
+      "LABEL_1": 1
+    },
+    "problem_type": null,
+    "vocab_size": 248320,
+    "hidden_size": 2048,
+    "intermediate_size": 6144,
+    "num_hidden_layers": 24,
+    "num_attention_heads": 8,
+    "num_key_value_heads": 2,
+    "hidden_act": "silu",
+    "max_position_embeddings": 262144,
+    "initializer_range": 0.02,
+    "rms_norm_eps": 1e-06,
+    "use_cache": true,
+    "tie_word_embeddings": true,
+    "rope_parameters": {
+      "mrope_interleaved": true,
+      "mrope_section": [
+        11,
+        11,
+        10
+      ],
+      "rope_type": "default",
+      "rope_theta": 10000000,
+      "partial_rotary_factor": 0.25
+    },
+    "attention_bias": false,
+    "attention_dropout": 0.0,
+    "head_dim": 256,
+    "linear_conv_kernel_dim": 4,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 16,
+    "layer_types": [
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention"
+    ],
+    "pad_token_id": null,
+    "bos_token_id": null,
+    "eos_token_id": 248044,
+    "_name_or_path": "",
+    "attn_output_gate": true,
+    "full_attention_interval": 4,
+    "mlp_only_layers": [],
+    "model_type": "qwen3_5_text",
+    "mtp_num_hidden_layers": 1,
+    "mtp_use_dedicated_embeddings": false,
+    "mamba_ssm_dtype": "float32",
+    "partial_rotary_factor": 0.25,
+    "output_attentions": false
+  },
+  "vision_config": {
+    "architectures": null,
+    "output_hidden_states": false,
+    "return_dict": true,
+    "dtype": "bfloat16",
+    "chunk_size_feed_forward": 0,
+    "is_encoder_decoder": false,
+    "id2label": {
+      "0": "LABEL_0",
+      "1": "LABEL_1"
+    },
+    "label2id": {
+      "LABEL_0": 0,
+      "LABEL_1": 1
+    },
+    "problem_type": null,
+    "depth": 24,
+    "hidden_size": 1024,
+    "hidden_act": "gelu_pytorch_tanh",
+    "intermediate_size": 4096,
+    "num_heads": 16,
+    "in_channels": 3,
+    "patch_size": 16,
+    "spatial_merge_size": 2,
+    "temporal_patch_size": 2,
+    "out_hidden_size": 2048,
+    "num_position_embeddings": 2304,
+    "initializer_range": 0.02,
+    "rope_parameters": {
+      "rope_theta": 10000.0,
+      "rope_type": "axial"
+    },
+    "_name_or_path": "",
+    "deepstack_visual_indexes": [],
+    "model_type": "qwen3_5_vision",
+    "output_attentions": false
+  },
+  "image_token_id": 248056,
+  "video_token_id": 248057,
+  "vision_start_token_id": 248053,
+  "vision_end_token_id": 248054,
+  "tie_word_embeddings": true,
+  "_name_or_path": "weights/Qwen3.5-2B",
+  "model_type": "qwen3_5",
+  "output_attentions": false
+}
