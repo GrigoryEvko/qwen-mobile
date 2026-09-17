@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import torch
 
-from .grid import BLOCK, q4_0_round, q4_0_scale_search
+from .grid import BLOCK, Q4_MAX, Q4_MIN, q4_0_scale_search
 
 
 def gptq_q4_0(w: torch.Tensor, hessian: torch.Tensor, damp: float = 0.01, chunk: int = 128,
@@ -58,7 +58,7 @@ def gptq_q4_0(w: torch.Tensor, hessian: torch.Tensor, damp: float = 0.01, chunk:
             assert d_cur is not None
             wc = w1[:, i]
             dd = hinv1[i, i]
-            q = q4_0_round(wc[:, None], d_cur[:, None]).reshape(rows)
+            q = torch.clamp(torch.round(wc / d_cur), Q4_MIN, Q4_MAX)
             deq = q * d_cur
             q1[:, i] = q
             err = (wc - deq) / dd
