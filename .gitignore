@@ -5,3 +5,7 @@ weights/
 llama.cpp/
 *.pftrace
 .DS_Store
+quant-out/
+data/
+eval/
+__pycache__/
