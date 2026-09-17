@@ -178,6 +178,10 @@ def write_toy_f16(gguf, path: Path, vocab: int, d: int, gen: np.random.Generator
         tensors["blk.1.nextn.shared_head_rot.weight"] = gen.standard_normal((d, d)).astype(np.float16)
     writer = gguf.GGUFWriter(str(path), "qwen35")
     writer.add_uint32("qwen35.embedding_length", d)
+    # The head geometry that the refold of a promoted class reads.
+    writer.add_uint32("qwen35.attention.head_count", 4)
+    writer.add_uint32("qwen35.attention.head_count_kv", 2)
+    writer.add_uint32("qwen35.attention.key_length", d // 4)
     for name, a in tensors.items():
         writer.add_tensor(name, a)
     writer.write_header_to_file()
@@ -350,3 +354,92 @@ def test_tied_export_takes_the_head_pack_and_the_folds(tmp_path: Path) -> None:
     assert np.array_equal(np.asarray(got["token_embd.weight"][1].data).reshape(vocab, -1), pack_nibbles(idx, sc))
     assert np.array_equal(_f32_of(got["output_norm.weight"][1]), norm)
     np.testing.assert_allclose(_f32_of(got["output_rot.weight"][1]), rot.astype(np.float16).astype(np.float32))
+
+
+def solved_pack(path: Path, w: np.ndarray) -> None:
+    """A Q4_0 pack of ``w`` [rows, cols], as the solver writes one."""
+    grid = Q4_0Grid()
+    idx, d = quantize(grid, torch.from_numpy(w.astype(np.float32)), search=True)
+    np.savez(path, q=idx.numpy(), d=d.numpy().view(np.uint16), levels=grid.levels.numpy(), kind=np.array("Q4_0"))
+
+
+def test_export_refuses_a_plan_change_on_an_unfolded_source(tmp_path: Path) -> None:
+    """A solved class that the plan moves to Q8_0 needs the folded reference, or --promote.
+
+    An old folds.npz holds no plan, thus the plan guard does not see the
+    change. Without this check the export would take the unfolded weight
+    of the F16 GGUF and the file would be wrong.
+    """
+    gguf = gguf_module()
+    gen = np.random.default_rng(11)
+    vocab, d = 48, 64
+    src = tmp_path / "src.gguf"
+    tensors = write_toy_f16(gguf, src, vocab, d, gen, layer=True)
+    packs = tmp_path / "packs"
+    packs.mkdir()
+    solved_pack(packs / "blk.0.attn_gate.weight.npz", tensors["blk.0.attn_gate.weight"])
+    np.savez(packs / "folds.npz", **{"blk.0.attn_norm.weight": tensors["blk.0.attn_norm.weight"]})
+    with pytest.raises(ValueError, match="the source is not folded"):
+        export(src, tmp_path / "bad.gguf", packs, Plan(gdn_gate="Q8_0", n_layers=1), LLAMA, torch.device("cpu"))
+    # The same plan on the folded reference is correct, and so is the pack on this source.
+    export(src, tmp_path / "folded.gguf", packs, Plan(gdn_gate="Q8_0", n_layers=1), LLAMA, torch.device("cpu"),
+           source_folded=True)
+    export(src, tmp_path / "packed.gguf", packs, Plan(n_layers=1), LLAMA, torch.device("cpu"))
+    assert read_all(gguf, tmp_path / "folded.gguf")["blk.0.attn_gate.weight"][0] == "Q8_0"
+    assert read_all(gguf, tmp_path / "packed.gguf")["blk.0.attn_gate.weight"][0] == "Q4_0"
+
+
+def test_promote_writes_the_folded_weight_of_an_unfolded_source(tmp_path: Path) -> None:
+    """--promote takes the column scales out of the norm and writes Q8_0 of the folded weight.
+
+    The calibration scaled the columns of the mixer inputs by t and put t
+    into the input norm. Thus the export must write Q8_0 of source · t,
+    and not Q8_0 of the source.
+    """
+    gguf = gguf_module()
+    gen = np.random.default_rng(12)
+    vocab, d = 48, 64
+    src = tmp_path / "src.gguf"
+    tensors = write_toy_f16(gguf, src, vocab, d, gen, layer=True)
+    t = np.exp(0.3 * gen.standard_normal(d)).astype(np.float32)
+    t = t / np.exp(np.log(t).mean())
+    folded_gate = tensors["blk.0.attn_gate.weight"].astype(np.float32) * t[None, :]
+    packs = tmp_path / "packs"
+    packs.mkdir()
+    solved_pack(packs / "blk.0.attn_gate.weight.npz", folded_gate)
+    np.savez(packs / "folds.npz",
+             **{"blk.0.attn_norm.weight": (tensors["blk.0.attn_norm.weight"] / t).astype(np.float32)})
+    out = tmp_path / "promoted.gguf"
+    export(src, out, packs, Plan(n_layers=1), LLAMA, torch.device("cpu"), promote=r"attn_gate\.weight")
+    got = read_all(gguf, out)
+    assert got["blk.0.attn_gate.weight"][0] == "Q8_0"
+    packed = np.asarray(got["blk.0.attn_gate.weight"][1].data).reshape(d, -1)
+    written = gguf.quants.dequantize(packed, gguf.GGMLQuantizationType.Q8_0)
+    expected = q8_0_dequantize(*q8_0_quantize(torch.from_numpy(folded_gate))).numpy()
+    np.testing.assert_allclose(written, expected, rtol=0, atol=1e-6)
+    unfolded = q8_0_dequantize(*q8_0_quantize(torch.from_numpy(tensors["blk.0.attn_gate.weight"].astype(np.float32))))
+    assert not np.allclose(written, unfolded.numpy(), atol=1e-4), "the fold moved the columns"
+    # The class of the plan that stays 4-bit keeps its pack, thus only the promoted class changes.
+    assert got["blk.0.ffn_gate.weight"][0] == "Q4_0"
+
+
+def test_promote_to_f16_keeps_the_folded_weight(tmp_path: Path) -> None:
+    """--promote-type F16 writes the folded weight with no quantization."""
+    gguf = gguf_module()
+    gen = np.random.default_rng(13)
+    vocab, d = 48, 64
+    src = tmp_path / "src.gguf"
+    tensors = write_toy_f16(gguf, src, vocab, d, gen, layer=True)
+    packs = tmp_path / "packs"
+    packs.mkdir()
+    np.savez(packs / "folds.npz", **{"blk.0.attn_norm.weight": tensors["blk.0.attn_norm.weight"]})
+    out = tmp_path / "f16.gguf"
+    export(src, out, packs, Plan(n_layers=1), LLAMA, torch.device("cpu"), promote=r"attn_gate\.weight",
+           promote_type="F16")
+    got = read_all(gguf, out)
+    assert got["blk.0.attn_gate.weight"][0] == "F16"
+    np.testing.assert_array_equal(_f32_of(got["blk.0.attn_gate.weight"][1]),
+                                  tensors["blk.0.attn_gate.weight"].astype(np.float32))
+    with pytest.raises(ValueError, match="Q8_0 or F16"):
+        export(src, tmp_path / "bad.gguf", packs, Plan(n_layers=1), LLAMA, torch.device("cpu"),
+               promote=r"attn_gate\.weight", promote_type="Q4_0")

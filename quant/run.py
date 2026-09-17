@@ -250,7 +250,8 @@ def _plan(args: argparse.Namespace, n_layers: int, tied: bool = False) -> Plan:
     """The plan of the flags. A tied head takes the type of the embedding, because it is the embedding."""
     edges = tuple(int(x) for x in args.edge_layers.split(",")) if args.edge_layers else ()
     return Plan(bulk=args.bulk, head=args.embedding if tied else args.head, embedding=args.embedding, kv_proj=args.kv_proj,
-                gdn_gate=args.gdn_gate, edge_layers=edges, edge_type="Q8_0", n_layers=n_layers, mtp=args.mtp)
+                gdn_gate=args.gdn_gate, ssm_out=args.ssm_out, ffn_down=args.ffn_down,
+                edge_layers=edges, edge_type="Q8_0", n_layers=n_layers, mtp=args.mtp)
 
 
 def main() -> None:
@@ -355,6 +356,9 @@ def _plan_args(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--embedding", default="Q8_0")
     sp.add_argument("--kv-proj", default="Q8_0")
     sp.add_argument("--gdn-gate", default="Q4_0")
+    sp.add_argument("--ssm-out", default=None,
+                    help="the GDN output projection, the class with the most KL per byte. The default follows --bulk")
+    sp.add_argument("--ffn-down", default=None, help="the MLP down projection. The default follows --bulk")
     sp.add_argument("--edge-layers", default="")
     sp.add_argument("--mtp", default="F16", choices=("F16", "Q8_0", "Q4_0", "IQ4_NL"),
                     help="the matrices of the MTP block: F16 as the converter wrote them, or round-to-nearest")

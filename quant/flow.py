@@ -371,6 +371,13 @@ class Quantizer:
 
     def column_scales(self, li: int, rels: list[str], h: torch.Tensor,
                       share: torch.Tensor | None = None) -> torch.Tensor | None:
+        """The column scales of the matrices ``rels``, or None. A class that is not on a 4-bit grid takes none.
+
+        A Q8_0 or F32 matrix needs no column scale: its block scales carry
+        256 levels. A scale for it would also move the rows of its
+        producer, thus the search runs on the solved members only.
+        """
+        rels = [rel for rel in rels if self.kind(li, rel) in self.plan.solved_types()]
         if not self.opts.scale or not rels:
             return None
         ws = [self.both(li, rel)[1].weight.data for rel in rels]

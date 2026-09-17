@@ -4,6 +4,11 @@ The plan is targeted, not uniform. The recurrence controls and the norms
 stay F32, the tensors with the heaviest tails stay Q8_0, and the bulk goes
 to Q4_0. Every class is a switch, thus the KL harness can move a class.
 
+``ssm_out`` and ``ffn_down`` are the two classes of the bulk with their own
+switch, because the measurements rank them first and second in KL per byte
+(refer to "The per-class plan" in analysis/quant-results.md). ``None``
+means that the class follows the bulk.
+
 The blocks after ``n_layers`` are the multi-token prediction (MTP) block,
 which llama.cpp loads only for the draft-mtp speculative mode. Its matrices
 take the type ``mtp``: F16 as the converter wrote them, or a round-to-nearest
@@ -38,6 +43,8 @@ class Plan:
     embedding: str = "Q8_0"
     kv_proj: str = "Q8_0"
     gdn_gate: str = "Q4_0"
+    ssm_out: str | None = None
+    ffn_down: str | None = None
     edge_layers: tuple[int, ...] = field(default_factory=tuple)
     edge_type: str = "Q8_0"
     n_layers: int = 24
@@ -65,7 +72,10 @@ class Plan:
             return self.gdn_gate if layer_idx not in self.edge_layers else self.edge_type
         if tail in ("ffn_gate.weight", "ffn_up.weight", "ffn_down.weight", "attn_qkv.weight",
                     "ssm_out.weight", "attn_q.weight", "attn_output.weight"):
-            return self.edge_type if layer_idx in self.edge_layers else self.bulk
+            if layer_idx in self.edge_layers:
+                return self.edge_type
+            guard = {"ssm_out.weight": self.ssm_out, "ffn_down.weight": self.ffn_down}.get(tail)
+            return guard or self.bulk
         return "keep"
 
     def solved_types(self) -> set[str]:
