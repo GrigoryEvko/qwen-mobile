@@ -24,9 +24,13 @@ BLOCK = 32
 
 
 class Trellis:
-    """The bit-shift trellis with 2^L states, k bits per step, and an integer table of 2^L values."""
+    """The bit-shift trellis with 2^L states, k bits per step, and an integer table of 2^L values.
 
-    def __init__(self, lut: torch.Tensor, k: int = 4) -> None:
+    ``level_of`` maps each state to one of a few tied levels, thus the Lloyd
+    step moves the levels and every state that shares a level moves with it.
+    """
+
+    def __init__(self, lut: torch.Tensor, k: int = 4, level_of: torch.Tensor | None = None) -> None:
         self.lut = lut.to(torch.float32)
         self.n_states = lut.shape[0]
         self.L = self.n_states.bit_length() - 1
@@ -35,18 +39,46 @@ class Trellis:
         self.branches = 1 << k
         self.mask = self.n_states - 1
         device = lut.device
+        self.level_of = level_of.to(device) if level_of is not None else torch.arange(self.n_states, device=device)
         # pred[s', t] = the predecessor state that reaches s' with the phantom high bits t.
         s = torch.arange(self.n_states, device=device)
         t = torch.arange(self.branches, device=device)
         self.pred = (s[:, None] >> k) | (t[None, :] << (self.L - k))
 
     @staticmethod
-    def gaussian(L: int, k: int = 4, seed: int = 0, device: torch.device | None = None) -> "Trellis":
-        """A table of 2^L Gaussian samples, integer levels in −127 … 127, sorted by state bits for no reason."""
+    def gaussian(L: int, k: int = 4, seed: int = 0, sigma: float = 40.0, device: torch.device | None = None) -> "Trellis":
+        """A table of 2^L Gaussian samples with the given spread, integer levels in −127 … 127."""
         gen = torch.Generator().manual_seed(seed)
-        z = torch.randn(1 << L, generator=gen)
-        lut = torch.clamp(torch.round(z / z.abs().max() * 127), -127, 127)
+        z = torch.randn(1 << L, generator=gen) * sigma
+        lut = torch.clamp(torch.round(z), -127, 127)
         return Trellis(lut.to(device or "cpu"), k)
+
+    @staticmethod
+    def ungerboeck(L: int, k: int = 4, amax: float = 127.0, device: torch.device | None = None) -> "Trellis":
+        """Trellis-coded quantization in the Ungerboeck form, on the bit-shift state.
+
+        The expanded codebook has 2^(k+1) uniform levels in four cosets
+        (level index mod 4). Each nibble holds one trellis bit (its top
+        bit) and k − 1 bits that pick the level inside the coset. The
+        coset comes from a rate-1/2 convolutional code over the trellis
+        bits of the window: the parity of two taps gives the two coset
+        bits (Marcellin and Fischer, 1990). The coset levels are tied, thus
+        the Lloyd step keeps 2^(k+1) values.
+        """
+        n_states = 1 << L
+        s = torch.arange(n_states)
+        nibbles = L // k
+        # The trellis bit of nibble j of the window (0 = newest).
+        tb = torch.stack([(s >> (j * k + k - 1)) & 1 for j in range(nibbles)], dim=1)
+        c0 = tb[:, 0] ^ (tb[:, 2] if nibbles > 2 else 0)
+        c1 = (tb[:, 1] if nibbles > 1 else 0) ^ (tb[:, 3] if nibbles > 3 else 0) ^ tb[:, 0]
+        coset = (c1 << 1) | c0
+        inner = s & ((1 << (k - 1)) - 1)
+        level_index = inner * 4 + coset
+        n_levels = 1 << (k + 1)
+        levels = torch.linspace(-amax, amax, n_levels)
+        lut = torch.round(levels[level_index])
+        return Trellis(lut.to(device or "cpu"), k, level_index.to(device or "cpu"))
 
     def encode(self, x: torch.Tensor, weights: torch.Tensor | None = None, chunk: int = 256) -> tuple[torch.Tensor, torch.Tensor]:
         """Viterbi over each row of x [N, T] (in table units). Returns (codes int8 [N, T], head int32 [N]).
@@ -105,14 +137,17 @@ class Trellis:
 
     def lloyd_step(self, x: torch.Tensor, codes: torch.Tensor, heads: torch.Tensor,
                    weights: torch.Tensor | None = None) -> None:
-        """Move each table entry to the weighted mean of the values it codes, integer levels."""
-        st = self.states(codes, heads).reshape(-1)
+        """Move each tied level to the weighted mean of the values it codes, integer levels."""
+        lv = self.level_of[self.states(codes, heads).reshape(-1)]
         xf = x.reshape(-1)
         w = torch.ones_like(xf) if weights is None else weights.reshape(-1)
-        total = torch.zeros(self.n_states, device=x.device).index_add_(0, st, w * xf)
-        mass = torch.zeros(self.n_states, device=x.device).index_add_(0, st, w)
-        new = total / mass.clamp_min(1e-30)
-        self.lut = torch.where(mass > 0, torch.clamp(torch.round(new), -127, 127), self.lut)
+        n_levels = int(self.level_of.max().item()) + 1
+        total = torch.zeros(n_levels, device=x.device).index_add_(0, lv, w * xf)
+        mass = torch.zeros(n_levels, device=x.device).index_add_(0, lv, w)
+        new = torch.clamp(torch.round(total / mass.clamp_min(1e-30)), -127, 127)
+        current = torch.zeros(n_levels, device=x.device).index_reduce_(0, self.level_of, self.lut, "mean", include_self=False)
+        levels = torch.where(mass > 0, new, current)
+        self.lut = levels[self.level_of]
 
 
 def quantize_trellis(w: torch.Tensor, d: torch.Tensor, trellis: Trellis, col_weights: torch.Tensor | None = None,
@@ -154,10 +189,11 @@ def self_test(rows: int = 256, cols: int = 512, L: int = 10, device: str = "cpu"
         print(f"{name:8s} relative mse {err / energy:.5f}  ({10 * torch.log10(energy / err):.2f} dB)")
     base = IQ4NLGrid().to(w.device)
     _, d = quantize(base, w, search=True)
-    tr = Trellis.gaussian(L, device=w.device)
-    codes, heads, tr = quantize_trellis(w, d.to(torch.float32), tr)
-    err = (dequantize_trellis(codes, heads, d, tr) - w).pow(2).mean()
-    print(f"TQ4 L={L:<3d} relative mse {err / energy:.5f}  ({10 * torch.log10(energy / err):.2f} dB)")
+    for name, tr, iters in (("TQ4 gauss", Trellis.gaussian(L, device=w.device), 6),
+                            ("TQ4 unger", Trellis.ungerboeck(L, device=w.device), 6)):
+        codes, heads, tr = quantize_trellis(w, d.to(torch.float32), tr, lloyd_iters=iters)
+        err = (dequantize_trellis(codes, heads, d, tr) - w).pow(2).mean()
+        print(f"{name} L={L:<3d} relative mse {err / energy:.5f}  ({10 * torch.log10(energy / err):.2f} dB)")
 
 
 if __name__ == "__main__":
