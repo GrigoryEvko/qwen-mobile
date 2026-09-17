@@ -98,12 +98,20 @@ sealed class Piece {
  * The compute unit of the model. The ggml device name is null for the CPU.
  * The GPU is the default, the NPU is opt-in: its single-token decode is
  * experimental. The hybrid one prefills on the NPU and decodes on the GPU.
+ * The image encoder runs on the device of the prompt: the NPU encodes a
+ * photo in less than one second, the GPU in some seconds. A null vision
+ * device takes the GPU when it is present.
  */
-enum class Backend(val deviceName: String?, val prefillDeviceName: String?, val label: String) {
-    CPU(null, null, "CPU"),
-    GPU("GPUOpenCL", null, "GPU"),
-    NPU("HTP0", null, "NPU"),
-    HYBRID("GPUOpenCL", "HTP0", "NPU+GPU");
+enum class Backend(
+    val deviceName: String?,
+    val prefillDeviceName: String?,
+    val visionDeviceName: String?,
+    val label: String,
+) {
+    CPU(null, null, null, "CPU"),
+    GPU("GPUOpenCL", null, "GPUOpenCL", "GPU"),
+    NPU("HTP0", null, "HTP0", "NPU"),
+    HYBRID("GPUOpenCL", "HTP0", "HTP0", "NPU+GPU");
 
     /** The ggml devices the backend needs. */
     val devices: List<String> get() = listOfNotNull(deviceName, prefillDeviceName)
@@ -121,7 +129,12 @@ data class EngineConfig(
     val threads: Int,
     val nCtx: Int = 8192,
     val mmproj: String? = null,
-)
+    /** Keep the image encoder on the GPU also when the prompt runs on the NPU. */
+    val visionOnGpu: Boolean = false,
+) {
+    /** The ggml device of the image encoder, or null for the GPU when it is present. */
+    val visionDeviceName: String? get() = if (visionOnGpu) Backend.GPU.deviceName else backend.visionDeviceName
+}
 
 /** A loaded model with the description line from the native side. */
 data class LoadedModel(val config: EngineConfig, val info: String)
@@ -212,6 +225,7 @@ object LlamaEngine {
             config.mmproj,
             config.backend.deviceName,
             config.backend.prefillDeviceName,
+            config.visionDeviceName,
             if (config.backend == Backend.CPU) 0 else 999,
             threads,
             config.nCtx,

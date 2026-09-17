@@ -64,6 +64,7 @@ class SettingsFragment : Fragment() {
         b.gpuChip.isEnabled = LlamaEngine.has(Backend.GPU)
         b.npuChip.isEnabled = LlamaEngine.has(Backend.NPU)
         b.hybridChip.isEnabled = LlamaEngine.has(Backend.HYBRID)
+        b.visionGpuSwitch.isEnabled = LlamaEngine.has(Backend.GPU)
     }
 
     override fun onResume() {
@@ -133,6 +134,10 @@ class SettingsFragment : Fragment() {
                 else -> Backend.CPU
             }
             store.update { it.copy(backend = backend) }
+        }
+        b.visionGpuSwitch.setOnCheckedChangeListener { _, checked ->
+            if (applying) return@setOnCheckedChangeListener
+            store.update { it.copy(visionOnGpu = checked) }
         }
         b.threadsSlider.valueFrom = SettingsStore.MIN_THREADS.toFloat()
         b.threadsSlider.valueTo = SettingsStore.MAX_THREADS.toFloat()
@@ -208,6 +213,7 @@ class SettingsFragment : Fragment() {
                     Backend.HYBRID -> b.hybridChip.id
                 },
             )
+            b.visionGpuSwitch.isChecked = s.visionOnGpu
             b.threadsSlider.value = s.threads.toFloat()
             b.threadsValue.text = s.threads.toString()
             for (i in 0 until b.contextGroup.childCount) {

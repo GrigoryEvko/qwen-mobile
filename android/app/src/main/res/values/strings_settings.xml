@@ -12,6 +12,8 @@
     <string name="settings_backend_gpu">GPU</string>
     <string name="settings_backend_npu">NPU</string>
     <string name="settings_backend_hybrid">NPU+GPU</string>
+    <string name="settings_vision_gpu">Encode images on the GPU</string>
+    <string name="settings_vision_gpu_hint">Off: the image encoder runs on the compute unit of the prompt. The NPU encodes a photo in less than one second, the GPU in some seconds.</string>
     <string name="settings_threads">Threads</string>
     <string name="settings_context">Context length</string>
     <string name="settings_generation">Generation</string>

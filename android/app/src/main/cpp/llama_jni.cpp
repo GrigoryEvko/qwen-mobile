@@ -133,9 +133,11 @@ struct Engine {
     llama_context *   ctx   = nullptr;
     llama_sampler *   smpl  = nullptr;
     ggml_threadpool * tp    = nullptr;
-    /** The vision projector. It loads on the first image, on the OpenCL GPU. */
+    /** The vision projector. It loads on the first image, on the device of vision_device. */
     mtmd_context *    mctx  = nullptr;
     std::string       mmproj;
+    /** The ggml device name of the image encoder. Empty takes the OpenCL GPU when it is present, else the CPU. */
+    std::string       vision_device;
     ggml_backend_dev_t device = nullptr;
     /** The batch of the text decodes, kBatch tokens, allocated one time. */
     llama_batch batch = {};
@@ -459,9 +461,19 @@ bool ensure_vision(Engine & e, std::string & error) {
         error = "This model has no vision projector (mmproj) next to it";
         return false;
     }
-    // The encoder runs on the OpenCL GPU. The Hexagon backend lacks operators of the CLIP
-    // graph and gives wrong image features. Without the GPU it runs on the CPU.
-    ggml_backend_dev_t dev = ggml_backend_dev_by_name("GPUOpenCL");
+    // The encoder runs on the device the app selected. The Hexagon NPU encodes a photo in
+    // less than one second, the OpenCL GPU in some seconds. A device that the app named
+    // and that is not available is an error, not a fallback to the CPU.
+    ggml_backend_dev_t dev = nullptr;
+    if (!e.vision_device.empty()) {
+        dev = ggml_backend_dev_by_name(e.vision_device.c_str());
+        if (dev == nullptr) {
+            error = "The image encoder device is not available: " + e.vision_device;
+            return false;
+        }
+    } else {
+        dev = ggml_backend_dev_by_name("GPUOpenCL");
+    }
     mtmd_context_params mp = mtmd_context_params_default();
     mp.use_gpu          = dev != nullptr;
     mp.device           = dev;
@@ -475,7 +487,8 @@ bool ensure_vision(Engine & e, std::string & error) {
         error = "The vision projector did not load: " + e.mmproj;
         return false;
     }
-    LOGI("vision projector loaded in %.0f ms: %s", (now_us() - t0) / 1000.0, e.mmproj.c_str());
+    LOGI("vision projector loaded in %.0f ms on %s: %s", (now_us() - t0) / 1000.0,
+         dev ? ggml_backend_dev_name(dev) : "CPU", e.mmproj.c_str());
     return true;
 }
 
@@ -975,11 +988,12 @@ Java_ai_airi_qwenmobile_LlamaNative_devices(JNIEnv * env, jclass) {
 
 JNIEXPORT jlong JNICALL
 Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, jstring jmmproj,
-                                          jstring jdevice, jstring jprefill, jint gpu_layers, jint n_threads,
-                                          jint n_ctx, jstring jcache) {
+                                          jstring jdevice, jstring jprefill, jstring jvision, jint gpu_layers,
+                                          jint n_threads, jint n_ctx, jstring jcache) {
     const std::string path    = jstring_to_std(env, jpath);
     const std::string device  = jstring_to_std(env, jdevice);
     const std::string prefill = jstring_to_std(env, jprefill);
+    const std::string vision  = jstring_to_std(env, jvision);
     const std::string cache   = jstring_to_std(env, jcache);
     if (n_ctx < kBatch) {
         throw_java(env, "The context length must be at least " + std::to_string(kBatch) + " tokens, not " + std::to_string(n_ctx));
@@ -990,6 +1004,7 @@ Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, js
     e->n_threads  = std::max(1, (int) n_threads);
     e->gpu_layers = gpu_layers;
     e->mmproj     = jstring_to_std(env, jmmproj);
+    e->vision_device = vision;
     const bool hybrid = !prefill.empty();
 
     // The device by its ggml name: GPUOpenCL for the Adreno, HTP0 for the Hexagon NPU.

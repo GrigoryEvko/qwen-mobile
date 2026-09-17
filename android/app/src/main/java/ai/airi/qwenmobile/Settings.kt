@@ -15,6 +15,8 @@ data class AppSettings(
     val backend: Backend,
     val threads: Int = 4,
     val nCtx: Int = 8192,
+    /** Keep the image encoder on the GPU also when the prompt runs on the NPU. */
+    val visionOnGpu: Boolean = false,
     val thinking: Boolean = false,
     val temperature: Float = 0.7f,
     val topP: Float = 0.8f,
@@ -58,6 +60,7 @@ class SettingsStore private constructor(context: Context) {
             } ?: defaultBackend(),
             threads = prefs.getInt(KEY_THREADS, 4),
             nCtx = prefs.getInt(KEY_N_CTX, 8192),
+            visionOnGpu = prefs.getBoolean(KEY_VISION_GPU, false),
             thinking = prefs.getBoolean(KEY_THINKING, false),
             temperature = prefs.getFloat(KEY_TEMPERATURE, 0.7f),
             topP = prefs.getFloat(KEY_TOP_P, 0.8f),
@@ -70,6 +73,7 @@ class SettingsStore private constructor(context: Context) {
             .putString(KEY_BACKEND, s.backend.name)
             .putInt(KEY_THREADS, s.threads)
             .putInt(KEY_N_CTX, s.nCtx)
+            .putBoolean(KEY_VISION_GPU, s.visionOnGpu)
             .putBoolean(KEY_THINKING, s.thinking)
             .putFloat(KEY_TEMPERATURE, s.temperature)
             .putFloat(KEY_TOP_P, s.topP)
@@ -82,6 +86,7 @@ class SettingsStore private constructor(context: Context) {
         private const val KEY_BACKEND = "backend"
         private const val KEY_THREADS = "threads"
         private const val KEY_N_CTX = "n_ctx"
+        private const val KEY_VISION_GPU = "vision_on_gpu"
         private const val KEY_THINKING = "thinking"
         private const val KEY_TEMPERATURE = "temperature"
         private const val KEY_TOP_P = "top_p"

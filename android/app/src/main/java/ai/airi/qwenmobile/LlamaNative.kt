@@ -40,6 +40,8 @@ object LlamaNative {
      * @param mmproj     The vision projector GGUF, or null for a text-only engine
      * @param device         The ggml device name (GPUOpenCL, HTP0), or null for the CPU
      * @param prefillDevice  The device of a second model copy for the prompt (HTP0), or null
+     * @param visionDevice   The device of the image encoder (HTP0, GPUOpenCL), or null for the
+     *                       GPU when it is present, else the CPU
      * @param gpuLayers      The number of layers on the device, 0 for the CPU only
      * @param threads        The number of CPU threads
      * @param nCtx           The context length in tokens
@@ -53,6 +55,7 @@ object LlamaNative {
         mmproj: String?,
         device: String?,
         prefillDevice: String?,
+        visionDevice: String?,
         gpuLayers: Int,
         threads: Int,
         nCtx: Int,

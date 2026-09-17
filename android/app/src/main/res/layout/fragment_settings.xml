@@ -151,6 +151,21 @@
                         android:text="@string/settings_backend_hybrid" />
                 </com.google.android.material.chip.ChipGroup>
 
+                <com.google.android.material.materialswitch.MaterialSwitch
+                    android:id="@+id/visionGpuSwitch"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="@string/settings_vision_gpu"
+                    android:textAppearance="?attr/textAppearanceBodyLarge" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="@string/settings_vision_gpu_hint"
+                    android:textAppearance="?attr/textAppearanceBodySmall"
+                    android:textColor="?attr/colorOnSurfaceVariant" />
+
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"

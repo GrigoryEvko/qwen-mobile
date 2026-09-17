@@ -194,7 +194,7 @@ object ChatSession {
             if (!file.isFile) {
                 null
             } else {
-                EngineConfig(path, s.backend, s.threads, s.nCtx, ModelFiles.mmprojFor(file)?.absolutePath)
+                EngineConfig(path, s.backend, s.threads, s.nCtx, ModelFiles.mmprojFor(file)?.absolutePath, s.visionOnGpu)
             }
         } ?: return app.getString(R.string.no_model_selected)
         wantedConfig = config
