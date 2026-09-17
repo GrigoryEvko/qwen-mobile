@@ -19,17 +19,63 @@ import java.util.concurrent.Executors
 /**
  * One message of the conversation. The role is "user", "assistant", or "system".
  * An image is the encoded file (JPEG) that goes to the vision projector.
- * [thinking] tells that an answer was generated in thinking mode, thus its
- * text is thinking until the closing tag.
+ *
+ * A streamed answer grows by [appendContent] and [appendThinking], which
+ * cost O(piece). The first read of [content] or [thinking] after a change
+ * copies the text one time, O(length), and the next reads are O(1).
+ * Read and write the text on the main thread only.
  */
-class ChatMessage(val role: String, var content: String, val image: ByteArray? = null) {
-    /** The phase of an answer. A user message is always DONE. */
-    enum class Phase { THINKING, ANSWERING, DONE, INTERRUPTED }
+class ChatMessage(val role: String, content: String, val image: ByteArray? = null) {
+    /**
+     * The phase of an answer. A user message is always DONE. INTERRUPTED is
+     * a stop before any answer text, FAILED is an error before any answer
+     * text. The two are not saved and the model does not see them.
+     */
+    enum class Phase { THINKING, ANSWERING, DONE, INTERRUPTED, FAILED }
 
     var phase: Phase = Phase.DONE
 
+    private val contentText = StringBuilder(content)
+    private var contentCache: String? = content
+
+    /** The text of the message. */
+    var content: String
+        get() = contentCache ?: contentText.toString().also { contentCache = it }
+        set(value) {
+            contentText.setLength(0)
+            contentText.append(value)
+            contentCache = value
+        }
+
+    /** True when [content] has text. O(1). */
+    val hasContent: Boolean get() = contentText.isNotEmpty()
+
+    private val thinkingText = StringBuilder()
+    private var thinkingCache: String? = ""
+
     /** The thinking of an answer, empty without one. It is not part of [content]. */
-    var thinking: String = ""
+    var thinking: String
+        get() = thinkingCache ?: thinkingText.toString().also { thinkingCache = it }
+        set(value) {
+            thinkingText.setLength(0)
+            thinkingText.append(value)
+            thinkingCache = value
+        }
+
+    /** True when [thinking] has text. O(1). */
+    val hasThinking: Boolean get() = thinkingText.isNotEmpty()
+
+    /** Add a piece of the streamed answer to [content]. */
+    fun appendContent(piece: CharSequence) {
+        contentText.append(piece)
+        contentCache = null
+    }
+
+    /** Add a piece of the streamed thinking to [thinking]. */
+    fun appendThinking(piece: CharSequence) {
+        thinkingText.append(piece)
+        thinkingCache = null
+    }
 
     /** The duration of the thinking, 0 without one. */
     var thinkingMs: Long = 0
@@ -174,39 +220,38 @@ object LlamaEngine {
     }
 
     /**
-     * Generate the answer to the conversation. Each emitted string is a
-     * piece of the answer. The flow stops at the end token, at the token
-     * limit, or when the collector cancels.
+     * Generate the answer to the conversation. Each emitted piece is a part
+     * of the answer or a thinking tag. The flow stops at the end token, at
+     * the token limit, or when the collector cancels. The messages are
+     * copied on the thread of the caller, thus the engine thread reads no
+     * shared text.
      */
     fun generate(
         messages: List<ChatMessage>,
         thinking: Boolean,
         temperature: Float = 0.7f,
         topP: Float = 0.8f,
-    ): Flow<Piece> = flow {
-        val h = requireHandle()
-        LlamaNative.chatStart(
-            h,
-            messages.map { it.role }.toTypedArray(),
-            messages.map { it.content }.toTypedArray(),
-            messages.map { it.image }.toTypedArray(),
-            thinking,
-            temperature,
-            topP,
-        )
-        var count = 0
-        while (count < MAX_ANSWER_TOKENS) {
-            val bytes = LlamaNative.generateNext(h) ?: break
-            count += 1
-            if (bytes.size > 1) {
-                emit(Piece.Text(String(bytes, 1, bytes.size - 1, Charsets.UTF_8)))
+    ): Flow<Piece> {
+        val roles = messages.map { it.role }.toTypedArray()
+        val contents = messages.map { it.content }.toTypedArray()
+        val images = messages.map { it.image }.toTypedArray()
+        return flow {
+            val h = requireHandle()
+            LlamaNative.chatStart(h, roles, contents, images, thinking, temperature, topP)
+            var count = 0
+            while (count < MAX_ANSWER_TOKENS) {
+                val bytes = LlamaNative.generateNext(h) ?: break
+                count += 1
+                if (bytes.size > 1) {
+                    emit(Piece.Text(String(bytes, 1, bytes.size - 1, Charsets.UTF_8)))
+                }
+                when (bytes[0].toInt()) {
+                    1 -> emit(Piece.ThinkOpen)
+                    2 -> emit(Piece.ThinkClose)
+                }
             }
-            when (bytes[0].toInt()) {
-                1 -> emit(Piece.ThinkOpen)
-                2 -> emit(Piece.ThinkClose)
-            }
-        }
-    }.flowOn(dispatcher)
+        }.flowOn(dispatcher)
+    }
 
     /** The speed line of the current turn. */
     suspend fun stats(): String = withContext(dispatcher) {

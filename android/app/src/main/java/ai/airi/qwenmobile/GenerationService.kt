@@ -10,6 +10,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 
@@ -68,7 +69,14 @@ class GenerationService : Service() {
 
         /** Remove the notification and stop the service. */
         fun stop(context: Context) {
-            context.startService(Intent(context, GenerationService::class.java).setAction(ACTION_STOP))
+            try {
+                context.startService(Intent(context, GenerationService::class.java).setAction(ACTION_STOP))
+            } catch (e: IllegalStateException) {
+                // The app is in the background without the service: there is nothing to stop.
+                Log.w(TAG, "The stop of the generation service was refused", e)
+            }
         }
+
+        private const val TAG = "GenerationService"
     }
 }

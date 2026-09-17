@@ -4,6 +4,65 @@ import android.view.View
 import android.widget.TextView
 
 /**
+ * The phase machine of one streamed answer. The pieces of the token stream
+ * move the message between the thinking and the answer. The end of the
+ * stream closes the message: a stop or an error inside the thinking leaves
+ * an interrupted message, an error before any answer text leaves a failed
+ * one. The clock gives milliseconds, and only differences of it are used.
+ */
+class AnswerStream(val answer: ChatMessage, private val clock: () -> Long) {
+    private var thinkingStart = clock()
+
+    /** Start the thinking time at this moment, after the model load. */
+    fun markStart() {
+        thinkingStart = clock()
+    }
+
+    /** Apply one piece of the stream to the message. */
+    fun accept(piece: Piece) {
+        when (piece) {
+            is Piece.Text -> if (answer.phase == ChatMessage.Phase.THINKING) {
+                answer.appendThinking(piece.text)
+            } else {
+                // The answer starts without the blank lines of the template.
+                answer.appendContent(if (answer.hasContent) piece.text else piece.text.trimStart())
+            }
+            Piece.ThinkOpen -> {
+                answer.phase = ChatMessage.Phase.THINKING
+                answer.thinkingExpanded = null
+                thinkingStart = clock()
+            }
+            Piece.ThinkClose -> {
+                answer.thinkingMs = clock() - thinkingStart
+                answer.phase = ChatMessage.Phase.ANSWERING
+                answer.thinkingExpanded = null
+            }
+        }
+    }
+
+    /**
+     * Close the message at the end of the stream. [error] is the text of a
+     * failure, or null. [cancelled] tells that the user stopped the answer.
+     */
+    fun finish(error: String?, cancelled: Boolean) {
+        answer.phase = when {
+            answer.phase == ChatMessage.Phase.THINKING -> {
+                answer.thinkingMs = clock() - thinkingStart
+                ChatMessage.Phase.INTERRUPTED
+            }
+            answer.hasContent -> ChatMessage.Phase.DONE
+            error != null -> {
+                answer.content = error
+                ChatMessage.Phase.FAILED
+            }
+            cancelled -> ChatMessage.Phase.INTERRUPTED
+            else -> ChatMessage.Phase.DONE
+        }
+        answer.thinkingExpanded = null
+    }
+}
+
+/**
  * The thinking field of an answer.
  *
  * The phase of the message drives the field: the body is open while the
@@ -11,37 +70,51 @@ import android.widget.TextView
  * tap on the header overrides that until the phase changes again.
  */
 object Thinking {
+    /** The text of the header of the thinking field. */
+    enum class Label { IN_PROGRESS, INTERRUPTED, DONE, DONE_WITH_SECONDS }
+
     /** Show the thinking field of [message] in the header row and the body. */
     fun bind(header: View, body: TextView, message: ChatMessage) {
         header.visibility = View.VISIBLE
         apply(header, body, message)
         header.setOnClickListener {
-            message.thinkingExpanded = !(message.thinkingExpanded ?: defaultExpanded(message))
+            message.thinkingExpanded = !isExpanded(message)
             apply(header, body, message)
         }
     }
 
-    /** Open while the model thinks, closed after. */
-    private fun defaultExpanded(message: ChatMessage): Boolean = message.phase == ChatMessage.Phase.THINKING
+    /** Open while the model thinks, closed after, unless the user tapped the header since the last phase change. */
+    fun isExpanded(message: ChatMessage): Boolean =
+        message.thinkingExpanded ?: (message.phase == ChatMessage.Phase.THINKING)
+
+    /** The header text of the thinking field of [message]. */
+    fun labelOf(message: ChatMessage): Label = when {
+        message.phase == ChatMessage.Phase.THINKING -> Label.IN_PROGRESS
+        message.phase == ChatMessage.Phase.INTERRUPTED -> Label.INTERRUPTED
+        message.thinkingMs > 0 -> Label.DONE_WITH_SECONDS
+        else -> Label.DONE
+    }
+
+    /** The duration of the thinking in whole seconds, one at the minimum. */
+    fun seconds(message: ChatMessage): Long = (message.thinkingMs / 1000L).coerceAtLeast(1L)
 
     private fun apply(header: View, body: TextView, message: ChatMessage) {
         val context = header.context
         val label = header.findViewById<TextView>(R.id.thinkingLabel)
         val chevron = header.findViewById<TextView>(R.id.thinkingChevron)
-        label.text = when (message.phase) {
-            ChatMessage.Phase.THINKING -> context.getString(R.string.thinking_in_progress)
-            ChatMessage.Phase.INTERRUPTED -> context.getString(R.string.thinking_interrupted)
-            else -> if (message.thinkingMs > 0) {
-                context.getString(R.string.thinking_done_seconds, (message.thinkingMs / 1000L).coerceAtLeast(1L))
-            } else {
-                context.getString(R.string.thinking_done)
-            }
+        label.text = when (labelOf(message)) {
+            Label.IN_PROGRESS -> context.getString(R.string.thinking_in_progress)
+            Label.INTERRUPTED -> context.getString(R.string.thinking_interrupted)
+            Label.DONE_WITH_SECONDS -> context.getString(R.string.thinking_done_seconds, seconds(message))
+            Label.DONE -> context.getString(R.string.thinking_done)
         }
-        val expanded = message.thinkingExpanded ?: defaultExpanded(message)
+        val expanded = isExpanded(message)
         chevron.rotation = if (expanded) 90f else 0f
         body.visibility = if (expanded) View.VISIBLE else View.GONE
         if (expanded) {
-            Markdown.render(body, message.thinking)
+            Markdown.render(body, message.thinking, streaming = message.phase == ChatMessage.Phase.THINKING)
+        } else {
+            Markdown.clear(body)
         }
     }
 }

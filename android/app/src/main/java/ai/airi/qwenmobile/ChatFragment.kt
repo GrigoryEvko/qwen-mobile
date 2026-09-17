@@ -38,8 +38,9 @@ class ChatFragment : Fragment() {
     private val session = ChatSession
     private val adapter = MessageAdapter(session.messages) { session.metaByMessage[it] }
 
-    /** The encoded image that goes with the next message. */
+    /** The encoded image that goes with the next message, and its thumbnail for the chip. */
     private var pendingImage: ByteArray? = null
+    private var pendingThumbnail: Bitmap? = null
 
     /** An image shared to the app before the view exists. */
     private var sharedUri: Uri? = null
@@ -56,6 +57,9 @@ class ChatFragment : Fragment() {
      * position. Only a real scroll (dy ≠ 0) changes it, not a relayout.
      */
     private var atBottom = true
+
+    /** The distance from the end of the list that still counts as the end, in pixels. */
+    private var endSlackPx = 0
 
     private val settings by lazy { SettingsStore.of(requireContext()) }
 
@@ -78,13 +82,14 @@ class ChatFragment : Fragment() {
         session.init(requireContext())
         val b = FragmentChatBinding.inflate(inflater, container, false)
         binding = b
+        endSlackPx = (END_SLACK_DP * resources.displayMetrics.density).toInt()
         b.messages.layoutManager = LinearLayoutManager(requireContext())
         b.messages.adapter = adapter
         b.messages.itemAnimator = null
         b.messages.addOnScrollListener(object : RecyclerView.OnScrollListener() {
             override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
                 if (dy != 0) {
-                    atBottom = !recyclerView.canScrollVertically(1)
+                    atBottom = isAtEnd(recyclerView)
                     updateJumpButton()
                 }
             }
@@ -94,8 +99,9 @@ class ChatFragment : Fragment() {
         b.stopButton.setOnClickListener { session.stop() }
         b.jumpButton.setOnClickListener { scrollToEnd() }
         b.attachButton.setOnClickListener { showAttachMenu(it) }
-        b.attachmentChip.setOnCloseIconClickListener { setPendingImage(null) }
+        b.attachmentChip.setOnCloseIconClickListener { setPendingImage(null, null) }
         b.grantButton.setOnClickListener { startActivity(ModelFiles.allFilesAccessIntent(requireContext())) }
+        showAttachment()
 
         val scope = viewLifecycleOwner.lifecycleScope
         scope.launch {
@@ -115,6 +121,7 @@ class ChatFragment : Fragment() {
             }
         }
         scope.launch { session.loading.collect { publishStatus() } }
+        scope.launch { session.error.collect { publishStatus() } }
         scope.launch { session.problems.collect { toast(it) } }
         scope.launch { LlamaEngine.state.collect { publishStatus() } }
         scope.launch { settings.state.collect { publishStatus() } }
@@ -128,22 +135,21 @@ class ChatFragment : Fragment() {
             sharedUri = null
             attachImage(uri)
         }
-        viewLifecycleOwner.lifecycleScope.launch {
-            session.autoLoad()?.let { toast(it) }
-        }
+        session.autoLoad()
     }
 
     override fun onDestroyView() {
-        super.onDestroyView()
+        // The list holds an observer of the adapter: without this line the old list stays reachable.
+        binding?.messages?.adapter = null
+        renderScheduled = false
         binding = null
+        super.onDestroyView()
     }
 
     // --- the model, from the app bar menu ---
 
     fun loadModel() {
-        viewLifecycleOwner.lifecycleScope.launch {
-            session.loadFromSettings()?.let { toast(it) }
-        }
+        session.requestLoad()
     }
 
     fun unloadModel() {
@@ -158,8 +164,10 @@ class ChatFragment : Fragment() {
     private fun publishStatus() {
         val host = activity as? MainActivity ?: return
         val loaded = LlamaEngine.state.value
+        val error = session.error.value
         when {
             session.loading.value -> host.setStatus(getString(R.string.status_loading), MainActivity.Tone.BUSY)
+            loaded == null && error != null -> host.setStatus(getString(R.string.status_error), MainActivity.Tone.ERROR)
             loaded == null -> host.setStatus(getString(R.string.status_idle), MainActivity.Tone.IDLE)
             else -> {
                 val id = if (session.generating.value) R.string.status_generating else R.string.status_ready
@@ -167,7 +175,7 @@ class ChatFragment : Fragment() {
             }
         }
         val path = loaded?.config?.path ?: settings.state.value.modelPath
-        host.setTitle(path?.let { ModelFiles.displayName(File(it)) } ?: getString(R.string.app_name))
+        host.setChatTitle(path?.let { ModelFiles.displayName(File(it)) } ?: getString(R.string.app_name))
     }
 
     // --- the attachment ---
@@ -206,29 +214,40 @@ class ChatFragment : Fragment() {
         }
     }
 
-    /** Read the image behind the URI and hold it for the next message. */
+    /** Read the image behind the URI off the main thread and hold it for the next message. */
     private fun attachImage(uri: Uri) {
+        val resolver = requireContext().contentResolver
+        val side = (THUMBNAIL_DP * resources.displayMetrics.density).toInt()
         viewLifecycleOwner.lifecycleScope.launch {
             try {
-                val resolver = requireContext().contentResolver
-                setPendingImage(withContext(Dispatchers.IO) { ImageBytes.load(resolver, uri) })
+                val (bytes, thumbnail) = withContext(Dispatchers.IO) {
+                    val bytes = ImageBytes.load(resolver, uri)
+                    val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    bytes to Bitmap.createScaledBitmap(bitmap, side, side, true)
+                }
+                setPendingImage(bytes, thumbnail)
             } catch (e: Exception) {
-                toast(getString(R.string.image_failed, e.message ?: "?"))
+                toast(getString(R.string.image_failed, e.message ?: e.javaClass.simpleName))
             }
         }
     }
 
-    private fun setPendingImage(bytes: ByteArray?) {
-        val b = binding ?: return
+    private fun setPendingImage(bytes: ByteArray?, thumbnail: Bitmap?) {
         pendingImage = bytes
-        if (bytes == null) {
+        pendingThumbnail = thumbnail
+        showAttachment()
+    }
+
+    /** The chip of the pending image, or no chip. It survives a new view. */
+    private fun showAttachment() {
+        val b = binding ?: return
+        val thumbnail = pendingThumbnail
+        if (thumbnail == null) {
             b.attachmentRow.visibility = View.GONE
             b.attachmentChip.chipIcon = null
             return
         }
-        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-        val side = (28 * resources.displayMetrics.density).toInt()
-        b.attachmentChip.chipIcon = BitmapDrawable(resources, Bitmap.createScaledBitmap(bitmap, side, side, true))
+        b.attachmentChip.chipIcon = BitmapDrawable(resources, thumbnail)
         b.attachmentRow.visibility = View.VISIBLE
     }
 
@@ -244,8 +263,8 @@ class ChatFragment : Fragment() {
         ensureNotificationPermission()
         val text = typed.ifEmpty { getString(R.string.describe_image) }
         b.input.text?.clear()
-        setPendingImage(null)
-        session.send(text, image) { problem -> toast(problem) }
+        setPendingImage(null, null)
+        session.send(text, image)
     }
 
     /** The foreground service shows a notification, thus the app asks for the permission one time. */
@@ -261,11 +280,12 @@ class ChatFragment : Fragment() {
 
     /** Redraw the last row at most every 80 ms while the answer streams. */
     private fun scheduleRender() {
+        val list = binding?.messages ?: return
         if (renderScheduled) {
             return
         }
         renderScheduled = true
-        binding?.messages?.postDelayed({ renderLast() }, 80)
+        list.postDelayed({ renderLast() }, RENDER_INTERVAL_MS)
     }
 
     private fun renderLast() {
@@ -291,6 +311,12 @@ class ChatFragment : Fragment() {
         }
     }
 
+    /** True when the end of the list is in view, with a small margin for a fling that stops near it. */
+    private fun isAtEnd(list: RecyclerView): Boolean {
+        val below = list.computeVerticalScrollRange() - list.computeVerticalScrollExtent() - list.computeVerticalScrollOffset()
+        return below <= endSlackPx
+    }
+
     /** The round arrow above the composer: only while an answer streams and the list is scrolled up. */
     private fun updateJumpButton() {
         val b = binding ?: return
@@ -302,6 +328,13 @@ class ChatFragment : Fragment() {
     }
 
     private fun toast(message: String) {
-        Toast.makeText(requireContext(), message, Toast.LENGTH_LONG).show()
+        val context = context ?: return
+        Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+    }
+
+    private companion object {
+        const val RENDER_INTERVAL_MS = 80L
+        const val THUMBNAIL_DP = 28
+        const val END_SLACK_DP = 24
     }
 }

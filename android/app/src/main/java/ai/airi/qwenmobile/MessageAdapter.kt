@@ -4,6 +4,7 @@ import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.TextView
+import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.RecyclerView
 import ai.airi.qwenmobile.databinding.ItemMessageBinding
 
@@ -65,28 +66,41 @@ class MessageAdapter(
         val b = holder.binding
         if (message.role == "user") {
             b.thinkingContainer.visibility = View.GONE
-            b.contentText.text = message.content
+            plain(b.contentText, message.content, R.color.ink)
         } else {
             val header = holder.thinkingHeader
             val body = holder.thinkingBody
-            val hasThinking = message.thinking.isNotEmpty() || message.phase == ChatMessage.Phase.THINKING
+            val hasThinking = message.hasThinking || message.phase == ChatMessage.Phase.THINKING
             if (hasThinking && header != null && body != null) {
                 b.thinkingContainer.visibility = View.VISIBLE
                 Thinking.bind(header, body, message)
             } else {
                 b.thinkingContainer.visibility = View.GONE
+                body?.let { Markdown.clear(it) }
             }
             when {
                 message.phase == ChatMessage.Phase.INTERRUPTED ->
-                    b.contentText.text = b.root.context.getString(R.string.answer_interrupted)
-                message.content.isBlank() ->
-                    b.contentText.text = if (message.phase == ChatMessage.Phase.ANSWERING) "…" else ""
-                else -> Markdown.render(b.contentText, message.content)
+                    plain(b.contentText, b.root.context.getString(R.string.answer_interrupted), R.color.muted)
+                message.phase == ChatMessage.Phase.FAILED ->
+                    plain(b.contentText, message.content, R.color.error_red)
+                !message.hasContent ->
+                    plain(b.contentText, if (message.phase == ChatMessage.Phase.ANSWERING) "…" else "", R.color.ink)
+                else -> {
+                    b.contentText.setTextColor(ContextCompat.getColor(b.root.context, R.color.ink))
+                    Markdown.render(b.contentText, message.content, streaming = message.phase == ChatMessage.Phase.ANSWERING)
+                }
             }
         }
         val info = meta(message)
         b.metaText.text = info
         b.metaText.visibility = if (info == null) View.GONE else View.VISIBLE
+    }
+
+    /** Plain text in the view. A Markdown render that waits for the view is removed, thus it cannot replace the text. */
+    private fun plain(view: TextView, text: String, color: Int) {
+        Markdown.clear(view)
+        view.setTextColor(ContextCompat.getColor(view.context, color))
+        view.text = text
     }
 
     companion object {

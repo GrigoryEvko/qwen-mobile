@@ -91,8 +91,8 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** The title of the app bar, the model name on the chat tab. */
-    fun setTitle(title: String) {
+    /** The title of the app bar on the chat tab: the model name, or the app name. */
+    fun setChatTitle(title: String) {
         chatTitle = title
         if (binding.bottomNav.selectedItemId == R.id.nav_chat) {
             binding.toolbar.title = title
