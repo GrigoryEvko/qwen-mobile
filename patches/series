@@ -6,3 +6,11 @@ hexagon-fusion/0002-hexagon-htp-fused-gdn-state-step.patch
 hexagon-fusion/0003-hexagon-htp-gdn-state-step-hvx-conv-and-match-fix.patch
 hexagon-vit/0001-hexagon-gelu-tanh-form.patch
 llama-tied-head/0001-qwen35-tied-head-output-rot.patch
+hexagon-fusion/0004-hexagon-htp-gdn-slot-index-from-host-and-error-report.patch
+llama-tied-head/0002-qwen35-mtp-rotation.patch
+mtmd/0001-mtmd-qwen3vl-position-embedding-on-cpu.patch
+mtmd/0002-mtmd-qwen3vl-one-rope-for-q-and-k.patch
+# hexagon-fusion/0005-hexagon-htp-gdn-chunked-hmx.patch
+#   The chunked gated delta rule of a batch on the HMX. The patch is in the
+#   repository, and the line above stays a comment until the kernel runs on the
+#   phone: it takes the switch GGML_HEXAGON_OPFUSION_STATE, which the app sets.

@@ -24,6 +24,19 @@ val prebuilt: Boolean = project.findProperty("prebuilt") == "true"
 // reproducible artifact. Without it, the debug key of this machine signs the release.
 val unsigned: Boolean = project.findProperty("unsigned") == "true"
 
+// The version of the app. android/version.properties holds versionName, and the
+// release workflow tags v<versionName> when that tag does not exist yet.
+// versionCode is the number of commits of the branch, which scripts/build-apk.sh
+// passes as -PversionCode. A build without that property takes the fallback of
+// the file, thus the version of the app is readable from the source alone.
+val versionProperties = Properties().apply {
+    rootProject.file("version.properties").inputStream().use { load(it) }
+}
+val appVersionName: String = versionProperties.getProperty("versionName")
+    ?: error("Set versionName in android/version.properties")
+val appVersionCode: Int = (project.findProperty("versionCode") as String?)?.toInt()
+    ?: versionProperties.getProperty("versionCodeFallback").toInt()
+
 android {
     namespace = "ai.airi.qwenmobile"
     compileSdk = 36
@@ -35,8 +48,8 @@ android {
         applicationId = "ai.airi.qwenmobile"
         minSdk = 28
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1"
+        versionCode = appVersionCode
+        versionName = appVersionName
 
         ndk {
             abiFilters += listOf("arm64-v8a")
