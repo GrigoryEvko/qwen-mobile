@@ -1,0 +1,79 @@
+# The same scripts as on a laptop, on ubuntu-latest: scripts/build-native.sh in
+# the Snapdragon container (a public image), scripts/build-apk.sh in the
+# container of ci/Containerfile, and the pipeline environment with uv. Podman
+# is on the ubuntu-latest runner, and the scripts fall back to docker.
+#
+# The signed APK on a runner has a new debug key on each run, because the
+# runner has no ~/.android/debug.keystore. The unsigned APK and the native
+# libraries are the comparable artifacts.
+
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  native:
+    name: Native libraries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Build the native libraries in the Snapdragon container
+        run: scripts/build-native.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hashes-native
+          path: build/hashes-native.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jniLibs
+          path: android/snapdragon/jniLibs
+
+  apk:
+    name: APK and unit tests
+    runs-on: ubuntu-latest
+    needs: native
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: jniLibs
+          path: android/snapdragon/jniLibs
+      - name: Build the APK and run the unit tests in the pinned container
+        run: scripts/build-apk.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hashes-apk
+          path: build/hashes-apk.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: |
+            build/apk/app-release-unsigned.apk
+            build/apk/app-release.apk
+            build/apk/test-results
+
+  pipeline:
+    # The lock holds torch with CUDA 13 wheels. The download is several GB,
+    # and the runner has approximately 14 GB of free disk space.
+    name: Quantization pipeline tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.11"
+      - name: Apply the patch series (gguf-py is a path dependency)
+        run: scripts/apply-patches.sh
+      - name: Install the locked environment
+        run: uv sync --frozen
+      - name: Run the tests
+        run: uv run --frozen pytest quant/tests
