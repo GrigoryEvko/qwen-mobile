@@ -4,22 +4,30 @@ The F16 GGUF of the transformed checkpoint supplies the metadata, the
 tokenizer, and every tensor. This module copies it and replaces each tensor
 according to the plan: packed Q4_0 blocks from the solver where they exist,
 round-to-nearest Q4_0 or Q8_0 otherwise, F32 for the sensitive small tensors.
+
+The solved blocks and the folds are in the order of the checkpoint. The
+converter writes the value heads of the linear attention in a different
+order when a model has fewer key heads than value heads (the 4B: 16 key
+heads, 32 value heads), thus the export permutes those tensors the same way.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import sys
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from .grid import pack_nibbles, pack_q8_0, q8_0_quantize, quantize
+from .grid import BLOCK, pack_nibbles, pack_q8_0, q8_0_quantize, quantize
 from .grids import make_grid
 from .plan import Plan
 
 GGUF_4BIT = {"Q4_0": "Q4_0", "IQ4_NL": "IQ4_NL"}
+FILE_TYPES = {"Q4_0": "MOSTLY_Q4_0", "IQ4_NL": "MOSTLY_IQ4_NL"}
 
 
 def _load_gguf_module(llama_dir: Path):
@@ -36,27 +44,143 @@ def _f32_of(reader_tensor) -> np.ndarray:
     return data.astype(np.float32).reshape(shape)
 
 
+@dataclass(frozen=True)
+class LinearAttentionLayout:
+    """The order of the value heads of the GDN tensors in the GGUF.
+
+    The checkpoint groups the value heads by key head: [K0 v0 … v(r−1),
+    K1 v0 … v(r−1), …]. The converter writes them tiled: [K0 v0, K1 v0, …,
+    K0 v1, K1 v1, …], thus ggml can repeat the key heads with one tiled
+    broadcast. With one value head per key head the two orders are equal.
+    """
+
+    num_k_heads: int
+    num_v_heads: int
+    head_k_dim: int
+    head_v_dim: int
+
+    @classmethod
+    def from_gguf(cls, reader, arch: str) -> "LinearAttentionLayout | None":
+        """The layout from the ssm metadata of the GGUF, or None for a model without linear attention."""
+        keys = [f"{arch}.ssm.group_count", f"{arch}.ssm.time_step_rank", f"{arch}.ssm.state_size",
+                f"{arch}.ssm.inner_size"]
+        if any(k not in reader.fields for k in keys):
+            return None
+        num_k, num_v, head_k, inner = (int(reader.fields[k].contents()) for k in keys)
+        return cls(num_k, num_v, head_k, inner // num_v)
+
+    def _tiled(self, head_dim: int) -> torch.Tensor | None:
+        """The index (grouped order) of each position in the tiled order, over num_v_heads · head_dim, or None."""
+        if self.num_k_heads == self.num_v_heads:
+            return None
+        per_k = self.num_v_heads // self.num_k_heads
+        order = torch.arange(self.num_v_heads * head_dim).view(self.num_k_heads, per_k, head_dim)
+        return order.permute(1, 0, 2).reshape(-1)
+
+    def rows(self, name: str) -> torch.Tensor | None:
+        """The row permutation of a GGUF tensor (new row i holds checkpoint row rows[i]), or None."""
+        tail = name.split(".", 2)[-1] if name.startswith("blk.") else name
+        if tail == "attn_qkv.weight":
+            v = self._tiled(self.head_v_dim)
+            if v is None:
+                return None
+            qk = 2 * self.num_k_heads * self.head_k_dim
+            return torch.cat([torch.arange(qk), qk + v])
+        if tail == "attn_gate.weight":
+            return self._tiled(self.head_v_dim)
+        if tail in ("ssm_alpha.weight", "ssm_beta.weight"):
+            return self._tiled(1)
+        return None
+
+    def cols(self, name: str) -> torch.Tensor | None:
+        """The column permutation of a GGUF tensor, or None."""
+        tail = name.split(".", 2)[-1] if name.startswith("blk.") else name
+        if tail == "ssm_out.weight":
+            return self._tiled(self.head_v_dim)
+        return None
+
+    def array(self, name: str, a: np.ndarray) -> np.ndarray:
+        """A float tensor [rows, cols] or [rows] of the checkpoint order in the GGUF order."""
+        rows, cols = self.rows(name), self.cols(name)
+        if rows is not None:
+            a = a[rows.numpy()]
+        if cols is not None:
+            a = a[:, cols.numpy()]
+        return a
+
+    def pack(self, name: str, idx: torch.Tensor, d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The indices [rows, cols] and the block scales [rows, cols // 32] in the GGUF order."""
+        rows, cols = self.rows(name), self.cols(name)
+        if rows is not None:
+            idx, d = idx[rows], d[rows]
+        if cols is not None:
+            idx, d = idx[:, cols], d[:, block_permutation(cols)]
+        return idx, d
+
+    def factors(self, name: str, a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """The low-rank factors a [rank, cols], b [rows, rank] in the GGUF order."""
+        rows, cols = self.rows(name), self.cols(name)
+        if rows is not None:
+            b = b[rows.numpy()]
+        if cols is not None:
+            a = a[:, cols.numpy()]
+        return a, b
+
+
+def block_permutation(cols: torch.Tensor) -> torch.Tensor:
+    """The permutation of the blocks of 32 that a column permutation of whole blocks makes."""
+    runs = cols.view(-1, BLOCK)
+    if not torch.equal(runs, runs[:, :1] + torch.arange(BLOCK)) or int((runs[:, 0] % BLOCK).max()) != 0:
+        raise ValueError("the column permutation splits a block of 32, the packed scales cannot follow it")
+    return runs[:, 0] // BLOCK
+
+
+def plan_of(folds) -> dict | None:
+    """The plan that the calibration used, from folds.npz, or None for an old file."""
+    if folds is None or "plan" not in folds.files:
+        return None
+    return json.loads(str(folds["plan"]))
+
+
 def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: Path,
-           device: torch.device, only: str | None = None, invert: bool = False) -> None:
+           device: torch.device, only: str | None = None, invert: bool = False,
+           source_folded: bool = False) -> None:
     """Write ``out_gguf``. Complexity is O(total bytes).
 
     ``only`` is a regular expression on the GGUF tensor name. The tensors
     that match keep their plan type and every other tensor stays F16, thus
     the file isolates the error of one class. ``invert`` swaps the two sets.
+
+    ``source_folded`` says that the F16 GGUF comes from the folded
+    reference (``--source tf``). The calibration folds move the columns of
+    the solved classes, the MLP channel order and the norms. A tensor that
+    the F16 GGUF supplies must be in those coordinates when the plan of the
+    export differs from the plan of the calibration, or when ``only`` keeps
+    some solved tensors in F16.
     """
     gguf = _load_gguf_module(llama_dir)
     selector = re.compile(only) if only else None
     # The small tensors that the calibration moved (norms, gates, Q8 matrices), in GGUF space.
     folds = np.load(packs / "folds.npz") if (packs / "folds.npz").exists() else None
+    saved_plan = plan_of(folds)
+    if folds is not None and not source_folded:
+        if only is not None:
+            raise ValueError("--only keeps solved tensors in F16: export from the folded reference (--source tf)")
+        if saved_plan is not None and saved_plan != json.loads(json.dumps(asdict(plan))):
+            raise ValueError(f"the plan differs from the calibration plan {saved_plan}: "
+                             "export from the folded reference (--source tf)")
+
+    reader = gguf.GGUFReader(str(f16_gguf))
+    arch = bytes(reader.fields["general.architecture"].parts[-1]).decode()
+    layout = LinearAttentionLayout.from_gguf(reader, arch)
 
     def source(t) -> np.ndarray:
         if folds is not None and t.name in folds.files:
-            return folds[t.name].astype(np.float32).reshape([int(x) for x in reversed(t.shape)])
+            a = folds[t.name].astype(np.float32).reshape([int(x) for x in reversed(t.shape)])
+            return layout.array(t.name, a) if layout is not None else a
         return _f32_of(t)
-    reader = gguf.GGUFReader(str(f16_gguf))
-    arch = bytes(reader.fields["general.architecture"].parts[-1]).decode()
-    writer = gguf.GGUFWriter(str(out_gguf), arch)
 
+    writer = gguf.GGUFWriter(str(out_gguf), arch)
     skip = {"general.architecture", "general.file_type", "GGUF.version", "GGUF.tensor_count", "GGUF.kv_count"}
     for key, field in reader.fields.items():
         if key in skip:
@@ -64,7 +188,7 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
         vtype = field.types[0]
         sub_type = field.types[-1] if vtype == gguf.GGUFValueType.ARRAY else None
         writer.add_key_value(key, field.contents(), vtype, sub_type=sub_type)
-    writer.add_file_type(gguf.LlamaFileType.MOSTLY_Q4_0)
+    writer.add_file_type(getattr(gguf.LlamaFileType, FILE_TYPES.get(plan.bulk, "MOSTLY_Q4_0")))
 
     counts: dict[str, int] = {}
     adapter: dict[str, tuple[np.ndarray, np.ndarray]] = {}
@@ -85,9 +209,12 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
             if "kind" in z and str(z["kind"]) != kind:
                 raise ValueError(f"{name}: the solved blocks are {z['kind']}, the plan says {kind}")
             d = torch.from_numpy(z["d"].view(np.float16))
+            if layout is not None:
+                idx, d = layout.pack(name, idx, d)
             writer.add_tensor(name, pack_nibbles(idx, d), raw_dtype=getattr(gguf.GGMLQuantizationType, GGUF_4BIT[kind]))
             if "lora_a" in z.files:
-                adapter[name] = (z["lora_a"], z["lora_b"])
+                a, b = z["lora_a"], z["lora_b"]
+                adapter[name] = layout.factors(name, a, b) if layout is not None else (a, b)
             kind = f"{kind} (solved)"
         elif kind in GGUF_4BIT:
             w = torch.from_numpy(_f32_of(t)).to(device)

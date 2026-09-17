@@ -6,7 +6,7 @@ the two sub-block updates (mixer and MLP):
 
 - rel: ‖a_q − a_r‖ / ‖a_r‖ over all tokens, and per position quarter
 - cos: the mean cosine per token
-- drift: the shift of the channel means, ‖mean(a_q) − mean(a_r)‖ / rms(a_r)
+- drift: the shift of the channel means, ‖mean(a_q) − mean(a_r)‖ / (the rms norm of a token of r)
 - rms: rms(a_q) / rms(a_r) − 1
 - the moves of the |a| quantiles p50, p99, p99.9 and of the maximum, q/r − 1
 - the mean per-channel skewness and excess kurtosis of r, and the same of q
@@ -60,6 +60,32 @@ def apply_packs(model, packs: Path) -> dict[str, tuple[float, float]]:
         stats[gguf_name] = (((deq - w).norm() / w.norm()).item(), kurtosis(w.reshape(-1)))
         w.copy_(deq.to(w.dtype))
     return stats
+
+
+@torch.no_grad()
+def apply_folds(model, packs: Path) -> int:
+    """Put the folded small tensors of ``folds.npz`` into the model. Returns the number of tensors.
+
+    The file holds GGUF-space values: the zero-centered norms carry their
+    +1, which comes off here. Without the file the model keeps its values.
+    """
+    from .flow import ZERO_CENTERED
+
+    path = packs / "folds.npz"
+    if not path.exists():
+        return 0
+    folds = np.load(path)
+    n = 0
+    for full_name, p in model.named_parameters():
+        gguf_name = to_gguf(full_name)
+        if gguf_name is None or gguf_name not in folds.files:
+            continue
+        v = torch.from_numpy(folds[gguf_name]).to(p.device, p.dtype)
+        if gguf_name.endswith(ZERO_CENTERED):
+            v = v - 1.0
+        p.copy_(v)
+        n += 1
+    return n
 
 
 def kurtosis(x: torch.Tensor) -> float:

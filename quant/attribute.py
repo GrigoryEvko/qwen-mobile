@@ -37,7 +37,7 @@ def main() -> None:
     p.add_argument("--model", default="Qwen3.5-2B")
     p.add_argument("--packs", required=True, help="the directory of the solved blocks")
     p.add_argument("--packs-tag", default="gptq", help="the label of the solved blocks in the table")
-    p.add_argument("--source", default="t")
+    p.add_argument("--source", default="tf", help="the folded reference: the kept F16 tensors share the fold coordinates")
     p.add_argument("--out", type=Path, default=ROOT / "analysis" / "quant-attribution.md")
     args = p.parse_args()
 

@@ -85,9 +85,11 @@ def main() -> None:
                 for f in packs.glob("*.npz"):
                     f.unlink()
             run(["quantize", "--model", args.model, *cfg.get("quantize_args", [])])
+            # The folded reference supplies the tensors that an export-only configuration moves to Q8_0.
+            run(["convert", "--model", args.model, "--source", "tf"])
         export_args = cfg.get("export", [])
         tag = f"{name}-Q4_0"
-        run(["export", "--model", args.model, "--tag", tag, *export_args])
+        run(["export", "--model", args.model, "--source", "tf", "--tag", tag, *export_args])
         gguf = ROOT / "weights" / "gguf" / f"{args.model}-{tag}.gguf"
         ev = parse_eval(run(["eval", "--model", args.model, "--gguf", str(gguf)]))
         append_row(name, cfg["desc"], gguf.stat().st_size / 2**30, ev)

@@ -127,7 +127,7 @@ def cmd_drift(args: argparse.Namespace) -> None:
     """The drift report of the solved blocks on a source checkpoint."""
     from transformers import AutoTokenizer
 
-    from .drift import apply_packs, drift_report
+    from .drift import apply_folds, apply_packs, drift_report
     from .flow import Lockstep
 
     src = ROOT / "weights" / f"{args.model}-{args.source}"
@@ -135,7 +135,7 @@ def cmd_drift(args: argparse.Namespace) -> None:
     ref = _load_model(src, args.device)
     work = _load_model(src, args.device)
     stats = apply_packs(work, _packs(args))
-    print(f"applied {len(stats)} solved blocks", flush=True)
+    print(f"applied {len(stats)} solved blocks and {apply_folds(work, _packs(args))} folded tensors", flush=True)
     step = Lockstep(ref, work, _wiki_ids(tok, 16, 1024), 4)
     args.out.write_text(drift_report(step, f"{args.model} {args.tag}", stats))
     print(f"wrote {args.out}")
@@ -148,7 +148,7 @@ def cmd_export(args: argparse.Namespace) -> None:
     out = ROOT / "weights" / "gguf" / (args.out or f"{args.model}-{args.tag}.gguf")
     plan = _plan(args, num_layers(ROOT / "weights" / args.model))
     export(f16, out, _packs(args), plan, ROOT / "llama.cpp", torch.device(args.device),
-           only=args.only, invert=args.invert)
+           only=args.only, invert=args.invert, source_folded=args.source == "tf")
 
 
 def _packs(args: argparse.Namespace) -> Path:
@@ -211,7 +211,8 @@ def main() -> None:
     q.add_argument("--epochs", type=int, default=8, help="block optimization epochs over the calibration set")
     q.add_argument("--opt-batch", type=int, default=4, help="sequences per optimization step")
     q.add_argument("--freeze-weights", action="store_true",
-                   help="optimize the scales, norms, levels and factors only, the rounding stays from the init")
+                   help="the latent 4-bit weights stay from the init: the scales, levels, factors, norms and the "
+                        "F32 and Q8_0 matrices of the layer still move")
     q.add_argument("--lr-weight", type=float, default=1e-5)
     q.add_argument("--lr-scale", type=float, default=1e-4)
     q.add_argument("--lr-other", type=float, default=1e-4)
@@ -235,7 +236,8 @@ def main() -> None:
     e = sub.add_parser("export", parents=[common])
     e.add_argument("--tag", default="Q4_0")
     e.add_argument("--out", default=None)
-    e.add_argument("--source", default="t", help="the F16 GGUF that supplies the unsolved tensors: t or tf")
+    e.add_argument("--source", default="t", help="the F16 GGUF that supplies the unsolved tensors: t or tf "
+                                                 "(tf is necessary with --only or a plan that differs from the calibration)")
     e.add_argument("--packs", default=None, help="the directory of the solved blocks, default quant-out/<model>")
     e.add_argument("--only", default=None, help="regex: quantize the matching tensors only, the rest stays F16")
     e.add_argument("--invert", action="store_true", help="with --only: quantize everything except the matches")
