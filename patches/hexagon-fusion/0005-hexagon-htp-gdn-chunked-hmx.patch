@@ -74,11 +74,18 @@ thread, and one job carries the products of every row of the group. Thus one chu
 dispatches and 3 HMX jobs, not 3 jobs a row, and one op of 512 tokens is 26 dispatches and 24 jobs.
 The DMA of the next chunk of q, k and v starts at the end of the first phase.
 
+The queue carries more than the jobs of this kernel. main.c pushes a wakeup signal into it at the
+start of every batch and a suspend signal at the end, and nothing retires the wakeup until the flush
+of the batch. Thus the descriptor at the pop index of the queue is not the one of this op, and a
+version of this kernel that read that index reported a queue in use at its first job. This kernel
+keeps the slot that its own push takes, waits for that slot, and moves the pop index past every
+descriptor up to it, the signal included. The queue thread works in order, thus all of them are done.
+hmx_queue_pop of the library does the same thing with a loop, and without a bound on the wait.
+
 Every wait of the op thread has a bound of 2000000000 cycles, about two seconds. When it fires, the
 op returns INTERNAL-ERROR with a detail code, and the host prints the op and the code (patch 0004
 carries that report):
 
-    20  another op left a job in the HMX queue
     21  the HMX queue took no job
     22  an HMX job did not finish inside the bound
 
@@ -138,11 +145,15 @@ GGML_HEXAGON_GDN_CHUNK=0 keeps the sequential kernel for every batch. The host g
 the DSP in the kernel params of each GATED_DELTA_NET op, thus one build runs both sides of an A/B
 test. The default is 1.
 
-The kernel also returns to the sequential one, per op, when: the gate is a vector (KDA, which
-Qwen3.5 does not use), K is not 1, the batch has fewer than 32 tokens, the head size is not a
+The kernel also returns the op to the sequential one, before it touches anything, when: the gate is a
+vector (KDA, which Qwen3.5 does not use), the op keeps more than the final state (K is not 1), the
+batch holds more than one sequence, one sequence holds fewer than 32 tokens, the head size is not a
 multiple of 32 or is over 128, a row of q, k or v is not contiguous, the gates of the heads of one
-token are not contiguous, the HMX is off, or the VTCM does not hold the buffers of the threads. The
-profile shows which kernel ran: 6.5 ms per op is the sequential one.
+token are not contiguous, the HMX is off, or VTCM holds no row. The token count of the test is the
+count of one sequence (v->ne[2]), thus one token of each of two sequences is two refusals, not a
+batch of two. Each refusal names itself in the DSP log at the level HIGH, and a refused op pushes
+nothing, thus it leaves the HMX queue as it found it. The profile shows which kernel ran: 6.5 ms per
+op is the sequential one.
 
 Expected speed
 
@@ -153,10 +164,10 @@ The phases serialize the HVX work and the HMX work of a group, thus the expectat
 per op against 6.5 ms, and 30 to 60 ms of the 235 ms that the 36 ops of one pp512 batch take today.
 diff --git a/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c b/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c
 new file mode 100644
-index 0000000..c59af91
+index 0000000..9215df3
 --- /dev/null
 +++ b/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c
-@@ -0,0 +1,1123 @@
+@@ -0,0 +1,1142 @@
 +// GATED_DELTA_NET for a batch of tokens: the chunked gated delta rule on the HMX.
 +//
 +// The sequential kernel of gated-delta-net-ops.c runs one token after the other on the HVX, thus it
@@ -301,7 +312,6 @@ index 0000000..c59af91
 +
 +// The error detail codes of this op (reported to the host with the batch status)
 +enum {
-+    GDN_CH_ERR_QUEUE_BUSY = 20, // the HMX queue held a job of another op
 +    GDN_CH_ERR_QUEUE_FULL = 21, // the HMX queue took no job
 +    GDN_CH_ERR_TIMEOUT    = 22, // the HMX job did not finish inside the bound
 +};
@@ -346,8 +356,15 @@ index 0000000..c59af91
 +    }
 +}
 +
-+// Gives the job to the HMX queue thread and waits for it. Only the op thread calls this, and one job
-+// is in flight at a time, thus the descriptor of this job is the one at the pop index.
++// Gives the job to the HMX queue thread and waits for it. Only the op thread calls this.
++//
++// The queue carries more than the jobs of this op: main.c pushes a wakeup signal at the start of a
++// batch and a suspend signal at the end, and nothing retires the wakeup until the flush of the batch.
++// Thus the descriptor at the pop index is not the one of this op, and this function keeps the slot
++// that its own push takes. The queue thread works in order, thus every descriptor up to that slot is
++// done when that slot is done, and the pop index moves past all of them together. hmx_queue_pop of
++// the library does the same thing with a loop, without a bound on the wait.
++//
 +// Returns 0, or the detail code of the failure.
 +static int gdn_ch_hmx_submit(struct gdn_ch_ctx * c) {
 +    hmx_queue_t q = c->octx->ctx->hmx_queue;
@@ -356,31 +373,29 @@ index 0000000..c59af91
 +    // the join of work_queue_run ordered the writes of the workers before it.
 +    asm volatile("syncht" : : : "memory");
 +
-+    const unsigned int ip = q->idx_pop;
-+    if (ip != atomic_load(&q->idx_write)) {
-+        // Another op left a job in the queue. This op takes the descriptor at the pop index as its
-+        // own, thus it stops instead.
-+        FARF(ERROR, "gdn-chunk: the HMX queue is not idle (pop %u write %u)\n", ip, atomic_load(&q->idx_write));
-+        return GDN_CH_ERR_QUEUE_BUSY;
-+    }
++    // The op thread is the only producer while an op runs, thus this is the slot of the push below.
++    const unsigned int my = atomic_load(&q->idx_write);
 +
 +    if (!hmx_queue_push(q, hmx_queue_make_desc(gdn_ch_hmx_run, &c->job))) {
 +        return GDN_CH_ERR_QUEUE_FULL;
 +    }
 +
-+    struct hmx_queue_desc * d = &q->desc[ip];
++    struct hmx_queue_desc * d = &q->desc[my];
 +
 +    const uint64_t deadline = hex_get_cycles() + GDN_CH_WAIT_CYCLES;
 +    while (!atomic_load(&d->done)) {
 +        if (hex_get_cycles() > deadline) {
 +            FARF(ERROR, "gdn-chunk: the HMX queue did not finish a job of %u products inside %llu cycles\n",
 +                 c->job.n_prod, (unsigned long long) GDN_CH_WAIT_CYCLES);
++            // The slot retires even so. The flush at the end of the batch waits for every descriptor
++            // without a bound, and this op reports the failure to the host by itself.
++            q->idx_pop = (my + 1) & q->idx_mask;
 +            return GDN_CH_ERR_TIMEOUT;
 +        }
 +        hex_pause();
 +    }
 +
-+    q->idx_pop = (ip + 1) & q->idx_mask;
++    q->idx_pop = (my + 1) & q->idx_mask;
 +    return 0;
 +}
 +
@@ -1158,10 +1173,25 @@ index 0000000..c59af91
 +    const uint32_t n_seqs   = v->ne[3];
 +    const uint32_t K        = octx->op_params[0];
 +
-+    if (K != 1 || g->ne[0] != 1 || n_tokens < GDN_CH_MIN_TOKENS) {
-+        return HTP_STATUS_NO_SUPPORT;
++    // The selection. Each condition sends the op to the sequential kernel, which takes every shape.
++    // n_tokens is the token count of ONE sequence (v->ne[2]) and n_seqs is the sequence count
++    // (v->ne[3]), thus a batch of one token per sequence never reaches this kernel, whatever the
++    // sequence count is.
++    const char * refuse = NULL;
++    if (K != 1) {
++        refuse = "the op keeps more than the final state";
++    } else if (g->ne[0] != 1) {
++        refuse = "the gate is a vector (KDA)";
++    } else if (n_seqs != 1) {
++        refuse = "more than one sequence";
++    } else if (n_tokens < GDN_CH_MIN_TOKENS) {
++        refuse = "fewer than 32 tokens in the sequence";
++    } else if (D % 32 != 0 || D > GDN_CH_MAX_D || q->ne[0] != D || k->ne[0] != D) {
++        refuse = "the head size";
 +    }
-+    if (D % 32 != 0 || D > GDN_CH_MAX_D || q->ne[0] != D || k->ne[0] != D) {
++    if (refuse) {
++        FARF(HIGH, "gdn-chunk: the sequential kernel runs (%s): D %u H %u tokens %u seqs %u K %u gate %u\n",
++             refuse, D, H, n_tokens, n_seqs, K, (unsigned) g->ne[0]);
 +        return HTP_STATUS_NO_SUPPORT;
 +    }
 +    if (q->nb[0] != sizeof(float) || k->nb[0] != sizeof(float) || v->nb[0] != sizeof(float)) {
@@ -1324,7 +1354,7 @@ index ff531e1..3382ca0 100644
      unary-ops.c
      sum-rows-ops.c
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index b6409ef..921665a 100644
+index b6409ef..e6b3f84 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -4661,6 +4661,47 @@ struct test_gated_delta_net : public test_case {
@@ -1375,7 +1405,7 @@ index b6409ef..921665a 100644
  // GET_ROWS + CONCAT + SSM_CONV + SILU + CPY: the conv half of the recurrent state step at one token.
  // The graph is the one that llama.cpp builds for a gated delta net layer (build_conv_state). The output
  // holds the conv output and the new state, thus the CPY into the cache is part of the graph.
-@@ -11068,6 +11109,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11068,6 +11109,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      // KDA (vector gate)
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 1, 1, 1, false, true));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 1, 2, 1, false, true));
@@ -1383,13 +1413,15 @@ index b6409ef..921665a 100644
 +    // Batches of tokens, for a backend that runs them as the chunked delta rule. The first three
 +    // cases are the shapes of Qwen3.5-2B: 16 heads of 128 with 512 tokens is one text prefill batch,
 +    // and 672 tokens is one image. 672, 100, 70, 65, 33 and 66 are not multiples of a 64-token chunk,
-+    // thus they also test the tail. The other cases cover the head sizes 32, 64 and 96, two
-+    // sequences, a k head that two v heads share, a gate that decays fast, and permuted inputs.
++    // thus they also test the tail. The other cases cover the head sizes 32, 64 and 96, a k head that
++    // two v heads share, a gate that decays fast, and permuted inputs. The case of two sequences
++    // holds a backend to the same result when it sends that shape to another kernel.
 +    test_cases.emplace_back(new test_gated_delta_net_batch(16, 128, 512, 1));
 +    test_cases.emplace_back(new test_gated_delta_net_batch(16, 128, 672, 1));
 +    test_cases.emplace_back(new test_gated_delta_net_batch(16, 128, 512, 1, 1, false, -20.0f));
 +    test_cases.emplace_back(new test_gated_delta_net_batch(4, 128, 100, 1));
 +    test_cases.emplace_back(new test_gated_delta_net_batch(4, 128, 64, 1));
++    test_cases.emplace_back(new test_gated_delta_net_batch(4, 64, 70, 1));
 +    test_cases.emplace_back(new test_gated_delta_net_batch(4, 64, 70, 2));
 +    test_cases.emplace_back(new test_gated_delta_net_batch(2, 32, 33, 1));
 +    test_cases.emplace_back(new test_gated_delta_net_batch(4, 96, 65, 1));
