@@ -154,3 +154,11 @@ from the project root:
     llama.cpp/build-cuda/bin/llama-perplexity -m weights/gguf/Qwen3.5-4B-F16.gguf -ngl 0 -t 12 -f data/wiki.test.raw -c 512 --chunks 16 --kl-divergence-base eval/Qwen3.5-4B-F16.wiki.c512x16.kld --kl-divergence
     llama.cpp/build-host/bin/llama-completion -m weights/gguf/Qwen3.5-2B-Q8_0.gguf -p "The three laws of thermodynamics are" -n 48 -no-cnv --temp 0 --simple-io
     llama.cpp/build-host/bin/llama-mtmd-cli -m weights/gguf/Qwen3.5-2B-Q8_0.gguf --mmproj weights/gguf/Qwen3.5-2B-Q8_0.mmproj.gguf --image <file.jpg> -p "Describe this image in one sentence." -n 64 --temp 0
+
+Decode path on the NPU with the fused recurrent state step (patches/hexagon-fusion/0002 to 0004, 2026-09-18):
+the one-token decode of the Q4_0 file (llama-perplexity -b 1 -ub 1, 2 chunks, against the CUDA F16
+base) gives mean ln(PPL(Q)/PPL(base)) 0.0380 ± 0.0216 with the fusion on and 0.0405 ± 0.0217 with it
+off, same top-1 (90.98 % against 90.78 %), maximum KLD 7.35 against 7.49: the fused path is at the
+floor of the unfused path. The decode batch on the DSP falls from 31.0 ms to 24.8 ms per token (513
+ops instead of 790). The 512-token prefill profile: GATED_DELTA_NET takes 235 ms of the 501 ms batch
+(44 %), the matmuls 152 ms, SSM_CONV plus CONCAT 54 ms; the prefill floor is about 160 ms.
