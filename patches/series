@@ -10,6 +10,9 @@ hexagon-fusion/0004-hexagon-htp-gdn-slot-index-from-host-and-error-report.patch
 llama-tied-head/0002-qwen35-mtp-rotation.patch
 mtmd/0001-mtmd-qwen3vl-position-embedding-on-cpu.patch
 mtmd/0002-mtmd-qwen3vl-one-rope-for-q-and-k.patch
+hexagon-host/0001-hexagon-host-timers-and-batch-cache.patch
+hexagon-host/0002-llama-host-timers-and-embd-lookup.patch
+hexagon-host/0003-llama-sampler-topset.patch
 # hexagon-fusion/0005-hexagon-htp-gdn-chunked-hmx.patch
 #   The chunked gated delta rule of a batch on the HMX. The patch is in the
 #   repository, and the line above stays a comment until the kernel runs on the
