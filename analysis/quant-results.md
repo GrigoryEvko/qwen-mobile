@@ -18,6 +18,11 @@ Hadamard R1 on the residual stream, head untied.
 | 3 | Targeted plan, GPTQ Q4_0 (128 x 2048 C4 tokens, damp 0.01), head round-to-nearest | 1.62 GiB file | 0.0373 | 0.629 | 1.01 | 88.48 % | 14.49 |
 | 4 | Qronos refit (FP-flow reference across the model) + folded column scales + MLP permutation, head solved, Q4_0, solver only | 1.62 GiB file | 0.0299 | 0.727 | 2.97 | 90.47 % | 14.08 |
 
+Grid test on Gaussian weights (256 x 512, block-32 F16 scales with the scale search, 4.5 bits per
+weight, `python -m quant.trellis`): Q4_0 21.8 dB, IQ4_NL 22.2 dB, codebook per matrix 22.3 dB,
+trellis (bit-shift, L = 12) 22.0 dB with a Gaussian table and 21.7 dB with the Ungerboeck cosets.
+The codebook grid is the best 4-bit grid at equal bytes on this test.
+
 The HF lockstep drift report (analysis/*.drift.md, 16 x 1024 WikiText tokens, fp32 on CUDA) gives
 the same ranking with its own numbers: row 3 mean KL 0.0291, row 4 0.0314. The KL attribution
 of row 3 is in analysis/quant-attribution.md: the round-to-nearest head alone is 0.011 of the

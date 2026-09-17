@@ -40,6 +40,7 @@ class OptOptions:
 
     epochs: int = 8
     batch: int = 4
+    freeze_weights: bool = False
     lr_weight: float = 1e-5
     lr_scale: float = 1e-4
     lr_other: float = 1e-4
@@ -220,8 +221,12 @@ def param_groups(layer: nn.Module, wrapped: dict, opts: OptOptions) -> list[dict
     for name, p in layer.named_parameters():
         if id(p) not in ste_ids and not any(f in name for f in FROZEN):
             others.append(p)
-    groups = [{"params": weights, "lr": opts.lr_weight}, {"params": scales, "lr": opts.lr_scale},
-              {"params": others, "lr": opts.lr_other}]
+    groups = [{"params": scales, "lr": opts.lr_scale}, {"params": others, "lr": opts.lr_other}]
+    if opts.freeze_weights:
+        for w in weights:
+            w.requires_grad_(False)
+    else:
+        groups.append({"params": weights, "lr": opts.lr_weight})
     if levels:
         groups.append({"params": levels, "lr": opts.lr_levels})
     if factors:
@@ -289,8 +294,11 @@ def optimize_head(step, target: Target, opts: OptOptions) -> Solved:
     ste = make_ste(lin, target, opts.head_rank)
     norm = work.model.norm
     norm.weight.requires_grad_(True)
-    groups = [{"params": [ste.weight], "lr": opts.lr_weight}, {"params": [ste.log_d], "lr": opts.lr_scale},
-              {"params": [norm.weight], "lr": opts.lr_other}]
+    groups = [{"params": [ste.log_d], "lr": opts.lr_scale}, {"params": [norm.weight], "lr": opts.lr_other}]
+    if opts.freeze_weights:
+        ste.weight.requires_grad_(False)
+    else:
+        groups.append({"params": [ste.weight], "lr": opts.lr_weight})
     if isinstance(ste.levels, nn.Parameter):
         groups.append({"params": [ste.levels], "lr": opts.lr_levels})
     if ste.lora_a is not None:

@@ -103,7 +103,8 @@ def cmd_quantize(args: argparse.Namespace) -> None:
     plan = _plan(args, num_layers(ROOT / "weights" / args.model))
     opts = Options(method=args.method, init=args.init, scale=not args.no_scale, permute_mlp=not args.no_permute,
                    mismatch=args.mismatch, damp=args.damp, refit_damp=args.refit_damp, batch=args.batch,
-                   opt=OptOptions(epochs=args.epochs, batch=args.opt_batch, lr_weight=args.lr_weight,
+                   opt=OptOptions(epochs=args.epochs, batch=args.opt_batch, freeze_weights=args.freeze_weights,
+                                  lr_weight=args.lr_weight,
                                   lr_scale=args.lr_scale, lr_other=args.lr_other, rank=args.rank,
                                   head_rank=args.head_rank, head_steps=args.head_steps))
     print(f"quantize {args.model}: {opts}", flush=True)
@@ -209,6 +210,8 @@ def main() -> None:
     q.add_argument("--init", choices=("rtn", "qronos", "gptq"), default="rtn", help="the rounding before the optimization")
     q.add_argument("--epochs", type=int, default=8, help="block optimization epochs over the calibration set")
     q.add_argument("--opt-batch", type=int, default=4, help="sequences per optimization step")
+    q.add_argument("--freeze-weights", action="store_true",
+                   help="optimize the scales, norms, levels and factors only, the rounding stays from the init")
     q.add_argument("--lr-weight", type=float, default=1e-5)
     q.add_argument("--lr-scale", type=float, default=1e-4)
     q.add_argument("--lr-other", type=float, default=1e-4)
