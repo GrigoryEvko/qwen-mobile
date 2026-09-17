@@ -6,6 +6,9 @@
     <string name="debug_reps">Reps</string>
     <string name="debug_run">Run</string>
     <string name="debug_clear">Clear</string>
+    <string name="debug_copy">Copy</string>
+    <string name="debug_copied">The report is on the clipboard.</string>
+    <string name="debug_power">Power</string>
     <string name="debug_no_model">No model is loaded. Load one on the Chat tab.</string>
     <string name="debug_devices">Devices</string>
     <string name="debug_no_devices">No ggml device is visible.</string>

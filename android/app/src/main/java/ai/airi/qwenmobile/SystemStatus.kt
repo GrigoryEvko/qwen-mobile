@@ -10,6 +10,8 @@ import android.os.Build
 import android.os.PerformanceHintManager
 import android.os.PowerManager
 import java.io.File
+import java.util.Locale
+import kotlin.math.abs
 
 /** Readers for the thermal state, the clocks, the battery, and the memory of the phone. */
 object SystemStatus {
@@ -33,9 +35,27 @@ object SystemStatus {
         val gameMode: String,
         val adpf: String,
         val cgroup: String,
+        /** The instantaneous battery current in microamperes, with the sign of the phone, or [PowerSample.INVALID]. */
+        val currentUa: Long,
+        /** The battery voltage in millivolts. */
+        val voltageMv: Int,
     ) {
         /** True at thermal status 0, the only state of the measurement protocol. */
         val cool: Boolean get() = thermalStatus == 0
+
+        /** The reading of the battery current as a sample, for its power. */
+        val power: PowerSample get() = PowerSample(0, currentUa, voltageMv)
+
+        /** The instantaneous power of the phone, as a text with its direction. */
+        fun powerText(): String {
+            if (!power.valid) {
+                return "n/a"
+            }
+            val direction = if (currentUa < 0) "discharge" else "charge"
+            return String.format(
+                Locale.US, "%.2f W (%.0f mA %s at %d mV)", power.watts, abs(currentUa) / 1000.0, direction, voltageMv,
+            )
+        }
 
         /** The lines of a benchmark record. */
         fun lines(): List<String> = listOf(
@@ -43,6 +63,7 @@ object SystemStatus {
                 if (cool) "" else "   <- NOT 0, wait before a measurement",
             "cpu0: $cpu0Cur / cap $cpu0Cap MHz, cpu7: $cpu7Cur / cap $cpu7Cap MHz",
             "battery: $batteryTemp C, $batteryLevel %, on $source",
+            "power: ${powerText()}",
             "memory: $availMb MB available of $totalMb MB",
             "game mode: $gameMode, ADPF: $adpf, cgroup: $cgroup",
         )
@@ -68,6 +89,8 @@ object SystemStatus {
         val temp = battery?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, -1) ?: -1
         val plugged = battery?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0
         val level = battery?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+        val voltage = battery?.getIntExtra(BatteryManager.EXTRA_VOLTAGE, 0) ?: 0
+        val current = BatteryReader(context).currentUa()
         val source = when (plugged) {
             BatteryManager.BATTERY_PLUGGED_AC -> "AC"
             BatteryManager.BATTERY_PLUGGED_USB -> "USB"
@@ -112,6 +135,8 @@ object SystemStatus {
             gameMode = gameMode,
             adpf = adpf,
             cgroup = cgroup(),
+            currentUa = current,
+            voltageMv = voltage,
         )
     }
 
