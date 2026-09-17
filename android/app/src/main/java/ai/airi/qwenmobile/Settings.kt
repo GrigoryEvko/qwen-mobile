@@ -90,8 +90,8 @@ class SettingsStore private constructor(context: Context) {
                 instance ?: SettingsStore(context.applicationContext).also { instance = it }
             }
 
-        /** The fastest visible compute unit. The enum lists them from slow to fast. */
-        fun defaultBackend(): Backend = Backend.entries.lastOrNull { LlamaEngine.has(it) } ?: Backend.CPU
+        /** The GPU when it is visible, else the CPU. The NPU is experimental, thus the user selects it. */
+        fun defaultBackend(): Backend = if (LlamaEngine.has(Backend.GPU)) Backend.GPU else Backend.CPU
 
         /** Keep every value inside its permitted range. A backend without a visible device falls back. */
         fun sanitize(s: AppSettings): AppSettings = s.copy(
