@@ -426,3 +426,74 @@ The commands, from the project root with the `.venv`:
         --promote 'ssm_out\.weight|attn_q\.weight|attn_output\.weight|attn_qkv\.weight|ffn_down\.weight' \
         --tag q8-all-but-mlp-gate-up
     .venv/bin/python -m quant.run eval --model Qwen3.5-2B --gguf weights/gguf/Qwen3.5-2B-<tag>.gguf
+
+## The plan for the 4B tied Q4_0 run (2026-09-18)
+
+The plan: the bulk Q4_0, `ssm_out` and `ffn_down` at Q8_0, the k and v projections Q8_0, the head
+tied and Q4_0, the recurrence controls and the norms F32, the MTP block Q8_0. The two guards come
+from the 2B measurement of the section above, which ranks them first and second in KL per byte, and
+from the 4B Q8_0 measurement, which names `ssm_out` as the class of the tail.
+
+| Class | Tensors | Weights | Type | MiB |
+|---|---|---|---|---|
+| `token_embd` (the tied head) | 1 | 635.7 M | Q4_0 | 341.0 |
+| `ffn_gate`, `ffn_up` | 64 | 1510.0 M | Q4_0 | 810.0 |
+| `ffn_down` | 32 | 755.0 M | **Q8_0** | 765.0 |
+| `attn_qkv` | 24 | 503.3 M | Q4_0 | 270.0 |
+| `attn_gate` | 24 | 251.7 M | Q4_0 | 135.0 |
+| `ssm_out` | 24 | 251.7 M | **Q8_0** | 255.0 |
+| `attn_q` | 8 | 167.8 M | Q4_0 | 90.0 |
+| `attn_output` | 8 | 83.9 M | Q4_0 | 45.0 |
+| `attn_k`, `attn_v` | 16 | 41.9 M | Q8_0 | 42.5 |
+| the F32 tails and the norms | 217 | 4.9 M | F32 | 18.7 |
+| `output_rot` | 1 | 6.6 M | F16 | 12.5 |
+| the MTP block (`blk.32`) | 15 | 120.6 M | Q8_0 + 2 F16 maps | 147.3 |
+| the metadata and the tokenizer | | | | 10.5 |
+
+Three sizes, by the guards that the run takes:
+
+| Guards | Size | Expected mean KL | Note |
+|---|---|---|---|
+| none, the bulk at Q4_0 | 2.41 GiB | 0.030 | the plan of row 11 on the 4B |
+| `ssm_out` Q8_0 | 2.52 GiB (+120 MiB) | 0.025 | the best value per byte, take it always |
+| `ssm_out` and `ffn_down` Q8_0 | 2.87 GiB (+480 MiB) | 0.019 | take it when 2.9 GiB fits the phone |
+
+The KL column is an extrapolation of the 2B ratios (−15 % for `ssm_out`, −37 % for the pair), and
+not a measurement of the 4B. Do not assume that the 4B is easier than the 2B: its Q8_0 file has a
+mean KL of 0.00202 against 0.00115 for the 2B. The first run must measure the baseline and the two
+guards, and it must record the maximum KL, because `ssm_out` is the class that moves it.
+
+Three classes stay at Q4_0 on purpose. `attn_qkv` costs 270 MiB more at Q8_0 and gives the worst
+KL per byte of the five classes on the 2B. `attn_q` and `attn_output` give 0.0013 of mean KL on the
+2B, and the 4B has 8 attention layers of 32, the same share. The embedding stays the tied Q4_0
+head: the 4-bit lookup costs 0.0013 of mean KL on the 2B and saves 341 MiB, which is the best trade
+of the file in the other direction.
+
+`ssm_out` at F16 costs 225 MiB more than Q8_0. The 4B Q8_0 file says that the Q8 rounding of
+`ssm_out` still makes a maximum KL of 1.56. But a Q4_0 file has a maximum KL of about 7 of its own
+(7.37 for the 2B row 7), thus Q8_0 is enough for `ssm_out` here. Take F16 for `ssm_out` only in a
+Q8_0 file, where it takes the maximum from 1.56 to 0.553.
+
+The plan needs no new machinery. `--ssm-out` and `--ffn-down` are switches of `quant/plan.py`, and
+a Q8_0 class already takes the whole path: the solver gives it the round trip, the block
+optimization trains it and rounds it again at the end of each layer, `save_folds` writes it, and
+the export reads it from the folds. The k and v projections have gone that way since row 3. The
+commands, from the project root with the `.venv`:
+
+    python -m quant.run transform --model Qwen3.5-4B --device cpu --tie-head
+    python -m quant.run convert   --model Qwen3.5-4B --source t
+    python -m quant.run quantize  --model Qwen3.5-4B --device cuda --stream \
+        --bulk Q4_0 --embedding Q4_0 --kv-proj Q8_0 --gdn-gate Q4_0 --ssm-out Q8_0 --ffn-down Q8_0 \
+        --init gptq --method blockopt --epochs 2 --freeze-weights --head-steps 300 --head-chunk 8192
+    python -m quant.run convert   --model Qwen3.5-4B --source tf
+    python -m quant.run export    --model Qwen3.5-4B --source tf \
+        --bulk Q4_0 --embedding Q4_0 --kv-proj Q8_0 --gdn-gate Q4_0 --ssm-out Q8_0 --ffn-down Q8_0 \
+        --tie-head --mtp Q8_0 --tag tied-q4-guards
+    python -m quant.run eval      --model Qwen3.5-4B --gguf weights/gguf/Qwen3.5-4B-tied-q4-guards.gguf --ngl 16
+
+Two notes for the run. The 4B has 16 key heads and 32 value heads, thus the converter tiles the
+value heads of `attn_qkv`, `attn_gate`, `ssm_alpha`, `ssm_beta` and the columns of `ssm_out`, and
+`LinearAttentionLayout` of the export permutes the packs the same way. The 2B has one value head
+per key head, thus the 2B rows never took that path, and the first 4B file must pass the
+`llama-completion` check before any KL run. And the export above reads the folded reference, thus
+it needs no `--promote` and no `quant/refold.py`.
