@@ -13,3 +13,4 @@ android/snapdragon/jniLibs/
 android/snapdragon/build/
 android/snapdragon/*.apk
 android/.device-lock
+/build/
