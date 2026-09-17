@@ -85,7 +85,8 @@ object LlamaNative {
     /**
      * Sample and decode one token.
      *
-     * @return The UTF-8 bytes of the complete characters so far, or null at the end of the answer
+     * @return Byte 0 is the kind of the token (0 text, 1 the thinking opens, 2 the thinking closes),
+     *   then the UTF-8 bytes of the complete characters so far. Null at the end of the answer.
      */
     @JvmStatic external fun generateNext(handle: Long): ByteArray?
 

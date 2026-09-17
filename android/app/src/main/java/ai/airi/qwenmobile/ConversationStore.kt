@@ -30,6 +30,8 @@ class ConversationStore(context: Context) {
             val obj = JSONObject()
                 .put("role", entry.message.role)
                 .put("content", entry.message.content)
+                .put("thinking", entry.message.thinking)
+                .put("thinkingMs", entry.message.thinkingMs)
             entry.message.image?.let { bytes ->
                 val name = hashName(bytes)
                 val target = File(imageDir, name)
@@ -64,10 +66,10 @@ class ConversationStore(context: Context) {
                 val obj = array.getJSONObject(i)
                 val image = obj.optString("image", "").takeIf { it.isNotEmpty() }
                     ?.let { File(imageDir, it) }?.takeIf { it.isFile }?.readBytes()
-                Entry(
-                    ChatMessage(obj.getString("role"), obj.getString("content"), image),
-                    obj.optString("meta", "").takeIf { it.isNotEmpty() },
-                )
+                val message = ChatMessage(obj.getString("role"), obj.getString("content"), image)
+                message.thinking = obj.optString("thinking", "")
+                message.thinkingMs = obj.optLong("thinkingMs", 0L)
+                Entry(message, obj.optString("meta", "").takeIf { it.isNotEmpty() })
             }
         } catch (e: Exception) {
             emptyList()

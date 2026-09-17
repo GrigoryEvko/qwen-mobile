@@ -19,10 +19,33 @@ import java.util.concurrent.Executors
 /**
  * One message of the conversation. The role is "user", "assistant", or "system".
  * An image is the encoded file (JPEG) that goes to the vision projector.
+ * [thinking] tells that an answer was generated in thinking mode, thus its
+ * text is thinking until the closing tag.
  */
 class ChatMessage(val role: String, var content: String, val image: ByteArray? = null) {
+    /** The phase of an answer. A user message is always DONE. */
+    enum class Phase { THINKING, ANSWERING, DONE, INTERRUPTED }
+
+    var phase: Phase = Phase.DONE
+
+    /** The thinking of an answer, empty without one. It is not part of [content]. */
+    var thinking: String = ""
+
+    /** The duration of the thinking, 0 without one. */
+    var thinkingMs: Long = 0
+
+    /** The choice of the user on the thinking field, null for the default of the phase. */
+    var thinkingExpanded: Boolean? = null
+
     /** The decoded image for the message list, decoded one time. */
     val bitmap: Bitmap? by lazy { image?.let { BitmapFactory.decodeByteArray(it, 0, it.size) } }
+}
+
+/** One step of a streamed answer. */
+sealed class Piece {
+    class Text(val text: String) : Piece()
+    object ThinkOpen : Piece()
+    object ThinkClose : Piece()
 }
 
 /**
@@ -160,7 +183,7 @@ object LlamaEngine {
         thinking: Boolean,
         temperature: Float = 0.7f,
         topP: Float = 0.8f,
-    ): Flow<String> = flow {
+    ): Flow<Piece> = flow {
         val h = requireHandle()
         LlamaNative.chatStart(
             h,
@@ -175,8 +198,12 @@ object LlamaEngine {
         while (count < MAX_ANSWER_TOKENS) {
             val bytes = LlamaNative.generateNext(h) ?: break
             count += 1
-            if (bytes.isNotEmpty()) {
-                emit(String(bytes, Charsets.UTF_8))
+            if (bytes.size > 1) {
+                emit(Piece.Text(String(bytes, 1, bytes.size - 1, Charsets.UTF_8)))
+            }
+            when (bytes[0].toInt()) {
+                1 -> emit(Piece.ThinkOpen)
+                2 -> emit(Piece.ThinkClose)
             }
         }
     }.flowOn(dispatcher)

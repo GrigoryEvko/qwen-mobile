@@ -67,19 +67,21 @@ class MessageAdapter(
             b.thinkingContainer.visibility = View.GONE
             b.contentText.text = message.content
         } else {
-            val parts = Thinking.split(message.content)
             val header = holder.thinkingHeader
             val body = holder.thinkingBody
-            if (parts.thinking != null && header != null && body != null) {
+            val hasThinking = message.thinking.isNotEmpty() || message.phase == ChatMessage.Phase.THINKING
+            if (hasThinking && header != null && body != null) {
                 b.thinkingContainer.visibility = View.VISIBLE
-                Thinking.bind(header, body, parts)
+                Thinking.bind(header, body, message)
             } else {
                 b.thinkingContainer.visibility = View.GONE
             }
-            if (parts.answer.isBlank() && parts.thinking == null) {
-                b.contentText.text = "…"
-            } else {
-                Markdown.render(b.contentText, parts.answer)
+            when {
+                message.phase == ChatMessage.Phase.INTERRUPTED ->
+                    b.contentText.text = b.root.context.getString(R.string.answer_interrupted)
+                message.content.isBlank() ->
+                    b.contentText.text = if (message.phase == ChatMessage.Phase.ANSWERING) "…" else ""
+                else -> Markdown.render(b.contentText, message.content)
             }
         }
         val info = meta(message)

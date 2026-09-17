@@ -3,5 +3,7 @@
     <string name="thinking_in_progress">Thinking…</string>
     <string name="thinking_done">Thinking</string>
     <string name="thinking_done_seconds">Thought for %1$d s</string>
+    <string name="thinking_interrupted">Interrupted</string>
     <string name="thinking_chevron">▸</string>
+    <string name="answer_interrupted">Interrupted</string>
 </resources>

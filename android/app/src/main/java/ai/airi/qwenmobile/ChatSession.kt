@@ -206,14 +206,19 @@ object ChatSession {
             return
         }
         messages += ChatMessage("user", text, image)
-        val history = messages.toList()
+        // An interrupted answer is not part of the conversation the model sees.
+        val history = messages.filter { it.phase != ChatMessage.Phase.INTERRUPTED }
+        val s = SettingsStore.of(app).state.value
         val answer = ChatMessage("assistant", "")
+        // In thinking mode the chat template opens the thinking, thus the answer starts in it.
+        answer.phase = if (s.thinking) ChatMessage.Phase.THINKING else ChatMessage.Phase.ANSWERING
         messages += answer
         structureFlow.value += 1
         generatingFlow.value = true
         GenerationService.start(app)
         generation = scope.launch {
             var lastSave = SystemClock.elapsedRealtime()
+            var thinkingStart = SystemClock.elapsedRealtime()
             try {
                 if (LlamaEngine.state.value == null) {
                     val problem = loadFromSettings()
@@ -222,9 +227,25 @@ object ChatSession {
                         return@launch
                     }
                 }
-                val s = SettingsStore.of(app).state.value
+                thinkingStart = SystemClock.elapsedRealtime()
                 LlamaEngine.generate(history, s.thinking, s.temperature, s.topP).collect { piece ->
-                    answer.content += piece
+                    when (piece) {
+                        is Piece.Text -> if (answer.phase == ChatMessage.Phase.THINKING) {
+                            answer.thinking += piece.text
+                        } else {
+                            answer.content += if (answer.content.isEmpty()) piece.text.trimStart() else piece.text
+                        }
+                        Piece.ThinkOpen -> {
+                            answer.phase = ChatMessage.Phase.THINKING
+                            answer.thinkingExpanded = null
+                            thinkingStart = SystemClock.elapsedRealtime()
+                        }
+                        Piece.ThinkClose -> {
+                            answer.thinkingMs = SystemClock.elapsedRealtime() - thinkingStart
+                            answer.phase = ChatMessage.Phase.ANSWERING
+                            answer.thinkingExpanded = null
+                        }
+                    }
                     revisionFlow.value += 1
                     val now = SystemClock.elapsedRealtime()
                     if (now - lastSave > SAVE_INTERVAL_MS) {
@@ -238,6 +259,14 @@ object ChatSession {
                     answer.content += "\n\n*${e.message}*"
                 }
             } finally {
+                // A stop inside the thinking leaves no answer: the message shows Interrupted and is not kept.
+                if (answer.phase == ChatMessage.Phase.THINKING) {
+                    answer.thinkingMs = SystemClock.elapsedRealtime() - thinkingStart
+                    answer.phase = ChatMessage.Phase.INTERRUPTED
+                } else {
+                    answer.phase = ChatMessage.Phase.DONE
+                }
+                answer.thinkingExpanded = null
                 revisionFlow.value += 1
                 generatingFlow.value = false
                 GenerationService.stop(app)
@@ -249,9 +278,11 @@ object ChatSession {
         }
     }
 
-    /** Write the conversation to disk, off the main thread. */
+    /** Write the conversation to disk, off the main thread. An interrupted answer is not written. */
     private fun save() {
-        val entries = messages.map { ConversationStore.Entry(it, metaByMessage[it]) }
+        val entries = messages
+            .filter { it.phase != ChatMessage.Phase.INTERRUPTED }
+            .map { ConversationStore.Entry(it, metaByMessage[it]) }
         scope.launch(Dispatchers.IO) { store.save(entries) }
     }
 }

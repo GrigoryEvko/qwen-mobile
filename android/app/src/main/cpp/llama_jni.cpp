@@ -87,6 +87,11 @@ struct Engine {
     ggml_backend_dev_t device_pf = nullptr;
     /** True when the first answer token of the turn was an end token on the prefill context. */
     bool first_eog = false;
+    /** The kind of the first answer token of a hybrid turn, for the next generateNext. */
+    int first_kind = 0;
+    /** The thinking tags of the vocabulary, or LLAMA_TOKEN_NULL. */
+    llama_token tok_think_open  = LLAMA_TOKEN_NULL;
+    llama_token tok_think_close = LLAMA_TOKEN_NULL;
     /** The state copies of the current turn, in microseconds. */
     int64_t transfer_us = 0;
     common_chat_templates_ptr tmpls;
@@ -151,6 +156,19 @@ std::set<int32_t> list_tids() {
     }
     closedir(dir);
     return tids;
+}
+
+/** The id of a special token, or LLAMA_TOKEN_NULL when the text is not one token. */
+llama_token single_token(const llama_vocab * vocab, const char * text) {
+    const std::vector<llama_token> ids = common_tokenize(vocab, text, false, true);
+    return ids.size() == 1 ? ids[0] : LLAMA_TOKEN_NULL;
+}
+
+/** The kind of a generated token for the app: 0 text, 1 the thinking opens, 2 the thinking closes. */
+int token_kind(const Engine & e, llama_token token) {
+    if (token == e.tok_think_open)  return 1;
+    if (token == e.tok_think_close) return 2;
+    return 0;
 }
 
 /** Length of the longest prefix of s that is complete UTF-8. */
@@ -267,7 +285,10 @@ bool hybrid_finish(Engine & e, std::string & error) {
         e.first_eog = true;
         return true;
     }
-    e.utf8_pending += common_token_to_piece(e.ctx, first, true);
+    e.first_kind = token_kind(e, first);
+    if (e.first_kind == 0) {
+        e.utf8_pending += common_token_to_piece(e.ctx, first, true);
+    }
     const int64_t t1 = now_us();
     if (decode_one(e, first) != 0) {
         error = "llama_decode failed on the first answer token";
@@ -425,6 +446,21 @@ std::pair<double, double> mean_std(const std::vector<double> & v) {
 
 Engine * engine_of(jlong handle) {
     return reinterpret_cast<Engine *>(handle);
+}
+
+/**
+ * The result of generateNext: byte 0 is the kind of the token (0 text,
+ * 1 the thinking opens, 2 the thinking closes), then the complete UTF-8
+ * bytes of the pending text. The tag tokens add no text.
+ */
+jbyteArray pack_piece(JNIEnv * env, Engine & e, int kind) {
+    const size_t complete = utf8_complete_prefix(e.utf8_pending);
+    jbyteArray out = env->NewByteArray((jsize) (1 + complete));
+    const jbyte k = (jbyte) kind;
+    env->SetByteArrayRegion(out, 0, 1, &k);
+    env->SetByteArrayRegion(out, 1, (jsize) complete, reinterpret_cast<const jbyte *>(e.utf8_pending.data()));
+    e.utf8_pending.erase(0, complete);
+    return out;
 }
 
 std::string jstring_to_std(JNIEnv * env, jstring s) {
@@ -635,6 +671,8 @@ Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, js
     e->hint = std::make_unique<PerfHintSession>(tids, kHintTargetNs);
 
     e->tmpls = common_chat_templates_init(e->model, "");
+    e->tok_think_open  = single_token(llama_model_get_vocab(e->model), "<think>");
+    e->tok_think_close = single_token(llama_model_get_vocab(e->model), "</think>");
     rebuild_sampler(*e, false, 0.7f, 0.8f);
 
     LOGI("model loaded: %s, device=%s, prefill=%s, gpu_layers=%d, threads=%d, n_ctx=%u, mmproj=%s",
@@ -723,6 +761,7 @@ Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass, jlong handle
     e->gen_tokens  = 0;
     e->gen_us      = 0;
     e->first_eog   = false;
+    e->first_kind  = 0;
     e->transfer_us = 0;
 
     if (!image_refs.empty()) {
@@ -796,6 +835,12 @@ Java_ai_airi_qwenmobile_LlamaNative_generateNext(JNIEnv * env, jclass, jlong han
         e->first_eog = false;
         return nullptr;
     }
+    if (e->first_kind != 0) {
+        // The first token of a hybrid turn was a thinking tag: report it before the next sample.
+        const int kind = e->first_kind;
+        e->first_kind = 0;
+        return pack_piece(env, *e, kind);
+    }
 
     const int64_t t0 = now_us();
     const llama_token token = llama_sampler_sample(e->smpl, e->ctx, -1);
@@ -804,19 +849,17 @@ Java_ai_airi_qwenmobile_LlamaNative_generateNext(JNIEnv * env, jclass, jlong han
         decode_one(*e, token);
         return nullptr;
     }
-    e->utf8_pending += common_token_to_piece(e->ctx, token, true);
+    const int kind = token_kind(*e, token);
+    if (kind == 0) {
+        e->utf8_pending += common_token_to_piece(e->ctx, token, true);
+    }
     if (decode_one(*e, token) != 0) {
         throw_java(env, "llama_decode failed during generation");
         return nullptr;
     }
     e->gen_tokens += 1;
     e->gen_us     += now_us() - t0;
-
-    const size_t complete = utf8_complete_prefix(e->utf8_pending);
-    jbyteArray out = env->NewByteArray((jsize) complete);
-    env->SetByteArrayRegion(out, 0, (jsize) complete, reinterpret_cast<const jbyte *>(e->utf8_pending.data()));
-    e->utf8_pending.erase(0, complete);
-    return out;
+    return pack_piece(env, *e, kind);
 }
 
 JNIEXPORT jstring JNICALL
