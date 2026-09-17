@@ -119,7 +119,7 @@ object ChatSession {
         if (path == null || !File(path).isFile) {
             return app.getString(R.string.no_model_selected)
         }
-        var config = EngineConfig(
+        val config = EngineConfig(
             path = path,
             backend = s.backend,
             threads = s.threads,
@@ -130,27 +130,20 @@ object ChatSession {
             return null
         }
         // A load that does not fit in memory gets killed while it runs. The
-        // hybrid backend holds the weights twice, thus it falls back to the GPU.
-        var problem: String? = null
+        // hybrid backend holds the weights twice. No other backend is taken
+        // in its place: the user selects the compute unit.
         if (!MemoryBudget.fits(app, config)) {
-            val fallback = if (config.backend == Backend.HYBRID) Backend.GPU else Backend.CPU
-            problem = app.getString(
-                R.string.load_too_large,
+            return app.getString(
+                R.string.load_no_memory,
                 MemoryBudget.format(MemoryBudget.weightBytes(config)),
                 MemoryBudget.format(MemoryBudget.availableBytes(app)),
-                fallback.label,
+                config.backend.label,
             )
-            config = config.copy(backend = fallback)
-            if (!MemoryBudget.fits(app, config)) {
-                return app.getString(R.string.load_no_memory, MemoryBudget.format(MemoryBudget.weightBytes(config)))
-            }
         }
         loadingFlow.value = true
         return try {
             LlamaEngine.load(config)
             LlamaEngine.resetChat()
-            // The fallback is a notice, not a failure: the model is loaded.
-            problem?.let { problemFlow.emit(it) }
             null
         } catch (e: Exception) {
             app.getString(R.string.load_failed, e.message ?: "?")

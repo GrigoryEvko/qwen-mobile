@@ -45,9 +45,14 @@ object MemoryBudget {
         return info.availMem
     }
 
-    /** True when the load fits with the runtime margin. */
-    fun fits(context: Context, config: EngineConfig): Boolean =
-        weightBytes(config) + RUNTIME_BYTES <= availableBytes(context)
+    /**
+     * True when the load fits with the runtime margin. The model that is
+     * loaded at the moment is released first, thus its bytes count as free.
+     */
+    fun fits(context: Context, config: EngineConfig): Boolean {
+        val loaded = LlamaEngine.state.value?.config?.let { weightBytes(it) } ?: 0L
+        return weightBytes(config) + RUNTIME_BYTES <= availableBytes(context) + loaded
+    }
 
     /** A text like "7.3 GB". */
     fun format(bytes: Long): String = "%.1f GB".format(bytes / 1e9)

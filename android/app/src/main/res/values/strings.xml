@@ -37,8 +37,7 @@
     <string name="no_model_selected">Select a model in Settings.</string>
     <string name="no_model">No model. Put a .gguf file in /sdcard/qwen/models and select it in Settings.</string>
     <string name="load_failed">The model did not load: %1$s</string>
-    <string name="load_too_large">The weights need %1$s, the phone has %2$s free. Loaded on the %3$s instead.</string>
-    <string name="load_no_memory">The weights need %1$s, more than the phone has free. Select a smaller model.</string>
+    <string name="load_no_memory">The weights need %1$s on the %3$s, the phone has %2$s free. Select a smaller model or another compute unit.</string>
     <string name="notification_channel">Generation</string>
     <string name="notification_answering">Qwen is answering</string>
     <string name="image_failed">The image did not open: %1$s</string>
