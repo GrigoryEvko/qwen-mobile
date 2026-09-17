@@ -19,6 +19,15 @@ from safetensors.torch import save_file
 LM = "model.language_model."
 # The dense map of a tied head, M = Qᵀ·diag(γ_f)·Q. The graph applies it after the final norm.
 OUTPUT_ROT = LM + "output_rot.weight"
+# The multi-token prediction (MTP) block, the ``mtp.`` prefix of the checkpoint.
+MTP = "mtp."
+# The dense map before the hidden norm of the MTP block, diag(γ_f)·Q: it makes the final-norm
+# output of the original model from the rotated normed state.
+MTP_HNORM_ROT = MTP + "hnorm_rot.weight"
+# The dense map after the shared head norm of the MTP block, Qᵀ·diag(γ_f)⁻¹·diag(γ_s)·Q. It puts
+# the normed state of the MTP block into the convention of the main model. Thus the shared head and
+# the next draft step read that state as they read the main model.
+MTP_HEAD_ROT = MTP + "shared_head_rot.weight"
 
 
 def load_checkpoint(directory: Path) -> "OrderedDict[str, torch.Tensor]":
