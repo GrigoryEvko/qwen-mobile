@@ -17,6 +17,11 @@ Hadamard R1 on the residual stream, head untied.
 | 2 | Targeted plan, round-to-nearest Q4_0 with MSE scale search (worst case) | 1.62 GiB file | 0.0836 | 1.50 | 3.21 | 84.22 % | 14.73 |
 | 3 | Targeted plan, GPTQ Q4_0 (128 x 2048 C4 tokens, damp 0.01), head round-to-nearest | 1.62 GiB file | 0.0373 | 0.629 | 1.01 | 88.48 % | 14.49 |
 | 4 | Qronos refit (FP-flow reference across the model) + folded column scales + MLP permutation, head solved, Q4_0, solver only | 1.62 GiB file | 0.0299 | 0.727 | 2.97 | 90.47 % | 14.08 |
+| 5 | Block optimization from the RTN start (8 epochs on 128 x 2048, all layer parameters, head on the KL), folds as row 4, Q4_0 | 1.62 GiB file | 0.0412 | 0.598 | 2.08 | 88.38 % | 14.69 |
+
+Row 5 over-fits: the per-layer training loss halves, the held-out error grows at every layer (drift
+KL 0.0421 against 0.0291 for row 3). The diagnostics (solver start, frozen latent weights, 2 epochs,
+4x data) follow.
 
 Grid test on Gaussian weights (256 x 512, block-32 F16 scales with the scale search, 4.5 bits per
 weight, `python -m quant.trellis`): Q4_0 21.8 dB, IQ4_NL 22.2 dB, codebook per matrix 22.3 dB,

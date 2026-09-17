@@ -12,3 +12,4 @@ __pycache__/
 android/snapdragon/jniLibs/
 android/snapdragon/build/
 android/snapdragon/*.apk
+android/.device-lock
