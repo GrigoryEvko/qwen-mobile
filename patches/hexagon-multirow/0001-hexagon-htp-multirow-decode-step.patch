@@ -30,10 +30,15 @@ sums next to the tiled blocks, in the DDR scratchpad of the context.
 The measurement of the lab, in cycles for one tile of 32 weight rows:
 
     rows        Q4_0 before   Q4_0 after    Q8_0 before   Q8_0 after
-    1           70.8          51.1          ---           ---
-    2           100.7         83.0          ---           ---
-    3           171.4         89.4          ---           ---
-    4           201.3         101.6         ---           ---
+    1           70.8          51.1          52.8          48.9
+    2           100.7         83.0          108.6         82.7
+    3           171.4         89.4          161.3         82.9
+    4           201.3         101.6         217.4         103.5
+
+A Q4_0 tile holds 576 bytes and a Q8_0 tile holds 1088 bytes. Thus the four rows of a Q8_0 verify
+step take 103.5 cycles for 1088 bytes: 10.5 bytes for each cycle, and the load unit of one thread
+reads 128 bytes in 8 cycles at best. The kernel of the checkout takes 217.4 cycles for the same
+tile. Each row of the lab agrees with the scalar reference of the harness to the last bit.
 
 GGML_HEXAGON_MULTIROW=0 gives the operator the row-pair path of the checkout, thus one build
 measures both. The operator keeps the row-pair path when the DDR scratchpad is too small for the
