@@ -15,6 +15,7 @@ hexagon-host/0002-llama-host-timers-and-embd-lookup.patch
 hexagon-host/0003-llama-sampler-topset.patch
 hexagon-fusion/0005-hexagon-htp-gdn-chunked-hmx.patch
 hexagon-multirow/0001-hexagon-htp-multirow-decode-step.patch
+hexagon-fusion/0006-hexagon-htp-gdn-conv-chunk.patch
 # The chunked delta rule above fails 6 of 47 cases of test-backend-ops on a
 # tolerance: the error is 1.24e-7 against a limit of 1.0e-7, which is the
 # rounding of the fp16 inputs of the HMX. The model does not move: the 2B Q8_0
