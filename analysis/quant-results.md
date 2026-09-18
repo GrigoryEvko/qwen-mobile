@@ -523,3 +523,18 @@ value heads of `attn_qkv`, `attn_gate`, `ssm_alpha`, `ssm_beta` and the columns 
 per key head, thus the 2B rows never took that path, and the first 4B file must pass the
 `llama-completion` check before any KL run. And the export above reads the folded reference, thus
 it needs no `--promote` and no `quant/refold.py`.
+
+The two product models on the NPU, 2026-09-18, thermal status 0, the series of 18 patches
+(llama-bench -p 512 -n 64, and llama-server --spec-type draft-mtp --spec-draft-n-max 3 on a
+free-form prompt of 96 tokens):
+
+| File | Prefill t/s | Decode t/s | Decode with MTP t/s | Accepted |
+|---|---|---|---|---|
+| Qwen3.5-2B-Q8_0 | 1558 | 23.6 | 27.8 to 28.8 | 77 to 82 % |
+| Qwen3.5-4B-Q8_0 | 755 | 10.4 | 15.4 | 71 % |
+
+The morning of the same day gave 981 / 21.5 for the 2B and 382 / 7.0 for the 4B, thus the prefill
+of both models is twice as fast. The chunked gated delta rule carries that gain, and the host
+patches make the speculative decoding pay. The multi-row matmul of a verify step is neutral end to
+end: the weight stream of a step already hides its compute, thus the kernel gives a margin for a
+longer draft and not a time today.
