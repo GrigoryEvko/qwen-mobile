@@ -64,6 +64,35 @@ operand is signed 8-bit (`weight.b`). A zero point on the activation is
 available and a zero point on the weight is not, which is the standard
 arrangement and the correct one. Refer to section 5.2.
 
+**The 2.05 figure is the multiply alone, and the accumulator read is not free.**
+The int32 accumulator has no f16 store and no f32 store. It leaves only as u8 or
+as u16, thus a full int32 read is four byte-plane stores of
+`mxmem(out, rN):after:retain:cm.ub = acc`, each with its own scale in the bias
+register. The intercepts of the same measurement price it. The f16 read costs
+nothing that the fit can see, and the int8 read costs about **711 processor
+cycles** for one 64 x 32 tile. One read covers the whole k range of one output
+tile, thus at K = 2560 the arithmetic is:
+
+| | f16, 64 rows | int8, 64 rows |
+|---|---|---|
+| multiply | 160 issues, 5558 cyc | 80 issues, 2707 cyc |
+| accumulator read | about 0 | about 711 cyc |
+| total | 5558 | 3418 |
+
+That is **1.63 times, not 2.05**. There is a worse case. Our own kernel reaches
+about 9 cycles for one f16 tile where the HexKL call costs 34, thus most of the
+per-issue figure is call overhead and not engine time. If the 711 cycles is
+mostly engine time, the true ratio falls toward 1.04. Do not plan on 2.05 until
+a device run settles it. `tools/hmx-bench` now times the read on its own.
+
+**The instruction set is reachable without HexKL, and that matters because the
+HexKL archive cannot ship.** The macros are in the tree at
+`ggml/src/ggml-hexagon/htp/hmx-utils.h`, behind patch `hexagon-hmx-i8/0001`.
+They compile with the Hexagon compiler and emit the same encodings as the vendor
+library. The multiply packet is
+`{ activation.ub = mxmem(act, 0x1f):cm ; weight.b = mxmem(wt, 0x380) }`, and the
+k tiles chain with `:deep:cm` in that order.
+
 ### 1.3 Where the time goes
 
 Decode is bandwidth bound. The 4B streams 4610 MB for each token at about
@@ -124,6 +153,17 @@ order of magnitude above that.
 
 This single fact, and not accuracy, rules out every large codebook on this
 part. Section 12.10 gives the measured curve.
+
+**One exception, and it is an instruction and not a grid.** The matrix engine
+has a native 4-bit weight load, `weight.n`, and HexKL ships `mm_u8i4` for it.
+The geometry is the same 64 x 32 x 32 and the issue count is the same. Only the
+weight tile changes, from 1024 bytes to 512, and the range operand from 0x380
+to 0x180. The engine unpacks the nibbles itself, thus the lookup budget of this
+section does not reach a 4-bit weight on the matmul path. That buys bytes and
+not issues, which is exactly the decode lever of section 1.3. It does not touch
+the accuracy question, and the scale rule of section 1.1 still binds: such a
+weight needs one scale for each output channel, not one for each block of 32.
+Refer to section 10.
 
 Two related facts, both worth a check in our tree.
 
@@ -1051,6 +1091,12 @@ WikiText-512 metrics favour quants whose calibration is WikiText-like.
 The owner's decision is 8 bits. This section records why, and what would have
 to be true for 4 bits to come back. The user asked directly whether any 4-bit
 method can close the gap with 8 bits, so the answer is here in full.
+
+One hardware fact arrived after this section, and it removes the kernel
+objection without touching the accuracy argument. Refer to section 1.5: the
+matrix engine has a native 4-bit weight load. Thus a 4-bit MLP would pay no HVX
+unpack and no extra issues, and it would halve the bytes of the class that is
+52.5 % of the token. The argument below is about accuracy alone, and it stands.
 
 ### 10.1 The measurement that decides it, from our own table
 
