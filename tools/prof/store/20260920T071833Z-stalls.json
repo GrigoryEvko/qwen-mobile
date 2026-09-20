@@ -1,0 +1,45 @@
+{
+  "when": "20260920T071833Z",
+  "set": "stalls",
+  "model": "/data/local/tmp/qwen/models/Qwen3.5-4B-Q8_0.gguf",
+  "dev": "HTP0",
+  "bindir": "/data/local/tmp/qwen/kl/bin",
+  "libdir": "/data/local/tmp/qwen/kl/lib",
+  "pp": 0,
+  "tg": 8,
+  "reps": 1,
+  "device_before": {
+    "serial": "192.168.14.130:5555",
+    "model": "PJZ110",
+    "charging": false,
+    "thermal": 0,
+    "battery": 86
+  },
+  "device_after": {
+    "serial": "192.168.14.130:5555",
+    "model": "PJZ110",
+    "charging": false,
+    "thermal": 0,
+    "battery": 86
+  },
+  "passes": [
+    {
+      "pass": 1,
+      "events": [
+        "COMMITTED_PKT_ANY",
+        "COMMITTED_INSTS",
+        "DU_CACHE_MISS_PVIEW_CYCLES",
+        "CU_BUSY_PVIEW_CYCLES",
+        "COPROC_BUSY_PVIEW_CYCLES",
+        "IU_NO_PKT_PVIEW_CYCLES",
+        "DU_BUSY_OTHER_PVIEW_CYCLES",
+        "SYSTEM_BUSY_PVIEW_CYCLES"
+      ],
+      "events_hex": "0x3,0x2a,0xe9,0xeb,0xed,0xe8,0xea,0xef",
+      "seconds": 38.0,
+      "log": "20260920T071833Z-stalls-p1.log",
+      "log_bytes": 1829716,
+      "tail": "rc=0\n| model                          |       size |     params | backend    | ngl | dev          |            test |                  t/s |\n| ------------------------------ | ---------: | ---------: | ---------- | --: | ------------ | --------------: | -------------------: |\n| qwen35 4B Q8_0                 |   4.40 GiB |     4.33 B | OpenCL,HTP |  99 | HTP0         |             tg8 |          7.76 \u00b1 0.00 |\nllama_perf_context_print:        load time =   10554.18 ms\nllama_perf_context_print: prompt eval time =       0.00 ms /     1 tokens (    0.00 ms per token,      inf tokens per second)\nllama_perf_context_print:        eval time =       0.00 ms /     9 runs   (    0.00 ms per token,      inf tokens per second)\nllama_perf_context_print:       total time =   11584.91 ms /    10 tokens\nllama_perf_context_print:    graphs reused =          7\n~llama_context:       HTP0 compute buffer size is   7.7389 MiB, matches expectation of   7.7389 MiB\n~llama_context:        CPU compute buffer size is   0.1605 MiB, matches expectation of   0.1605 MiB\n\nbuild: c6824a9 (11008)"
+    }
+  ]
+}
