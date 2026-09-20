@@ -238,9 +238,13 @@ def launch(model: str, binary: str, gpu: int, port: int, np: int, ctx: int, lv: 
         The server process
     """
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu))
+    # The host prompt cache of the server keeps the state of every finished
+    # slot in RAM, 8192 MiB per server by default, and the harvest never
+    # repeats a prompt: with it on, nine servers grow by about 1 GiB per
+    # minute each until the memory guard fires.
     cmd = [binary, "-m", model, "--spec-type", spec, "-ngl", "99", "-fa", "on",
            "-np", str(np), "-c", str(ctx), "-b", str(ubatch), "-ub", str(ubatch),
-           "--host", "127.0.0.1", "--port", str(port),
+           "--cache-ram", "0", "--host", "127.0.0.1", "--port", str(port),
            "-lv", str(lv), "--metrics", *extra]
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             env=env, bufsize=1024 * 1024)
