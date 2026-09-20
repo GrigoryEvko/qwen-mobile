@@ -21,12 +21,29 @@
 #   the proposal patches (tools/htp-lab/proposals/*.patch) applied to a copy in the output directory.
 #
 # Environment:
-#   LLAMA_DIR  The llama.cpp checkout, read only. Default: /home/grigory/Downloads/llama.cpp
+#   LLAMA_DIR  The llama.cpp checkout, read only. Default: the submodule third_party/llama.cpp with the
+#              patch series applied, thus the lab measures the kernels that the app ships. A different
+#              checkout gives a notice, because its numbers are not those of the app.
+#              Each report starts with a "lab: tree" line: the path, the commit, and a hash of the
+#              kernel directory. The hash changes with each edit of a kernel file, thus a number
+#              always names its source. A target with the suffix "_after" also gets a
+#              "lab: proposals" line with the name and the hash of each applied proposal.
 #   IMAGE      The container image with the Hexagon SDK. Default: ghcr.io/snapdragon-toolchain/arm64-android:v0.7
 #   SIM_ARGS   More options for hexagon-sim, for example "--plimit 60000000"
 #   TAG        The name of the output directory suffix of "run" (out/<target>-<tag>). Default: run
 #   MODE       "functional" runs "run" without the timing model. Default: timing
 #   NO_BUILD   Set to 1 to skip the build step of "run" (for parallel runs of built programs)
+#   LAB_OUT    The output directory, relative to the repository. Default: tools/htp-lab/out.
+#              Each concurrent user of the lab needs its own, because the build directory and the
+#              patched copy of the kernel directory live there.
+#   LAB_TARGETS The targets to build, space separated and without the "target_" prefix. The
+#              default is every lab/target_*.c. Name your targets when others are editing the
+#              lab at the same time: a build failure of a target that you do not name cannot
+#              stop yours. The build also passes -k 0, thus one broken target never stops the
+#              others, and "run" reports a missing program rather than a build error.
+#   PROPOSALS  The proposal patches to apply, as space-separated names of tools/htp-lab/proposals.
+#              Default: every patch of that directory. "none" applies no patch, thus the "_after"
+#              programs measure the kernels of the checkout.
 #
 # Output (tools/htp-lab/out/, not in git):
 #   build/                       The CMake build directory (Ninja)
@@ -64,20 +81,66 @@ set -euo pipefail
 
 LAB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${LAB_DIR}/../.." && pwd)"
-LLAMA_DIR="${LLAMA_DIR:-/home/grigory/Downloads/llama.cpp}"
+LLAMA_DIR="${LLAMA_DIR:-${REPO_DIR}/third_party/llama.cpp}"
 IMAGE="${IMAGE:-ghcr.io/snapdragon-toolchain/arm64-android:v0.7}"
 SIM_ARGS="${SIM_ARGS:-}"
-OUT_REL="tools/htp-lab/out"
+OUT_REL="${LAB_OUT:-tools/htp-lab/out}"
+PROPOSALS="${PROPOSALS:-}"
+LAB_TARGETS="${LAB_TARGETS:-}"
+SUBMODULE_DIR="${REPO_DIR}/third_party/llama.cpp"
+HTP_REL="ggml/src/ggml-hexagon/htp"
+
+# Print the identity of the measured tree: the path, the commit, and the first 12 characters of the
+# SHA-256 of all files of the kernel directory. O(bytes of the kernel directory).
+tree_id() {
+    local commit hash
+    commit=$(git -C "${LLAMA_DIR}" rev-parse --short HEAD 2> /dev/null || echo unknown)
+    hash=$(cd "${LLAMA_DIR}/${HTP_REL}" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-12)
+    echo "${LLAMA_DIR} commit ${commit} htp ${hash}"
+}
+
+# Print "<name>:<first 8 characters of the SHA-256>" for each active proposal, or "none".
+proposal_ids() {
+    local p out="" list
+    if [ "${PROPOSALS}" = "none" ]; then
+        echo none
+        return
+    fi
+    if [ -n "${PROPOSALS}" ]; then
+        list=""
+        for p in ${PROPOSALS}; do
+            list="$list ${LAB_DIR}/proposals/$p"
+        done
+    else
+        list=$(ls "${LAB_DIR}"/proposals/*.patch 2> /dev/null || true)
+    fi
+    for p in $list; do
+        [ -e "$p" ] || continue
+        out+="$(basename "$p"):$(sha256sum "$p" | cut -c1-8) "
+    done
+    echo "${out:-none}"
+}
+
+[ -d "${LLAMA_DIR}/${HTP_REL}" ] || {
+    echo "error: ${LLAMA_DIR}/${HTP_REL} does not exist. Run 'git submodule update --init', or set LLAMA_DIR to a llama.cpp checkout." >&2
+    exit 1
+}
+if [ "$(cd "${LLAMA_DIR}" && pwd -P)" != "$(cd "${SUBMODULE_DIR}" 2> /dev/null && pwd -P)" ]; then
+    echo "lab: NOTICE: LLAMA_DIR=${LLAMA_DIR} is not the submodule. These numbers are not those of the app." >&2
+fi
+LAB_TREE="$(tree_id)"
+LAB_PROPOSALS="$(proposal_ids)"
 
 usage() {
-    sed -n '2,60p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,78p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 in_container() {
     # Runs the given script text inside the container with the repository and llama.cpp mounted
     podman run --rm --userns=keep-id --security-opt label=disable \
         -v "${REPO_DIR}:/repo" -v "${LLAMA_DIR}:/llama" -w /repo \
-        -e "SIM_ARGS=${SIM_ARGS}" \
+        -e "SIM_ARGS=${SIM_ARGS}" -e "LAB_TREE=${LAB_TREE}" -e "LAB_PROPOSALS=${LAB_PROPOSALS}" \
+        -e "OUT_REL=${OUT_REL}" -e "PROPOSALS=${PROPOSALS}" -e "LAB_TARGETS=${LAB_TARGETS}" \
         "${IMAGE}" bash -c "$1"
 }
 
@@ -90,7 +153,7 @@ mkdir -p /tmp/shim
 ln -sf /usr/lib/x86_64-linux-gnu/libncurses.so.6 /tmp/shim/libncurses.so.5
 ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /tmp/shim/libtinfo.so.5
 export LD_LIBRARY_PATH=/tmp/shim
-OUT=/repo/tools/htp-lab/out
+OUT="/repo/${OUT_REL}"
 EOF
 
 # Builds all programs. The proposal patches are applied to a copy of the kernel directory.
@@ -99,15 +162,26 @@ mkdir -p "$OUT"
 rm -rf "$OUT/htp-proposed"
 cp -r /llama/ggml/src/ggml-hexagon/htp "$OUT/htp-proposed"
 PROPOSED=""
-for p in /repo/tools/htp-lab/proposals/*.patch; do
-    [ -e "$p" ] || continue
-    git -C /repo apply -p5 --directory=tools/htp-lab/out/htp-proposed "$p"
+if [ "${PROPOSALS:-}" = "none" ]; then
+    list=""
+elif [ -n "${PROPOSALS:-}" ]; then
+    list=""
+    for name in $PROPOSALS; do
+        [ -e "/repo/tools/htp-lab/proposals/$name" ] || { echo "no proposal $name"; exit 1; }
+        list="$list /repo/tools/htp-lab/proposals/$name"
+    done
+else
+    list=$(ls /repo/tools/htp-lab/proposals/*.patch 2> /dev/null || true)
+fi
+for p in $list; do
+    git -C /repo apply -p5 --directory="${OUT_REL}/htp-proposed" "$p"
     PROPOSED="$OUT/htp-proposed"
 done
 cmake -G Ninja -S /repo/tools/htp-lab -B "$OUT/build" \
     -DCMAKE_TOOLCHAIN_FILE=/repo/tools/htp-lab/toolchain.cmake \
-    -DLLAMA_DIR=/llama -DHTP_PROPOSED_DIR="$PROPOSED" > "$OUT/cmake.log"
-ninja -C "$OUT/build"
+    -DLLAMA_DIR=/llama -DHTP_PROPOSED_DIR="$PROPOSED" -DLAB_TARGETS="${LAB_TARGETS:-}" > "$OUT/cmake.log"
+# -k 0 keeps going after a failure, thus a target that another agent is editing cannot stop yours.
+ninja -k 0 -C "$OUT/build" || echo "lab: NOTE: at least one target did not build. The others did."
 EOF
 
 # Runs one program under the simulator and writes the profile files.
@@ -121,13 +195,16 @@ run_target() {
     [ -x "$elf" ] || { echo "no program $elf"; return 1; }
     rm -rf "$dir"; mkdir -p "$dir"; cd "$dir"
     echo "== run $target-$tag: $*"
+    # the source of the numbers, as the first lines of the output and thus of the report
+    echo "lab: tree ${LAB_TREE}" > tree.txt
+    case "$target" in *_after) echo "lab: proposals ${LAB_PROPOSALS}" >> tree.txt ;; esac
     if [ "${MODE:-timing}" = "functional" ]; then
-        hexagon-sim --mv79 $SIM_ARGS "$elf" -- "$@" 2>&1 | tee stdout.txt
+        { cat tree.txt; hexagon-sim --mv79 $SIM_ARGS "$elf" -- "$@"; } 2>&1 | tee stdout.txt
         grep "^lab:" stdout.txt > report.txt || true
         return 0
     fi
-    hexagon-sim --mv79 --timing --profile --packet_analyze pa.json --pmu_statsfile pmu.txt $SIM_ARGS \
-        "$elf" -- "$@" 2>&1 | tee stdout.txt
+    { cat tree.txt; hexagon-sim --mv79 --timing --profile --packet_analyze pa.json --pmu_statsfile pmu.txt $SIM_ARGS \
+        "$elf" -- "$@"; } 2>&1 | tee stdout.txt
     hexagon-profiler --packet_analyze --json=pa.json --elf="$elf" -o pa.html > /dev/null 2>&1 || true
     hexagon-nm -S -n "$elf" > symbols.txt
     hexagon-llvm-objdump -d --no-show-raw-insn "$elf" > disasm.txt

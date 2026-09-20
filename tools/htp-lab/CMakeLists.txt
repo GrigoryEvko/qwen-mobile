@@ -32,7 +32,24 @@ function(lab_add_target name source htp_include)
     target_link_options(${name} PRIVATE -m${HEXAGON_ARCH} -mhvx=${HEXAGON_ARCH} -mhmx -G0)
 endfunction()
 
-set(LAB_TARGETS gdn_conv q4 q8 hmx)
+# The targets are the files lab/target_<name>.c. A new target needs no edit of this file, thus
+# several agents can add targets at the same time without a conflict. CONFIGURE_DEPENDS makes
+# the build system run CMake again when a file appears or goes away.
+# LAB_TARGETS selects the targets. When it is empty every lab/target_*.c is a target, thus a
+# new target needs no edit of this file and several agents can add targets at the same time.
+# Naming the targets is faster and it keeps a broken target of another agent out of the build.
+set(LAB_TARGETS "" CACHE STRING "The targets to build, empty for every lab/target_*.c")
+if (NOT LAB_TARGETS)
+    file(GLOB LAB_TARGET_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/lab/target_*.c)
+    foreach(src ${LAB_TARGET_SOURCES})
+        get_filename_component(base ${src} NAME_WE)
+        string(REPLACE "target_" "" name ${base})
+        list(APPEND LAB_TARGETS ${name})
+    endforeach()
+endif()
+separate_arguments(LAB_TARGETS)
+list(SORT LAB_TARGETS)
+message(STATUS "lab targets: ${LAB_TARGETS}")
 foreach(t ${LAB_TARGETS})
     lab_add_target(lab_${t} ${CMAKE_CURRENT_SOURCE_DIR}/lab/target_${t}.c ${HTP_DIR})
     if (HTP_PROPOSED_DIR)

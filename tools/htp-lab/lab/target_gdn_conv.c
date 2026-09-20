@@ -22,20 +22,26 @@
 #define TARGET "gdn_conv"
 #define D_CONV 4
 
+// The slot holds the three taps of a channel one after the other, in both programs.
+//
+// A plane layout (tap t of every channel in one row) would remove almost every permute of this
+// kernel, but the slot is the recurrent state cache of llama.cpp: the graph of
+// src/models/delta-net-base.cpp builds it with a CONCAT of [d_conv - 1, n_ch], every chain that
+// the Hexagon matcher refuses reads it with the generic ops, and
+// llama_memory_recurrent::state_write_data writes those bytes into the state file that the app
+// stores. Thus a plane layout needs the host, the CPU reference and the state file to change
+// together, and at one token the conversion at the two ends costs the permutes again. The
+// proposal keeps the layout and changes the schedule instead.
 #ifdef LAB_PROPOSED
-#define LAYOUT "planes"
-// plane t of the slot holds tap t of every channel
-static inline size_t slot_off(uint32_t c, uint32_t t, uint32_t n_ch) {
-    return (size_t) t * n_ch + c;
-}
+#define LAYOUT "interleaved (proposal)"
 #else
 #define LAYOUT "interleaved"
-// the slot holds the three taps of a channel one after the other
+#endif
+
 static inline size_t slot_off(uint32_t c, uint32_t t, uint32_t n_ch) {
     (void) n_ch;
     return (size_t) c * 3 + t;
 }
-#endif
 
 // The scalar reference: the sum order of ggml_compute_forward_ssm_conv_f32, then x * sigmoid(x).
 // taps[t * n_ch + c] is tap t of channel c, in time order.
