@@ -258,9 +258,12 @@ def stop_servers(procs: list[subprocess.Popen]) -> None:
     """
     for p in procs:
         p.terminate()
+    # One deadline for all of them, thus a slow shutdown of nine servers
+    # takes 30 seconds and not nine times that.
+    deadline = time.time() + 30.0
     for p in procs:
         try:
-            p.wait(timeout=30)
+            p.wait(timeout=max(0.1, deadline - time.time()))
         except subprocess.TimeoutExpired:
             p.kill()
 
@@ -575,8 +578,9 @@ def main() -> int:
     ap.add_argument("--np", type=int, default=32, help="parallel slots per server")
     ap.add_argument("--ctx", type=int, default=0,
                     help="total context per server, 0 = np times the slot context of its profile")
-    ap.add_argument("--ubatch", type=int, default=2048,
-                    help="the micro batch of a server, at least the slots plus the longest prompt")
+    ap.add_argument("--ubatch", type=int, default=1024,
+                    help="the batch and the micro batch of a server, thus one decode step never "
+                         "spans two micro batches; 2048 costs about 3 GiB more host memory per server")
     ap.add_argument("--lv", type=int, default=5, help="5 emits the draft candidates")
     ap.add_argument("--spec", default="draft-mtp")
     ap.add_argument("--extra", default="-t 4 -tb 8", help="more server flags, space separated")
