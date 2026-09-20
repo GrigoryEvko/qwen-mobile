@@ -1,0 +1,134 @@
+hexagon: overlap the HMX weight stream below 33 rows, and fall back when it does not fit
+
+Base: llama.cpp commit c6824a9 plus the patches before this one in patches/series.
+
+Files:
+    ggml/src/ggml-hexagon/htp/matmul-ops.h  the row count at which the HMX 2D path pipelines
+    ggml/src/ggml-hexagon/ggml-hexagon.cpp  the serial fallback when the pipelined solve refuses
+
+The problem
+
+htp_mm_hmx_pipeline returned m > 32, thus every row count from 5 to 32 ran the HMX 2D path
+with the weight DMA, the dequantization and the multiply in sequence. Measured on the phone on
+2026-09-20 with test-backend-ops perf --test-file over the three 4B shapes at Q8_0 with f32
+activations (k 2560 n 9216, k 9216 n 2560, k 2560 n 2560), the weight stream runs at 51 to
+55 GB/s at 1 to 4 rows, at 41 to 44 GB/s over 5 to 32 rows, and at 51 to 55 GB/s again at
+64 rows. At k 2560 n 9216 that is 572 us at 5 rows against 457 us at 64 rows: the op is
+slower in wall time for a tenth of the work. The host pads the row count to a multiple of 32
+(ne11_padded) and the solver aligns its m chunk down to 32, thus 5 rows and 32 rows do the same
+HMX work, and the whole range is one plateau.
+
+Rows 5 to 32 are where the speculative verify runs, where a short prefill lands, and where the
+MTP ladder expects its rows to be cheap.
+
+Why 32 was chosen
+
+Not for capacity. The pipelined layout holds a second weight buffer, a second scratch pad and a
+second output tile, and its overhead is 7 tiles rather than 5, thus its cost for each column is
+twice that of the serial layout. It still fits. A model of htp_mm_hmx_compute_chunks and
+htp_mm_hmx_vtcm_layout_build that reproduces the vtcm value of the profile line exactly at
+5, 32, 64, 128 and 512 rows gives, at 32 rows and the 8 MB budget:
+
+    shape                     serial m_chunk n_chunk    vtcm  |  pipelined m_chunk n_chunk    vtcm
+    k 2560 n 9216 gate_up          32     992  8165376  |          32     480  7907328
+    k 9216 n 2560 down             32     256  7981056  |          32     128  7981056
+    k 2560 n 2560 proj             32     992  8165376  |          32     480  7907328
+    k 2560 n 248320 head           32     992  8165376  |          32     480  7907328
+
+The pipelined layout is the smaller of the two at three of the four shapes, because the solver
+spends the budget it saves on a wider n chunk and stops at the same m chunk of 32 either way.
+The m chunk stays 32, thus the weight is still streamed once for the whole op, and the
+activation stays resident: the layout puts it in group A, which never overlaps the compute
+buffers.
+
+Not for correctness either. The pipelined loop guards its prologue on n_chunk_cnt > 1, its
+prefetch on i + 2 < n_chunk_cnt and its store on i > 0, and its epilogue drains the last tile,
+thus it is correct with one n chunk. Nothing in it reads the row count except
+hmx_ceil_div(n_rows, 32), which is 1 for every row count from 1 to 32. The comment on the other
+branch of the same if, "Synchronous loop (m <= 32 or fallback)", records the threshold and not a
+reason for it.
+
+The change
+
+1. htp_mm_hmx_pipeline returns m > HTP_MM_HMX_MIN_NROWS, which is the row count at which the
+   HMX path starts at all, thus every HMX matmul pipelines.
+
+2. ggml_hexagon_precompute_hmx_mm_params tries the serial layout when the solver refuses the
+   pipelined one. The doubled cost for each column does exceed the budget for a large reduction
+   dimension: at n 4096 and Q8_0 the pipelined layout fits up to k 31680 and the serial layout up
+   to k 51040. Without the fallback such a shape would lose the HMX path and fall to HVX, which
+   is a regression. No shape of our models is near that limit (the largest k is 9216), thus the
+   fallback is a guard and not a path we take.
+
+Prediction, not a measurement
+
+The simulator runs HMX functionally and its timing model never retires an HMX instruction, thus
+this change cannot be timed in tools/htp-lab. The expectation is that rows 5 to 32 move from
+41 to 44 GB/s to the 51 to 55 GB/s that 1 to 4 rows and 64 rows already reach, because the same
+weight stream then overlaps the dequantization. At k 2560 n 9216 that is 572 us to about 460 us,
+a factor of about 1.25, and it would make the cost flat from 1 row to 64 rows. The recipe that
+measures it is in the report of this work.
+
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index fc5609e..6884a0d 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -4810,7 +4810,7 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
+     struct htp_mm_kernel_params * kparams
+ ) {
+     const int aligned_tile_size = htp_mm_get_weight_aligned_tile_size(wtype);
+-    const bool pipeline = is_matmul_id ? false : htp_mm_hmx_pipeline(ne11);
++    bool pipeline = is_matmul_id ? false : htp_mm_hmx_pipeline(ne11);
+     const int n_threads = (int)sess->n_threads;
+     const int ne10 = src1->ne[0];
+ 
+@@ -4835,7 +4835,17 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
+         // Fallback to simple 2D path (group_size = 1)
+         const int m_id_rows = (dst && is_matmul_id) ? (int) ((size_t) dst->ne[1] * dst->ne[2]) : 0;
+         if (!htp_mm_hmx_solve_2d_params(wtype, ne00_padded, m_id_rows, ne01_padded, ne11_padded, ne11, n_threads, pipeline, is_matmul_id, aligned_tile_size, vtcm_budget, &m_chunk, &n_chunk, &act_threads_selected, &vtcm_size)) {
+-            return false;
++            // The pipelined layout holds a second weight buffer, a second scratch pad and a
++            // second output tile, thus its cost for each column is twice that of the serial
++            // layout. A shape with a very large k can exceed the VTCM budget where the serial
++            // layout fits. Use the serial layout for that shape rather than give up the HMX path.
++            if (!pipeline) {
++                return false;
++            }
++            pipeline = false;
++            if (!htp_mm_hmx_solve_2d_params(wtype, ne00_padded, m_id_rows, ne01_padded, ne11_padded, ne11, n_threads, pipeline, is_matmul_id, aligned_tile_size, vtcm_budget, &m_chunk, &n_chunk, &act_threads_selected, &vtcm_size)) {
++                return false;
++            }
+         }
+     }
+ 
+diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.h b/ggml/src/ggml-hexagon/htp/matmul-ops.h
+index 4953592..1bf43b1 100644
+--- a/ggml/src/ggml-hexagon/htp/matmul-ops.h
++++ b/ggml/src/ggml-hexagon/htp/matmul-ops.h
+@@ -285,8 +285,25 @@ static inline size_t htp_mm_round_up(size_t n, size_t m) {
+     return ((n + m - 1) / m) * m;
+ }
+ 
++// Whether the HMX 2D path overlaps the weight DMA and the dequantization with the multiply.
++//
++// The threshold was m > 32, which left every row count from 5 to 32 on the serial path. That is
++// not a capacity limit: the pipelined layout needs a second weight buffer, a second scratch pad
++// and a second output tile, and at 32 rows it still fits the 8 MB VTCM with room to spare on
++// every shape of our models (measured on 2026-09-20: k 2560 n 9216 needs 7907328 of 8388608
++// bytes pipelined against 8165376 serial, because the solver spends the budget it saves on a
++// wider n chunk). It is not a correctness limit either: the pipelined loop guards its prologue
++// and its epilogue on n_chunk_cnt and runs correctly with one n chunk.
++//
++// The serial path measured 41 to 44 GB/s of the weight stream over rows 5 to 32 on all three
++// 4B shapes, against 51 to 55 GB/s at 1 to 4 rows and at 64 rows, because the DMA and the
++// multiply do not overlap. The row count at which pipelining starts to pay is thus the row
++// count at which the HMX path starts at all.
++//
++// The caller must fall back to the serial layout when the solver refuses the pipelined one,
++// because a shape with a very large k can exceed the budget with the doubled per-column cost.
+ static inline bool htp_mm_hmx_pipeline(uint32_t m) {
+-    return m > 32;
++    return m > HTP_MM_HMX_MIN_NROWS;
+ }
+ 
+ static inline void htp_mm_hmx_get_2d_chunk_costs(

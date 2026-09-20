@@ -1,0 +1,939 @@
+hexagon: the chunked gated delta net and the conv chunk with the rollback slots of a draft
+
+Base: llama.cpp commit c6824a9 plus the patches before this one in patches/series.
+
+Files:
+    ggml/src/ggml-hexagon/htp/gdn-step.h             a new header, one token of the delta rule
+    ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c  that token as one function, and the output guard of the fused step
+    ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c        the chunked kernel takes K > 1
+    ggml/src/ggml-hexagon/htp/gdn-conv-ops.c         the conv chunk writes K slots
+    tests/test-backend-ops.cpp                       the gate of the accuracy bound, and seven cases at K > 1
+
+The problem
+
+Speculative decoding gives the context K recurrent rollback slots, and the app sets K = 4. The
+chunked kernel of gdn-chunk-ops.c refused every K above 1, thus a prefill with speculation on ran
+the sequential kernel of gated-delta-net-ops.c instead. On the OnePlus 13 with the 4B at Q8_0,
+pp512 fell from 899.65 t/s to 425.08 t/s, a factor of 2.1. The conv half had the same defect: the
+host matcher refuses a batch with more than one snapshot slot, because the batch kernel wrote one.
+
+What the output must hold
+
+The output of GATED_DELTA_NET is one contiguous f32 tensor
+[S_v * H_v, n_tokens * n_seqs + K * S_v * n_seqs]. The attention region is
+out[((seq * n_tokens + t) * H_v + h) * S_v + j]. The snapshot region starts at the float offset
+A = S_v * H_v * n_tokens * n_seqs, and slot s of head h of sequence seq is
+out[A + s * (D * n_seqs) + (seq * H_v + h) * S_v * S_v + j * S_v + i], with D = S_v * S_v * H_v.
+The index i is the key index and j is the value index, thus the state is transposed, and the input
+state uses the same layout. Slot s holds the state after token n_tokens - 1 - s. The op writes the
+slots 0 to min(n_tokens, K) - 1 and leaves the other slots as they are. The reference of the CPU
+gives that rule at ggml/src/ggml-cpu/ops.cpp:10955 and calls the other slots caller-owned.
+
+Why a chunk gives no slot
+
+The chunked kernel takes chunks of 64 tokens. Inside a chunk the recurrence becomes matrix products,
+and the kernel keeps the state at the chunk boundary only. The states of the tokens inside a chunk
+are never materialized: the kernel holds the WY form of the chunk, not the states. A state K tokens
+back is thus not available at the end of the chunk, and a backward walk from the final state divides
+by the decay of each token, which amplifies the error without a bound when a gate is small.
+
+The tail
+
+The chunk loop stops K tokens before the end of the batch, and those tokens run one by one on the
+HVX. Each of them gives one snapshot slot: token n_tok_ch + s gives slot n_tail - 1 - s, thus the
+last token gives slot 0. The state of the chunk boundary is already in VTCM, and phase_end
+transposes it into the layout of DDR before the tail starts. The tail then reads and writes that
+same buffer, and a DMA of the buffer after each token gives the slot. No transpose is necessary for
+each slot.
+
+The tail is not new arithmetic. The per-token body of the two sequential threads was the same code
+twice, and this patch moves it into one function, gdn_step_token_f32. The two threads call it, and
+so does the tail. The function is the code that task #74 verified against a float64 reference at
+K = 1 to 4, thus the tail inherits that result.
+
+The gate of the chunked kernel becomes the token count outside the tail: the kernel takes the batch
+when n_tokens - K is 32 or more. A shorter batch runs the sequential kernel, which takes every shape.
+
+The conv chunk
+
+Slot g of the conv cache holds the three columns of the CONCAT that end at token T - 1 - g. The
+kernel walked the shift over the last three tokens and stored one slot. It now starts the walk two
+tokens before the deepest slot and stores each slot as the walk reaches it, thus K slots cost K - 1
+more steps of the shift. When the batch is shorter than the slots ask for, the walk starts at token
+0 from the state of the cache, which is the state of every slot that reaches before the batch. The
+host clamps the window of such a slot to column 0 of the CONCAT, which is that same state.
+
+The walk no longer calls gdn_conv_block. The convolution and the SiLU of those steps were never
+used, and the new gdn_conv_shift_slot does the lane work alone. Thus one slot is cheaper than before.
+
+The output guard of the fused state step
+
+op_gdn_state_step demanded an output of [S_v * H, 1 + K * S_v]. The op writes one row of it, the
+attention row, because the new state goes to the cache slot. The guard now validates that row alone,
+thus the host can hand a view of the row and keep the dirty range at S_v * H floats. At K = 4 the
+whole output is 4.20 MB for the 2B and 8.40 MB for the 4B, and both cross
+HEX_L2_FLUSH_ALL_THRESHOLD of htp/hex-utils.h, which flushes the whole L2. The full output still
+passes the guard, thus the host of today keeps working.
+
+The cost
+
+Bytes, for the 4B with S_v 128, H_v 32, one sequence: one slot is 2.10 MB, thus K = 4 writes
+8.39 MB for each of the 24 gated delta net layers instead of 2.10 MB. The extra traffic of one
+ubatch of 512 tokens is 151 MB. The attention region of the same ubatch is 8.39 MB for each layer,
+thus the snapshots double the write traffic of this op.
+
+Cycles, measured in the cycle-accurate simulator with tools/htp-lab (target gdntail, head size 128):
+one token of the tail costs 14456 cycles for one head, which is 6.84 us at 2112 MHz. A tail of
+K = 4 over 32 heads on 4 threads costs 462 592 cycles for each layer, which is 219 us. Over 24
+layers that is 5.26 ms of an ubatch, against 569 ms of a 512-token prefill at 899.65 t/s.
+
+The same measurement gives the cost of the defect: the sequential kernel over 512 tokens costs
+28.0 ms for each layer on 4 threads, thus 673 ms over 24 layers, against 78 ms for the chunked
+kernel. The loss that the phone showed is 635 ms.
+
+The conv slots cost 1.6 % of the conv chunk over 512 tokens (target gdnconvslots, 8192 channels,
+one thread): 3 more steps of the shift at 300 cycles for each block of 32 channels.
+
+Accuracy
+
+The lab target gdntail does a check of gdn_step_token_f32 against a float64 reference of the same
+token. At head size 128 with the scalar gate the NMSE of the state is 1.94e-15 and the NMSE of the
+attention output is 8.83e-15. With KDA the two are 7.35e-15 and 1.43e-14. The head sizes 32 and 35
+cover the other two unroll branches of the function, and each of the four runs stays below 1.5e-14.
+
+The lab target gdnconvslots does a check of every slot of the conv chunk against a scalar reference
+at 1 to 5 slots, at 8192 channels over 16 and 64 tokens. Every slot agrees to the bit.
+
+A model of the control flow on the host, with the delta rule in float64 in both the reference and
+the kernel, covers what the patch changes: the split of the batch, the token of each slot, the
+address of each slot, the address of each attention row, and the slots that stay as they are. Over
+14 shapes with K of 1 to 32, head sizes 32 to 128, 1 to 8 value heads, a value head repeat of 1 and
+2, and 33 to 200 tokens, the two models agree element by element with an NMSE of exactly 0.
+
+The accuracy bound of test-backend-ops held the tight default at K > 1, because its predicate had
+K == 1 in it. The predicate now takes the token count outside the tail, thus the bound of the chunk
+covers the shapes that the chunked kernel takes at K > 1. The tail is f32, thus it is tighter than
+the chunk, and the bound of the chunk holds for the whole output.
+
+The tests
+
+No case of test-backend-ops had n_tokens of 32 or more together with K > 1, thus no case reached the
+chunked kernel at K > 1. This patch adds seven cases: the chunk count 1 and 2, a chunk that is not
+full, the boundary of the gate at 32 tokens outside the tail, the shape one token below it, a value
+head repeat of 2, and K = 5.
+
+What this patch does not do
+
+The host still refuses the conv chain of a batch with more than one snapshot slot, at
+ggml/src/ggml-hexagon/htp-gdn-match.h:327. That line belongs to the host side. The kernel is ready
+for it now.
+
+diff -urN A/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c B/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
+--- A/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c	2026-09-20 04:51:12.278264803 +0300
++++ B/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c	2026-09-20 04:58:58.019655700 +0300
+@@ -6,6 +6,7 @@
+ #include "hex-fastdiv.h"
+ #include "hex-common.h"
+ #include "hex-profile.h"
++#include "gdn-step.h"
+ 
+ #define GGML_COMMON_DECL_C
+ #include "ggml-common.h"
+@@ -581,6 +582,131 @@
+     hvx_vec_store_u(sums + 4, 4 * sizeof(float), hvx_vec_reduce_sum_f32x4(accB));
+ }
+ 
++// One token of the recurrence. Refer to gdn-step.h for the contract. The sequential threads of this
++// file and the tail of the chunked kernel call it, thus the two paths give the same numbers.
++void gdn_step_token_f32(float * restrict state, const float * restrict q_t, const float * restrict k_t,
++                        const float * restrict v_t, const float * restrict g_t, float beta_val,
++                        float * restrict attn_out, uint32_t S_v, bool kda, float scale) {
++    float local_gate[HTP_GDN_MAX_SV] __attribute__((aligned(128)));
++    float local_q[HTP_GDN_MAX_SV] __attribute__((aligned(128)));
++    float local_k[HTP_GDN_MAX_SV] __attribute__((aligned(128)));
++    float local_sums[32] __attribute__((aligned(128)));
++
++    hvx_copy_f32_au((uint8_t *) local_q, (const uint8_t *) q_t, S_v);
++    hvx_copy_f32_au((uint8_t *) local_k, (const uint8_t *) k_t, S_v);
++
++    if (kda) {
++        hvx_exp_f32((uint8_t *) local_gate, (const uint8_t *) g_t, S_v, false);
++
++        uint32_t j = 0;
++        for (; j + 8 <= S_v; j += 8) {
++            float * row0 = state + (uint64_t) (j + 0) * S_v;
++            float * row1 = state + (uint64_t) (j + 1) * S_v;
++            float * row2 = state + (uint64_t) (j + 2) * S_v;
++            float * row3 = state + (uint64_t) (j + 3) * S_v;
++            float * row4 = state + (uint64_t) (j + 4) * S_v;
++            float * row5 = state + (uint64_t) (j + 5) * S_v;
++            float * row6 = state + (uint64_t) (j + 6) * S_v;
++            float * row7 = state + (uint64_t) (j + 7) * S_v;
++            gdn_mul_dot8_f32(row0, row1, row2, row3, row4, row5, row6, row7,
++                             local_gate, local_k, S_v, local_sums);
++
++            float local_delta_b[32] __attribute__((aligned(128)));
++            HVX_Vector vv_t = hvx_vmemu(v_t + j);
++            HVX_Vector v_local_sums = hvx_vmem(local_sums);
++            HVX_Vector diff = hvx_vec_sub_f32_f32(vv_t, v_local_sums);
++            hvx_vmem(local_delta_b) = hvx_vec_mul_f32_f32(diff, hvx_vec_splat_f32(beta_val));
++
++            gdn_add_scaled_dot8_f32(row0, row1, row2, row3, row4, row5, row6, row7,
++                                    local_k, local_delta_b, local_q, S_v, local_sums);
++
++            HVX_Vector res_attn = hvx_vec_mul_f32_f32(hvx_vmem(local_sums), hvx_vec_splat_f32(scale));
++            hvx_vec_store_u(attn_out + j, 8 * sizeof(float), res_attn);
++        }
++        for (; j + 4 <= S_v; j += 4) {
++            float * row0 = state + (uint64_t) (j + 0) * S_v;
++            float * row1 = state + (uint64_t) (j + 1) * S_v;
++            float * row2 = state + (uint64_t) (j + 2) * S_v;
++            float * row3 = state + (uint64_t) (j + 3) * S_v;
++            gdn_mul_dot4_f32(row0, row1, row2, row3, local_gate, local_k, S_v, local_sums);
++
++            float local_delta_b[32] __attribute__((aligned(128)));
++            HVX_Vector vv_t = hvx_vmemu(v_t + j);
++            HVX_Vector v_local_sums = hvx_vmem(local_sums);
++            HVX_Vector diff = hvx_vec_sub_f32_f32(vv_t, v_local_sums);
++            hvx_vmem(local_delta_b) = hvx_vec_mul_f32_f32(diff, hvx_vec_splat_f32(beta_val));
++
++            gdn_add_scaled_dot4_f32(row0, row1, row2, row3, local_k, local_delta_b, local_q, S_v, local_sums);
++
++            HVX_Vector res_attn = hvx_vec_mul_f32_f32(hvx_vmem(local_sums), hvx_vec_splat_f32(scale));
++            hvx_vec_store_u(attn_out + j, 4 * sizeof(float), res_attn);
++        }
++        HVX_Vector vscale_splat = hvx_vec_splat_f32(scale);
++        for (; j < S_v; ++j) {
++            float * row = state + (uint64_t) j * S_v;
++            HVX_Vector vsum = gdn_mul_dot_f32(row, local_gate, local_k, S_v);
++            HVX_Vector vv_t = hvx_vec_splat_f32(v_t[j]);
++            HVX_Vector vdj = hvx_vec_mul_f32_f32(hvx_vec_sub_f32_f32(vv_t, vsum), hvx_vec_splat_f32(beta_val));
++            HVX_Vector vres = gdn_add_scaled_dot_f32(row, local_k, vdj, local_q, S_v);
++            attn_out[j] = hvx_vec_get_f32(hvx_vec_mul_f32_f32(vres, vscale_splat));
++        }
++    } else {
++        const float gate = expf(g_t[0]);
++        uint32_t j = 0;
++        for (; j + 8 <= S_v; j += 8) {
++            float * row0 = state + (uint64_t) (j + 0) * S_v;
++            float * row1 = state + (uint64_t) (j + 1) * S_v;
++            float * row2 = state + (uint64_t) (j + 2) * S_v;
++            float * row3 = state + (uint64_t) (j + 3) * S_v;
++            float * row4 = state + (uint64_t) (j + 4) * S_v;
++            float * row5 = state + (uint64_t) (j + 5) * S_v;
++            float * row6 = state + (uint64_t) (j + 6) * S_v;
++            float * row7 = state + (uint64_t) (j + 7) * S_v;
++            gdn_mul_scalar_dot8_f32(row0, row1, row2, row3, row4, row5, row6, row7,
++                                    gate, local_k, S_v, local_sums);
++
++            float local_delta_b[32] __attribute__((aligned(128)));
++            HVX_Vector vv_t = hvx_vmemu(v_t + j);
++            HVX_Vector v_local_sums = hvx_vmem(local_sums);
++            HVX_Vector diff = hvx_vec_sub_f32_f32(vv_t, v_local_sums);
++            hvx_vmem(local_delta_b) = hvx_vec_mul_f32_f32(diff, hvx_vec_splat_f32(beta_val));
++
++            gdn_add_scaled_dot8_f32(row0, row1, row2, row3, row4, row5, row6, row7,
++                                    local_k, local_delta_b, local_q, S_v, local_sums);
++
++            HVX_Vector res_attn = hvx_vec_mul_f32_f32(hvx_vmem(local_sums), hvx_vec_splat_f32(scale));
++            hvx_vec_store_u(attn_out + j, 8 * sizeof(float), res_attn);
++        }
++        for (; j + 4 <= S_v; j += 4) {
++            float * row0 = state + (uint64_t) (j + 0) * S_v;
++            float * row1 = state + (uint64_t) (j + 1) * S_v;
++            float * row2 = state + (uint64_t) (j + 2) * S_v;
++            float * row3 = state + (uint64_t) (j + 3) * S_v;
++            gdn_mul_scalar_dot4_f32(row0, row1, row2, row3, gate, local_k, S_v, local_sums);
++
++            float local_delta_b[32] __attribute__((aligned(128)));
++            HVX_Vector vv_t = hvx_vmemu(v_t + j);
++            HVX_Vector v_local_sums = hvx_vmem(local_sums);
++            HVX_Vector diff = hvx_vec_sub_f32_f32(vv_t, v_local_sums);
++            hvx_vmem(local_delta_b) = hvx_vec_mul_f32_f32(diff, hvx_vec_splat_f32(beta_val));
++
++            gdn_add_scaled_dot4_f32(row0, row1, row2, row3, local_k, local_delta_b, local_q, S_v, local_sums);
++
++            HVX_Vector res_attn = hvx_vec_mul_f32_f32(hvx_vmem(local_sums), hvx_vec_splat_f32(scale));
++            hvx_vec_store_u(attn_out + j, 4 * sizeof(float), res_attn);
++        }
++        HVX_Vector vscale_splat = hvx_vec_splat_f32(scale);
++        for (; j < S_v; ++j) {
++            float * row = state + (uint64_t) j * S_v;
++            HVX_Vector vsum = gdn_mul_scalar_dot_f32(row, gate, local_k, S_v);
++            HVX_Vector vv_t = hvx_vec_splat_f32(v_t[j]);
++            HVX_Vector vdj = hvx_vec_mul_f32_f32(hvx_vec_sub_f32_f32(vv_t, vsum), hvx_vec_splat_f32(beta_val));
++            HVX_Vector vres = gdn_add_scaled_dot_f32(row, local_k, vdj, local_q, S_v);
++            attn_out[j] = hvx_vec_get_f32(hvx_vec_mul_f32_f32(vres, vscale_splat));
++        }
++    }
++}
++
+ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, void * data) {
+     struct htp_gdn_context * gctx = (struct htp_gdn_context *) data;
+     struct htp_ops_context * octx = gctx->octx;
+@@ -614,10 +740,6 @@
+     const float * state_in_base = (const float *) (uintptr_t) state->data;
+ 
+     const bool kda = (g->ne[0] == S_v);
+-    float local_gate[HTP_GDN_MAX_SV] __attribute__((aligned(128)));
+-    float local_q[HTP_GDN_MAX_SV] __attribute__((aligned(128)));
+-    float local_k[HTP_GDN_MAX_SV] __attribute__((aligned(128)));
+-    float local_sums[32] __attribute__((aligned(128)));
+ 
+     dma_queue * dma = octx->ctx->dma[ith];
+     size_t state_aligned = (size_t) S_v * S_v * sizeof(float);
+@@ -695,119 +817,7 @@
+             const float beta_val = *(const float *) ((const uint8_t *) (uintptr_t) beta->data +
+                     (uint64_t) iv3 * beta->nb[3] + (uint64_t) t * beta->nb[2] + (uint64_t) iv1 * beta->nb[1]);
+ 
+-            hvx_copy_f32_au((uint8_t *) local_q, (const uint8_t *) q_t, S_v);
+-            hvx_copy_f32_au((uint8_t *) local_k, (const uint8_t *) k_t, S_v);
+-
+-            if (kda) {
+-                hvx_exp_f32((uint8_t *) local_gate, (const uint8_t *) g_t, S_v, false);
+-
+-                uint32_t j = 0;
+-                for (; j + 8 <= S_v; j += 8) {
+-                    float * row0 = s_work_curr + (uint64_t) (j + 0) * S_v;
+-                    float * row1 = s_work_curr + (uint64_t) (j + 1) * S_v;
+-                    float * row2 = s_work_curr + (uint64_t) (j + 2) * S_v;
+-                    float * row3 = s_work_curr + (uint64_t) (j + 3) * S_v;
+-                    float * row4 = s_work_curr + (uint64_t) (j + 4) * S_v;
+-                    float * row5 = s_work_curr + (uint64_t) (j + 5) * S_v;
+-                    float * row6 = s_work_curr + (uint64_t) (j + 6) * S_v;
+-                    float * row7 = s_work_curr + (uint64_t) (j + 7) * S_v;
+-                    gdn_mul_dot8_f32(row0, row1, row2, row3, row4, row5, row6, row7,
+-                                     local_gate, local_k, S_v, local_sums);
+-
+-                    float local_delta_b[32] __attribute__((aligned(128)));
+-                    HVX_Vector vv_t = hvx_vmemu(v_t + j);
+-                    HVX_Vector v_local_sums = hvx_vmem(local_sums);
+-                    HVX_Vector diff = hvx_vec_sub_f32_f32(vv_t, v_local_sums);
+-                    hvx_vmem(local_delta_b) = hvx_vec_mul_f32_f32(diff, hvx_vec_splat_f32(beta_val));
+-
+-                    gdn_add_scaled_dot8_f32(row0, row1, row2, row3, row4, row5, row6, row7,
+-                                            local_k, local_delta_b, local_q, S_v, local_sums);
+-
+-                    HVX_Vector res_attn = hvx_vec_mul_f32_f32(hvx_vmem(local_sums), hvx_vec_splat_f32(scale));
+-                    hvx_vec_store_u(attn_data + j, 8 * sizeof(float), res_attn);
+-                }
+-                for (; j + 4 <= S_v; j += 4) {
+-                    float * row0 = s_work_curr + (uint64_t) (j + 0) * S_v;
+-                    float * row1 = s_work_curr + (uint64_t) (j + 1) * S_v;
+-                    float * row2 = s_work_curr + (uint64_t) (j + 2) * S_v;
+-                    float * row3 = s_work_curr + (uint64_t) (j + 3) * S_v;
+-                    gdn_mul_dot4_f32(row0, row1, row2, row3, local_gate, local_k, S_v, local_sums);
+-
+-                    float local_delta_b[32] __attribute__((aligned(128)));
+-                    HVX_Vector vv_t = hvx_vmemu(v_t + j);
+-                    HVX_Vector v_local_sums = hvx_vmem(local_sums);
+-                    HVX_Vector diff = hvx_vec_sub_f32_f32(vv_t, v_local_sums);
+-                    hvx_vmem(local_delta_b) = hvx_vec_mul_f32_f32(diff, hvx_vec_splat_f32(beta_val));
+-
+-                    gdn_add_scaled_dot4_f32(row0, row1, row2, row3, local_k, local_delta_b, local_q, S_v, local_sums);
+-
+-                    HVX_Vector res_attn = hvx_vec_mul_f32_f32(hvx_vmem(local_sums), hvx_vec_splat_f32(scale));
+-                    hvx_vec_store_u(attn_data + j, 4 * sizeof(float), res_attn);
+-                }
+-                HVX_Vector vscale_splat = hvx_vec_splat_f32(scale);
+-                for (; j < S_v; ++j) {
+-                    float * row = s_work_curr + (uint64_t) j * S_v;
+-                    HVX_Vector vsum = gdn_mul_dot_f32(row, local_gate, local_k, S_v);
+-                    HVX_Vector vv_t = hvx_vec_splat_f32(v_t[j]);
+-                    HVX_Vector vdj = hvx_vec_mul_f32_f32(hvx_vec_sub_f32_f32(vv_t, vsum), hvx_vec_splat_f32(beta_val));
+-                    HVX_Vector vres = gdn_add_scaled_dot_f32(row, local_k, vdj, local_q, S_v);
+-                    attn_data[j] = hvx_vec_get_f32(hvx_vec_mul_f32_f32(vres, vscale_splat));
+-                }
+-            } else {
+-                const float gate = expf(g_t[0]);
+-                uint32_t j = 0;
+-                for (; j + 8 <= S_v; j += 8) {
+-                    float * row0 = s_work_curr + (uint64_t) (j + 0) * S_v;
+-                    float * row1 = s_work_curr + (uint64_t) (j + 1) * S_v;
+-                    float * row2 = s_work_curr + (uint64_t) (j + 2) * S_v;
+-                    float * row3 = s_work_curr + (uint64_t) (j + 3) * S_v;
+-                    float * row4 = s_work_curr + (uint64_t) (j + 4) * S_v;
+-                    float * row5 = s_work_curr + (uint64_t) (j + 5) * S_v;
+-                    float * row6 = s_work_curr + (uint64_t) (j + 6) * S_v;
+-                    float * row7 = s_work_curr + (uint64_t) (j + 7) * S_v;
+-                    gdn_mul_scalar_dot8_f32(row0, row1, row2, row3, row4, row5, row6, row7,
+-                                            gate, local_k, S_v, local_sums);
+-
+-                    float local_delta_b[32] __attribute__((aligned(128)));
+-                    HVX_Vector vv_t = hvx_vmemu(v_t + j);
+-                    HVX_Vector v_local_sums = hvx_vmem(local_sums);
+-                    HVX_Vector diff = hvx_vec_sub_f32_f32(vv_t, v_local_sums);
+-                    hvx_vmem(local_delta_b) = hvx_vec_mul_f32_f32(diff, hvx_vec_splat_f32(beta_val));
+-
+-                    gdn_add_scaled_dot8_f32(row0, row1, row2, row3, row4, row5, row6, row7,
+-                                            local_k, local_delta_b, local_q, S_v, local_sums);
+-
+-                    HVX_Vector res_attn = hvx_vec_mul_f32_f32(hvx_vmem(local_sums), hvx_vec_splat_f32(scale));
+-                    hvx_vec_store_u(attn_data + j, 8 * sizeof(float), res_attn);
+-                }
+-                for (; j + 4 <= S_v; j += 4) {
+-                    float * row0 = s_work_curr + (uint64_t) (j + 0) * S_v;
+-                    float * row1 = s_work_curr + (uint64_t) (j + 1) * S_v;
+-                    float * row2 = s_work_curr + (uint64_t) (j + 2) * S_v;
+-                    float * row3 = s_work_curr + (uint64_t) (j + 3) * S_v;
+-                    gdn_mul_scalar_dot4_f32(row0, row1, row2, row3, gate, local_k, S_v, local_sums);
+-
+-                    float local_delta_b[32] __attribute__((aligned(128)));
+-                    HVX_Vector vv_t = hvx_vmemu(v_t + j);
+-                    HVX_Vector v_local_sums = hvx_vmem(local_sums);
+-                    HVX_Vector diff = hvx_vec_sub_f32_f32(vv_t, v_local_sums);
+-                    hvx_vmem(local_delta_b) = hvx_vec_mul_f32_f32(diff, hvx_vec_splat_f32(beta_val));
+-
+-                    gdn_add_scaled_dot4_f32(row0, row1, row2, row3, local_k, local_delta_b, local_q, S_v, local_sums);
+-
+-                    HVX_Vector res_attn = hvx_vec_mul_f32_f32(hvx_vmem(local_sums), hvx_vec_splat_f32(scale));
+-                    hvx_vec_store_u(attn_data + j, 4 * sizeof(float), res_attn);
+-                }
+-                HVX_Vector vscale_splat = hvx_vec_splat_f32(scale);
+-                for (; j < S_v; ++j) {
+-                    float * row = s_work_curr + (uint64_t) j * S_v;
+-                    HVX_Vector vsum = gdn_mul_scalar_dot_f32(row, gate, local_k, S_v);
+-                    HVX_Vector vv_t = hvx_vec_splat_f32(v_t[j]);
+-                    HVX_Vector vdj = hvx_vec_mul_f32_f32(hvx_vec_sub_f32_f32(vv_t, vsum), hvx_vec_splat_f32(beta_val));
+-                    HVX_Vector vres = gdn_add_scaled_dot_f32(row, local_k, vdj, local_q, S_v);
+-                    attn_data[j] = hvx_vec_get_f32(hvx_vec_mul_f32_f32(vres, vscale_splat));
+-                }
+-            }
++            gdn_step_token_f32(s_work_curr, q_t, k_t, v_t, g_t, beta_val, attn_data, S_v, kda, scale);
+ 
+             if (K > 1) {
+                 // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
+@@ -878,10 +888,6 @@
+     const float * state_in_base  = gctx->state_in_base;
+ 
+     const bool kda = (g->ne[0] == S_v);
+-    float local_gate[HTP_GDN_MAX_SV] __attribute__((aligned(128)));
+-    float local_q[HTP_GDN_MAX_SV] __attribute__((aligned(128)));
+-    float local_k[HTP_GDN_MAX_SV] __attribute__((aligned(128)));
+-    float local_sums[32] __attribute__((aligned(128)));
+ 
+     dma_queue * dma = octx->ctx->dma[ith];
+     size_t state_aligned = (size_t) S_v * S_v * sizeof(float);
+@@ -957,119 +963,7 @@
+         const float beta_val = *(const float *) ((const uint8_t *) (uintptr_t) beta->data +
+                 (uint64_t) iv3 * beta->nb[3] + (uint64_t) iv1 * beta->nb[1]);
+ 
+-        hvx_copy_f32_au((uint8_t *) local_q, (const uint8_t *) q_t, S_v);
+-        hvx_copy_f32_au((uint8_t *) local_k, (const uint8_t *) k_t, S_v);
+-
+-        if (kda) {
+-            hvx_exp_f32((uint8_t *) local_gate, (const uint8_t *) g_t, S_v, false);
+-
+-            uint32_t j = 0;
+-            for (; j + 8 <= S_v; j += 8) {
+-                float * row0 = s_work_curr + (uint64_t) (j + 0) * S_v;
+-                float * row1 = s_work_curr + (uint64_t) (j + 1) * S_v;
+-                float * row2 = s_work_curr + (uint64_t) (j + 2) * S_v;
+-                float * row3 = s_work_curr + (uint64_t) (j + 3) * S_v;
+-                float * row4 = s_work_curr + (uint64_t) (j + 4) * S_v;
+-                float * row5 = s_work_curr + (uint64_t) (j + 5) * S_v;
+-                float * row6 = s_work_curr + (uint64_t) (j + 6) * S_v;
+-                float * row7 = s_work_curr + (uint64_t) (j + 7) * S_v;
+-                gdn_mul_dot8_f32(row0, row1, row2, row3, row4, row5, row6, row7,
+-                                 local_gate, local_k, S_v, local_sums);
+-
+-                float local_delta_b[32] __attribute__((aligned(128)));
+-                HVX_Vector vv_t = hvx_vmemu(v_t + j);
+-                HVX_Vector v_local_sums = hvx_vmem(local_sums);
+-                HVX_Vector diff = hvx_vec_sub_f32_f32(vv_t, v_local_sums);
+-                hvx_vmem(local_delta_b) = hvx_vec_mul_f32_f32(diff, hvx_vec_splat_f32(beta_val));
+-
+-                gdn_add_scaled_dot8_f32(row0, row1, row2, row3, row4, row5, row6, row7,
+-                                        local_k, local_delta_b, local_q, S_v, local_sums);
+-
+-                HVX_Vector res_attn = hvx_vec_mul_f32_f32(hvx_vmem(local_sums), hvx_vec_splat_f32(scale));
+-                hvx_vec_store_u(attn_data + j, 8 * sizeof(float), res_attn);
+-            }
+-            for (; j + 4 <= S_v; j += 4) {
+-                float * row0 = s_work_curr + (uint64_t) (j + 0) * S_v;
+-                float * row1 = s_work_curr + (uint64_t) (j + 1) * S_v;
+-                float * row2 = s_work_curr + (uint64_t) (j + 2) * S_v;
+-                float * row3 = s_work_curr + (uint64_t) (j + 3) * S_v;
+-                gdn_mul_dot4_f32(row0, row1, row2, row3, local_gate, local_k, S_v, local_sums);
+-
+-                float local_delta_b[32] __attribute__((aligned(128)));
+-                HVX_Vector vv_t = hvx_vmemu(v_t + j);
+-                HVX_Vector v_local_sums = hvx_vmem(local_sums);
+-                HVX_Vector diff = hvx_vec_sub_f32_f32(vv_t, v_local_sums);
+-                hvx_vmem(local_delta_b) = hvx_vec_mul_f32_f32(diff, hvx_vec_splat_f32(beta_val));
+-
+-                gdn_add_scaled_dot4_f32(row0, row1, row2, row3, local_k, local_delta_b, local_q, S_v, local_sums);
+-
+-                HVX_Vector res_attn = hvx_vec_mul_f32_f32(hvx_vmem(local_sums), hvx_vec_splat_f32(scale));
+-                hvx_vec_store_u(attn_data + j, 4 * sizeof(float), res_attn);
+-            }
+-            HVX_Vector vscale_splat = hvx_vec_splat_f32(scale);
+-            for (; j < S_v; ++j) {
+-                float * row = s_work_curr + (uint64_t) j * S_v;
+-                HVX_Vector vsum = gdn_mul_dot_f32(row, local_gate, local_k, S_v);
+-                HVX_Vector vv_t = hvx_vec_splat_f32(v_t[j]);
+-                HVX_Vector vdj = hvx_vec_mul_f32_f32(hvx_vec_sub_f32_f32(vv_t, vsum), hvx_vec_splat_f32(beta_val));
+-                HVX_Vector vres = gdn_add_scaled_dot_f32(row, local_k, vdj, local_q, S_v);
+-                attn_data[j] = hvx_vec_get_f32(hvx_vec_mul_f32_f32(vres, vscale_splat));
+-            }
+-        } else {
+-            const float gate = expf(g_t[0]);
+-            uint32_t j = 0;
+-            for (; j + 8 <= S_v; j += 8) {
+-                float * row0 = s_work_curr + (uint64_t) (j + 0) * S_v;
+-                float * row1 = s_work_curr + (uint64_t) (j + 1) * S_v;
+-                float * row2 = s_work_curr + (uint64_t) (j + 2) * S_v;
+-                float * row3 = s_work_curr + (uint64_t) (j + 3) * S_v;
+-                float * row4 = s_work_curr + (uint64_t) (j + 4) * S_v;
+-                float * row5 = s_work_curr + (uint64_t) (j + 5) * S_v;
+-                float * row6 = s_work_curr + (uint64_t) (j + 6) * S_v;
+-                float * row7 = s_work_curr + (uint64_t) (j + 7) * S_v;
+-                gdn_mul_scalar_dot8_f32(row0, row1, row2, row3, row4, row5, row6, row7,
+-                                        gate, local_k, S_v, local_sums);
+-
+-                float local_delta_b[32] __attribute__((aligned(128)));
+-                HVX_Vector vv_t = hvx_vmemu(v_t + j);
+-                HVX_Vector v_local_sums = hvx_vmem(local_sums);
+-                HVX_Vector diff = hvx_vec_sub_f32_f32(vv_t, v_local_sums);
+-                hvx_vmem(local_delta_b) = hvx_vec_mul_f32_f32(diff, hvx_vec_splat_f32(beta_val));
+-
+-                gdn_add_scaled_dot8_f32(row0, row1, row2, row3, row4, row5, row6, row7,
+-                                        local_k, local_delta_b, local_q, S_v, local_sums);
+-
+-                HVX_Vector res_attn = hvx_vec_mul_f32_f32(hvx_vmem(local_sums), hvx_vec_splat_f32(scale));
+-                hvx_vec_store_u(attn_data + j, 8 * sizeof(float), res_attn);
+-            }
+-            for (; j + 4 <= S_v; j += 4) {
+-                float * row0 = s_work_curr + (uint64_t) (j + 0) * S_v;
+-                float * row1 = s_work_curr + (uint64_t) (j + 1) * S_v;
+-                float * row2 = s_work_curr + (uint64_t) (j + 2) * S_v;
+-                float * row3 = s_work_curr + (uint64_t) (j + 3) * S_v;
+-                gdn_mul_scalar_dot4_f32(row0, row1, row2, row3, gate, local_k, S_v, local_sums);
+-
+-                float local_delta_b[32] __attribute__((aligned(128)));
+-                HVX_Vector vv_t = hvx_vmemu(v_t + j);
+-                HVX_Vector v_local_sums = hvx_vmem(local_sums);
+-                HVX_Vector diff = hvx_vec_sub_f32_f32(vv_t, v_local_sums);
+-                hvx_vmem(local_delta_b) = hvx_vec_mul_f32_f32(diff, hvx_vec_splat_f32(beta_val));
+-
+-                gdn_add_scaled_dot4_f32(row0, row1, row2, row3, local_k, local_delta_b, local_q, S_v, local_sums);
+-
+-                HVX_Vector res_attn = hvx_vec_mul_f32_f32(hvx_vmem(local_sums), hvx_vec_splat_f32(scale));
+-                hvx_vec_store_u(attn_data + j, 4 * sizeof(float), res_attn);
+-            }
+-            HVX_Vector vscale_splat = hvx_vec_splat_f32(scale);
+-            for (; j < S_v; ++j) {
+-                float * row = s_work_curr + (uint64_t) j * S_v;
+-                HVX_Vector vsum = gdn_mul_scalar_dot_f32(row, gate, local_k, S_v);
+-                HVX_Vector vv_t = hvx_vec_splat_f32(v_t[j]);
+-                HVX_Vector vdj = hvx_vec_mul_f32_f32(hvx_vec_sub_f32_f32(vv_t, vsum), hvx_vec_splat_f32(beta_val));
+-                HVX_Vector vres = gdn_add_scaled_dot_f32(row, local_k, vdj, local_q, S_v);
+-                attn_data[j] = hvx_vec_get_f32(hvx_vec_mul_f32_f32(vres, vscale_splat));
+-            }
+-        }
++        gdn_step_token_f32(s_work_curr, q_t, k_t, v_t, g_t, beta_val, attn_data, S_v, kda, scale);
+ 
+         // Push real write-back
+         dma_queue_push(dma, dma_make_ptr(s_out, s_work_curr),
+@@ -1290,7 +1184,12 @@
+     if (slot->ne[0] != D || slot->nb[0] != sizeof(float)) {
+         GDN_STATE_FAIL(GDN_STATE_ERR_SLOT, HTP_STATUS_INVAL_PARAMS);
+     }
+-    if (dst->ne[0] != S_v * H || dst->ne[1] != 1 + (int64_t) K * S_v) {
++    // The op writes one row of the output, the attention row. The snapshot rows of the GATED_DELTA_NET
++    // output stay untouched: the new state goes to the cache slot, not to that tensor. Thus the guard
++    // validates the attention row only, and the host can hand a view of that row alone. A view keeps
++    // the dirty range of the op at S_v * H floats instead of the whole output, which at K = 4 crosses
++    // HEX_L2_FLUSH_ALL_THRESHOLD and flushes the whole L2. The full output still passes this guard.
++    if (dst->ne[0] != S_v * H || dst->ne[1] < 1 || dst->nb[0] != sizeof(float)) {
+         GDN_STATE_FAIL(GDN_STATE_ERR_DST, HTP_STATUS_INVAL_PARAMS);
+     }
+ 
+diff -urN A/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c B/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c
+--- A/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c	2026-09-20 04:51:12.283587384 +0300
++++ B/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c	2026-09-20 04:58:58.021169709 +0300
+@@ -49,6 +49,7 @@
+ #include "hex-fastdiv.h"
+ #include "hex-common.h"
+ #include "hex-profile.h"
++#include "gdn-step.h"
+ 
+ #define GGML_COMMON_DECL_C
+ #include "ggml-common.h"
+@@ -131,7 +132,10 @@
+     uint32_t                 n_chunks;
+     uint32_t                 D;
+     uint32_t                 H;
+-    uint32_t                 n_tokens;
++    uint32_t                 n_tokens;        // the tokens of the batch
++    uint32_t                 n_tok_ch;        // the tokens that the chunk loop takes
++    uint32_t                 n_tail;          // the tokens after those, one snapshot slot each
++    uint64_t                 snap_stride;     // floats from one snapshot slot to the next
+     uint32_t                 n_seqs;
+     uint32_t                 n_kt;            // D / 32
+     float                    scale;
+@@ -739,7 +743,7 @@
+ 
+ static inline uint32_t gdn_ch_chunk_len(const struct gdn_ch_ctx * c, uint32_t ic) {
+     const uint32_t t0 = ic * GDN_CH_C;
+-    const uint32_t left = c->n_tokens - t0;
++    const uint32_t left = c->n_tok_ch - t0;
+     return left < GDN_CH_C ? left : GDN_CH_C;
+ }
+ 
+@@ -923,7 +927,29 @@
+     }
+ }
+ 
+-// The last chunk of the group, and the state back to DDR
++// One token of the tail on one row. The state stays in stg_q, in the layout of DDR: the transpose
++// of phase_end put it there, and gdn_step_token_f32 reads and writes exactly that layout.
++//
++// The inputs come from DDR with unaligned vector loads, as the sequential kernel reads them. The
++// tail is a few tokens, thus a DMA of them would cost more than it saves.
++static void gdn_ch_tail_token(struct gdn_ch_ctx * c, uint32_t i, const struct gdn_ch_row_ptrs * rp, uint32_t t) {
++    struct gdn_ch_row * rw = &c->row[i];
++
++    const uint32_t head = (c->row0 + i) % c->H;
++
++    const float * q_t = (const float *) (rp->q + (size_t) t * rp->q_nb2);
++    const float * k_t = (const float *) (rp->k + (size_t) t * rp->k_nb2);
++    const float * v_t = (const float *) (rp->v + (size_t) t * rp->v_nb2);
++    const float * g_t = (const float *) (rp->g + (size_t) t * rp->g_nb2) + head;
++    const float   b_t = *((const float *) (rp->b + (size_t) t * rp->b_nb2) + head);
++
++    float * attn = rp->attn + (size_t) t * c->D * c->H;
++
++    // The kernel takes a scalar gate only, thus kda is false. Refer to the selection of the op.
++    gdn_step_token_f32(rw->stg_q, q_t, k_t, v_t, g_t, b_t, attn, c->D, false, c->scale);
++}
++
++// The last chunk of the group, then the tail tokens, and the state of each snapshot slot to DDR
+ static void gdn_ch_phase_end(unsigned int nth, unsigned int ith, void * data) {
+     struct gdn_ch_ctx * c = (struct gdn_ch_ctx *) data;
+     (void) nth;
+@@ -935,17 +961,46 @@
+     }
+ 
+     dma_queue * dma = c->octx->ctx->dma[ith];
++    const size_t row = (size_t) c->D * sizeof(float);
+ 
++    // DDR holds M[j][i] = S[i][j], thus the state goes back transposed.
+     for (uint32_t i = begin; i < end; ++i) {
+         gdn_ch_finish_chunk(c, i, c->n_chunks - 1);
++        gdn_ch_transpose_f32(c->row[i].stg_q, c->row[i].s32, c->D);
++    }
+ 
+-        struct gdn_ch_row * rw = &c->row[i];
+-        struct gdn_ch_row_ptrs rp;
+-        gdn_ch_row_ptrs_init(c, i, &rp);
++    if (c->n_tail == 0) {
++        for (uint32_t i = begin; i < end; ++i) {
++            struct gdn_ch_row_ptrs rp;
++            gdn_ch_row_ptrs_init(c, i, &rp);
++            dma_queue_push(dma, dma_make_ptr(rp.s_out, c->row[i].stg_q), row, row, row, c->D);
++            dma_queue_pop(dma);
++        }
++        return;
++    }
+ 
+-        const size_t row = (size_t) c->D * sizeof(float);
+-        gdn_ch_transpose_f32(rw->stg_q, rw->s32, c->D);
+-        dma_queue_push(dma, dma_make_ptr(rp.s_out, rw->stg_q), row, row, row, c->D);
++    // The tail. Token n_tok_ch + s gives snapshot slot n_tail - 1 - s, thus the last token gives
++    // slot 0. The rows of this thread go in the same order at each step, and the pop of a row waits
++    // for its own transfer of the step before. The work of the other rows covers that wait.
++    for (uint32_t s = 0; s < c->n_tail; ++s) {
++        const uint32_t t    = c->n_tok_ch + s;
++        const uint32_t slot = c->n_tail - 1 - s;
++        for (uint32_t i = begin; i < end; ++i) {
++            if (s > 0) {
++                dma_queue_pop(dma);
++            }
++            struct gdn_ch_row_ptrs rp;
++            gdn_ch_row_ptrs_init(c, i, &rp);
++            gdn_ch_tail_token(c, i, &rp, t);
++            // The DMA reads the buffer that the token wrote. gdn_ch_transpose_f32 ends with the same
++            // wait for the same reason.
++            gdn_ch_mem_sync();
++            dma_queue_push(dma, dma_make_ptr(rp.s_out + (size_t) slot * c->snap_stride, c->row[i].stg_q),
++                           row, row, row, c->D);
++        }
++    }
++    for (uint32_t i = begin; i < end; ++i) {
++        (void) i;
+         dma_queue_pop(dma);
+     }
+ }
+@@ -1090,15 +1145,25 @@
+     // n_tokens is the token count of ONE sequence (v->ne[2]) and n_seqs is the sequence count
+     // (v->ne[3]), thus a batch of one token per sequence never reaches this kernel, whatever the
+     // sequence count is.
++    // The op writes the state after each of the last min(n_tokens, K) tokens, most recent first. A
++    // chunk gives the state at its boundary only, thus the chunk loop stops K tokens early and the
++    // tail runs those tokens one by one on the HVX. Each tail token gives one slot. With K = 1 there
++    // is no tail: the state at the end of the last chunk is slot 0.
++    //
++    // The gate below keeps 32 tokens or more in the chunk loop, thus n_tokens is always larger than
++    // K here and the op writes every one of the K slots. The rule of the reference, which writes
++    // min(n_tokens, K) slots and leaves the older slots as they are, needs no case in this kernel.
++    // The sequential kernel of gated-delta-net-ops.c holds that rule for the shorter batches.
++    const uint32_t n_tail  = (K > 1) ? K : 0;
++    const uint32_t n_tok_ch = (n_tokens > n_tail) ? (n_tokens - n_tail) : 0;
++
+     const char * refuse = NULL;
+-    if (K != 1) {
+-        refuse = "the op keeps more than the final state";
+-    } else if (g->ne[0] != 1) {
++    if (g->ne[0] != 1) {
+         refuse = "the gate is a vector (KDA)";
+     } else if (n_seqs != 1) {
+         refuse = "more than one sequence";
+-    } else if (n_tokens < GDN_CH_MIN_TOKENS) {
+-        refuse = "fewer than 32 tokens in the sequence";
++    } else if (n_tok_ch < GDN_CH_MIN_TOKENS) {
++        refuse = "fewer than 32 tokens outside the snapshot tail";
+     } else if (D % 32 != 0 || D > GDN_CH_MAX_D || q->ne[0] != D || k->ne[0] != D) {
+         refuse = "the head size";
+     }
+@@ -1160,17 +1225,22 @@
+     hmx_init_column_scales(base, Q6_V_vsplat_R(0x3c00)); // 1.0 in fp16
+     base += GDN_CH_ALIGN;
+ 
+-    c.octx     = octx;
+-    c.D        = D;
+-    c.H        = H;
+-    c.n_tokens = n_tokens;
+-    c.n_seqs   = n_seqs;
+-    c.n_kt     = D / 32;
+-    c.scale    = 1.0f / sqrtf((float) D);
+-    c.n_chunks = (n_tokens + GDN_CH_C - 1) / GDN_CH_C;
+-
+-    FARF(HIGH, "gdn-chunk: D %u H %u n_tokens %u n_seqs %u rows %u..%u group %u per-row %zu chunks %u\n",
+-         D, H, n_tokens, n_seqs, row_start, row_start + nrows, group, per_row, c.n_chunks);
++    c.octx        = octx;
++    c.D           = D;
++    c.H           = H;
++    c.n_tokens    = n_tokens;
++    c.n_tok_ch    = n_tok_ch;
++    c.n_tail      = n_tail;
++    c.snap_stride = (uint64_t) D * D * H * n_seqs;
++    c.n_seqs      = n_seqs;
++    c.n_kt        = D / 32;
++    c.scale       = 1.0f / sqrtf((float) D);
++    c.n_chunks    = (n_tok_ch + GDN_CH_C - 1) / GDN_CH_C;
++
++    FARF(HIGH, "gdn-chunk: D %u H %u n_tokens %u (chunked %u tail %u) n_seqs %u rows %u..%u group %u "
++         "per-row %zu chunks %u K %u\n",
++         D, H, n_tokens, n_tok_ch, n_tail, n_seqs, row_start, row_start + nrows, group, per_row,
++         c.n_chunks, K);
+ 
+     work_queue_t wq = octx->ctx->work_queue;
+ 
+diff -urN A/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c B/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
+--- A/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c	2026-09-20 04:51:12.298340322 +0300
++++ B/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c	2026-09-20 04:58:58.022512836 +0300
+@@ -324,6 +324,16 @@
+     gdn_conv_c_to_slot(mk, c, n0, n1, n2);
+ }
+ 
++// The 96 new slot lanes of a block at one token, without the convolution. The state of a token is
++// the three columns that end at it, thus a walk over the last tokens gives one snapshot slot each.
++static inline void gdn_conv_shift_slot(const struct gdn_conv_masks * mk,
++                                       HVX_Vector s0, HVX_Vector s1, HVX_Vector s2, HVX_Vector x,
++                                       HVX_Vector * n0, HVX_Vector * n1, HVX_Vector * n2) {
++    HVX_Vector c[4];
++    gdn_conv_lanes_to_c(mk, s0, s1, s2, x, c);
++    gdn_conv_c_to_slot(mk, c, n0, n1, n2);
++}
++
+ static void gdn_conv_step_thread(unsigned int nth, unsigned int ith, void * data) {
+     (void) nth;
+     struct htp_gdn_conv_context * cctx = (struct htp_gdn_conv_context *) data;
+@@ -672,6 +682,8 @@
+     uint32_t      n_ch;
+     uint32_t      n_tokens;
+     uint32_t      chunk;      // channels per thread, a multiple of 32
++    uint32_t      n_slots;    // rollback snapshot slots to write, 1 without speculation
++    uint32_t      slot_stride; // bytes from one slot to the next, n_slots > 1 only
+     uint8_t *     vtcm;       // the plane buffers of the threads
+     size_t        vtcm_per_thread;
+ };
+@@ -832,30 +844,48 @@
+         }
+     }
+ 
+-    // The new state is the last three tokens of the batch, in the layout of the cache. Three steps of
+-    // the single token block from an empty state give exactly that, and the output of those steps is
+-    // not used.
++    // The state of a snapshot slot is the three columns of the CONCAT that end at its token: slot g
++    // holds the state after token T - 1 - g. A walk of the shift over the last tokens gives all the
++    // slots, and the walk starts two tokens before the deepest one, thus the shift is full by then.
++    //
++    // When the batch is shorter than the slots need, the walk starts at token 0 from the state of
++    // the cache, which is the state of every slot that reaches before the batch. The host clamps the
++    // window of such a slot to column 0 of the CONCAT, which is that same state.
+     float * d_ptr = cctx->dst_slot + (size_t) c0 * (GDN_CONV_D_CONV - 1);
++    const uint32_t n_slots = cctx->n_slots;
++    const uint32_t warm    = GDN_CONV_D_CONV - 2;   // tokens of the shift before the deepest slot
++    const bool     late    = T >= n_slots + warm;
++    const uint32_t t_start = late ? (T - n_slots - warm) : 0;
+ 
+     for (uint32_t i = 0; i < nb; i++) {
+-        HVX_Vector w0 = hvx_vmemu(w_ptr + i * 128);
+-        HVX_Vector w1 = hvx_vmemu(w_ptr + i * 128 + 32);
+-        HVX_Vector w2 = hvx_vmemu(w_ptr + i * 128 + 64);
+-        HVX_Vector w3 = hvx_vmemu(w_ptr + i * 128 + 96);
+-
+         HVX_Vector n0 = Q6_V_vzero();
+         HVX_Vector n1 = Q6_V_vzero();
+         HVX_Vector n2 = Q6_V_vzero();
+-        HVX_Vector y;
+ 
+-        for (uint32_t t = T - (GDN_CONV_D_CONV - 1); t < T; t++) {
+-            HVX_Vector xv = hvx_vmemu(cctx->x + (size_t) t * cctx->x_stride + c0 + i * VLEN_FP32);
+-            gdn_conv_block(&mk, n0, n1, n2, xv, w0, w1, w2, w3, &y, &n0, &n1, &n2);
++        if (!late) {
++            n0 = hvx_vmemu(s_ptr + i * 96);
++            n1 = hvx_vmemu(s_ptr + i * 96 + 32);
++            n2 = hvx_vmemu(s_ptr + i * 96 + 64);
++            for (uint32_t g = T; g < n_slots; g++) {
++                float * g_ptr = (float *) ((uint8_t *) d_ptr + (size_t) g * cctx->slot_stride);
++                hvx_vmemu(g_ptr + i * 96)      = n0;
++                hvx_vmemu(g_ptr + i * 96 + 32) = n1;
++                hvx_vmemu(g_ptr + i * 96 + 64) = n2;
++            }
+         }
+ 
+-        hvx_vmemu(d_ptr + i * 96)      = n0;
+-        hvx_vmemu(d_ptr + i * 96 + 32) = n1;
+-        hvx_vmemu(d_ptr + i * 96 + 64) = n2;
++        for (uint32_t t = t_start; t < T; t++) {
++            HVX_Vector xv = hvx_vmemu(cctx->x + (size_t) t * cctx->x_stride + c0 + i * VLEN_FP32);
++            gdn_conv_shift_slot(&mk, n0, n1, n2, xv, &n0, &n1, &n2);
++
++            const uint32_t g = T - 1 - t;
++            if (g < n_slots) {
++                float * g_ptr = (float *) ((uint8_t *) d_ptr + (size_t) g * cctx->slot_stride);
++                hvx_vmemu(g_ptr + i * 96)      = n0;
++                hvx_vmemu(g_ptr + i * 96 + 32) = n1;
++                hvx_vmemu(g_ptr + i * 96 + 64) = n2;
++            }
++        }
+     }
+ 
+     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) (c0 + n));
+@@ -918,6 +948,12 @@
+     if (slot->ne[0] != row || slot->nb[0] != sizeof(float)) {
+         GDN_CHUNK_FAIL(GDN_CHUNK_ERR_SHAPE, HTP_STATUS_INVAL_PARAMS);
+     }
++    // With speculative decoding the destination spans the rollback slots of this sequence: ne[1] of
++    // them, nb[1] apart, slot g the conv state after token T - 1 - g. Without it there is one slot.
++    const uint32_t n_slots = slot->ne[1] > 0 ? slot->ne[1] : 1;
++    if (n_slots > 1 && slot->nb[1] < (uint32_t) row * sizeof(float)) {
++        GDN_CHUNK_FAIL(GDN_CHUNK_ERR_SHAPE, HTP_STATUS_INVAL_PARAMS);
++    }
+     if (y->ne[0] != n_ch || y->ne[1] != T || y->nb[0] != sizeof(float) ||
+         (y->nb[1] % sizeof(float)) != 0) {
+         GDN_CHUNK_FAIL(GDN_CHUNK_ERR_SHAPE, HTP_STATUS_INVAL_PARAMS);
+@@ -958,11 +994,13 @@
+     cctx.n_ch     = n_ch;
+     cctx.n_tokens = T;
+     cctx.chunk    = chunk;
++    cctx.n_slots     = n_slots;
++    cctx.slot_stride = n_slots > 1 ? slot->nb[1] : 0;
+     cctx.vtcm     = octx->ctx->vtcm_base;
+     cctx.vtcm_per_thread = vtcm_per_thread;
+ 
+-    FARF(HIGH, "gdn-conv-chunk: n_ch %u tokens %u slot %d chunk %u threads %u vtcm %zu\n",
+-         n_ch, T, src_idx, chunk, n_threads, vtcm_per_thread * n_threads);
++    FARF(HIGH, "gdn-conv-chunk: n_ch %u tokens %u slot %d slots %u chunk %u threads %u vtcm %zu\n",
++         n_ch, T, src_idx, n_slots, chunk, n_threads, vtcm_per_thread * n_threads);
+ 
+     work_queue_run(octx->ctx->work_queue, gdn_conv_chunk_thread, &cctx, n_threads);
+ 
+diff -urN A/ggml/src/ggml-hexagon/htp/gdn-step.h B/ggml/src/ggml-hexagon/htp/gdn-step.h
+--- A/ggml/src/ggml-hexagon/htp/gdn-step.h	1970-01-01 03:00:00.000000000 +0300
++++ B/ggml/src/ggml-hexagon/htp/gdn-step.h	2026-09-20 04:58:58.023975546 +0300
+@@ -0,0 +1,41 @@
++// One token of the gated delta rule, on one (sequence, head) row.
++//
++// The sequential kernel of gated-delta-net-ops.c and the tail of the chunked kernel of
++// gdn-chunk-ops.c run the same recurrence, thus one function holds it. The chunked kernel takes
++// chunks of tokens, and the last tokens of a batch need one snapshot of the state each. A chunk
++// gives the state at its boundary only, thus the chunked kernel stops before those tokens and
++// this function does them one by one.
++//
++// The state buffer is transposed, as the state tensor and the snapshot region of the output are:
++//   state[j * S_v + i] = S[i][j], i the key index, j the value index.
++// Thus row j of the buffer is column j of S, and the buffer goes to DDR without a transpose.
++
++#ifndef GDN_STEP_H
++#define GDN_STEP_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++// Applies one token to the state and writes the attention output of that token.
++//
++// The recurrence of token t, with a the decay, k the key, v the value, q the query and beta:
++//   S    = diag(a) S          (a is one value, or one value for each key index with KDA)
++//   d[j] = beta (v[j] - sum_i S[i][j] k[i])
++//   S    = S + k d^T
++//   o[j] = scale sum_i S[i][j] q[i]
++// The state that the function leaves is the state after the token.
++//
++// state:    [S_v * S_v] f32, transposed, in VTCM. The function reads and writes it
++// q_t, k_t: [S_v] f32, the query and the key of the token, in VTCM or in DDR
++// v_t:      [S_v] f32, the value of the token
++// g_t:      the log decay: one value, or [S_v] values when kda is true
++// beta_val: beta of the token
++// attn_out: [S_v] f32, the attention output of the token
++// S_v:      the head size, a maximum of HTP_GDN_MAX_SV
++// kda:      true when the gate is one value for each key index
++// scale:    1 / sqrt(S_v)
++void gdn_step_token_f32(float * restrict state, const float * restrict q_t, const float * restrict k_t,
++                        const float * restrict v_t, const float * restrict g_t, float beta_val,
++                        float * restrict attn_out, uint32_t S_v, bool kda, float scale);
++
++#endif // GDN_STEP_H
+diff -urN A/tests/test-backend-ops.cpp B/tests/test-backend-ops.cpp
+--- A/tests/test-backend-ops.cpp	2026-09-20 04:51:12.274959904 +0300
++++ B/tests/test-backend-ops.cpp	2026-09-20 04:58:58.024490783 +0300
+@@ -4667,10 +4667,15 @@
+     // those with a margin of 6.6 and still catches a regression of 7. The predicate is the gate of the
+     // kernel (gdn-chunk-ops.c): another shape runs the sequential kernel and keeps the tight bound, as
+     // does every other backend.
++    //
++    // With K > 1 the kernel stops the chunk loop K tokens early and runs those tokens one by one in
++    // f32, one snapshot slot each. Thus the tail is tighter than the chunk, and the bound of the
++    // chunk holds for the whole output. The gate of the kernel is the token count outside that tail.
+     double max_nmse_err(ggml_backend_t backend) override {
+         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+-        const bool chunkable = n_seq_tokens >= 32 && !kda && K == 1 && n_seqs == 1 &&
+-                               head_size % 32 == 0 && head_size <= 128;
++        const int64_t n_tail    = K > 1 ? K : 0;
++        const bool    chunkable = n_seq_tokens - n_tail >= 32 && !kda && n_seqs == 1 &&
++                                  head_size % 32 == 0 && head_size <= 128;
+         if (chunkable && strcmp(ggml_backend_reg_name(reg), "HTP") == 0) {
+             return std::max(test_case::max_nmse_err(backend), 2e-6);
+         }
+@@ -11203,6 +11208,18 @@
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+ 
++    // K > 1 on the shapes of the chunked kernel of the HTP backend (one sequence, a scalar gate, a
++    // head size that is a multiple of 32 and at most 128). That kernel takes chunks of 64 tokens and
++    // stops K tokens before the end, thus these cases cover the chunk count 1 and 2, a chunk that is
++    // not full, the boundary of the gate (32 tokens outside the tail) and the shape below it.
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  36, 1, 1, false, false, /*K=*/4));
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  35, 1, 1, false, false, /*K=*/4));
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  66, 1, 1, false, false, /*K=*/2));
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  68, 1, 1, false, false, /*K=*/4));
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 132, 1, 1, false, false, /*K=*/4));
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 64,  100, 1, 2, false, false, /*K=*/3));
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   96, 1, 1, false, false, /*K=*/5));
++
+     // gdn + cache cpy fusion (K > 1)
+     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
+     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 64,   4, 1, 2));

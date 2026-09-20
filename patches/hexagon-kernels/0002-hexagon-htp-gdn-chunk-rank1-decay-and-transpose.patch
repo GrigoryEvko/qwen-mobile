@@ -1,0 +1,177 @@
+The chunked gated delta net: the decay matrix as an outer product, and a shuffle transpose
+(lab proposal)
+
+GATED_DELTA_NET is 78 ms of the 536 ms of DSP op time of a 512-token prefill of the 4B, at 1.83
+instructions per packet. Qwen3.5 gives the gate the shape [1, H, tokens, seqs], thus g->ne[0] is
+1, and with K = 1 and one sequence op_gated_delta_net_chunked accepts the batch: this file is the
+kernel that runs, and the sequential thread of gated-delta-net-ops.c is the fallback for K > 1.
+
+Measured on the v79 timing model with tools/htp-lab (target gdn_state), one head and one chunk of
+C = 64 at D = 128, the HVX helpers of this kernel cost 86544 cycles together. Two of them are
+this change.
+
+1. gdn_ch_decay_matrix cost 15701 cycles. It called two vector exponentials for each of the 64
+   rows, 128 in all, to build a matrix that is a rank-1 product:
+   E[t][s] = exp(gamma_t - gamma_s) = u[t] * w[s]. The factors need four vector exponentials, and
+   a row is then one broadcast and two multiplies. A guard keeps the old path when the log decay
+   of the chunk spans more than 80, where a factor would leave the range of an f32.
+
+2. gdn_ch_transpose_f32 cost 24759 cycles, which is 48.4 cycles for each vector of the matrix.
+   It issued one Q6_vscatter_RMVwV for each vector, and a scatter of the v79 retires in about 45
+   cycles (measured on its own with the target hvxcost). The five-stage shuffle butterfly of
+   ssm-conv.c does the same work with five permutes for each vector.
+
+diff -urN a/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c b/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c
+--- a/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c	2026-09-20 03:04:32.198440445 +0300
++++ b/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c	2026-09-20 03:08:02.951650530 +0300
+@@ -371,28 +371,66 @@
+ 
+ // f32 [n x n] transpose in VTCM through 32-bit scatters: dst[c][r] = src[r][c]. n is a multiple of 32,
+ // and n * n * 4 is at most 64 KB, which is the limit of a scatter region.
++// In-register 32x32 f32 transpose, the five-stage HVX shuffle butterfly. The same network as
++// hvx_transpose_32x32_f32 of ssm-conv.c.
++static inline void gdn_ch_transpose_32x32_f32(HVX_Vector m[32]) {
++    HVX_Vector tmp[32];
++
++    for (int i = 0; i < 16; ++i) {
++        HVX_VectorPair p = Q6_W_vshuff_VVR(m[2 * i + 1], m[2 * i], -4);
++        tmp[2 * i + 0] = Q6_V_lo_W(p);
++        tmp[2 * i + 1] = Q6_V_hi_W(p);
++    }
++    for (int b = 0; b < 32; b += 4) {
++        HVX_VectorPair p0 = Q6_W_vshuff_VVR(tmp[b + 2], tmp[b + 0], -8);
++        HVX_VectorPair p1 = Q6_W_vshuff_VVR(tmp[b + 3], tmp[b + 1], -8);
++        m[b + 0] = Q6_V_lo_W(p0); m[b + 1] = Q6_V_hi_W(p0);
++        m[b + 2] = Q6_V_lo_W(p1); m[b + 3] = Q6_V_hi_W(p1);
++    }
++    for (int b = 0; b < 32; b += 8) {
++        for (int i = 0; i < 4; ++i) {
++            HVX_VectorPair p = Q6_W_vshuff_VVR(m[b + i + 4], m[b + i], -16);
++            tmp[b + 2 * i + 0] = Q6_V_lo_W(p);
++            tmp[b + 2 * i + 1] = Q6_V_hi_W(p);
++        }
++    }
++    for (int b = 0; b < 32; b += 16) {
++        for (int i = 0; i < 8; ++i) {
++            HVX_VectorPair p = Q6_W_vshuff_VVR(tmp[b + i + 8], tmp[b + i], -32);
++            m[b + 2 * i + 0] = Q6_V_lo_W(p);
++            m[b + 2 * i + 1] = Q6_V_hi_W(p);
++        }
++    }
++    for (int i = 0; i < 16; ++i) {
++        HVX_VectorPair p = Q6_W_vshuff_VVR(m[i + 16], m[i], -64);
++        tmp[2 * i + 0] = Q6_V_lo_W(p);
++        tmp[2 * i + 1] = Q6_V_hi_W(p);
++    }
++    for (int i = 0; i < 32; ++i) {
++        m[i] = tmp[i];
++    }
++}
++
++// The state transpose, block by block of 32 x 32.
++//
++// The scatter form of this function cost one Q6_vscatter_RMVwV for each vector of the matrix, and
++// a scatter of the v79 retires in about 45 cycles, thus a 128 x 128 transpose cost 24759 cycles
++// on the timing model. The shuffle butterfly costs five permutes for each vector, and a permute
++// is one for each packet, thus the same transpose needs about 160 packets for each 32 x 32 block.
++//
++// n is a multiple of 32, which op_gated_delta_net_chunked already demands of D. Both buffers are
++// VTCM allocations aligned to a vector, thus the aligned load and store forms are correct.
+ static void gdn_ch_transpose_f32(float * restrict dst, const float * restrict src, uint32_t n) {
+-    const size_t bytes = (size_t) n * n * sizeof(float);
+-    size_t region = 1;
+-    while (region < bytes) {
+-        region <<= 1;
+-    }
+-    region -= 1;
+-
+-    // lane l of a source vector holds column c0 + l, and goes to byte offset (c0 + l) * n * 4 + r * 4.
+-    // The scatter offsets table holds l * 128, thus l * n * 4 is the table n / 32 times.
+-    const HVX_Vector table = hvx_vmem(hmx_transpose_scatter_offsets);
+-    HVX_Vector lane = table;
+-    for (uint32_t m = 32; m < n; m += 32) {
+-        lane = Q6_Vw_vadd_VwVw(lane, table);
+-    }
+-
+-    for (uint32_t r = 0; r < n; ++r) {
+-        const float * p = src + (size_t) r * n;
+-        for (uint32_t c0 = 0; c0 < n; c0 += 32) {
+-            HVX_Vector offs = Q6_Vw_vadd_VwVw(lane, Q6_V_vsplat_R(c0 * n * sizeof(float) + r * sizeof(float)));
+-            HVX_Vector vals = hvx_vmem(p + c0);
+-            Q6_vscatter_RMVwV((size_t) dst, region, offs, vals);
++    for (uint32_t bi = 0; bi < n; bi += 32) {
++        for (uint32_t bj = 0; bj < n; bj += 32) {
++            HVX_Vector m[32];
++            for (uint32_t r = 0; r < 32; ++r) {
++                m[r] = hvx_vmem(src + (size_t) (bi + r) * n + bj);
++            }
++            gdn_ch_transpose_32x32_f32(m);
++            for (uint32_t c = 0; c < 32; ++c) {
++                hvx_vmem(dst + (size_t) (bj + c) * n + bi) = m[c];
++            }
+         }
+     }
+     gdn_ch_mem_sync();
+@@ -430,14 +468,59 @@
+ }
+ 
+ // E[t][s] = exp(gamma_t - gamma_s) for s <= t, 0 for s > t
++// The largest span of the cumulative log decay over one chunk that the factored decay matrix
++// accepts. The factors reach exp(span / 2), and an f32 holds exp(88), thus 80 leaves a margin.
++#define GDN_CH_DECAY_MAX_SPAN 80.0f
++
++// The decay matrix by two vector exponentials of the chunk instead of two for each row.
++//
++// E[t][s] = exp(gamma_t - gamma_s). With gamma_m the log decay in the middle of the chunk,
++//   E[t][s] = exp(gamma_t - gamma_m) * exp(gamma_m - gamma_s) = u[t] * w[s],
++// thus E is one outer product and a row of it is one broadcast and two multiplies. The pivot is
++// the middle and not the first token, thus each factor reaches only exp(span / 2).
++//
++// gamma is not increasing, thus the span is gamma_0 - gamma_(C-1). A span above
++// GDN_CH_DECAY_MAX_SPAN would overflow a factor, and the exponential of each row runs instead.
++// A real gate gives a span far below that limit.
+ static void gdn_ch_decay_matrix(struct gdn_ch_row * rw, const struct gdn_ch_gates * ga) {
+     const HVX_Vector vg0 = hvx_vmem(ga->gam);
+     const HVX_Vector vg1 = hvx_vmem(ga->gam + 32);
+     const HVX_Vector zero = Q6_V_vzero();
++
++    const float span = ga->gam[0] - ga->gam[GDN_CH_C - 1];
++    if (!(span >= 0.0f && span <= GDN_CH_DECAY_MAX_SPAN)) {
++        for (uint32_t t = 0; t < GDN_CH_C; ++t) {
++            const HVX_Vector vt = hvx_vec_splat_f32(ga->gam[t]);
++            HVX_Vector e0 = hvx_vec_exp_f32(hvx_vec_sub_f32_f32(vt, vg0));
++            HVX_Vector e1 = hvx_vec_exp_f32(hvx_vec_sub_f32_f32(vt, vg1));
++            if (t < 32) {
++                e0 = Q6_V_vmux_QVV(Q6_Q_vsetq2_R((t + 1) * 4), e0, zero);
++                e1 = zero;
++            } else {
++                e1 = Q6_V_vmux_QVV(Q6_Q_vsetq2_R((t - 31) * 4), e1, zero);
++            }
++            hvx_vmem(rw->e32 + (size_t) t * GDN_CH_C)      = e0;
++            hvx_vmem(rw->e32 + (size_t) t * GDN_CH_C + 32) = e1;
++        }
++        return;
++    }
++
++    const HVX_Vector vgm = hvx_vec_splat_f32(ga->gam[GDN_CH_C / 2]);
++
++    // w[s] = exp(gamma_m - gamma_s), the two halves of the row factor
++    const HVX_Vector w0 = hvx_vec_exp_f32(hvx_vec_sub_f32_f32(vgm, vg0));
++    const HVX_Vector w1 = hvx_vec_exp_f32(hvx_vec_sub_f32_f32(vgm, vg1));
++
++    // u[t] = exp(gamma_t - gamma_m). The broadcast reads one lane, thus u goes to the stack:
++    // a scalar read of the VTCM is slow.
++    float u[GDN_CH_C] __attribute__((aligned(VLEN)));
++    hvx_vmem(u)      = hvx_vec_exp_f32(hvx_vec_sub_f32_f32(vg0, vgm));
++    hvx_vmem(u + 32) = hvx_vec_exp_f32(hvx_vec_sub_f32_f32(vg1, vgm));
++
+     for (uint32_t t = 0; t < GDN_CH_C; ++t) {
+-        const HVX_Vector vt = hvx_vec_splat_f32(ga->gam[t]);
+-        HVX_Vector e0 = hvx_vec_exp_f32(hvx_vec_sub_f32_f32(vt, vg0));
+-        HVX_Vector e1 = hvx_vec_exp_f32(hvx_vec_sub_f32_f32(vt, vg1));
++        const HVX_Vector vu = hvx_vec_splat_f32(u[t]);
++        HVX_Vector e0 = hvx_vec_mul_f32_f32(vu, w0);
++        HVX_Vector e1 = hvx_vec_mul_f32_f32(vu, w1);
+         if (t < 32) {
+             e0 = Q6_V_vmux_QVV(Q6_Q_vsetq2_R((t + 1) * 4), e0, zero);
+             e1 = zero;

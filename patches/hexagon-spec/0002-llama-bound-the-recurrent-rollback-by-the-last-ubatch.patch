@@ -1,0 +1,209 @@
+llama: bound the recurrent rollback by the depth that the last ubatch wrote
+
+Base: llama.cpp commit c6824a9 plus the patches before this one in patches/series.
+
+Files:
+    src/llama-memory-recurrent.h    the per-seq depth of the snapshot groups
+    src/llama-memory-recurrent.cpp  the depth, and the limit that seq_rm applies
+
+The problem
+
+A context with n_rs_seq > 0 keeps K = n_rs_seq + 1 groups of the recurrent state of each
+sequence. A partial llama_memory_seq_rm of r tokens sets rs_idx to r, and the next graph reads
+group r through s_copy.
+
+The graph of a ubatch that holds T tokens of one sequence writes the groups 0 thru
+min(T, K) - 1, and group g holds the state after the token T - g of that ubatch. Refer to
+llm_build_delta_net_base::build_recurrent_attn, where n_written is min(n_seq_tokens, K). Thus
+each group from min(T, K) upward keeps what an earlier ubatch left in it, and that state belongs
+to a different position.
+
+seq_rm does a check of r against n_rs_seq only. It has no value for T. A caller that asks for a
+rollback deeper than the last ubatch gets the state of a different position, no error message,
+and wrong logits. The condition is not documented and no assert states it.
+
+The measurement
+
+A host program decodes a prefill of 64 tokens on two contexts. The roll context decodes a tail of
+T more tokens and removes all T of them again, thus a correct rollback puts it in the state of
+the reference context. Both contexts then decode one identical batch of 8 tokens, thus the ubatch
+shapes agree and a correct result matches bitwise. The model is Qwen3.5-2B Q4_0 on the CPU
+backend. The floor of a comparison of two different batch shapes is 0.168 on the same model.
+
+    case                    max|dlogit| before   after
+    tail T=1 r=1            2.20884              refused
+    tail T=2 r=2            2.18867              refused
+    tail T=3 r=3            2.18571              refused
+    tail T=4 r=4  (K=9)     1.98843              refused
+    tail T=8 r=8  (K=9)     2.23574              refused
+    inner T=4 r=1           0                    0
+    inner T=4 r=2           0                    0
+    inner T=4 r=3           0.16409              0.16409
+
+Every rollback that undoes a whole ubatch reads a stale group today. Every rollback that lands
+inside its ubatch is correct, and this patch does not change it.
+
+The change
+
+llama_memory_recurrent keeps one more value for each sequence, rs_depth, which is the deepest
+rollback that the groups of that sequence hold. The memory context sets it in apply(), one time
+for each ubatch, from the token count of the ubatch. seq_rm takes that value as its limit in
+place of n_rs_seq, thus a rollback that reaches a group which no ubatch wrote returns false.
+
+The value goes to zero when the sequence is cleared, when the whole sequence is removed, and
+after a state load, because the load writes group 0 only. seq_cp gives the destination the value
+of the source, because the two sequences then share the cell and its groups.
+
+Who this changes
+
+llama_memory_seq_rm returns false in place of a wrong state. tools/server already takes that
+path: server-context.cpp compares n_rollback against llama_n_rs_seq and restores a checkpoint
+when the rollback is too deep, and a false return reaches the same recovery. The app does not
+reach the limit: spec_step submits 1 + n_draft tokens and rolls back at most n_draft of them,
+thus r is always less than T.
+
+State of the verification
+
+The host program above ran on the CPU backend with the 2B Q4_0 file, with n_rs_seq 3 and 8.
+The Android build of the pinned container compiles the change. The device did not run it: the
+patch changes no kernel and no graph, thus no speed number moves.
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index 57919ac..88c1418 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -34,6 +34,7 @@ llama_memory_recurrent::llama_memory_recurrent(
+ 
+     this->n_rs_seq = n_rs_seq;
+     rs_idx.assign(n_seq_max, 0);
++    rs_depth.assign(n_seq_max, 0);
+ 
+     cells.clear();
+     cells.resize(mem_size);
+@@ -156,6 +157,7 @@ void llama_memory_recurrent::clear(bool data) {
+     }
+ 
+     std::fill(rs_idx.begin(), rs_idx.end(), 0);
++    std::fill(rs_depth.begin(), rs_depth.end(), 0);
+ }
+ 
+ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+@@ -177,6 +179,12 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
+     const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
+     if (rm_all) {
+         set_rs_idx(seq_id, 0);
++        // The sequence goes away, thus no group of it holds a state that a rollback can read.
++        if (seq_id < 0) {
++            std::fill(rs_depth.begin(), rs_depth.end(), 0);
++        } else if ((size_t) seq_id < rs_depth.size()) {
++            rs_depth[seq_id] = 0;
++        }
+     }
+ 
+     // models like Mamba or RWKV can't have a state partially erased at the end
+@@ -195,7 +203,12 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
+                 const llama_pos rollback = cell.pos - (p0 - 1);
+                 // pending rollback is single-use
+                 const bool pending = rs_idx[seq_id] != 0;
+-                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
++                // [TAG_RECURRENT_ROLLBACK_DEPTH]
++                // The group that this rollback reads must hold the state of the position that
++                // the rollback goes to. Only the ubatch that wrote the group gives that, thus
++                // the depth of that ubatch is the limit, and it is never more than n_rs_seq.
++                const llama_pos depth = (llama_pos) std::min<uint32_t>(n_rs_seq, rs_depth[seq_id]);
++                if (!pending && rollback >= 1 && rollback <= depth) {
+                     set_rs_idx(seq_id, (uint32_t) rollback);
+                     cell.pos = p0 - 1;
+                     return true;
+@@ -280,6 +293,12 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
+             cell_src.seq_id.insert(seq_id_dst);
+             tail_dst.tail = tail_src.tail;
+         }
++
++        // [TAG_RECURRENT_ROLLBACK_DEPTH] the two sequences share the cell, thus they share the
++        // snapshot groups of that cell and the depth that those groups hold.
++        if ((size_t) seq_id_src < rs_depth.size() && (size_t) seq_id_dst < rs_depth.size()) {
++            rs_depth[seq_id_dst] = tail_src.tail >= 0 ? rs_depth[seq_id_src] : 0;
++        }
+     }
+ }
+ 
+@@ -403,6 +422,31 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
+     return result;
+ }
+ 
++void llama_memory_recurrent::set_rs_depth(const llama_ubatch & ubatch) {
++    if (n_rs_seq == 0) {
++        return;
++    }
++
++    // [TAG_RECURRENT_ROLLBACK_DEPTH]
++    // The graph writes min(n_seq_tokens, K) groups, and group g holds the state after the token
++    // n_seq_tokens - g of this ubatch. Thus group 0 is the state that the next step reads, and
++    // the deepest rollback that the ubatch covers is one less than the count of the groups.
++    const uint32_t groups  = n_rs_seq + 1;
++    const uint32_t written = std::min<uint32_t>(ubatch.n_seq_tokens, groups);
++
++    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
++        const uint32_t i = s * ubatch.n_seq_tokens; // first token of sequence set s
++
++        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
++            const llama_seq_id seq_id = ubatch.seq_id[i][j];
++
++            if (seq_id >= 0 && (size_t) seq_id < rs_depth.size()) {
++                rs_depth[seq_id] = written - 1;
++            }
++        }
++    }
++}
++
+ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
+     if (seq_id < 0) {
+         std::fill(rs_idx.begin(), rs_idx.end(), 0);
+@@ -872,6 +916,13 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
+ 
+     if (n_rs_seq != 0) {
+         set_rs_idx(seq_id, 0);
++        // [TAG_RECURRENT_ROLLBACK_DEPTH] the load writes group 0 only, thus the groups above it
++        // keep the history of this context and no rollback can read them.
++        if (seq_id < 0) {
++            std::fill(rs_depth.begin(), rs_depth.end(), 0);
++        } else if ((size_t) seq_id < rs_depth.size()) {
++            rs_depth[seq_id] = 0;
++        }
+     }
+ }
+ 
+@@ -1261,6 +1312,7 @@ bool llama_memory_recurrent_context::apply() {
+     }
+ 
+     mem->find_slot(ubatches[i_next]);
++    mem->set_rs_depth(ubatches[i_next]);
+ 
+     return true;
+ }
+diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
+index 4abb3f5..3c4ffa1 100644
+--- a/src/llama-memory-recurrent.h
++++ b/src/llama-memory-recurrent.h
+@@ -76,8 +76,21 @@ public:
+     // per-seq rollback index
+     std::vector<uint32_t> rs_idx;
+ 
++    // [TAG_RECURRENT_ROLLBACK_DEPTH]
++    // Per-seq deepest rollback that the snapshot groups hold, one value for each sequence.
++    //
++    // The graph of a ubatch that holds T tokens of a sequence writes the groups 0 thru
++    // min(T, K) - 1, where group g holds the state after the token T - g of that ubatch. The
++    // groups above keep what an earlier ubatch put there, and that state belongs to a different
++    // position. Thus seq_rm refuses a rollback that reaches one of them.
++    std::vector<uint32_t> rs_depth;
++
+     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
+ 
++    // Record the deepest rollback that the ubatch which goes to the graph can serve, for each
++    // sequence of that ubatch. The memory context calls this one time for each ubatch.
++    void set_rs_depth(const llama_ubatch & ubatch);
++
+     // computed before each graph build
+     uint32_t n = 0;
+ 

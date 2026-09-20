@@ -1,0 +1,43 @@
+hexagon: take the packed band path of the batch conv by default
+
+Base: llama.cpp commit c6824a9 plus the patches before this one in patches/series.
+
+Files:
+    ggml/src/ggml-hexagon/htp/gdn-conv-ops.c  the default of GDN_CONV_F16_MODE
+
+The problem
+
+The patch that adds the packed band path leaves its default at 0, which is the f32 chain that
+came before it. Thus the measured work does nothing until a build selects mode 4.
+
+The change
+
+The default becomes 4: f16 taps, a 32-bit accumulator, the int16 SiLU, and 3 token rows in
+each iteration. Measured in tools/htp-lab against a float64 reference, for each 32-lane block:
+
+    mode 0, the f32 chain      438.6 cycles   NMSE 2.7e-14
+    mode 4, the packed band     29.0 cycles   NMSE 2.9e-07
+
+15 times faster. GDN_CONV_CHUNK is the largest single op of a 512-token prefill of the 4B, at
+27 % of the time on the digital signal processor, thus this is the largest prefill change of
+the series. The op runs when a batch has more than one token, thus it serves the prefill and
+the speculative verify, and not the single-token decode step.
+
+The error
+
+2.9e-07 of NMSE against a baseline of 2.7e-14. The consumer of this output, the chunked gated
+delta net, already measures 3.0e-07 of its own, and the bound that the backend tests apply is
+2e-06, thus this value costs nothing downstream. It is a regression from an exact baseline and
+a reviewer must see it. GDN_CONV_F16_MODE 0 takes the old path back.
+diff -urN a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
+--- a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c	2026-09-20 03:59:39.046281562 +0300
++++ b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c	2026-09-20 03:59:39.062841780 +0300
+@@ -192,7 +192,7 @@
+ //   3  f16 taps, f16 accumulate, f16 SiLU. Every product goes back to f16 before the sum.
+ //   4  the packed path: f16 taps, 32-bit accumulate, int16 SiLU, 4 token rows in each iteration.
+ #ifndef GDN_CONV_F16_MODE
+-#define GDN_CONV_F16_MODE 0
++#define GDN_CONV_F16_MODE 4
+ #endif
+ static int gdn_conv_f16_mode = GDN_CONV_F16_MODE;
+ 

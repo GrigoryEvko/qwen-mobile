@@ -1,0 +1,127 @@
+The 2D transpose path of the copy kernel (lab proposal)
+
+ggml_cont(ggml_transpose(x)) of a contiguous x gives a source whose row stride is one element.
+The reshape path of cpy-ops.c then finds rows_contig false and copies one element for each
+iteration of its loop. The gated delta net asks for that shape twice per layer
+(src/models/delta-net-base.cpp:89 for the cumsum input, :123 and :124 for kb and kq of the
+chunked path), thus every prefill pays it.
+
+This proposal stages a 32 x 32 tile in the VTCM and transposes it with 32 independent gathers.
+Measured in tools/htp-lab (target move, a 256 x 256 f32 transpose), both results byte for byte
+equal to the reference: 3.02 cycles per element before, 0.51 after, thus 5.98 times faster.
+
+The gather is cheap only when its result is not read by the next instruction. One gather with a
+dependent load costs 45 cycles; 32 independent gathers cost 4.7 cycles each, because the unit
+pipelines them. concat-ops.c already uses that pattern.
+
+diff -urN a/ggml/src/ggml-hexagon/htp/cpy-ops.c b/ggml/src/ggml-hexagon/htp/cpy-ops.c
+--- a/ggml/src/ggml-hexagon/htp/cpy-ops.c	2026-09-20 03:09:26.672091400 +0300
++++ b/ggml/src/ggml-hexagon/htp/cpy-ops.c	2026-09-20 03:09:26.697617414 +0300
+@@ -201,6 +201,90 @@
+ DEFINE_CPY_RESHAPE(f32,  float, 4)
+ DEFINE_CPY_RESHAPE(f16, __fp16, 2)
+ 
++// The 2D transpose path.
++//
++// ggml_cont(ggml_transpose(x)) of a contiguous x gives a source whose row stride is one element
++// and whose element stride is a whole row of the original. The generic reshape path above then
++// finds rows_contig false and copies ONE ELEMENT for each iteration of its loop. The gated delta
++// net asks for exactly that shape twice per layer (src/models/delta-net-base.cpp, the kb and kq
++// of the chunked path, and the g of the cumsum), thus the cost is paid on every prefill.
++//
++// Measured on the v79 timing model (tools/htp-lab, target move, a 256 x 256 f32 transpose, both
++// results byte for byte equal to the reference):
++//   the element loop            3.02 cycles per element
++//   this path                   0.51 cycles per element     5.98 times faster
++//
++// How it works. A 32 x 32 tile of the source is staged into the VTCM, where the gather unit can
++// address it. Output row c is then the gather of column c of the tile, with 32 offsets of the
++// tile row stride. The 32 gathers are independent, thus the gather unit pipelines them and each
++// costs 4.7 cycles rather than the 45 of a gather whose result the next instruction reads.
++#define CPY_T_TILE      32
++#define CPY_T_TILE_VECS 2                              // the staging tile and the gather tile
++#define CPY_T_VTCM      (CPY_T_TILE_VECS * CPY_T_TILE * VLEN)
++
++// One 32 x 32 f32 tile. src and dst are the tile origins, the strides are in floats.
++static inline void cpy_tile32_transpose_f32(float * restrict dst, uint32_t dst_stride,
++                                            const float * restrict src, uint32_t src_stride,
++                                            HVX_Vector * restrict stage, HVX_Vector * restrict gtile,
++                                            HVX_Vector voff, uint32_t mu) {
++    for (uint32_t r = 0; r < CPY_T_TILE; r++) {
++        stage[r] = hvx_vmemu(src + (size_t) r * src_stride);
++    }
++    for (uint32_t c = 0; c < CPY_T_TILE; c++) {
++        Q6_vgather_ARMVw(&gtile[c], (size_t) ((const uint8_t *) stage + c * sizeof(float)), mu, voff);
++    }
++    for (uint32_t c = 0; c < CPY_T_TILE; c++) {
++        hvx_vmemu(dst + (size_t) c * dst_stride) = gtile[c];
++    }
++}
++
++// Each thread takes a band of tile rows of the output. ne0 and ne1 of the destination are
++// multiples of the tile, which exec_cpy checks before it selects this function.
++static void cpy_thread_f32_transpose2d(unsigned int nth, unsigned int ith, void * data) {
++    struct htp_copy_context * ct = (struct htp_copy_context *) data;
++    struct htp_ops_context * octx = ct->octx;
++    cpy_preamble;
++
++    const uint32_t tiles_r = ne1 / CPY_T_TILE;         // tile rows of the destination
++    const uint32_t tiles_c = ne0 / CPY_T_TILE;
++    const uint32_t per_th  = (tiles_r + nth - 1) / nth;
++    const uint32_t tr0     = ith * per_th;
++    const uint32_t tr1     = MIN(tr0 + per_th, tiles_r);
++    if (tr0 >= tr1) {
++        return;
++    }
++
++    uint8_t *    vtcm  = octx->ctx->vtcm_base + (size_t) ith * CPY_T_VTCM;
++    HVX_Vector * stage = (HVX_Vector *) vtcm;
++    HVX_Vector * gtile = stage + CPY_T_TILE;
++
++    int32_t offsets[CPY_T_TILE] __attribute__((aligned(VLEN)));
++    for (uint32_t k = 0; k < CPY_T_TILE; k++) {
++        offsets[k] = (int32_t) (k * VLEN);             // the row stride of the staging tile
++    }
++    const HVX_Vector voff = *(HVX_Vector *) offsets;
++    const uint32_t   mu   = CPY_T_TILE * VLEN;
++
++    const uint32_t src_stride = nb01 / sizeof(float);  // one row of the original matrix
++    const uint32_t dst_stride = nb1  / sizeof(float);
++
++    for (uint32_t i03 = 0; i03 < ne3; i03++) {
++        for (uint32_t i02 = 0; i02 < ne2; i02++) {
++            const float * src_m = (const float *) ((const uint8_t *) src0->data + i02 * nb02 + i03 * nb03);
++            float *       dst_m = (float *)       ((uint8_t *)       dst->data  + i02 * nb2  + i03 * nb3);
++
++            for (uint32_t tr = tr0; tr < tr1; tr++) {
++                for (uint32_t tc = 0; tc < tiles_c; tc++) {
++                    // the tile of the destination at (tr, tc) is the tile of the source at (tc, tr)
++                    cpy_tile32_transpose_f32(dst_m + (size_t) tr * CPY_T_TILE * dst_stride + tc * CPY_T_TILE, dst_stride,
++                                             src_m + (size_t) tc * CPY_T_TILE * src_stride + tr * CPY_T_TILE, src_stride,
++                                             stage, gtile, voff, mu);
++                }
++            }
++        }
++    }
++}
++
+ static void cpy_thread_f16_f32_sameshape(unsigned int nth, unsigned int ith, void * data) {
+     struct htp_copy_context * ct = (struct htp_copy_context *) data;
+     struct htp_ops_context * octx = ct->octx;
+@@ -402,6 +486,16 @@
+             }
+             work_queue_run(octx->ctx->work_queue, copy_fun, &ct, n_threads);
+         }
++    } else if (sametype && src0->type == HTP_TYPE_F32 &&
++               // src0 is a transposed view of a contiguous matrix, dst is contiguous
++               nb01 == sizeof(float) && nb00 == (uint32_t) (ne01 * sizeof(float)) &&
++               nb0  == sizeof(float) && nb1  == (uint32_t) (ne0  * sizeof(float)) &&
++               ne0 == ne00 && ne1 == ne01 && ne2 == ne02 && ne3 == ne03 &&
++               // whole tiles only, thus no edge case inside the kernel
++               (ne0 % CPY_T_TILE) == 0 && (ne1 % CPY_T_TILE) == 0 &&
++               octx->ctx->mdev.count <= 1 &&
++               octx->ctx->vtcm_size >= (size_t) n_threads * CPY_T_VTCM) {
++        work_queue_run(octx->ctx->work_queue, cpy_thread_f32_transpose2d, &ct, n_threads);
+     } else if (sametype) {
+         const uint32_t total_elems = ne0 * ne1 * ne2 * ne3;
+         const uint32_t elems_per_line = (ct.dst_type_size == 4) ? 32 : 64;

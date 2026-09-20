@@ -1,0 +1,394 @@
+hexagon: the GDN state and conv fusions with the rollback slots of a draft
+
+Base: llama.cpp commit c6824a9 plus the patches before this one in patches/series.
+
+Files:
+    ggml/src/ggml-hexagon/htp-gdn-match.h           the two matchers: K > 1, the slot span, the alias guard
+    ggml/src/ggml-hexagon/ggml-hexagon.cpp          the emit of the two fused ops, the spanning dummy tensor
+    ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c the shape guard of the fused state step
+    ggml/src/ggml-hexagon/htp/gdn-conv-ops.c        the write of the K slots of the conv state
+
+The problem
+
+Speculative decoding asks the recurrent layers to keep the last K states, thus a rejected draft rolls
+back without a copy: the app sets n_rs_seq = 4, and the graph then carries K = 4. The two fused ops of
+the patches before this one accept K = 1 only, thus every speculative decode ran the unfused chain: the
+state half costs about 5.5 ms of a token and the conv half about 0.2 ms, over 18 layers.
+
+The state chain
+
+The op writes the attention row and the new state. With K > 1 the output of GATED_DELTA_NET is
+[S_v * H, 1 + K * S_v], and the CPU reference writes the state of the token into the snapshot slot
+n_tokens - 1 - t, thus slot 0 holds the newest state. At one token only slot 0 is written, and the
+matcher accepts the chain when the shape agrees with 1 + K * S_v. The DSP op takes K from op_params[0]
+and validates the same shape.
+
+The conv chain
+
+At one token the graph writes the same pre-token state into each of the K slots, as K separate CPY
+nodes of the same source. The matcher collects them, sorts them by the address of their destination,
+and checks that slot g copies the column max(0, n_tokens - g) of the CONCAT and that the slots are
+evenly strided. The K destinations are contiguous rows of the conv cache, thus the fused op takes one
+synthetic tensor that spans them, with n_slots rows and the slot stride, and the DSP writes the same
+row to each slot. The span is an input and an output of the op: the backend marks the output tensors
+dirty, and the limit is 4 outputs and 10 inputs.
+
+The alias guard
+
+The fused op stands at the first CPY of the chain, which is up to 18 nodes before the SILU whose
+output it writes. The graph allocator can give that output the bytes of a tensor that died earlier,
+and the projection that the op reads is such a tensor. A measurement with ggml_gallocr over one layer
+produced exactly that overlap. The kernel loads a channel before it stores the same channel, thus the
+result is correct today, but the property is not part of the contract of the op. The matcher now
+refuses a chain whose projection and output share bytes.
+
+A batch of tokens still refuses both fusions: the chunked delta rule of patch 0005 covers the prefill
+and it keeps the final state only.
+
+State of the verification
+
+The matchers, the slot mapping, the completeness of the member lists and the addresses of the span
+were checked on the host against the real graph allocator and the CPU reference (2026-09-19): the
+slot stride of the 2B is 73728 bytes, the span covers 294912 bytes and no foreign byte, the attention
+row and the snapshot slot 0 of K = 4 equal those of K = 1 exactly, and no member runs twice or is
+skipped. The kernels themselves are not yet measured on the device.
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 9155741..fc5609e 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -6404,9 +6404,31 @@ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, co
+             const bool batch = m.n_tokens > 1;
+             htp_opnode node(batch ? HTP_OP_GDN_CONV_CHUNK : HTP_OP_GDN_CONV_STEP, m.S);
+             node.name    = batch ? "GDN_CONV_CHUNK" : "GDN_CONV_STEP";
+-            node.inputs  = { m.states, m.idx, m.xt, m.W, m.slot };
+-            node.outputs = { m.S, m.slot };
+-            node.fused   = { m.R, m.CI, m.C, m.P };
++
++            // Rollback snapshots make the chain write several consecutive slots of the cache.
++            // They go to the DSP as one tensor of n_slots rows, so the op writes them from one
++            // base and one stride, and the backend marks the whole range dirty. With one slot
++            // the destination of the CPY goes as it is, thus that path does not change.
++            const ggml_tensor * slots = m.slot;
++            if (m.n_slots > 1) {
++                ggml_tensor span = *m.slot;
++                span.ne[1]    = m.n_slots;
++                span.ne[2]    = 1;
++                span.ne[3]    = 1;
++                span.nb[1]    = m.slot_stride;
++                span.nb[2]    = span.nb[1] * span.ne[1];
++                span.nb[3]    = span.nb[2];
++                span.op       = GGML_OP_NONE;
++                span.view_src = nullptr;
++                span.view_offs = 0;
++                for (int s = 0; s < GGML_MAX_SRC; s++) {
++                    span.src[s] = nullptr;
++                }
++                slots = node.add_dummy(span);
++            }
++            node.inputs  = { m.states, m.idx, m.xt, m.W, slots };
++            node.outputs = { m.S, slots };
++            node.fused   = m.fused;
+ 
+             fu.at.emplace(m.emit, std::move(node));
+             skip_members(m.emit, m.members);
+diff --git a/ggml/src/ggml-hexagon/htp-gdn-match.h b/ggml/src/ggml-hexagon/htp-gdn-match.h
+index fc840ad..1c16862 100644
+--- a/ggml/src/ggml-hexagon/htp-gdn-match.h
++++ b/ggml/src/ggml-hexagon/htp-gdn-match.h
+@@ -35,13 +35,16 @@ struct ggml_hexagon_gdn_conv_match {
+     ggml_tensor * states = nullptr; // the state table [row, n_slots]
+     ggml_tensor * idx    = nullptr; // the s_copy view [1]
+     ggml_tensor * xt     = nullptr; // the transposed projection [1, n_ch]
+-    ggml_tensor * P      = nullptr; // CPY into the slot
+-    ggml_tensor * slot   = nullptr; // the destination slot view [row, 1]
++    ggml_tensor * P      = nullptr; // CPY into slot 0, the newest state
++    ggml_tensor * slot   = nullptr; // the destination slot 0 view [row, 1]
+     std::vector<ggml_tensor *> members; // every node the fused op replaces
++    std::vector<ggml_tensor *> fused;   // the nodes the op stands in for, in graph order
+     int     emit     = -1;              // graph index where the fused op goes
+     int64_t d_conv   = 0;
+     int64_t n_ch     = 0;
+     int64_t n_tokens = 0;               // 1 is the decode step, more is a batch
++    int64_t n_slots  = 1;               // rollback snapshot slots this chain writes
++    size_t  slot_stride = 0;            // bytes from one slot to the next, n_slots > 1 only
+ };
+ 
+ struct ggml_hexagon_gdn_state_match {
+@@ -304,47 +307,117 @@ static inline const char * ggml_hexagon_gdn_conv_chain_check(const ggml_cgraph *
+         return "the second CONCAT input is not the transposed projection [n_tokens, n_ch]";
+     }
+ 
+-    // the state write: the one CPY of the last d_conv - 1 columns of the CONCAT into a slot of the cache
+-    int n_cpy = 0;
+-    ggml_tensor * P = ggml_hexagon_gdn_find_cpy(gf, CI, n_cpy);
+-    if (!P) {
+-        return n_cpy == 0 ? "no CPY of the CONCAT into the cache" : "more than one CPY of the CONCAT (rollback snapshots)";
++    // The state write: one CPY of a d_conv - 1 column window of the CONCAT into each rollback
++    // slot of the cache. Without rollback slots there is exactly one. Speculative decoding sets
++    // n_rs_seq > 0 and adds K - 1 more, where slot g takes the window at column
++    // max(0, n_tokens - g), which is the conv state after token n_tokens - g. At one token every
++    // slot above 0 therefore takes column 0, the state that this step read from the cache, so the
++    // fused op writes them as a plain copy of its own input row. A batch is not taken here: its
++    // windows differ per slot and the batch kernel writes one.
++    std::vector<ggml_tensor *> cpys;
++    for (int i = 0; i < gf->n_nodes; i++) {
++        ggml_tensor * n = gf->nodes[i];
++        if (n->op == GGML_OP_CPY && n->src[0] && n->src[1] && ggml_hexagon_gdn_root(n->src[0]) == CI) {
++            cpys.push_back(n);
++        }
+     }
+-    if (P->type != GGML_TYPE_F32) {
+-        return "the CPY is not F32";
++    if (cpys.empty()) {
++        return "no CPY of the CONCAT into the cache";
+     }
+-    ggml_tensor * last = P->src[0];
+-    ggml_tensor * slot = P->src[1];
+-    if (last->view_offs != (size_t) n_tokens * sizeof(float) || last->ne[0] != d_conv - 1 || last->ne[1] != n_ch ||
+-        last->ne[2] != 1 || last->ne[3] != 1 || last->nb[0] != sizeof(float) || last->nb[1] != CI->nb[1]) {
+-        return "the CPY source is not the last d_conv - 1 columns of the CONCAT";
++    if (cpys.size() > 1 && n_tokens > 1) {
++        return "more than one CPY of the CONCAT on a batch (rollback snapshots)";
+     }
+-    if (slot == cache || ggml_hexagon_gdn_root(slot) != cache) {
+-        return "the CPY destination is not a view of the conv cache";
++    // Slot 0 holds the newest state and sits at the lowest address of the group, thus the order
++    // by address is the slot order. Every destination is allocated by now: the match runs after
++    // the graph allocation.
++    for (ggml_tensor * n : cpys) {
++        if (!n->src[1]->data) {
++            return "a CPY destination has no address at match time";
++        }
+     }
+-    if (!ggml_hexagon_gdn_is_f32_row(slot, row)) {
+-        return "the CPY destination is not one contiguous row";
++    std::sort(cpys.begin(), cpys.end(), [](const ggml_tensor * a, const ggml_tensor * b) {
++        return (const char *) a->src[1]->data < (const char *) b->src[1]->data;
++    });
++
++    const int64_t n_slots = (int64_t) cpys.size();
++    size_t        stride  = 0;
++    for (int64_t g = 0; g < n_slots; ++g) {
++        ggml_tensor * Pg   = cpys[g];
++        ggml_tensor * lastg = Pg->src[0];
++        ggml_tensor * slotg = Pg->src[1];
++        if (Pg->type != GGML_TYPE_F32) {
++            return "a CPY is not F32";
++        }
++        const int64_t col = n_tokens > g ? n_tokens - g : 0;
++        if (lastg->view_offs != (size_t) col * sizeof(float) || lastg->ne[0] != d_conv - 1 ||
++            lastg->ne[1] != n_ch || lastg->ne[2] != 1 || lastg->ne[3] != 1 ||
++            lastg->nb[0] != sizeof(float) || lastg->nb[1] != CI->nb[1]) {
++            return "a CPY source is not the d_conv - 1 columns of its snapshot";
++        }
++        if (slotg == cache || ggml_hexagon_gdn_root(slotg) != cache) {
++            return "a CPY destination is not a view of the conv cache";
++        }
++        if (!ggml_hexagon_gdn_is_f32_row(slotg, row)) {
++            return "a CPY destination is not one contiguous row";
++        }
++        if (g > 0) {
++            const size_t step =
++                (size_t) ((const char *) slotg->data - (const char *) cpys[g - 1]->src[1]->data);
++            if (g == 1) {
++                stride = step;
++            } else if (step != stride) {
++                return "the snapshot slots are not evenly strided";
++            }
++        }
+     }
+ 
++    ggml_tensor * P    = cpys[0];
++    ggml_tensor * last = P->src[0];
++    ggml_tensor * slot = P->src[1];
++
+     const std::vector<ggml_tensor *> intermediates = { R, CI, C };
+-    const std::vector<ggml_tensor *> members       = { R, cs, CI, C, S, last, P };
++    std::vector<ggml_tensor *>       members       = { R, cs, CI, C, S };
++    for (ggml_tensor * n : cpys) {
++        members.push_back(n->src[0]);
++        members.push_back(n);
++    }
+     if (const char * reason = ggml_hexagon_gdn_chain_is_private(gf, intermediates, members, nullptr, 0)) {
+         return reason;
+     }
+ 
+     auto ir = index.find(R);
+-    auto ip = index.find(P);
+-    if (ir == index.end() || ip == index.end()) {
+-        return "GET_ROWS or CPY is not a node of the graph";
++    if (ir == index.end()) {
++        return "GET_ROWS is not a node of the graph";
++    }
++    // The fused op stands where the earliest member of the chain is, and the span that must stay
++    // clean reaches the latest one. Every CPY counts: the snapshots can sit apart in the graph.
++    int emit     = is;
++    int last_idx = is;
++    for (ggml_tensor * n : cpys) {
++        auto ic = index.find(n);
++        if (ic == index.end()) {
++            return "a CPY is not a node of the graph";
++        }
++        emit     = std::min(emit, ic->second);
++        last_idx = std::max(last_idx, ic->second);
+     }
+-    const int emit     = std::min(is, ip->second);
+-    const int last_idx = std::max(is, ip->second);
+     if (ir->second > emit) {
+         return "the GET_ROWS comes after the SILU or the CPY";
+     }
+     if (!ggml_hexagon_gdn_chain_span_is_clean(gf, ir->second, last_idx, cache, members)) {
+         return "another node touches the conv cache inside the chain span";
+     }
++    // The op reads the projection of the tokens and writes its own output in
++    // one pass over the channels. The fused op stands at the first CPY, long
++    // before the SILU, thus the allocator can give the output the bytes of a
++    // tensor that died earlier, and the projection is such a tensor.
++    {
++        const char * xd = (const char *) xt->data;
++        const char * sd = (const char *) S->data;
++        if (xd != nullptr && sd != nullptr && xd < sd + ggml_nbytes(S) && sd < xd + ggml_nbytes(xt)) {
++            return "the projection and the output of the chain share bytes";
++        }
++    }
+ 
+     m.S      = S;
+     m.C      = C;
+@@ -357,10 +430,17 @@ static inline const char * ggml_hexagon_gdn_conv_chain_check(const ggml_cgraph *
+     m.P      = P;
+     m.slot   = slot;
+     m.members = members;
+-    m.emit     = emit;
+-    m.d_conv   = d_conv;
+-    m.n_ch     = n_ch;
+-    m.n_tokens = n_tokens;
++    m.fused   = { R, CI, C };
++    for (ggml_tensor * n : cpys) {
++        m.fused.push_back(n);
++    }
++    m.emit        = emit;
++    m.d_conv      = d_conv;
++    m.n_ch        = n_ch;
++    m.n_tokens    = n_tokens;
++    m.n_slots     = n_slots;
++    m.slot_stride = stride;
++    (void) last;
+     return nullptr;
+ }
+ 
+@@ -374,8 +454,14 @@ static inline const char * ggml_hexagon_gdn_state_chain_check(const ggml_cgraph
+     if (G->type != GGML_TYPE_F32 || !ggml_is_contiguous(G)) {
+         return "the output is not contiguous F32";
+     }
+-    if (ggml_get_op_params_i32(G, 0) != 1) {
+-        return "K is not 1";
++    // K is the number of rollback snapshot slots that the op reserves in its output.
++    // This chain is the one-token case, where the op writes the state after the last
++    // token into slot 0 and leaves the other slots untouched, whatever K is. The graph
++    // then copies min(n_tokens, K) = 1 slot into the cache. Thus any K >= 1 fuses, and
++    // speculative decoding (K = n_rs_seq + 1) keeps the fused step.
++    const int64_t K = ggml_get_op_params_i32(G, 0);
++    if (K < 1) {
++        return "K is not positive";
+     }
+     ggml_tensor * q    = G->src[0];
+     ggml_tensor * k    = G->src[1];
+@@ -395,8 +481,8 @@ static inline const char * ggml_hexagon_gdn_state_chain_check(const ggml_cgraph
+         return "q or k is not one token of one sequence";
+     }
+     const int64_t D = S_v * S_v * H;
+-    if (G->ne[0] != S_v * H || G->ne[1] != 1 + S_v || G->ne[2] != 1 || G->ne[3] != 1) {
+-        return "the output is not [S_v * H, 1 + S_v]";
++    if (G->ne[0] != S_v * H || G->ne[1] != 1 + K * S_v || G->ne[2] != 1 || G->ne[3] != 1) {
++        return "the output is not [S_v * H, 1 + K * S_v]";
+     }
+     const size_t head_bytes = (size_t) S_v * H * sizeof(float);
+ 
+diff --git a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
+index a75d5a5..c2c78ab 100644
+--- a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
++++ b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
+@@ -1268,7 +1268,11 @@ int op_gdn_state_step(struct htp_ops_context * octx) {
+     const uint32_t n_seqs   = v->ne[3];
+     const uint32_t K        = octx->op_params[0];
+ 
+-    if (S_v == 0 || S_v > HTP_GDN_MAX_SV || H == 0 || n_tokens != 1 || n_seqs != 1 || K != 1) {
++    // K is the snapshot slot count of the output. At one token the op writes the state
++    // after that token, which is slot 0, and the host matched a chain whose single CPY
++    // takes exactly that slot. The other slots stay untouched, thus any K >= 1 runs here
++    // and speculative decoding keeps the fused step.
++    if (S_v == 0 || S_v > HTP_GDN_MAX_SV || H == 0 || n_tokens != 1 || n_seqs != 1 || K < 1) {
+         GDN_STATE_FAIL(GDN_STATE_ERR_SHAPE, HTP_STATUS_NO_SUPPORT);
+     }
+     if ((g->ne[0] != 1 && g->ne[0] != S_v) || beta->ne[0] != 1) {
+@@ -1286,7 +1290,7 @@ int op_gdn_state_step(struct htp_ops_context * octx) {
+     if (slot->ne[0] != D || slot->nb[0] != sizeof(float)) {
+         GDN_STATE_FAIL(GDN_STATE_ERR_SLOT, HTP_STATUS_INVAL_PARAMS);
+     }
+-    if (dst->ne[0] != S_v * H || dst->ne[1] != 1 + S_v) {
++    if (dst->ne[0] != S_v * H || dst->ne[1] != 1 + (int64_t) K * S_v) {
+         GDN_STATE_FAIL(GDN_STATE_ERR_DST, HTP_STATUS_INVAL_PARAMS);
+     }
+ 
+diff --git a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
+index eb0c029..78c834b 100644
+--- a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
++++ b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
+@@ -53,12 +53,14 @@
+ struct htp_gdn_conv_context {
+     struct htp_ops_context * octx;
+     const float * src_slot;   // source slot, DDR
+-    float *       dst_slot;   // destination slot, DDR
++    float *       dst_slot;   // destination slot 0, DDR
+     const float * x;          // new column, DDR
+     const float * w;          // conv weights, DDR
+     float *       y;          // output, DDR
+     uint32_t      n_ch;
+     uint32_t      chunk;      // channels per thread, a multiple of VLEN_FP32
++    uint32_t      n_slots;    // rollback snapshot slots to write, 1 without speculation
++    uint32_t      slot_stride; // bytes from one slot to the next, n_slots > 1 only
+ };
+ 
+ // Lane masks: a lane is 32 bits, a mask lane is all ones or all zeros
+@@ -247,6 +249,14 @@ static void gdn_conv_step_thread(unsigned int nth, unsigned int ith, void * data
+     float *       n_ptr = cctx->dst_slot + (size_t) c0 * 3;
+     float *       y_ptr = cctx->y + c0;
+ 
++    // The rollback snapshots above slot 0 hold the conv state as it was before this token, which
++    // is the row that this step reads. They are written first on purpose: slot 0 can be that same
++    // row, and the convolution below overwrites it in place.
++    for (uint32_t g = 1; g < cctx->n_slots; ++g) {
++        float * d_ptr = (float *) ((uint8_t *) cctx->dst_slot + (size_t) g * cctx->slot_stride) + (size_t) c0 * 3;
++        memcpy(d_ptr, s_ptr, (size_t) n * 3 * sizeof(float));
++    }
++
+     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c0);
+ 
+@@ -356,6 +366,12 @@ int op_gdn_conv_step(struct htp_ops_context * octx) {
+     if (slot->ne[0] != row || slot->nb[0] != sizeof(float)) {
+         GDN_CONV_FAIL(GDN_CONV_ERR_SLOT, HTP_STATUS_INVAL_PARAMS);
+     }
++    // With speculative decoding the destination spans the rollback slots of this sequence: ne[1]
++    // of them, nb[1] apart. Without it there is one slot and the tensor is the CPY destination.
++    const uint32_t n_slots = slot->ne[1] > 0 ? slot->ne[1] : 1;
++    if (n_slots > 1 && slot->nb[1] < (uint32_t) row * sizeof(float)) {
++        GDN_CONV_FAIL(GDN_CONV_ERR_SLOT, HTP_STATUS_INVAL_PARAMS);
++    }
+     if (y->ne[0] != n_ch || y->nb[0] != sizeof(float)) {
+         GDN_CONV_FAIL(GDN_CONV_ERR_Y, HTP_STATUS_INVAL_PARAMS);
+     }
+@@ -386,9 +402,11 @@ int op_gdn_conv_step(struct htp_ops_context * octx) {
+     cctx.y        = (float *) (uintptr_t) y->data;
+     cctx.n_ch     = n_ch;
+     cctx.chunk    = chunk;
++    cctx.n_slots     = n_slots;
++    cctx.slot_stride = slot->nb[1];
+ 
+-    FARF(HIGH, "gdn-conv-step: n_ch %u slot %d -> %p chunk %u n_threads %u\n",
+-         n_ch, src_idx, (void *) cctx.dst_slot, chunk, n_threads);
++    FARF(HIGH, "gdn-conv-step: n_ch %u slot %d -> %p slots %u chunk %u n_threads %u\n",
++         n_ch, src_idx, (void *) cctx.dst_slot, n_slots, chunk, n_threads);
+ 
+     work_queue_run(octx->ctx->work_queue, gdn_conv_step_thread, &cctx, n_threads);
+ 

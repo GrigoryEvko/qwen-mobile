@@ -1,0 +1,131 @@
+Collapse the duplicated block queueing of the HVX flash attention (lab proposal)
+
+flash_attn_ext_f16_thread compiles to 21472 bytes in one body, and on the phone
+FLASH_ATTN_EXT shows IU_NO_PKT 11.0 %, the highest instruction-fetch stall of the pp512 profile
+of the 4B. The row loop queued the K, V and mask transfer of a block from four places with the
+body written out each time. This proposal moves that body into one function that stays out of
+line, which removes three of the four copies. It changes no arithmetic, thus the output is
+unchanged.
+
+diff -urN a/ggml/src/ggml-hexagon/htp/flash-attn-ops.c b/ggml/src/ggml-hexagon/htp/flash-attn-ops.c
+--- a/ggml/src/ggml-hexagon/htp/flash-attn-ops.c	2026-09-20 02:59:51.925406487 +0300
++++ b/ggml/src/ggml-hexagon/htp/flash-attn-ops.c	2026-09-20 03:13:25.175925742 +0300
+@@ -158,6 +158,25 @@
+     dma_cache    m_cache;
+ };
+ 
++// One K, V and mask transfer of a block into a scratchpad slot. The row loop queues this from
++// four places, and the four copies together were about 2 KB of the 21472 bytes of
++// flash_attn_ext_f16_thread. The function stays out of line, thus the body exists once: it runs
++// once for each row and not for each element, thus the call costs nothing that matters, and a
++// smaller row loop is what the instruction fetch of the phone needs.
++static __attribute__((noinline)) void fa_queue_block(dma_queue * dma, dma_cache * m_cache,
++                                                     const struct htp_fa_context * factx,
++                                                     uint8_t * k_dst, uint8_t * v_dst,
++                                                     const uint8_t * k_src, const uint8_t * v_src,
++                                                     const uint8_t * m_src, uint32_t nrows,
++                                                     uint32_t nbk1, uint32_t nbv1,
++                                                     size_t size_k_row, size_t size_v_row) {
++    dma_queue_push(dma, dma_make_ptr(k_dst, k_src), factx->size_k_row_padded, nbk1, size_k_row, nrows);
++    dma_queue_push(dma, dma_make_ptr(v_dst, v_src), factx->size_v_row_padded, nbv1, size_v_row, nrows);
++    if (m_src) {
++        dma_cache_push(dma, m_cache, m_src, nrows * 2, nrows * 2, nrows * 2, 1);
++    }
++}
++
+ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void * data) {
+     struct htp_fa_context * factx = (struct htp_fa_context *) data;
+     const struct htp_ops_context * octx = factx->octx;
+@@ -426,20 +445,9 @@
+                 dma_queue_push(dma, dma_make_ptr(spad_q, next_q_row_ptr), factx->size_q_row_padded, nbq1, size_q_row, 1);
+ 
+                 if (factx->n_blocks % 2 == 0) {
+-                    // Queue next row's block 0 (into buffer slot 0)
+-                    uint8_t * k_dst = spad_k + 0 * factx->size_k_block;
+-                    uint8_t * v_dst = spad_v + 0 * factx->size_v_block;
+-
+-                    // K (block 0 of next row)
+-                    dma_queue_push(dma, dma_make_ptr(k_dst, next_k_src0), factx->size_k_row_padded, nbk1, size_k_row, next_block_size0);
+-
+-                    // V (block 0 of next row)
+-                    dma_queue_push(dma, dma_make_ptr(v_dst, next_v_src0), factx->size_v_row_padded, nbv1, size_v_row, next_block_size0);
+-
+-                    // Mask (block 0 of next row)
+-                    if (mask) {
+-                        dma_cache_push(dma, &m_cache, next_m_src0, next_block_size0 * 2, next_block_size0 * 2, next_block_size0 * 2, 1);
+-                    }
++                    // the block 0 of the next row, into the slot 0
++                    fa_queue_block(dma, &m_cache, factx, spad_k, spad_v, next_k_src0, next_v_src0,
++                                   next_m_src0, next_block_size0, nbk1, nbv1, size_k_row, size_v_row);
+                 }
+             }
+ 
+@@ -517,57 +525,17 @@
+         }
+ 
+         if (has_next_ir) {
+-            if (factx->n_blocks % 2 == 0) {
+-                // Queue next row's block 1 (into buffer slot 1, if n_blocks > 1)
+-                if (factx->n_blocks > 1) {
+-                    uint8_t * k_dst = spad_k + 1 * factx->size_k_block;
+-                    uint8_t * v_dst = spad_v + 1 * factx->size_v_block;
+-
+-                    // K (block 1 of next row)
+-                    dma_queue_push(dma, dma_make_ptr(k_dst, next_k_src1), factx->size_k_row_padded, nbk1, size_k_row, next_block_size1);
+-
+-                    // V (block 1 of next row)
+-                    dma_queue_push(dma, dma_make_ptr(v_dst, next_v_src1), factx->size_v_row_padded, nbv1, size_v_row, next_block_size1);
+-
+-                    // Mask (block 1 of next row)
+-                    if (mask) {
+-                        dma_cache_push(dma, &m_cache, next_m_src1, next_block_size1 * 2, next_block_size1 * 2, next_block_size1 * 2, 1);
+-                    }
+-                }
+-            } else {
+-                // Queue next row's block 0 (into buffer slot 0)
+-                {
+-                    uint8_t * k_dst = spad_k + 0 * factx->size_k_block;
+-                    uint8_t * v_dst = spad_v + 0 * factx->size_v_block;
+-
+-                    // K (block 0 of next row)
+-                    dma_queue_push(dma, dma_make_ptr(k_dst, next_k_src0), factx->size_k_row_padded, nbk1, size_k_row, next_block_size0);
+-
+-                    // V (block 0 of next row)
+-                    dma_queue_push(dma, dma_make_ptr(v_dst, next_v_src0), factx->size_v_row_padded, nbv1, size_v_row, next_block_size0);
+-
+-                    // Mask (block 0 of next row)
+-                    if (mask) {
+-                        dma_cache_push(dma, &m_cache, next_m_src0, next_block_size0 * 2, next_block_size0 * 2, next_block_size0 * 2, 1);
+-                    }
+-                }
+-
+-                // Queue next row's block 1 (into buffer slot 1, if n_blocks > 1)
+-                if (factx->n_blocks > 1) {
+-                    uint8_t * k_dst = spad_k + 1 * factx->size_k_block;
+-                    uint8_t * v_dst = spad_v + 1 * factx->size_v_block;
+-
+-                    // K (block 1 of next row)
+-                    dma_queue_push(dma, dma_make_ptr(k_dst, next_k_src1), factx->size_k_row_padded, nbk1, size_k_row, next_block_size1);
+-
+-                    // V (block 1 of next row)
+-                    dma_queue_push(dma, dma_make_ptr(v_dst, next_v_src1), factx->size_v_row_padded, nbv1, size_v_row, next_block_size1);
+-
+-                    // Mask (block 1 of next row)
+-                    if (mask) {
+-                        dma_cache_push(dma, &m_cache, next_m_src1, next_block_size1 * 2, next_block_size1 * 2, next_block_size1 * 2, 1);
+-                    }
+-                }
++            // An odd block count leaves the slot 0 of the next row unqueued, thus queue it here.
++            // The slot 1 follows in both cases when the row has more than one block.
++            if (factx->n_blocks % 2 != 0) {
++                fa_queue_block(dma, &m_cache, factx, spad_k, spad_v, next_k_src0, next_v_src0,
++                               next_m_src0, next_block_size0, nbk1, nbv1, size_k_row, size_v_row);
++            }
++            if (factx->n_blocks > 1) {
++                fa_queue_block(dma, &m_cache, factx,
++                               spad_k + factx->size_k_block, spad_v + factx->size_v_block,
++                               next_k_src1, next_v_src1, next_m_src1, next_block_size1,
++                               nbk1, nbv1, size_k_row, size_v_row);
+             }
+         }
+ 

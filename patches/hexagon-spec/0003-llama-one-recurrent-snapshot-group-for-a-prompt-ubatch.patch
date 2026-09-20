@@ -1,0 +1,202 @@
+llama: one recurrent snapshot group for a prompt ubatch
+
+Base: llama.cpp commit c6824a9 plus the patches before this one in patches/series. This patch
+needs patches/hexagon-spec/0002 before it, which gives the rollback its checked limit.
+
+Files:
+    src/llama-cparams.h             llama_n_rs_groups(), the shared rule
+    src/llama-context.cpp           the per-ubatch value in the copy that the graph gets
+    src/llama-graph.h               the value in the reuse key of the graph
+    src/llama-memory-recurrent.cpp  the same rule for the depth of the rollback
+
+The problem
+
+Speculation costs the prefill 2.1 times. Measured on the phone, 4B Q8_0, pp512, thermal 0, off
+the charger: 899.65 t/s with the switch off and 425.08 t/s with it on, on one build. A shell
+llama-bench of the same libraries gives 911.84 t/s.
+
+The switch gives the context n_rs_seq = 3, thus K = 4 (llama_jni.cpp sets cp.n_rs_seq to
+kSpecDraftMax). K reaches the prefill graph through cparams.n_rs_seq, and it stops two kernels
+of a batch:
+
+  1. The HMX chunked delta rule refuses. gdn-chunk-ops.c:1094 reads
+     "if (K != 1) refuse = the op keeps more than the final state". The op then runs
+     gated_delta_net_f32_pp_thread, which carries the whole cliff. GATED_DELTA_NET costs 78 ms of
+     a 512 token prefill on the chunked path.
+  2. The fused conv chunk refuses. build_conv_state emits K copy nodes of the CONCAT, and
+     htp-gdn-match.h:327 reads "more than one CPY of the CONCAT on a batch (rollback snapshots)".
+     Thus GDN_CONV_CHUNK is never emitted while speculation is on, and the conv work of
+     patches/hexagon-kernels is dead on that path. This is a second, independent cause.
+
+Neither refusal is a defect of the kernels. The prefill asks for four rollback groups that no
+caller reads.
+
+The rule
+
+A verify step of speculative decoding submits one token for each drafted token, plus the token
+of the step before it. common_params_speculative::need_n_rs_seq() sets n_rs_seq to the largest
+draft, thus a verify step never holds more than n_rs_seq + 1 tokens of one sequence. A ubatch
+that holds more tokens of one sequence is a prompt, and no rollback reaches into it. Such a
+ubatch writes one group.
+
+llama_n_rs_groups(n_rs_seq, n_seq_tokens) in llama-cparams.h holds the rule.
+llama_context::graph_params writes the value into the cparams copy that the graph gets, thus one
+line reaches every model builder and the conv path and the state path of each one cannot
+disagree. The context member keeps the count of the whole memory, thus llama_n_rs_seq(), the
+size of the cache and the ubatch split do not change.
+
+Two properties make the rule safe:
+
+  - It depends on the shape of the ubatch only. llm_graph_params::allow_reuse compares
+    n_seq_tokens, thus a graph that comes from the cache always carries the value of its own
+    ubatch. The patch adds n_rs_seq to that comparison as well, because a later rule that is not
+    a function of the shape would otherwise reuse a graph of a different topology with no error
+    message.
+  - llama_memory_recurrent::set_rs_depth calls the same function. Thus a rollback that reaches a
+    group which the ubatch did not write makes llama_memory_seq_rm return false, and the caller
+    replays the tokens or restores a checkpoint. Patch 0001 gives that limit.
+
+The measurement
+
+A host program counts the nodes of the graph through the eval callback of the scheduler. The
+model is Qwen3.5-2B Q4_0 on the CPU backend, 18 linear layers.
+
+    n_rs_seq   ubatch tokens   K       GATED_DELTA_NET output rows   CPY nodes
+    0          64              1       192                           72
+    3          64              4 -> 1  576 -> 192                    126 -> 72
+    3          4               4       516                           126
+    3          1               4       513                           126
+    8          64              9 -> 1  1216 -> 192                   216 -> 72
+    8          4               9       1156                          216
+    8          1               9       1153                          216
+
+The prefill graph of a context with rollback groups is now the graph of a context without them,
+node for node. A verify step of 4 tokens and a decode of 1 token keep every group.
+
+The logits of a prefill of 64 tokens agree bitwise between n_rs_seq 0 and n_rs_seq 3, before the
+patch and after it.
+
+What this changes for a caller
+
+A partial llama_memory_seq_rm right after a prompt ubatch of more than K tokens now returns
+false. Before the patch it gave a correct state for a rollback of 1 to n_rs_seq tokens. No caller
+in the tree does this: the speculative loop of tools/server and the spec_step of the app both
+roll back inside the verify ubatch, which keeps its groups.
+
+State of the verification
+
+The host program above ran on the CPU backend with the 2B Q4_0 file. The Android build of the
+pinned container compiles the change. The device has not run it: the prefill number of the phone
+is the measurement that stays open.
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index be2dd78..9f5eecc 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2622,10 +2622,20 @@ llm_graph_params llama_context::graph_params(
+                       const llama_ubatch & ubatch,
+             const llama_memory_context_i * mctx,
+                           llm_graph_type   gtype) const {
++    // [TAG_RECURRENT_ROLLBACK_DEPTH]
++    // The recurrent layers of this ubatch write llama_n_rs_groups() snapshot groups, and each
++    // model graph reads that count from cparams.n_rs_seq. The copy that the graph gets therefore
++    // carries the count of this ubatch. The context member keeps the count of the whole memory,
++    // which llama_n_rs_seq() reports and which sizes the cache, thus neither the cache nor the
++    // ubatch split changes.
++    llama_cparams cparams_gf = cparams;
++
++    cparams_gf.n_rs_seq = llama_n_rs_groups(cparams.n_rs_seq, ubatch.n_seq_tokens) - 1;
++
+     return {
+         /*.arch        =*/ model.arch,
+         /*.hparams     =*/ model.hparams,
+-        /*.cparams     =*/ cparams,
++        /*.cparams     =*/ cparams_gf,
+         /*.ubatch      =*/ ubatch,
+         /*.gtype       =*/ gtype,
+         /*.sched       =*/ sched.get(),
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index b592de1..68bb782 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -65,3 +65,34 @@ struct llama_cparams {
+ 
+     llama_context * ctx_other;
+ };
++
++// [TAG_RECURRENT_ROLLBACK_DEPTH]
++// The count of recurrent snapshot groups that the graph of one ubatch writes.
++//
++// A context with n_rs_seq > 0 keeps n_rs_seq + 1 groups of the recurrent state of each sequence,
++// thus a partial llama_memory_seq_rm undoes up to n_rs_seq tokens with no replay. Group g holds
++// the state after the token n_seq_tokens - g of the ubatch that wrote it.
++//
++// A verify step of speculative decoding submits one token for each drafted token, plus the token
++// of the step before it. Thus it never holds more than n_rs_seq + 1 tokens of one sequence,
++// because common_params_speculative::need_n_rs_seq() sets n_rs_seq to the largest draft. A ubatch
++// that holds more tokens of one sequence is a prompt, and no rollback reaches into it. Such a
++// ubatch writes one group.
++//
++// Two properties make this safe:
++//   - The value depends on the shape of the ubatch only. llm_graph_params::allow_reuse compares
++//     n_seq_tokens, thus a graph that comes from the cache always carries the value of its own
++//     ubatch.
++//   - llama_memory_recurrent::set_rs_depth calls this function as well. Thus a rollback that
++//     reaches a group which the last ubatch did not write makes llama_memory_seq_rm return false,
++//     and the caller replays the tokens or restores a checkpoint instead.
++//
++// On the Hexagon backend the count also selects the kernel of a batch: the chunked delta rule on
++// the HMX and the fused conv chunk both take one group only.
++static inline uint32_t llama_n_rs_groups(uint32_t n_rs_seq, uint32_t n_seq_tokens) {
++    if (n_rs_seq == 0) {
++        return 1;
++    }
++
++    return n_seq_tokens > n_rs_seq + 1 ? 1 : n_rs_seq + 1;
++}
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index cc41106..8458ba4 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -871,6 +871,14 @@ struct llm_graph_params {
+             return false;
+         }
+ 
++        // [TAG_RECURRENT_ROLLBACK_DEPTH]
++        // The count of the recurrent snapshot groups changes the shape of the gated delta net
++        // output and the count of the conv copy nodes, thus it changes the topology. The value in
++        // this copy is the value of the ubatch, which llama_context::graph_params computes.
++        if (cparams.n_rs_seq != other.cparams.n_rs_seq) {
++            return false;
++        }
++
+         return
+             cparams.embeddings              == other.cparams.embeddings              &&
+             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index 88c1418..ac19ab5 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -4,6 +4,7 @@
+ #include "llama-impl.h"
+ #include "llama-io.h"
+ #include "llama-batch.h"
++#include "llama-cparams.h"
+ #include "llama-model.h"
+ 
+ #include <algorithm>
+@@ -428,10 +429,11 @@ void llama_memory_recurrent::set_rs_depth(const llama_ubatch & ubatch) {
+     }
+ 
+     // [TAG_RECURRENT_ROLLBACK_DEPTH]
+-    // The graph writes min(n_seq_tokens, K) groups, and group g holds the state after the token
+-    // n_seq_tokens - g of this ubatch. Thus group 0 is the state that the next step reads, and
+-    // the deepest rollback that the ubatch covers is one less than the count of the groups.
+-    const uint32_t groups  = n_rs_seq + 1;
++    // The graph writes min(n_seq_tokens, groups) groups, and group g holds the state after the
++    // token n_seq_tokens - g of this ubatch. Thus group 0 is the state that the next step reads,
++    // and the deepest rollback that the ubatch covers is one less than the count that it wrote.
++    // llama_context::graph_params gives the graph the same count.
++    const uint32_t groups  = llama_n_rs_groups(n_rs_seq, ubatch.n_seq_tokens);
+     const uint32_t written = std::min<uint32_t>(ubatch.n_seq_tokens, groups);
+ 
+     for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {

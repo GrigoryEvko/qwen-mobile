@@ -1,0 +1,81 @@
+hexagon: the host matcher gives the conv chunk the snapshot slots of a batch
+
+Base: llama.cpp commit c6824a9 plus the patches before this one in patches/series.
+
+Needs patches/hexagon-spec/0001 before it, which makes the conv chunk kernel write K slots.
+Without that kernel the fused op writes one window into every slot and the conv state of a
+rollback is wrong.
+
+Files:
+    ggml/src/ggml-hexagon/htp-gdn-match.h   the refusal of a batch with several snapshot slots
+
+The problem
+
+patches/hexagon-spec/0001 makes gdn-conv-ops.c write K slots of the conv cache on a batch, and
+its kernel context takes n_slots and slot_stride. Nothing reaches that code, because the host
+matcher refuses the chain first:
+
+    if (cpys.size() > 1 && n_tokens > 1) {
+        return "more than one CPY of the CONCAT on a batch (rollback snapshots)";
+    }
+
+The refusal comes from patches/hexagon-fusion/0007, where the batch kernel wrote one slot. Thus
+GDN_CONV_CHUNK is never emitted while the context keeps rollback slots, and the conv work of
+patches/hexagon-kernels is dead on that path.
+
+The change
+
+The refusal goes. Nothing else in the matcher needs a change:
+
+  - The loop that follows already checks the window of each slot at any token count. It takes
+    the column max(0, n_tokens - g) for slot g, which is the column that build_conv_state writes
+    (s_idx = max(0, n_seq_tokens - s_slot)), and it checks that the slots are evenly strided.
+  - Every CPY is already a member of the chain, thus ggml_hexagon_gdn_chain_is_private and
+    ggml_hexagon_gdn_chain_span_is_clean already cover them.
+  - ggml_hexagon_match_gdn_fusions already builds the span tensor whenever n_slots is more than
+    one, with n_slots rows and the slot stride, and it does not look at the token count.
+
+The comment above the loop carried the old reason. It now states that the batch takes the same
+path and that the kernel reads the slot count and the slot stride from the span.
+
+What still refuses
+
+A batch with one slot is unchanged. A chain whose slots are not evenly strided, or whose windows
+are not the expected columns, still refuses, and the unfused nodes run.
+
+With patches/hexagon-spec/0003 a prompt ubatch writes one slot, thus this patch is not what gives
+the prefill its speed. It gives the conv chunk to a multi-token ubatch that keeps its slots,
+which is the verify step of speculative decoding.
+
+State of the verification
+
+The Android build of the pinned container compiles the change. The device has not run it. The
+device check is a prefill with speculation on and GGML_HEXAGON_VERBOSE set: the line
+"fused GDN_CONV_CHUNK" must appear for each linear layer, and the answer must not move.
+diff --git a/ggml/src/ggml-hexagon/htp-gdn-match.h b/ggml/src/ggml-hexagon/htp-gdn-match.h
+index 1c16862..2503aa9 100644
+--- a/ggml/src/ggml-hexagon/htp-gdn-match.h
++++ b/ggml/src/ggml-hexagon/htp-gdn-match.h
+@@ -312,8 +312,10 @@ static inline const char * ggml_hexagon_gdn_conv_chain_check(const ggml_cgraph *
+     // n_rs_seq > 0 and adds K - 1 more, where slot g takes the window at column
+     // max(0, n_tokens - g), which is the conv state after token n_tokens - g. At one token every
+     // slot above 0 therefore takes column 0, the state that this step read from the cache, so the
+-    // fused op writes them as a plain copy of its own input row. A batch is not taken here: its
+-    // windows differ per slot and the batch kernel writes one.
++    // fused op writes them as a plain copy of its own input row. A batch takes the same path: its
++    // windows differ per slot, and the loop below checks the window of each one. The batch kernel
++    // reads the slot count and the slot stride from the span that the backend builds, thus it
++    // writes each window into its own slot.
+     std::vector<ggml_tensor *> cpys;
+     for (int i = 0; i < gf->n_nodes; i++) {
+         ggml_tensor * n = gf->nodes[i];
+@@ -324,9 +326,6 @@ static inline const char * ggml_hexagon_gdn_conv_chain_check(const ggml_cgraph *
+     if (cpys.empty()) {
+         return "no CPY of the CONCAT into the cache";
+     }
+-    if (cpys.size() > 1 && n_tokens > 1) {
+-        return "more than one CPY of the CONCAT on a batch (rollback snapshots)";
+-    }
+     // Slot 0 holds the newest state and sits at the lowest address of the group, thus the order
+     // by address is the slot order. Every destination is allocated by now: the match runs after
+     // the graph allocation.

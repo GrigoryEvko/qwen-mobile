@@ -1,0 +1,61 @@
+hexagon: two defects of the f16 math helpers that an f16 kernel meets at once
+
+Base: llama.cpp commit c6824a9 plus the patches before this one in patches/series.
+
+Files:
+    ggml/src/ggml-hexagon/htp/hvx-exp.h      the top coefficient of hvx_vec_exp2_f16 as an IEEE half
+    ggml/src/ggml-hexagon/htp/hvx-sigmoid.h  the negative branch of hvx_vec_fast_sigmoid_f16
+
+The problem
+
+1. hvx_vec_exp2_f16 gave its top coefficient as the raw qf16 pattern 0x5082 to the qf16 x qf16
+   multiply. hexagon-clang 19.0.07 emits that multiply as qf16 x hf when it inlines the function
+   into a larger loop (the form occurs in no source line; the standalone function keeps
+   qf16 x qf16). The pattern then reads as the IEEE half 36.06 and not as 1.54e-4, thus the
+   polynomial gets 36 * x^6 more: 2 % at a fraction of 0.3 and 56 % at 0.5. Measured in
+   tools/htp-lab (target f16math): 3334 of 8192 lanes off by more than 2 % with the function
+   inlined, 0 with the function out of line, and the same 0 with this patch and the function
+   inlined. The library of the app does not hold the wrong form today (72 qf16 x qf16 multiplies,
+   no qf16 x hf), thus no shipped result changes. The defect is latent: it appears when a new
+   kernel inlines the helper, and flash-attn-ops.c inlines it into the softmax.
+   The fix gives the coefficient as the IEEE half 0x090c (ln(2)^6 / 720 = 1.5403e-4) to the
+   qf16 x hf multiply, thus the constant has one value whatever form the compiler picks.
+
+2. hvx_vec_fast_sigmoid_f16 returned 1 - sigmoid(|x|) for a negative x. The two numbers are almost
+   equal for a large |x|: at x = -9.2 the result was 0 where the value is 1.0e-4, and the error
+   over [-12, 12] was 29 % rms. The fix returns e / (1 + e), which has no subtraction. The cost is
+   the same, one multiply replaces one subtract. hvx_vec_tanh_f16 takes the same gain.
+
+diff --git a/ggml/src/ggml-hexagon/htp/hvx-exp.h b/ggml/src/ggml-hexagon/htp/hvx-exp.h
+--- a/ggml/src/ggml-hexagon/htp/hvx-exp.h
++++ b/ggml/src/ggml-hexagon/htp/hvx-exp.h
+@@ -230,7 +230,12 @@
+     HVX_Vector x_qf16 = Q6_Vqf16_vsub_VhfVhf(x_v, f_v);        // fractional part in qf16
+ 
+     // Horner: y = ((((E5*x + E4)*x + E3)*x + E2)*x + E1)*x + E0
+-    HVX_Vector y = Q6_Vqf16_vmpy_Vqf16Vqf16(Q6_Vh_vsplat_R(0x5082), x_qf16); // E5*x
++    // E5 = ln(2)^6 / 720 as an IEEE half, and the multiply takes it as an IEEE half. Before, the
++    // constant was the raw qf16 pattern 0x5082 for the qf16 x qf16 multiply. hexagon-clang 19.0.07
++    // emits that multiply as qf16 x hf when it inlines this function into a larger loop. The
++    // pattern then reads as 36.06, thus the polynomial gets 36 * x^6 more: 2 % at x = 0.3 and
++    // 56 % at x = 0.5. An IEEE constant has the same value in the two forms.
++    HVX_Vector y = Q6_Vqf16_vmpy_Vqf16Vhf(x_qf16, Q6_Vh_vsplat_R(0x090c));   // E5*x
+     y            = Q6_Vqf16_vadd_Vqf16Vhf(y, Q6_Vh_vsplat_R(0x157d));        // + E4
+     y            = Q6_Vqf16_vmpy_Vqf16Vqf16(y, x_qf16);
+     y            = Q6_Vqf16_vadd_Vqf16Vhf(y, Q6_Vh_vsplat_R(0x20ed));        // + E3
+diff --git a/ggml/src/ggml-hexagon/htp/hvx-sigmoid.h b/ggml/src/ggml-hexagon/htp/hvx-sigmoid.h
+--- a/ggml/src/ggml-hexagon/htp/hvx-sigmoid.h
++++ b/ggml/src/ggml-hexagon/htp/hvx-sigmoid.h
+@@ -219,8 +219,10 @@
+     // check if x_v < 0 (using integer comparison on absolute value)
+     HVX_VectorPred is_neg = Q6_Q_vcmp_gt_VhVh(abs_x, x_v);
+ 
+-    // If x_v < 0, return 1.0f - sig_abs
+-    HVX_Vector sig_neg = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vsub_VhfVhf(v_one, sig_abs));
++    // For a negative x the sigmoid is e / (1 + e). The form 1 - sigmoid(|x|) subtracts two almost
++    // equal numbers: at x = -9.2 it gave 0 where the value is 1.0e-4, and the error over
++    // [-12, 12] was 29 % rms.
++    HVX_Vector sig_neg = hvx_vec_mul_f16_f16(exp_val, sig_abs);
+     return Q6_V_vmux_QVV(is_neg, sig_neg, sig_abs);
+ }
+ 

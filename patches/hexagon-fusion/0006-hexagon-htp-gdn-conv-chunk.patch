@@ -662,27 +662,34 @@ index c095652..9155741 100644
              ggml_hexagon_gdn_state_match m;
              const char * reason = ggml_hexagon_gdn_state_chain_check(gf, index, i, m);
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 83f6d15..014d121 100644
+index 83f6d15..8f7fa72 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -4659,6 +4659,16 @@ struct test_gated_delta_net : public test_case {
+@@ -4659,6 +4659,23 @@ struct test_gated_delta_net : public test_case {
              }
          }
      }
 +
-+    // A batch of tokens with a scalar gate and the final state only is the shape where a backend may
-+    // rewrite the recurrence of a block of tokens as matrix products (the chunked delta rule). The
-+    // rewrite is exact, thus the error is the rounding of those products, and fp16 products with f32
-+    // accumulation land near 3e-07 against this f32 reference. The tolerance holds that with a margin
-+    // of 20, and every other shape keeps the tight one.
-+    double max_nmse_err() override {
-+        const bool chunkable = n_seq_tokens >= 32 && !kda && K == 1;
-+        return chunkable ? 1e-5 : 1e-7;
++    // On the shapes that the HTP backend sends to its chunked kernel, it rewrites the recurrence of a
++    // block of tokens as fp16 HMX products with f32 accumulation (the chunked delta rule). The rewrite
++    // is exact, thus the error is the rounding of those products: a model of that dataflow in float64
++    // gives 3.0e-07 over 256 to 672 tokens, and the device gives 1.24e-07. The bound holds the worst of
++    // those with a margin of 6.6 and still catches a regression of 7. The predicate is the gate of the
++    // kernel (gdn-chunk-ops.c): another shape runs the sequential kernel and keeps the tight bound, as
++    // does every other backend.
++    double max_nmse_err(ggml_backend_t backend) override {
++        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
++        const bool chunkable = n_seq_tokens >= 32 && !kda && K == 1 && n_seqs == 1 &&
++                               head_size % 32 == 0 && head_size <= 128;
++        if (chunkable && strcmp(ggml_backend_reg_name(reg), "HTP") == 0) {
++            return std::max(test_case::max_nmse_err(backend), 2e-6);
++        }
++        return test_case::max_nmse_err(backend);
 +    }
  };
  
  // GATED_DELTA_NET over a batch of tokens.
-@@ -4682,6 +4692,8 @@ struct test_gated_delta_net_batch : public test_gated_delta_net {
+@@ -4682,6 +4699,8 @@ struct test_gated_delta_net_batch : public test_gated_delta_net {
          return test_gated_delta_net::vars() + "," + VARS_TO_STR1(gate_min);
      }
  
@@ -691,7 +698,7 @@ index 83f6d15..014d121 100644
      void initialize_tensors(ggml_context * ctx) override {
          for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
              if (ggml_is_view_op(t->op)) { continue; }
-@@ -4696,10 +4708,6 @@ struct test_gated_delta_net_batch : public test_gated_delta_net {
+@@ -4696,10 +4715,6 @@ struct test_gated_delta_net_batch : public test_gated_delta_net {
              }
          }
      }
@@ -702,7 +709,7 @@ index 83f6d15..014d121 100644
  };
  
  // GET_ROWS + CONCAT + SSM_CONV + SILU + CPY: the conv half of the recurrent state step at one token.
-@@ -4711,21 +4719,23 @@ struct test_gdn_conv_state_fusion : public test_case {
+@@ -4711,21 +4726,23 @@ struct test_gdn_conv_state_fusion : public test_case {
      const int64_t n_slots;
      const int64_t src_slot;
      const int64_t dst_slot;
@@ -730,7 +737,7 @@ index 83f6d15..014d121 100644
          ggml_tensor * w      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, n_ch);
          ggml_set_name(states, "cache_r");
          ggml_set_name(s_copy, "s_copy");
-@@ -4739,7 +4749,8 @@ struct test_gdn_conv_state_fusion : public test_case {
+@@ -4739,7 +4756,8 @@ struct test_gdn_conv_state_fusion : public test_case {
          ggml_tensor * ci = ggml_concat(ctx, cs, ggml_transpose(ctx, x), 0);
          ggml_set_name(ci, "conv_input");
  
@@ -740,7 +747,7 @@ index 83f6d15..014d121 100644
          ggml_tensor * upd  = ggml_view_2d(ctx, states, row, 1, states->nb[1], dst_slot * states->nb[1]);
          ggml_tensor * cpy  = ggml_cpy(ctx, last, upd);
          ggml_set_name(cpy, "conv_state_update");
-@@ -4747,7 +4758,9 @@ struct test_gdn_conv_state_fusion : public test_case {
+@@ -4747,7 +4765,9 @@ struct test_gdn_conv_state_fusion : public test_case {
          ggml_tensor * y = ggml_silu(ctx, ggml_ssm_conv(ctx, ci, w));
          ggml_set_name(y, "conv_output_silu");
  
@@ -751,7 +758,7 @@ index 83f6d15..014d121 100644
          return out;
      }
  
-@@ -11112,6 +11125,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11112,6 +11132,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gdn_conv_state_fusion(4, 6144, 3, 2, 1));
      test_cases.emplace_back(new test_gdn_conv_state_fusion(4, 100, 2, 1, 1));
      test_cases.emplace_back(new test_gdn_conv_state_fusion(3, 64, 2, 0, 1));

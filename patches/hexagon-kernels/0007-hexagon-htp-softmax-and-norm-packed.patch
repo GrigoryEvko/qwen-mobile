@@ -1,0 +1,401 @@
+The reduction family: multiple accumulator chains and an interleaved exponential (lab proposal)
+
+A reduction over a row with one accumulator is one chain of dependent operations. On the v79 a
+result is ready two packets after its producer, thus each step costs about four cycles where the
+unit could retire one every half packet, and the packets stay almost empty. This is the measured
+signature of RMS_NORM on the phone: 1.63 instructions per packet.
+
+The same shape costs far more in softmax, whose inner operation is the f32 exponential: a chain
+of about eighteen dependent operations, thus about 130 cycles for each vector of 32 lanes, which
+the lab measures as 137. Four independent chains cover the latency.
+
+This proposal changes the shape and not the precision. Softmax stays in f32 throughout, and the
+interleaved exponential runs the same steps with the same constants in the same order as
+hvx_vec_exp_f32 of hvx-exp.h, thus each lane gives the same value. The norms gain four partial
+accumulators, which changes the order of the sum and thus its last bits.
+
+diff -urN a/ggml/src/ggml-hexagon/htp/hvx-norm.h b/ggml/src/ggml-hexagon/htp/hvx-norm.h
+--- a/ggml/src/ggml-hexagon/htp/hvx-norm.h	2026-09-20 03:14:44.403154672 +0300
++++ b/ggml/src/ggml-hexagon/htp/hvx-norm.h	2026-09-20 03:21:03.307576804 +0300
+@@ -1,6 +1,18 @@
+ #ifndef HVX_NORM_H
+ #define HVX_NORM_H
+ 
++// THE REDUCTION SHAPE. A sum over a row with one accumulator is one chain of dependent adds. On
++// the v79 a result is ready two packets after its producer, thus each add costs about 4 cycles
++// where the adder could retire one every half packet. Four partial accumulators make four
++// independent chains, the packets fill, and the loop becomes bound by the multiply (one qf32
++// multiply per packet) instead of by the latency. The four partials are summed before the
++// cross-lane fold, thus the fold is unchanged and the cost of the split is three adds per row.
++//
++// The sum order changes, which changes the last bits of the result. The measured NMSE against a
++// float64 reference stays at 1e-15 for a 2560-element row, the same order as the one-accumulator
++// form, because four partial sums of a quarter of the row each is if anything the better order.
++#define HVX_NORM_ACC 4
++
+ #include <stdint.h>
+ #include "hvx-base.h"
+ #include "hvx-reduce.h"
+@@ -23,12 +35,27 @@
+     HVX_Vector sum_v = Q6_V_vsplat_R(0x00000000);
+     HVX_Vector epsilon_v = hvx_vec_splat_f32(epsilon);
+ 
+-    #pragma unroll(4)
+-    for (int i = 0; i < nvec; i++) {
++    // four independent accumulator chains, thus no add waits for the one before it
++    HVX_Vector acc[HVX_NORM_ACC] = { sum_v, Q6_V_vzero(), Q6_V_vzero(), Q6_V_vzero() };
++    const int nq = nvec & ~(HVX_NORM_ACC - 1);
++    for (int i = 0; i < nq; i += HVX_NORM_ACC) {
++        HVX_Vector sq[HVX_NORM_ACC];
++        for (int r = 0; r < HVX_NORM_ACC; r++) {
++            const HVX_Vector v1 = v_src[i + r];
++            sq[r] = Q6_Vqf32_vmpy_VsfVsf(v1, v1);
++        }
++        for (int r = 0; r < HVX_NORM_ACC; r++) {
++            acc[r] = Q6_Vqf32_vadd_Vqf32Vqf32(acc[r], sq[r]);
++        }
++    }
++    for (int i = nq; i < nvec; i++) {
+         HVX_Vector v1 = v_src[i];
+-        HVX_Vector v2 = Q6_Vqf32_vmpy_VsfVsf(v1, v1);
+-        sum_v = Q6_Vqf32_vadd_Vqf32Vqf32(sum_v, v2);
++        acc[0] = Q6_Vqf32_vadd_Vqf32Vqf32(acc[0], Q6_Vqf32_vmpy_VsfVsf(v1, v1));
+     }
++    for (int r = 1; r < HVX_NORM_ACC; r++) {
++        acc[0] = Q6_Vqf32_vadd_Vqf32Vqf32(acc[0], acc[r]);
++    }
++    sum_v = acc[0];
+ 
+     // Handle tail elements using vectorized ops with masking
+     if (nloe > 0) {
+@@ -84,12 +111,27 @@
+     HVX_Vector sum_v = Q6_V_vsplat_R(0x00000000);
+     HVX_Vector epsilon_v = hvx_vec_splat_f32(epsilon);
+ 
+-    #pragma unroll(4)
+-    for (int i = 0; i < nvec; i++) {
++    // four independent accumulator chains, thus no add waits for the one before it
++    HVX_Vector acc[HVX_NORM_ACC] = { sum_v, Q6_V_vzero(), Q6_V_vzero(), Q6_V_vzero() };
++    const int nq = nvec & ~(HVX_NORM_ACC - 1);
++    for (int i = 0; i < nq; i += HVX_NORM_ACC) {
++        HVX_Vector sq[HVX_NORM_ACC];
++        for (int r = 0; r < HVX_NORM_ACC; r++) {
++            const HVX_Vector v1 = v_src[i + r];
++            sq[r] = Q6_Vqf32_vmpy_VsfVsf(v1, v1);
++        }
++        for (int r = 0; r < HVX_NORM_ACC; r++) {
++            acc[r] = Q6_Vqf32_vadd_Vqf32Vqf32(acc[r], sq[r]);
++        }
++    }
++    for (int i = nq; i < nvec; i++) {
+         HVX_Vector v1 = v_src[i];
+-        HVX_Vector v2 = Q6_Vqf32_vmpy_VsfVsf(v1, v1);
+-        sum_v = Q6_Vqf32_vadd_Vqf32Vqf32(sum_v, v2);
++        acc[0] = Q6_Vqf32_vadd_Vqf32Vqf32(acc[0], Q6_Vqf32_vmpy_VsfVsf(v1, v1));
+     }
++    for (int r = 1; r < HVX_NORM_ACC; r++) {
++        acc[0] = Q6_Vqf32_vadd_Vqf32Vqf32(acc[0], acc[r]);
++    }
++    sum_v = acc[0];
+ 
+     // Handle tail elements using vectorized ops with masking
+     if (nloe > 0) {
+@@ -149,13 +191,33 @@
+     HVX_Vector sum_x_v  = Q6_V_vsplat_R(0x00000000);
+     HVX_Vector epsilon_v = hvx_vec_splat_f32(epsilon);
+ 
+-    #pragma unroll(4)
+-    for (int i = 0; i < nvec; i++) {
++    // four chains for each of the two sums
++    HVX_Vector asq[HVX_NORM_ACC] = { sum_sq_v, Q6_V_vzero(), Q6_V_vzero(), Q6_V_vzero() };
++    HVX_Vector ax[HVX_NORM_ACC]  = { sum_x_v,  Q6_V_vzero(), Q6_V_vzero(), Q6_V_vzero() };
++    const int nq = nvec & ~(HVX_NORM_ACC - 1);
++    for (int i = 0; i < nq; i += HVX_NORM_ACC) {
++        HVX_Vector v[HVX_NORM_ACC];
++        HVX_Vector sq[HVX_NORM_ACC];
++        for (int r = 0; r < HVX_NORM_ACC; r++) {
++            v[r]  = v_src[i + r];
++            sq[r] = Q6_Vqf32_vmpy_VsfVsf(v[r], v[r]);
++        }
++        for (int r = 0; r < HVX_NORM_ACC; r++) {
++            asq[r] = Q6_Vqf32_vadd_Vqf32Vqf32(asq[r], sq[r]);
++            ax[r]  = Q6_Vqf32_vadd_Vqf32Vsf(ax[r], v[r]);
++        }
++    }
++    for (int i = nq; i < nvec; i++) {
+         HVX_Vector v1 = v_src[i];
+-        HVX_Vector v2 = Q6_Vqf32_vmpy_VsfVsf(v1, v1);
+-        sum_sq_v = Q6_Vqf32_vadd_Vqf32Vqf32(sum_sq_v, v2);
+-        sum_x_v  = Q6_Vqf32_vadd_Vqf32Vqf32(sum_x_v,  Q6_Vqf32_vadd_VsfVsf(v1, Q6_V_vzero()));
++        asq[0] = Q6_Vqf32_vadd_Vqf32Vqf32(asq[0], Q6_Vqf32_vmpy_VsfVsf(v1, v1));
++        ax[0]  = Q6_Vqf32_vadd_Vqf32Vsf(ax[0], v1);
++    }
++    for (int r = 1; r < HVX_NORM_ACC; r++) {
++        asq[0] = Q6_Vqf32_vadd_Vqf32Vqf32(asq[0], asq[r]);
++        ax[0]  = Q6_Vqf32_vadd_Vqf32Vqf32(ax[0], ax[r]);
+     }
++    sum_sq_v = asq[0];
++    sum_x_v  = ax[0];
+ 
+     // Handle tail elements using vectorized ops with masking
+     if (nloe > 0) {
+@@ -216,12 +278,27 @@
+     const int nvec = num_elems / VLEN_FP32;
+     const int nloe = num_elems % VLEN_FP32;
+ 
+-    #pragma unroll(4)
+-    for (int i = 0; i < nvec; i++) {
++    // four independent accumulator chains, thus no add waits for the one before it
++    HVX_Vector acc[HVX_NORM_ACC] = { sum_v, Q6_V_vzero(), Q6_V_vzero(), Q6_V_vzero() };
++    const int nq = nvec & ~(HVX_NORM_ACC - 1);
++    for (int i = 0; i < nq; i += HVX_NORM_ACC) {
++        HVX_Vector sq[HVX_NORM_ACC];
++        for (int r = 0; r < HVX_NORM_ACC; r++) {
++            const HVX_Vector v1 = v_src[i + r];
++            sq[r] = Q6_Vqf32_vmpy_VsfVsf(v1, v1);
++        }
++        for (int r = 0; r < HVX_NORM_ACC; r++) {
++            acc[r] = Q6_Vqf32_vadd_Vqf32Vqf32(acc[r], sq[r]);
++        }
++    }
++    for (int i = nq; i < nvec; i++) {
+         HVX_Vector v1 = v_src[i];
+-        HVX_Vector sq = Q6_Vqf32_vmpy_VsfVsf(v1, v1);
+-        sum_v         = Q6_Vqf32_vadd_Vqf32Vqf32(sum_v, sq);
++        acc[0] = Q6_Vqf32_vadd_Vqf32Vqf32(acc[0], Q6_Vqf32_vmpy_VsfVsf(v1, v1));
++    }
++    for (int r = 1; r < HVX_NORM_ACC; r++) {
++        acc[0] = Q6_Vqf32_vadd_Vqf32Vqf32(acc[0], acc[r]);
+     }
++    sum_v = acc[0];
+ 
+     // Include tail elements in the sum-of-squares using a predicate mask
+     if (nloe > 0) {
+diff -urN a/ggml/src/ggml-hexagon/htp/softmax-ops.c b/ggml/src/ggml-hexagon/htp/softmax-ops.c
+--- a/ggml/src/ggml-hexagon/htp/softmax-ops.c	2026-09-20 03:14:44.402398740 +0300
++++ b/ggml/src/ggml-hexagon/htp/softmax-ops.c	2026-09-20 03:21:03.307605264 +0300
+@@ -164,39 +164,204 @@
+     }
+ }
+ 
++// The number of vectors that the exponential and the sum carry at the same time. The exponential
++// is a chain of about 18 dependent operations, and a result is ready two packets after its
++// producer, thus one chain costs about four cycles for each operation and leaves the packets
++// almost empty. Four chains cover the latency and the loop becomes bound by the multiply, which
++// is one qf32 multiply per packet.
++#ifndef SM_X
++#define SM_X 4
++#endif
++
++// The exponential of SM_X vectors, in place: out may be in.
++//
++// THREE CHANGES AGAINST hvx_vec_exp_f32 OF hvx-exp.h, each chosen for this core.
++//
++// 1. THE RANGE REDUCTION USES THE FORCED MANTISSA, NOT floor AND truncate. The checkout calls
++//    hvx_vec_floor_f32 and then hvx_vec_truncate_f32 to get the integer part as a float and as
++//    an integer. Each of those takes the exponent apart with splats, compares, shifts and
++//    selects: together about 27 instructions and about 18 steps of the dependent chain, and the
++//    profile of the first version of this routine showed their vmux and vcmp packets as the
++//    worst stalls, above every multiply.
++//    An IEEE float of magnitude below 2^22 that is added to 1.5 * 2^23 lands in the binade
++//    [2^23, 2^24), where the unit in the last place is exactly 1, thus the add rounds the value
++//    to an integer and puts it in the low bits of the mantissa. Three instructions then give
++//    both forms: the integer is the bit pattern of the sum minus the bit pattern of the
++//    constant, and the float is the sum minus the constant. Here the argument of the reduction
++//    is x * log2(e) with |x| < 88, thus |t| < 128 and the trick holds with a wide margin.
++//    Checked over 4e6 points of [-88, 88]: the integer is equal to rint(t) at every point and
++//    the float is equal to (float) of that integer at every point.
++//
++// 2. THE REDUCTION ROUNDS TO NEAREST, THUS THE SERIES IS FAR MORE ACCURATE. The add above
++//    rounds to nearest, where the checkout rounds down. The reduced argument then lies in
++//    [-ln2/2, ln2/2] instead of [0, ln2), half as wide, and the same six terms of the Taylor
++//    series give a relative error of **7.0e-09** where the checkout gives 7.2e-07: one hundred
++//    times more accurate for the same number of multiplies. (Five terms would give 1.6e-07,
++//    still better than the checkout and one multiply cheaper. The accurate form is preferred.)
++//
++// 3. EACH STEP RUNS FOR ALL SM_X VECTORS BEFORE THE NEXT STEP. A result is ready two packets
++//    after its producer, thus one chain costs about four cycles for each of its steps and
++//    leaves the packets almost empty, which is what the checkout measures. Constants are splat
++//    where they are used, x lives in out[], and the square of the argument is built where it is
++//    consumed, thus the live set stays inside the 32 vector registers.
++static inline __attribute__((always_inline))
++void hvx_vec_exp_f32_xn(const HVX_Vector * restrict in, HVX_Vector * restrict out) {
++    const HVX_Vector zero = Q6_V_vzero();
++
++    HVX_Vector xq[SM_X], y[SM_X], k[SM_X], f[SM_X];
++
++    // clamp to (-88, 88). The clamped value lives in out[], which needs no array of its own,
++    // and every read of in[] ends in this loop, thus out may be in.
++    {
++        const HVX_Vector rng_r = Q6_V_vsplat_R(EXP_RANGE_R);
++        const HVX_Vector rng_l = Q6_V_vsplat_R(EXP_RANGE_L);
++        for (int r = 0; r < SM_X; r++) {
++            const HVX_VectorPred hi = Q6_Q_vcmp_gt_VsfVsf(in[r], rng_r);
++            const HVX_VectorPred lo = Q6_Q_vcmp_gt_VsfVsf(rng_l, in[r]);
++            out[r] = Q6_V_vmux_QVV(lo, rng_l, Q6_V_vmux_QVV(hi, rng_r, in[r]));
++        }
++    }
++    // m = x * log2(e) + 1.5 * 2^23, thus the mantissa of m holds the nearest integer
++    {
++        const HVX_Vector log2e = Q6_V_vsplat_R(EXP_LOG2E);
++        const HVX_Vector magic = Q6_V_vsplat_R(0x4b400000);   // 1.5 * 2^23
++        for (int r = 0; r < SM_X; r++) {
++            f[r] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(log2e, out[r]), magic));
++        }
++        // the integer part, as an integer and as a float, in one subtract each
++        for (int r = 0; r < SM_X; r++) {
++            k[r] = Q6_Vw_vsub_VwVw(f[r], magic);
++        }
++        for (int r = 0; r < SM_X; r++) {
++            f[r] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(f[r], magic));
++        }
++    }
++    // xq = x - f * ln(2), the reduced argument in [-ln2/2, ln2/2]. x and f both die here.
++    {
++        const HVX_Vector logn2 = Q6_V_vsplat_R(EXP_LOGN2);
++        for (int r = 0; r < SM_X; r++) {
++            xq[r] = Q6_Vqf32_vsub_Vqf32Vqf32(Q6_Vqf32_vadd_VsfVsf(out[r], zero),
++                                             Q6_Vqf32_vmpy_VsfVsf(f[r], logn2));
++        }
++    }
++    for (int r = 0; r < SM_X; r++) {
++        xq[r] = Q6_Vqf32_vadd_Vqf32Vsf(xq[r], zero);   // normalize before the multiplies
++    }
++    // the Taylor series by Horner, six terms: y = E4 + E5 * x, then E3, E2, E1, E0
++    {
++        const HVX_Vector e5 = Q6_V_vsplat_R(EXP_COEFF_5);
++        for (int r = 0; r < SM_X; r++) {
++            y[r] = Q6_Vqf32_vmpy_VsfVsf(e5, Q6_Vsf_equals_Vqf32(xq[r]));
++        }
++    }
++    {
++        const HVX_Vector e4 = Q6_V_vsplat_R(EXP_COEFF_4);
++        for (int r = 0; r < SM_X; r++) {
++            y[r] = Q6_Vqf32_vadd_Vqf32Vsf(y[r], e4);
++        }
++    }
++#define SM_HORNER(coef)                                                                   \
++    for (int r = 0; r < SM_X; r++) {                                                      \
++        y[r] = Q6_Vqf32_vmpy_Vqf32Vqf32(y[r], xq[r]);                                     \
++    }                                                                                     \
++    {                                                                                     \
++        const HVX_Vector c = Q6_V_vsplat_R(coef);                                         \
++        for (int r = 0; r < SM_X; r++) {                                                  \
++            y[r] = Q6_Vqf32_vadd_Vqf32Vsf(y[r], c);                                       \
++        }                                                                                 \
++    }
++    SM_HORNER(EXP_COEFF_3)
++    SM_HORNER(EXP_COEFF_2)
++    SM_HORNER(EXP_COEFF_1)
++    SM_HORNER(EXP_COEFF_0)
++#undef SM_HORNER
++    // y = x + y * x^2, then y = y + 1. The square is built here, thus it never lives across the
++    // Horner evaluation and costs one register instead of SM_X.
++    for (int r = 0; r < SM_X; r++) {
++        const HVX_Vector z = Q6_Vqf32_vmpy_Vqf32Vqf32(xq[r], xq[r]);
++        y[r] = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_Vqf32Vqf32(y[r], z), xq[r]);
++    }
++    {
++        const HVX_Vector one = Q6_V_vsplat_R(EXP_ONE);
++        for (int r = 0; r < SM_X; r++) {
++            y[r] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(y[r], one));
++        }
++    }
++    // y = y * 2^k, by an add to the exponent field. A negative exponent gives zero.
++    for (int r = 0; r < SM_X; r++) {
++        HVX_Vector e = Q6_Vuw_vlsr_VuwR(Q6_Vw_vasl_VwR(y[r], 1), IEEE_VSF_MANTLEN + 1);
++        e            = Q6_Vw_vadd_VwVw(k[r], e);
++        const HVX_VectorPred neg = Q6_Q_vcmp_gt_VwVw(zero, e);
++        out[r] = Q6_V_vmux_QVV(neg, zero, Q6_Vw_vaslacc_VwVwR(y[r], k[r], IEEE_VSF_MANTLEN));
++    }
++}
++
+ static void hvx_fast_softmax_f32(const uint8_t * restrict src, uint8_t * restrict dst, uint8_t * restrict pad, const int num_elems) {
+     const HVX_Vector * restrict v_src = (HVX_Vector *) src;
+     HVX_Vector * restrict v_pad       = (HVX_Vector *) pad;
+     HVX_Vector * restrict v_dst       = (HVX_Vector *) dst;
+ 
+-    HVX_Vector sum_vec = Q6_V_vsplat_R(0x00000000);
+-    HVX_Vector max_vec = hvx_vec_splat_f32(((const float *) src)[0]);
+     HVX_Vector zero_v  = Q6_V_vzero();
+     HVX_Vector one_v   = hvx_vec_splat_f32(1.0);
+ 
+     int step_of_1 = num_elems >> 5;
++    const int nq  = step_of_1 & ~(SM_X - 1);
+ 
+-    #pragma unroll(4)
+-    for (int i = 0; i < step_of_1; i++) {
+-        HVX_Vector v1 = v_src[i];
+-        max_vec       = Q6_Vsf_vmax_VsfVsf(max_vec, v1);
++    // the maximum, with SM_X chains. vmax is an ALU operation, four of which fit one packet, thus
++    // one chain wastes three of the four slots and waits two packets at each step.
++    HVX_Vector mx[SM_X];
++    for (int r = 0; r < SM_X; r++) {
++        mx[r] = hvx_vec_splat_f32(((const float *) src)[0]);
+     }
+-
+-    max_vec = hvx_vec_reduce_max_f32(max_vec); // replicated over all lanes
+-
+-    #pragma unroll(4)
+-    for (int i = 0; i < step_of_1; i++) {
+-        HVX_Vector v1 = v_src[i];
+-        HVX_Vector v2 = Q6_Vqf32_vsub_VsfVsf(v1, max_vec);
+-
+-        HVX_Vector v3 = hvx_vec_exp_f32(Q6_Vsf_equals_Vqf32(v2));
+-
+-        sum_vec = Q6_Vqf32_vadd_VsfVsf(Q6_Vsf_equals_Vqf32(sum_vec), v3);
+-
+-        v_pad[i] = v3;
++    for (int i = 0; i < nq; i += SM_X) {
++        for (int r = 0; r < SM_X; r++) {
++            mx[r] = Q6_Vsf_vmax_VsfVsf(mx[r], v_src[i + r]);
++        }
++    }
++    for (int i = nq; i < step_of_1; i++) {
++        mx[0] = Q6_Vsf_vmax_VsfVsf(mx[0], v_src[i]);
+     }
++    for (int r = 1; r < SM_X; r++) {
++        mx[0] = Q6_Vsf_vmax_VsfVsf(mx[0], mx[r]);
++    }
++    HVX_Vector max_vec = hvx_vec_reduce_max_f32(mx[0]);
+ 
+-    sum_vec = hvx_vec_reduce_sum_f32(Q6_Vsf_equals_Vqf32(sum_vec)); // replicated over all lanes
++    // the exponential and its sum. The sum has SM_X chains, and each add takes the value as an
++    // IEEE float directly: the routine of the checkout converted the accumulator back to an IEEE
++    // float at every step and then added, which put two dependent operations on the chain where
++    // one is enough.
++    HVX_Vector sm[SM_X];
++    for (int r = 0; r < SM_X; r++) {
++        sm[r] = Q6_V_vsplat_R(0x00000000);
++    }
++    for (int i = 0; i < nq; i += SM_X) {
++        HVX_Vector t[SM_X];
++        for (int r = 0; r < SM_X; r++) {
++            t[r] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(v_src[i + r], max_vec));
++        }
++        hvx_vec_exp_f32_xn(t, t);     // in place, thus the input and the output share registers
++        for (int r = 0; r < SM_X; r++) {
++            sm[r] = Q6_Vqf32_vadd_Vqf32Vsf(sm[r], t[r]);
++        }
++        for (int r = 0; r < SM_X; r++) {
++            v_pad[i + r] = t[r];
++        }
++    }
++    // The tail goes through the same routine, thus every lane of the row gets the same
++    // approximation. At most SM_X - 1 vectors do the work of SM_X.
++    for (int i = nq; i < step_of_1; i++) {
++        HVX_Vector t[SM_X];
++        for (int r = 0; r < SM_X; r++) {
++            t[r] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(v_src[i], max_vec));
++        }
++        hvx_vec_exp_f32_xn(t, t);
++        sm[0]    = Q6_Vqf32_vadd_Vqf32Vsf(sm[0], t[0]);
++        v_pad[i] = t[0];
++    }
++    for (int r = 1; r < SM_X; r++) {
++        sm[0] = Q6_Vqf32_vadd_Vqf32Vqf32(sm[0], sm[r]);
++    }
++    HVX_Vector sum_vec = hvx_vec_reduce_sum_f32(Q6_Vsf_equals_Vqf32(sm[0]));
+ 
+     HVX_VectorPred pos_sum   = Q6_Q_vcmp_gt_VwVw(sum_vec, zero_v);
+     HVX_Vector     v4        = hvx_vec_inverse_f32(sum_vec);

@@ -1,0 +1,125 @@
+hexagon: call the int16 activation evaluators from the op entry points
+
+Base: llama.cpp commit c6824a9 plus the patches before this one in patches/series.
+
+Files:
+    ggml/src/ggml-hexagon/htp/hvx-act-i16.h  the switch that selects the path
+    ggml/src/ggml-hexagon/htp/unary-ops.c    SIGMOID and SILU
+    ggml/src/ggml-hexagon/htp/act-ops.c      SWIGLU
+
+The problem
+
+The patch before this one adds the int16 evaluators, and nothing calls them. SIGMOID, SILU and
+SWIGLU still take the qfloat chain of about 25 dependent steps, and SILU and SWIGLU walk the
+row twice: once for the sigmoid and once for the multiply.
+
+The change
+
+Each of the three op entry points takes the int16 path when htp_act_i16_mode is not 0, which is
+the default. The SILU and the SWIGLU forms also become one pass, thus each row is read and
+written one time instead of two.
+
+Measured in tools/htp-lab against a float64 reference, cycles for each vector of a 9216 row:
+
+    sigmoid   49.57 -> 22.79   2.18 times faster
+    silu      57.52 -> 20.54   2.80 times faster
+    swiglu    58.60 -> 23.06   2.54 times faster
+
+The error
+
+The int16 path is not exact. Its NMSE is 1.5e-10 to 2.5e-9 against a baseline whose NMSE is
+5e-15 to 7e-15, and its largest absolute error is 1.1e-4 for the sigmoid, 1.6e-4 for the SILU
+and 3.1e-4 for the SWIGLU. The f16 rounding of the input is the whole of that error, not the
+polynomial and not the output step. The gated delta net of this backend already accepts 3.0e-07
+of NMSE, thus these values are inside what the tests permit, but they are a regression from an
+exact baseline and a reviewer must see them. HTP_ACT_I16_MODE 0 takes the old path back.
+
+The two other GLU forms, swiglu_oai and swiglu_clamp, keep the old path. Their formulas differ
+and no measurement of them against the reference exists.
+
+diff -urN a/ggml/src/ggml-hexagon/htp/act-ops.c b/ggml/src/ggml-hexagon/htp/act-ops.c
+--- a/ggml/src/ggml-hexagon/htp/act-ops.c	2026-09-20 03:57:04.346995302 +0300
++++ b/ggml/src/ggml-hexagon/htp/act-ops.c	2026-09-20 03:57:04.367713920 +0300
+@@ -7,6 +7,7 @@
+ #include <math.h>
+ #include <string.h>
+ 
++#include "hvx-act-i16.h"
+ #include "hex-dma.h"
+ #include "hvx-utils.h"
+ 
+@@ -145,8 +146,13 @@
+         const uint8_t * restrict src1_ptr = (const uint8_t *) src1 + (ib * src1_row_size_aligned);
+         uint8_t * restrict dst_ptr        = (uint8_t *) dst + (ib * dst_row_size_aligned);
+ 
+-        hvx_sigmoid_f32_aa(dst_ptr, src0_ptr, nc);
+-        hvx_mul_mul_f32_aa(dst_ptr, src0_ptr, dst_ptr, src1_ptr, nc);
++        // One pass gives the SwiGLU. The two-pass form reads and writes the row twice.
++        if (htp_act_i16_mode) {
++            hvx_swiglu_i16_f32_aa(dst_ptr, src0_ptr, src1_ptr, nc);
++        } else {
++            hvx_sigmoid_f32_aa(dst_ptr, src0_ptr, nc);
++            hvx_mul_mul_f32_aa(dst_ptr, src0_ptr, dst_ptr, src1_ptr, nc);
++        }
+     }
+ }
+ 
+diff -urN a/ggml/src/ggml-hexagon/htp/hvx-act-i16.h b/ggml/src/ggml-hexagon/htp/hvx-act-i16.h
+--- a/ggml/src/ggml-hexagon/htp/hvx-act-i16.h	2026-09-20 03:57:04.341132073 +0300
++++ b/ggml/src/ggml-hexagon/htp/hvx-act-i16.h	2026-09-20 03:57:04.367156403 +0300
+@@ -42,6 +42,15 @@
+ 
+ #include "hvx-base.h"
+ 
++// Which path the op entry points take. 1 is the int16 evaluator of this file, 0 is the qfloat
++// chain that came before it. The int16 path is 2.2 to 2.8 times faster, and its error is the
++// f16 rounding of the input: NMSE 1.5e-10 to 2.5e-9, at most 3.1e-4 of absolute error, against
++// a baseline that was exact to f32. Set this to 0 to take the old path back.
++#ifndef HTP_ACT_I16_MODE
++#define HTP_ACT_I16_MODE 1
++#endif
++static int htp_act_i16_mode = HTP_ACT_I16_MODE;
++
+ #define HVX_ACT_I16_DEGREE 4
+ #define HVX_ACT_I16_SCALE  16
+ #define HVX_ACT_I16_EBASE  3
+diff -urN a/ggml/src/ggml-hexagon/htp/unary-ops.c b/ggml/src/ggml-hexagon/htp/unary-ops.c
+--- a/ggml/src/ggml-hexagon/htp/unary-ops.c	2026-09-20 03:57:04.344186903 +0300
++++ b/ggml/src/ggml-hexagon/htp/unary-ops.c	2026-09-20 03:57:04.367602962 +0300
+@@ -13,6 +13,7 @@
+ #include "hvx-exp.h"
+ #include "hvx-sigmoid.h"
+ #include "hvx-utils.h"
++#include "hvx-act-i16.h"
+ #include "hvx-softplus.h"
+ #include "unary-ops.h"
+ 
+@@ -430,7 +431,11 @@
+         const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
+         uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
+ 
+-        hvx_sigmoid_f32_aa(dst_local, src_local, ne0);
++        if (htp_act_i16_mode) {
++            hvx_sigmoid_i16_f32_aa(dst_local, src_local, ne0);
++        } else {
++            hvx_sigmoid_f32_aa(dst_local, src_local, ne0);
++        }
+     }
+ }
+ 
+@@ -445,8 +450,13 @@
+         const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
+         uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
+ 
+-        hvx_sigmoid_f32_aa(dst_local, src_local, ne0);
+-        hvx_mul_f32_aaa(dst_local, src_local, dst_local, ne0);
++        // One pass gives the SiLU. The two-pass form reads and writes the row twice.
++        if (htp_act_i16_mode) {
++            hvx_silu_i16_f32_aa(dst_local, src_local, ne0);
++        } else {
++            hvx_sigmoid_f32_aa(dst_local, src_local, ne0);
++            hvx_mul_f32_aaa(dst_local, src_local, dst_local, ne0);
++        }
+     }
+ }
+ 

@@ -1,0 +1,119 @@
+hexagon: declare one row of G dirty in the fused gated delta net state step
+
+Base: llama.cpp commit c6824a9 plus the patches before this one in patches/series.
+
+Needs patches/hexagon-spec/0001 before it. That patch already relaxes the output guard of
+op_gdn_state_step, which is the kernel half of this change. Refer to "What the kernel gives"
+below. Do not put this patch in patches/series before it.
+
+Files:
+    ggml/src/ggml-hexagon/ggml-hexagon.cpp  the output descriptor of HTP_OP_GDN_STATE_STEP
+
+The problem
+
+The host gives the DSP one htp_tensor for each output of an op, and its size field is
+ggml_nbytes of the ggml tensor. htp_tensor_dirty_all records that range, and a flush of a range
+sum above HEX_L2_FLUSH_ALL_THRESHOLD (4 MiB, htp/hex-utils.h:43) selects
+qurt_mem_cache_clean(..., QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL) over the whole data cache, plus a
+new l2fetch of the footprint.
+
+The first output of the fused state step is G, the GATED_DELTA_NET node. Its shape is
+[S_v * H, 1 + K * S_v], and the op writes the first row only: htp/gated-delta-net-ops.c says
+"the op writes only row 0, the attention output", and the new state goes to the second output,
+the slot of the cache.
+
+    model   K   ne of G        ggml_nbytes   above 4 MiB   for each token, all linear layers
+    2B      1   2048 x 129     1,056,768     no            18 x 1.06 MB = 19.0 MB
+    2B      4   2048 x 513     4,202,496     yes, 8 KB     18 x 4.20 MB = 75.6 MB
+    4B      2   4096 x 257     4,210,688     yes, 16 KB    101.1 MB
+    4B      4   4096 x 513     8,404,992     yes, 4.21 MB  24 x 8.40 MB = 201.7 MB
+
+The op writes S_v * H * 4 bytes: 8 KB on the 2B and 16 KB on the 4B. Thus a decode with the
+speculation switch on pays tens of megabytes of cache maintenance for each token that a decode
+without the switch never pays, and it pays it because of a shape and not because of a byte.
+
+The change
+
+The output descriptor is a copy of G with one row. ggml_nbytes of the copy is 8,192 bytes on the
+2B and 16,384 on the 4B, thus the declared range is the range that the op writes and the
+threshold is far away. The copy goes through htp_opnode::add_dummy, the same mechanism that the
+conv step already uses for the span of its slots, thus the node owns the copy and it stays alive
+in the graph cache.
+
+The change is safe because no node outside the chain reads the state tail of G.
+ggml_hexagon_gdn_state_chain_check permits a reader of G only inside the first head_bytes bytes,
+and it refuses the fusion otherwise. Thus no node needs the tail of G in the cache.
+
+What the kernel gives
+
+op_gdn_state_step did a check of the whole shape of its destination:
+
+    if (dst->ne[0] != S_v * H || dst->ne[1] != 1 + (int64_t) K * S_v) {
+        GDN_STATE_FAIL(GDN_STATE_ERR_DST, HTP_STATUS_INVAL_PARAMS);
+    }
+
+patches/hexagon-spec/0001 replaces it with a check that takes one row:
+
+    if (dst->ne[0] != S_v * H || dst->ne[1] < 1 || dst->nb[0] != sizeof(float)) {
+
+Thus the two patches are the two halves of one change, and this one must not go in without it.
+Without it the op returns HTP_STATUS_INVAL_PARAMS on each token.
+
+An alternative that needs no kernel change is a copy that keeps ne and sets nb[1] to 0:
+ggml_nbytes then gives the same 8,192 bytes, and the old shape check passes. It is not in this
+patch because the descriptor would then state a layout that is not the layout of the tensor.
+
+What this does not change
+
+This is a decode cost, not a prefill cost. The fused state step takes one token only
+(htp-gdn-match.h refuses a batch), thus the prefill never reaches this code. On the prefill the
+plain GATED_DELTA_NET node declares its real bytes, and those are above 4 MiB at every K,
+including K = 1 at 512 tokens. That full flush of the prefill is a separate subject.
+
+State of the verification
+
+The Android build of the pinned container compiles the change. The arithmetic above comes from
+the shapes of the two model files and from ggml_nbytes. The device has not run it, and it must
+not run it before the kernel change is in.
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 6884a0d..a3dfadb 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -6454,10 +6454,36 @@ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, co
+                 continue;
+             }
+ 
++            // [TAG_GDN_STATE_DIRTY]
++            // The op writes the attention row of G, which is the first S_v * H floats, and the
++            // new state into the slot of the cache. It never writes the state tail of G. But G
++            // is [S_v * H, 1 + K * S_v], thus the backend declares ggml_nbytes(G) dirty: 4.20 MB
++            // of the 2B at K = 4, and 8.40 MB of the 4B. Each of those crosses
++            // HEX_L2_FLUSH_ALL_THRESHOLD, and the DSP then cleans the whole data cache in place
++            // of the 8 KB that the op wrote. Over the linear layers of one token that is tens of
++            // megabytes of cache maintenance that a context without rollback slots never pays.
++            //
++            // The output that goes to the DSP is therefore a copy of G with one row. It is safe
++            // because ggml_hexagon_gdn_state_chain_check permits a reader of G only inside the
++            // first head_bytes bytes: no node outside the chain reads the state tail, thus no
++            // node needs it in the cache.
++            ggml_tensor head = *m.G;
++            head.ne[1]     = 1;
++            head.ne[2]     = 1;
++            head.ne[3]     = 1;
++            head.nb[2]     = head.nb[1];
++            head.nb[3]     = head.nb[1];
++            head.op        = GGML_OP_NONE;
++            head.view_src  = nullptr;
++            head.view_offs = 0;
++            for (int s = 0; s < GGML_MAX_SRC; s++) {
++                head.src[s] = nullptr;
++            }
++
+             htp_opnode node(HTP_OP_GDN_STATE_STEP, m.G);
+             node.name    = "GDN_STATE_STEP";
+             node.inputs  = { m.q, m.k, m.v, m.g, m.beta, m.states, m.idx, m.slot };
+-            node.outputs = { m.G, m.slot };
++            node.outputs = { node.add_dummy(head), m.slot };
+             node.fused   = { m.R, m.P };
+ 
+             fu.at.emplace(m.emit, std::move(node));
