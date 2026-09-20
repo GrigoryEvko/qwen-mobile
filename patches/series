@@ -88,3 +88,7 @@ hexagon-spec/0001-hexagon-htp-gdn-chunked-and-conv-rollback-slots.patch
 # one snapshot group and its graph equals the graph of speculation off.
 hexagon-spec/0002-llama-bound-the-recurrent-rollback-by-the-last-ubatch.patch
 hexagon-spec/0003-llama-one-recurrent-snapshot-group-for-a-prompt-ubatch.patch
+
+# The drafter reads a frequency-ranked subset of the head. A model without the
+# three tensors takes the full head, thus the patch is inert for a plain GGUF.
+draft-head/0001-llama-qwen35-reduced-mtp-draft-head.patch

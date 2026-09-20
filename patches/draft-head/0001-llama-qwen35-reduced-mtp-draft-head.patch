@@ -1,0 +1,179 @@
+llama: a reduced head for the MTP drafter of qwen35
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+Our 4B ties the head to token_embd.weight, 248320 rows of 2560 columns. Every MTP draft step reads
+all of it, 675 MB at Q8_0, which is 86 % of the 782 MB of a draft step. The drafter does not need
+the whole vocabulary. quant/draftset.py gathers a frequency-ranked subset of the rows into three
+tensors of the GGUF, and the MTP graph reads the subset instead.
+
+The change is lossless. The subset decides only what the drafter can propose. The target model
+verifies each proposed token against the full head, thus a token outside the subset is never
+accepted wrongly, it is simply never proposed. Measured on the 2B on a host CPU, greedy, draft
+depth 3, a complete answer at end of generation: the output is byte-identical with the full head
+and with the subset, 205 tokens.
+
+The three tensors, all optional, all read only by the MTP graph:
+
+    blk.N.nextn.draft_head.weight  the gathered rows, in the type of the source head
+    blk.N.nextn.draft_ids          the vocabulary index of each row, I32, the scatter index
+    blk.N.nextn.draft_fill         one F32, the logit of every token outside the subset
+
+The scatter. ggml_set_rows writes whole rows, thus the graph puts the logits in the transposed
+shape [1, n_vocab] for the scatter and reshapes on both sides. At one output row both reshapes are
+views, thus an MTP pass with more rows takes the full head. ggml_repeat_4d builds the background
+from draft_fill, and the Hexagon backend supports REPEAT and SET_ROWS for these shapes, thus the
+draft graph does not split.
+
+Files:
+    src/llama-arch.h            three LLM_TENSOR_NEXTN_DRAFT_* entries
+    src/llama-arch.cpp          their names and their tensor info
+    src/llama-model.h           three fields of llama_layer_nextn
+    src/llama-model-loader.cpp  a buft probe for SET_ROWS and for REPEAT
+    src/models/qwen35.cpp       the tensors at load, the reduced matmul and the scatter in build_mtp
+
+The loader skips a tensor whose info says GGML_OP_NONE, thus the index and the fill tensors declare
+the op that reads them. weight_buft_supported had no case for either op and its default aborts.
+
+How to apply, from the llama.cpp root:
+
+    git apply patches/draft-head/0001-llama-qwen35-reduced-mtp-draft-head.patch
+
+A model without the three tensors takes the full head, thus the patch changes nothing for a GGUF
+that quant/draftset.py has not processed.
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index c135a4d..68e84f9 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -588,6 +588,9 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+     { LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,                 "blk.%d.nextn.shared_head_norm" },
+     { LLM_TENSOR_NEXTN_HNORM_ROT,                        "blk.%d.nextn.hnorm_rot" },
+     { LLM_TENSOR_NEXTN_SHARED_HEAD_ROT,                  "blk.%d.nextn.shared_head_rot" },
++    { LLM_TENSOR_NEXTN_DRAFT_HEAD,                       "blk.%d.nextn.draft_head" },
++    { LLM_TENSOR_NEXTN_DRAFT_IDS,                        "blk.%d.nextn.draft_ids" },
++    { LLM_TENSOR_NEXTN_DRAFT_FILL,                       "blk.%d.nextn.draft_fill" },
+     { LLM_TENSOR_ATTN_SUB_NORM,                          "blk.%d.attn_sub_norm" },
+     { LLM_TENSOR_FFN_SUB_NORM,                           "blk.%d.ffn_sub_norm" },
+     { LLM_TENSOR_DEC_OUTPUT_NORM,                        "dec.output_norm" },
+@@ -981,6 +984,11 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+     {LLM_TENSOR_NEXTN_HNORM_ROT,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_NEXTN_SHARED_HEAD_ROT,      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    // the draft head of the MTP block. The op of each entry is the op that reads the tensor, thus
++    // the buft probe keeps all three on the device that runs the draft graph.
++    {LLM_TENSOR_NEXTN_DRAFT_HEAD,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_NEXTN_DRAFT_IDS,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_SET_ROWS}},
++    {LLM_TENSOR_NEXTN_DRAFT_FILL,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_REPEAT}},
+     // Nemotron 3 Super
+     // latent projections feed ggml_mul_mat, the buft probe must use MUL_MAT to keep them on GPU
+     {LLM_TENSOR_FFN_LATENT_DOWN,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index d5aacdb..b083375 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -699,6 +699,9 @@ enum llm_tensor {
+     LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
+     LLM_TENSOR_NEXTN_HNORM_ROT,       // a dense map before hnorm, for a rotated residual stream
+     LLM_TENSOR_NEXTN_SHARED_HEAD_ROT, // a dense map after shared_head_norm, for a rotated residual stream
++    LLM_TENSOR_NEXTN_DRAFT_HEAD,      // a frequency-ranked subset of the rows of the head, for the drafter
++    LLM_TENSOR_NEXTN_DRAFT_IDS,       // the vocabulary index of each row of that subset
++    LLM_TENSOR_NEXTN_DRAFT_FILL,      // the logit that every token outside the subset gets
+     LLM_TENSOR_MASKED_EMBD_CENTROIDS,
+     LLM_TENSOR_MASKED_EMBD_ORDERING,
+     LLM_TENSOR_HRM_Z_L_INIT,
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 91bb5e7..35ed3e5 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -943,6 +943,18 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
+                 ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 512);
+                 op_tensor = ggml_get_rows(ctx, w, b);
+             } break;
++        case GGML_OP_SET_ROWS:
++            {
++                // w is the index tensor, thus it gives the number of rows that the op writes
++                ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, w->ne[0]);
++                ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, w->ne[0]);
++                op_tensor = ggml_set_rows(ctx, a, b, w);
++            } break;
++        case GGML_OP_REPEAT:
++            {
++                // w is the source that the op broadcasts, thus the destination is a multiple of it
++                op_tensor = ggml_repeat_4d(ctx, w, w->ne[0], w->ne[1]*512, w->ne[2], w->ne[3]);
++            } break;
+         case GGML_OP_MUL_MAT:
+             {
+                 ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], 512, w->ne[2], w->ne[3]);
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 5b6294f..240cfc4 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -236,6 +236,13 @@ struct llama_layer_nextn {
+     // the block into the convention of the h_nextn of the main graph
+     struct ggml_tensor * hnorm_rot             = nullptr;
+     struct ggml_tensor * shared_head_rot       = nullptr;
++    // The reduced head of the drafter: a frequency-ranked subset of the rows of the shared head.
++    // draft_ids gives the vocabulary index of each row, and draft_fill gives the logit of every
++    // token that the subset leaves out. The three arrive together or not at all. The scale of the
++    // head is one value for the whole tensor, thus the subset reads the scale of the full head.
++    struct ggml_tensor * draft_head            = nullptr;
++    struct ggml_tensor * draft_ids             = nullptr;
++    struct ggml_tensor * draft_fill            = nullptr;
+ };
+ 
+ struct llama_layer_switch_lora {
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 8fc47bf..8b239ea 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -120,6 +120,17 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
+         // the two dense maps of a rotated checkpoint, which a plain conversion does not have
+         layer.nextn.hnorm_rot        = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM_ROT,        "weight", il), { n_embd, n_embd },      mtp_flags|TENSOR_NOT_REQUIRED);
+         layer.nextn.shared_head_rot  = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_ROT,  "weight", il), { n_embd, n_embd },      mtp_flags|TENSOR_NOT_REQUIRED);
++
++        // The reduced head of the drafter, which quant/draftset.py writes. The row count comes
++        // from the file, because it is a choice of the pipeline and not of the architecture.
++        // The three tensors arrive together, thus one missing tensor turns the feature off.
++        const struct ggml_tensor * draft_meta = ml.get_tensor_meta(tn(LLM_TENSOR_NEXTN_DRAFT_HEAD, "weight", il).str().c_str());
++        if (draft_meta) {
++            const int64_t n_draft = draft_meta->ne[1];
++            layer.nextn.draft_head = create_tensor(tn(LLM_TENSOR_NEXTN_DRAFT_HEAD, "weight", il), { n_embd, n_draft }, mtp_flags|TENSOR_NOT_REQUIRED);
++            layer.nextn.draft_ids  = create_tensor(tn(LLM_TENSOR_NEXTN_DRAFT_IDS,            il), { n_draft },         mtp_flags|TENSOR_NOT_REQUIRED);
++            layer.nextn.draft_fill = create_tensor(tn(LLM_TENSOR_NEXTN_DRAFT_FILL,           il), { 1 },               mtp_flags|TENSOR_NOT_REQUIRED);
++        }
+     };
+ 
+     for (int i = 0; i < n_layer; ++i) {
+@@ -668,7 +679,31 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+         cur = ggml_mul_mat(ctx0, model.output_rot, cur);
+         cb(cur, "mtp_output_rot", -1);
+     }
+-    cur = build_lora_mm(head_w, cur, head_s);
++    // The drafter reads a reduced head when the pipeline put one in the file (quant/draftset.py).
++    // The subset decides only what the drafter proposes. The target model verifies each proposed
++    // token against the full head, thus a token outside the subset is never accepted wrongly and
++    // the answer of the model does not change. One output row keeps the two reshapes of the
++    // scatter as views, thus an MTP pass with more rows reads the full head.
++    const bool use_draft_head = layer.nextn.draft_head && layer.nextn.draft_ids
++            && layer.nextn.draft_fill && cur->ne[1] == 1;
++    if (use_draft_head) {
++        const int64_t n_vocab_full = head_w->ne[1];
++        const int64_t n_draft      = layer.nextn.draft_head->ne[1];
++
++        ggml_tensor * small = build_lora_mm(layer.nextn.draft_head, cur, head_s);
++        cb(small, "mtp_draft_logits", -1);
++
++        // ggml_set_rows writes whole rows, thus the scatter holds one logit per row. The
++        // background gives every token outside the subset the logit of draft_fill.
++        ggml_tensor * bg = ggml_repeat_4d(ctx0, layer.nextn.draft_fill, n_vocab_full, 1, 1, 1);
++        cur = ggml_set_rows(ctx0,
++                ggml_reshape_2d(ctx0, bg, 1, n_vocab_full),
++                ggml_reshape_2d(ctx0, small, 1, n_draft),
++                layer.nextn.draft_ids);
++        cur = ggml_reshape_2d(ctx0, cur, n_vocab_full, 1);
++    } else {
++        cur = build_lora_mm(head_w, cur, head_s);
++    }
+     cb(cur, "result_output", -1);
+ 
+     res->t_logits = cur;
