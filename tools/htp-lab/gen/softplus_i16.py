@@ -183,6 +183,13 @@ HEADER = '''// The softplus in vector form for the HVX. tools/htp-lab/gen/softpl
 // 2 cycles, a result is ready 2 packets after its producer, and one chain of dependent operations
 // thus leaves three quarters of the slots empty. The routines do each step for all four vectors
 // before the next step, thus no packet waits.
+//
+// The loop body does the full groups of four vectors first and then one tail block for the rest.
+// The compiler inlines the four-vector routine one time for each block, and it can give the two
+// copies different code. The model calls the op with ne0 = ssm_dt_rank, which is 16 for the 2B
+// and 32 for the 4B, thus the tail block is the only block that runs on the device. A test with
+// an element count that is a multiple of 128 measures the other copy only. tools/htp-lab
+// (target unary) thus sweeps the counts 1, 8, 15, 16, 17, 31, 32, 33, 48, 64, 96, 127 and 128.
 
 #ifndef HVX_SOFTPLUS_H
 #define HVX_SOFTPLUS_H
@@ -225,21 +232,29 @@ static inline __attribute__((always_inline)) void hvx_softplus_f32_x4(const HVX_
         t[i] = hvx_vec_exp_f32(t[i]);
     }}
 
-    // log1p(t) = t * P(t), by Horner over the four chains
+    // log1p(t) = t * P(t), by Horner over the four chains. The first step multiplies the top
+    // coefficient as the IEEE single that it is, thus acc holds a qf32 number from its first
+    // value and each Q6_Vsf_equals_Vqf32 below gets an operand of the correct type.
+    //
+    // DO NOT seed acc with Q6_V_vsplat_R of a coefficient. The IEEE pattern then goes to the
+    // Q6_Vsf_equals_Vqf32 of the next step, which reads it as a qf32 number: the pattern
+    // 0xbb5568f7 (-0.00325637846) reads as -1.4261448e36. The library of the app, which builds
+    // with -flto, gave that value at each element count. The lab, which builds without -flto,
+    // gave it in the tail block only, because hexagon-clang 19.0.07 put an sf to qf32 conversion
+    // before the read in the other copy. Refer to the header of
+    // patches/hexagon-kernels/0004 of the qwen-mobile repository.
+    const HVX_Vector c_top = Q6_V_vsplat_R(hvx_softplus_log1p_p[HVX_SOFTPLUS_LOG1P_DEGREE]);
     for (int i = 0; i < 4; i++) {{
-        acc[i] = Q6_V_vsplat_R(hvx_softplus_log1p_p[HVX_SOFTPLUS_LOG1P_DEGREE]);
+        acc[i] = Q6_Vqf32_vmpy_VsfVsf(c_top, t[i]);
     }}
     for (int d = HVX_SOFTPLUS_LOG1P_DEGREE - 1; d >= 0; d--) {{
         const HVX_Vector c = Q6_V_vsplat_R(hvx_softplus_log1p_p[d]);
         for (int i = 0; i < 4; i++) {{
-            acc[i] = Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vqf32(acc[i]), t[i]);
-        }}
-        for (int i = 0; i < 4; i++) {{
             acc[i] = Q6_Vqf32_vadd_Vqf32Vsf(acc[i], c);
         }}
-    }}
-    for (int i = 0; i < 4; i++) {{
-        acc[i] = Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vqf32(acc[i]), t[i]);
+        for (int i = 0; i < 4; i++) {{
+            acc[i] = Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vqf32(acc[i]), t[i]);
+        }}
     }}
 
     // relu(x) + log1p(t). A negative f32 is a negative int32, thus vmax on words gives relu.

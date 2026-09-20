@@ -74,6 +74,42 @@ def evaluate(u16: np.ndarray, q: np.ndarray) -> np.ndarray:
     return np.where(ok, acc, 0) / 2.0 ** SCALE
 
 
+def integer_h(q: np.ndarray) -> np.ndarray:
+    """h * 2^SCALE for every f16 input, before the clamp. O(65536).
+
+    Args:
+        q: The coefficient table of table()
+
+    Returns:
+        The integer results, one for each of the 65536 f16 bit patterns
+    """
+    bits = np.arange(0x10000, dtype=np.uint16).astype(np.int64) & 0x7FFF
+    u = np.minimum(bits, 0x4BFF)
+    idx = (u >> 10) - (E_LO + 15)
+    v = ((u << 6) & 0xFFFF) >> 1
+    ok = idx >= 0
+    k = np.clip(idx, 0, PIECES - 1)
+    acc = q[k, DEGREE]
+    for d in range(DEGREE - 1, -1, -1):
+        acc = np.clip((acc * v * 2 + 0x8000) >> 16, -32768, 32767)
+        acc = np.clip(acc + q[k, d], -32768, 32767)
+    return np.where(ok, acc, 0)
+
+
+def h_bound(q: np.ndarray) -> int:
+    """The largest integer result of the routine. O(65536)."""
+    return int(np.max(integer_h(q)))
+
+
+def n_negative(q: np.ndarray) -> int:
+    """The number of f16 inputs where the integer Horner is negative. O(65536).
+
+    The clamp of the routine covers these inputs. The count goes into the comment of the
+    generated file, thus a change of the fit shows there.
+    """
+    return int(np.sum(integer_h(q) < 0))
+
+
 def check() -> int:
     """Print the error of relu(x) - h(|x|) against the exact SiLU.
 
@@ -85,7 +121,10 @@ def check() -> int:
                         rng.normal(0, 0.05, 100000)]).astype(np.float32)
     x64 = x.astype(np.float64)
     ref = x64 / (1 + np.exp(-x64))
-    y = np.maximum(x64, 0) - evaluate(np.abs(x).astype(np.float16), table())
+    q = table()
+    y = np.maximum(x64, 0) - np.maximum(evaluate(np.abs(x).astype(np.float16), q), 0.0)
+    print(f"integer h: max {h_bound(q)}, negative for {n_negative(q)} of 65536 f16 inputs"
+          f" (the routine clamps these to 0)")
     err = y - ref
     print(f"max abs {np.max(np.abs(err)):.3e}  rms {np.sqrt(np.mean(err ** 2)):.3e}"
           f"  nmse {np.sum(err ** 2) / np.sum(ref ** 2):.2e}")
@@ -107,6 +146,14 @@ HEADER = '''// The SiLU in int16 for the HVX. tools/htp-lab/gen/silu_i16.py of t
 //
 // The measured error of relu(x) - h(|x|) against the exact SiLU: max 1.6e-4, NMSE 4e-11. Most
 // of that is the f16 rounding of |x|, not the polynomial.
+//
+// The contract of hvx_silu_h_i16: the result is in [0, {h_max}]. The routine clamps, because the
+// integer Horner of the last octave gives -1 or -2 for {n_neg} of the 65536 f16 inputs, all with
+// |x| in [14.4922, 15.7266]. The fitted polynomial of that octave crosses zero near the top of
+// the octave, where h itself is 1e-5. A caller that divides h by 2^{scale} with an unsigned saturating
+// subtract of {scale} steps from the f16 exponent field then reads -1 as +Inf: the bit pattern of the
+// f16 -1.0 is 0xBC00, and 0xBC00 - 0x4000 is 0x7C00. Refer to the check of this range in
+// tools/htp-lab/lab/target_gdn_chunk.c, phase silu.
 //
 // Why int16: a v79 packet holds 2 int16 multiplies or 1 qfloat multiply, 4 selects or integer adds,
 // and each packet costs 2 cycles. A multiply result is ready 2 packets after its packet. Thus
@@ -139,12 +186,13 @@ static const int16_t hvx_silu_i16_table[HVX_SILU_I16_DEGREE + 1][64] __attribute
 }};
 
 // h(|a|) * 2^16 as int16 for n vectors of 64 f16 lanes. n is 1, 2 or 4 and a constant at the call.
-// The lane order of h is the lane order of a.
+// The result is in [0, {h_max}] and the lane order of h is the lane order of a.
 // The routine must be inline: n is then a constant, the loops unroll, and the vectors stay in registers.
 static inline __attribute__((always_inline)) void hvx_silu_h_i16(const HVX_Vector * a, HVX_Vector * h, const int n) {{
     const HVX_Vector u_max  = Q6_Vh_vsplat_R(0x4bff);              // the largest f16 below 16
     const HVX_Vector e_base = Q6_Vh_vsplat_R({e_base});                  // the exponent field of 2^{e_lo}
     const HVX_Vector m_byte = Q6_Vh_vsplat_R(0x00ff);
+    const HVX_Vector zero   = Q6_V_vzero();
 
     // The table address is opaque to the compiler, thus it reloads a coefficient vector where it
     // needs one instead of holding all 5 in registers across the loop of the caller. Loads are the
@@ -199,14 +247,19 @@ static inline __attribute__((always_inline)) void hvx_silu_h_i16(const HVX_Vecto
             acc[r] = Q6_Vh_vadd_VhVh_sat(acc[r], c[r]);
         }}
     }}
+    // h is a value of [0, 0.2785] and the polynomial of the last octave crosses zero, thus the
+    // clamp holds the contract of the routine. It is one integer ALU operation for each vector,
+    // and a packet holds 4 of them, thus the measured cost of the whole op is 1.8 %.
     for (int r = 0; r < n; r++) {{
-        h[r] = acc[r];
+        h[r] = Q6_Vh_vmax_VhVh(acc[r], zero);
     }}
 }}
 
 // -h as a qf32 pair, from h * 2^16 as int16. The int16 becomes an f16 number, an unsigned
 // saturating subtract of 2 from its exponent field divides it by 4 and keeps a zero a zero,
 // and the widening multiply by -2^-14 gives the scale and the 32-bit form in one step.
+// A subtract of 2 steps cannot cross the sign bit of the f16, thus this form is correct for a
+// negative h16 as well. A subtract of 16 steps is not.
 static inline __attribute__((always_inline)) HVX_VectorPair hvx_silu_neg_h_qf32(HVX_Vector h16) {{
     const HVX_Vector quarter = Q6_Vh_vsplat_R(0x0800);
     const HVX_Vector k       = Q6_Vh_vsplat_R(0x8400);             // -2^-14 as f16
@@ -241,7 +294,8 @@ def main(argv: list[str] | None = None) -> int:
             cells[2 * k] = str(int(q[k, d]))
         rows.append(f"    // the coefficient of v^{d}\n    {{ " + ", ".join(cells) + " },")
     sys.stdout.write(HEADER.format(degree=DEGREE, scale=SCALE, e_lo=E_LO, e_hi_m1=E_HI - 1,
-                                   e_base=E_LO + 15, rows="\n".join(rows)))
+                                   e_base=E_LO + 15, rows="\n".join(rows),
+                                   h_max=h_bound(q), n_neg=n_negative(q)))
     return 0
 
 

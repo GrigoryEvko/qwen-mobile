@@ -12,23 +12,47 @@ came before it. Thus the measured work does nothing until a build selects mode 4
 
 The change
 
-The default becomes 4: f16 taps, a 32-bit accumulator, the int16 SiLU, and 3 token rows in
-each iteration. Measured in tools/htp-lab against a float64 reference, for each 32-lane block:
+The default becomes 4: f16 taps, a 16-bit qfloat accumulator, the int16 SiLU, and 3 token rows in
+each iteration. Measured in tools/htp-lab, target gdn_chunk, 512 channels and 32 tokens on one
+thread, against a float64 reference:
 
-    mode 0, the f32 chain      438.6 cycles   NMSE 2.7e-14
-    mode 4, the packed band     29.0 cycles   NMSE 2.9e-07
+    mode 0, the f32 chain      115447 cycles   NMSE 2.7e-14
+    mode 4, the packed band     31993 cycles   NMSE 3.0e-07
 
-15 times faster. GDN_CONV_CHUNK is the largest single op of a 512-token prefill of the 4B, at
+3.61 times faster. GDN_CONV_CHUNK is the largest single op of a 512-token prefill of the 4B, at
 27 % of the time on the digital signal processor, thus this is the largest prefill change of
 the series. The op runs when a batch has more than one token, thus it serves the prefill and
 the speculative verify, and not the single-token decode step.
 
 The error
 
-2.9e-07 of NMSE against a baseline of 2.7e-14. The consumer of this output, the chunked gated
+3.0e-07 of NMSE against a baseline of 2.7e-14. The consumer of this output, the chunked gated
 delta net, already measures 3.0e-07 of its own, and the bound that the backend tests apply is
 2e-06, thus this value costs nothing downstream. It is a regression from an exact baseline and
 a reviewer must see it. GDN_CONV_F16_MODE 0 takes the old path back.
+
+Why this patch was out of the series between 2026-09-20 03:59 and this revision
+
+The first form of the packed band path gave -Inf for a conv output in [14.4922, 15.7266]. The
+model Qwen3.5-2B then gave one token again and again on the digital signal processor, and the
+central processor and the graphics processor stayed correct. The cause was in the patch that
+adds the path, not in this one, and the revision of that patch of 2026-09-20 holds the fix.
+Refer to its text.
+
+Two measurements decide whether mode 4 is safe, and neither of them is in this lab:
+
+1. The conv output of the real model reaches the band. A forward pass of Qwen3.5-2B on the
+   prompt "The capital of France is" gives 8 values in that band over 4 of the 18 gated delta
+   net layers, and a 605-token prefill gives 699 over 13 layers.
+2. The lab reaches the band only with an input range of 6 or more. The default of the target is
+   4, thus every measurement before this revision stayed out of the band. The target of this
+   revision has a phase that walks the f16 octaves, thus the default arguments now cover it.
+
+Before this patch goes back into the series, do a test of the model on the phone and do a run of
+the parity harness (llama-perplexity --kl-divergence against the central processor). The lab
+proves the shape of the SiLU and the absence of a value that is not finite. It does not prove
+the quality of the model, because an f16 accumulator over 4 taps cancels: at an input range of
+4 the largest error of one value is 8.0e-03 at an output of 2.02.
 diff -urN a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
 --- a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c	2026-09-20 03:59:39.046281562 +0300
 +++ b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c	2026-09-20 03:59:39.062841780 +0300
@@ -40,4 +64,4 @@ diff -urN a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c b/ggml/src/ggml-hexagon/htp
 +#define GDN_CONV_F16_MODE 4
  #endif
  static int gdn_conv_f16_mode = GDN_CONV_F16_MODE;
- 
+

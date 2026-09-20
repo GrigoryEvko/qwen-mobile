@@ -1,0 +1,220 @@
+hexagon: store the partial trailing vector of the int16 activation rows
+
+Base: llama.cpp commit c6824a9 plus the patches of patches/series and the regenerated
+hexagon-kernels/0010. Apply this patch immediately after 0010. An alternative is to fold it
+into 0003, which is where the generated header comes from. Then no ordering matters.
+
+Files:
+    ggml/src/ggml-hexagon/htp/hvx-act-i16.h  the three row kernels
+    tools/htp-lab/gen/act_i16.py             the generator of that header (separate diff)
+
+The problem
+
+The three row kernels of hvx-act-i16.h compute the number of whole HVX vectors and no
+remainder:
+
+    const uint32_t nvec = n / 32;
+
+Each loop stops at nvec, thus the last `n % 32` elements of a row keep the value that the
+destination held before the call. The f32 baseline that these kernels replace does compute the
+remainder and it stores the partial vector through a masked store. Refer to
+hvx-sigmoid.h line 82 and hvx-arith.h line 26:
+
+    const uint32_t nloe = n % epv;
+    ...
+    if (nloe) { ... vec_store((void *) &vdst[i], nloe * sizeof(float), tmp); }
+
+The element count is the first dimension of the tensor and nothing rounds it up. unary-ops.c
+line 1259 sets `.nc = src0->ne[0]` and act-ops.c line 567 sets `actx.nc = dst->ne[0]`.
+
+Qwen3.5 gives the SIGMOID a row of 1 element. src/models/qwen35.cpp line 371 reshapes the beta
+gate of the gated delta net to [1, num_v_heads, n_seq_tokens, n_seqs] and line 374 applies the
+sigmoid to it. For the 2B that is 1 element in each of 16 rows in each of 18 layers, which is
+288 rows for each token. With n = 1 the value of nvec is 0, every loop of the kernel is empty,
+and the kernel writes nothing at all. The gate then holds the previous contents of the VTCM
+scratch pad.
+
+Measured in tools/htp-lab (target act, --sweep 1), the destination elements that keep a poison
+value, before this patch:
+
+    n        1   16   31   33   63  100  127  159  4095    128  2048  6144  9216
+    i16      1   16   31    1   31    4   31   31    31      0     0     0     0
+    f32      0    0    0    0    0    0    0    0     0      0     0     0     0
+
+After this patch the int16 row is 0 at every count.
+
+The change
+
+Each kernel gets `nloe = n % 32` and a second tail branch. The single-vector body of each
+kernel becomes a small always_inline function, thus the whole-vector tail and the partial
+vector share one copy of it. The partial branch reads the whole trailing vector, which the
+caller pads to 128 bytes with hex_round_up, and stores `nloe * 4` bytes with hvx_vec_store_a.
+That is the same shape as the f32 baseline.
+
+The cost
+
+Measured in tools/htp-lab, cycles for each vector of a 9216 row, which takes neither tail
+branch:
+
+    sigmoid   22.79 -> 21.32
+    silu      20.54 -> 20.08
+    swiglu    23.06 -> 23.56
+
+The three numbers move inside the noise of the measurement, thus the branch costs nothing on a
+row that does not need it. The error of the rows that are a multiple of 32 elements does not
+move: the NMSE and the maximum absolute error of each of the 7 real shapes are equal before and
+after, to every printed digit.
+
+What this patch does NOT fix
+
+The int16 evaluator keeps two behaviors that the f32 path does not have. A reviewer must decide
+whether the gated delta net accepts them, and only a run on the device answers that:
+
+  1. The sigmoid gives an exact 0 for x of about -11 or less, where the value is 1.7e-5, and an
+     exact 1.0 for x of about 11 or more, where 1 - sigmoid is 1.7e-5. The int16 grid has the
+     step 2^-16, thus it cannot hold a smaller value. The f32 path clamps its exponent at -87
+     and never gives an exact 0.
+  2. The SiLU is the ReLU for |x| below 2^-12, which is 2.44e-4, because the table has no octave
+     there and a lookup miss gives 0. For x = -1e-4 the kernel gives 0 and the value is -5.0e-5.
+
+diff -urN b/ggml/src/ggml-hexagon/htp/hvx-act-i16.h c/ggml/src/ggml-hexagon/htp/hvx-act-i16.h
+--- b/ggml/src/ggml-hexagon/htp/hvx-act-i16.h	2026-09-20 07:00:28.343746860 +0300
++++ c/ggml/src/ggml-hexagon/htp/hvx-act-i16.h	2026-09-20 07:16:36.794500405 +0300
+@@ -213,6 +213,20 @@
+     }
+ }
+ 
++// The SiLU of one f32 vector. The second half of the stream repeats the first and the routine
++// drops its result. The tail of a row calls it two times: one time for the last whole vector and
++// one time for the partial vector after it.
++static inline __attribute__((always_inline))
++HVX_Vector hvx_silu_i16_one(const HVX_Vector * restrict vsrc, uint32_t i,
++                            HVX_Vector k_sf, HVX_Vector zero) {
++    HVX_Vector a = hvx_act_f32_pair_to_f16(vsrc[i], vsrc[i]);
++    HVX_Vector h16;
++    hvx_act_i16_eval(&a, &h16, hvx_act_i16_tab_h, 1, 0);
++    const HVX_VectorPair nh = hvx_act_i16_to_qf32(h16, k_sf);
++    return Q6_Vsf_equals_Vqf32(
++        Q6_Vqf32_vadd_Vqf32Vsf(Q6_V_lo_W(nh), Q6_Vw_vmax_VwVw(vsrc[i], zero)));
++}
++
+ static inline void hvx_silu_i16_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src,
+                                        uint32_t n) {
+     HVX_Vector * restrict vdst = (HVX_Vector *) dst;
+@@ -222,6 +236,7 @@
+     const HVX_Vector zero = Q6_V_vzero();
+ 
+     const uint32_t nvec = n / 32;
++    const uint32_t nloe = n % 32;
+     uint32_t i = 0;
+ 
+     for (; i + HVX_ACT_I16_UNROLL <= nvec; i += HVX_ACT_I16_UNROLL) {
+@@ -231,13 +246,15 @@
+         hvx_silu_i16_block(vsrc, vdst, i, k_sf, zero, 1);
+     }
+     if (i < nvec) {
+-        // one vector left: the second half of the stream repeats the first and its result is dropped
+-        HVX_Vector a = hvx_act_f32_pair_to_f16(vsrc[i], vsrc[i]);
+-        HVX_Vector h16;
+-        hvx_act_i16_eval(&a, &h16, hvx_act_i16_tab_h, 1, 0);
+-        const HVX_VectorPair nh = hvx_act_i16_to_qf32(h16, k_sf);
+-        vdst[i] = Q6_Vsf_equals_Vqf32(
+-            Q6_Vqf32_vadd_Vqf32Vsf(Q6_V_lo_W(nh), Q6_Vw_vmax_VwVw(vsrc[i], zero)));
++        vdst[i] = hvx_silu_i16_one(vsrc, i, k_sf, zero);
++        i++;
++    }
++    // The last 1 to 31 elements. Qwen3.5 gives the gated delta net gates a row of 1 element,
++    // thus this branch is not a corner case. The routine reads the whole trailing vector, which
++    // the caller pads to 128 bytes, and the masked store writes the valid bytes only. The f32
++    // path of hvx-sigmoid.h and hvx-arith.h does the same.
++    if (nloe) {
++        hvx_vec_store_a(&vdst[i], nloe * sizeof(float), hvx_silu_i16_one(vsrc, i, k_sf, zero));
+     }
+ }
+ 
+@@ -265,6 +282,14 @@
+     }
+ }
+ 
++// The SwiGLU of one f32 vector. The tail of a row calls it two times, as the SiLU form does.
++static inline __attribute__((always_inline))
++HVX_Vector hvx_swiglu_i16_one(const HVX_Vector * restrict vsrc0, const HVX_Vector * restrict vsrc1,
++                              uint32_t i, HVX_Vector k_sf, HVX_Vector zero) {
++    const HVX_Vector sv = hvx_silu_i16_one(vsrc0, i, k_sf, zero);
++    return Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(sv, vsrc1[i]));
++}
++
+ static inline void hvx_swiglu_i16_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src0,
+                                          const uint8_t * restrict src1, uint32_t n) {
+     HVX_Vector * restrict vdst = (HVX_Vector *) dst;
+@@ -275,6 +300,7 @@
+     const HVX_Vector zero = Q6_V_vzero();
+ 
+     const uint32_t nvec = n / 32;
++    const uint32_t nloe = n % 32;
+     uint32_t i = 0;
+ 
+     for (; i + HVX_ACT_I16_UNROLL <= nvec; i += HVX_ACT_I16_UNROLL) {
+@@ -284,13 +310,12 @@
+         hvx_swiglu_i16_block(vsrc0, vsrc1, vdst, i, k_sf, zero, 1);
+     }
+     if (i < nvec) {
+-        HVX_Vector a = hvx_act_f32_pair_to_f16(vsrc0[i], vsrc0[i]);
+-        HVX_Vector h16;
+-        hvx_act_i16_eval(&a, &h16, hvx_act_i16_tab_h, 1, 0);
+-        const HVX_VectorPair nh = hvx_act_i16_to_qf32(h16, k_sf);
+-        const HVX_Vector sv = Q6_Vsf_equals_Vqf32(
+-            Q6_Vqf32_vadd_Vqf32Vsf(Q6_V_lo_W(nh), Q6_Vw_vmax_VwVw(vsrc0[i], zero)));
+-        vdst[i] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(sv, vsrc1[i]));
++        vdst[i] = hvx_swiglu_i16_one(vsrc0, vsrc1, i, k_sf, zero);
++        i++;
++    }
++    if (nloe) {
++        hvx_vec_store_a(&vdst[i], nloe * sizeof(float),
++                        hvx_swiglu_i16_one(vsrc0, vsrc1, i, k_sf, zero));
+     }
+ }
+ 
+@@ -320,6 +345,17 @@
+     }
+ }
+ 
++// The sigmoid of one f32 vector. The tail of a row calls it two times, as the SiLU form does.
++static inline __attribute__((always_inline))
++HVX_Vector hvx_sigmoid_i16_one(const HVX_Vector * restrict vsrc, uint32_t i,
++                               HVX_Vector k_sf, HVX_Vector one) {
++    HVX_Vector a = hvx_act_f32_pair_to_f16(vsrc[i], vsrc[i]);
++    HVX_Vector g16;
++    hvx_act_i16_eval(&a, &g16, hvx_act_i16_tab_g, 1, 1);
++    const HVX_VectorPair g32 = hvx_act_i16_to_qf32(g16, k_sf);
++    return hvx_sigmoid_i16_combine(Q6_V_lo_W(g32), vsrc[i], one);
++}
++
+ static inline void hvx_sigmoid_i16_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src,
+                                           uint32_t n) {
+     HVX_Vector * restrict vdst = (HVX_Vector *) dst;
+@@ -329,6 +365,7 @@
+     const HVX_Vector one  = hvx_vec_splat_f32(1.0f);
+ 
+     const uint32_t nvec = n / 32;
++    const uint32_t nloe = n % 32;
+     uint32_t i = 0;
+ 
+     for (; i + HVX_ACT_I16_UNROLL <= nvec; i += HVX_ACT_I16_UNROLL) {
+@@ -338,11 +375,11 @@
+         hvx_sigmoid_i16_block(vsrc, vdst, i, k_sf, one, 1);
+     }
+     if (i < nvec) {
+-        HVX_Vector a = hvx_act_f32_pair_to_f16(vsrc[i], vsrc[i]);
+-        HVX_Vector g16;
+-        hvx_act_i16_eval(&a, &g16, hvx_act_i16_tab_g, 1, 1);
+-        const HVX_VectorPair g32 = hvx_act_i16_to_qf32(g16, k_sf);
+-        vdst[i] = hvx_sigmoid_i16_combine(Q6_V_lo_W(g32), vsrc[i], one);
++        vdst[i] = hvx_sigmoid_i16_one(vsrc, i, k_sf, one);
++        i++;
++    }
++    if (nloe) {
++        hvx_vec_store_a(&vdst[i], nloe * sizeof(float), hvx_sigmoid_i16_one(vsrc, i, k_sf, one));
+     }
+ }
+ 

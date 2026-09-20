@@ -37,13 +37,15 @@ hexagon-f16/0001-hexagon-f16-exp2-coefficient-and-sigmoid-branch.patch
 # float64 reference, in the cycle-accurate simulator, and its header carries the
 # cycles and the error before and after.
 #
-# THREE OF THEM GIVE A WRONG MODEL ON THE DEVICE AND THE LAB DOES NOT SEE IT.
+# THREE OF THEM GAVE A WRONG MODEL ON THE DEVICE AND THE LAB DID NOT SEE IT.
 # On 2026-09-20 the NPU answered every prompt with one repeated token, while the
-# CPU and the GPU were correct. A bisect of the series on the phone, one variant
-# for each prefix, isolated 0004 and 0011. The other twelve patches of that day
-# are good. 0010 is out because it needs the context that 0004 gives to
-# unary-ops.c, and because it wires the same int16 activation tables that 0011
-# selects. Refer to the header of each patch.
+# CPU and the GPU were correct. A bisect on the phone, one library for each
+# prefix, isolated 0004 and 0011, and an audit then found a third defect in 0010.
+# Each one is now repaired and each patch header holds its mechanism:
+#   0004  the Horner seed was an IEEE single that the next step read as a qf32
+#   0010  the int16 rows dropped the tail, and the SIGMOID row is 1 element
+#   0001  the int16 SiLU returned a negative h, and an unsigned exponent
+#         subtract then turned it into +Inf. 0011 only selects that path.
 #
 # Why the lab passed them: it measures one kernel that it compiles on its own,
 # with a token count that is a multiple of 4 vectors, against a float64
@@ -55,15 +57,22 @@ hexagon-f16/0001-hexagon-f16-exp2-coefficient-and-sigmoid-branch.patch
 hexagon-kernels/0001-hexagon-htp-gdn-conv-chunk-packed-band.patch
 hexagon-kernels/0002-hexagon-htp-gdn-chunk-rank1-decay-and-transpose.patch
 hexagon-kernels/0003-hexagon-htp-activation-int16-tables.patch
-# hexagon-kernels/0004-hexagon-htp-softplus-on-the-vector-unit.patch  WRONG ON THE DEVICE
+hexagon-kernels/0004-hexagon-htp-softplus-on-the-vector-unit.patch
 hexagon-kernels/0005-hexagon-htp-gdn-conv-step-four-chains.patch
 hexagon-kernels/0006-hexagon-htp-arith-fused-chains.patch
 hexagon-kernels/0007-hexagon-htp-softmax-and-norm-packed.patch
 hexagon-kernels/0008-hexagon-htp-flash-attn-code-size.patch
 hexagon-kernels/0009-hexagon-htp-cpy-transpose-tiles.patch
 
-# hexagon-kernels/0010-hexagon-htp-wire-activation-tables.patch  NEEDS 0004
-# hexagon-kernels/0011-hexagon-htp-gdn-conv-chunk-band-by-default.patch  WRONG ON THE DEVICE
+hexagon-kernels/0010-hexagon-htp-wire-activation-tables.patch
+
+# The int16 activation kernels of 0003 compute nvec = n / 32 and drop the rest of
+# the row. Qwen3.5 gives the SIGMOID a row of 1 element, thus the kernel wrote
+# nothing and the gate held the previous contents of the scratch pad. This patch
+# adds the tail store. It comes after 0010, which is the tree it was made against.
+hexagon-kernels/0003b-hexagon-htp-act-i16-tail-store.patch
+
+hexagon-kernels/0011-hexagon-htp-gdn-conv-chunk-band-by-default.patch
 
 # The HMX 2D path pipelines below 33 rows. The threshold was an untested guess:
 # the VTCM budget allows the pipelined layout at every row count from 5 to 32.
