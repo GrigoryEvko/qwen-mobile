@@ -1,0 +1,3 @@
+# The raw profile logs are large build artifacts. The JSON records beside
+# them name every run and are small enough to track.
+*.log

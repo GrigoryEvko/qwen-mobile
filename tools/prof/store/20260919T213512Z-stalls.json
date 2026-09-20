@@ -1,0 +1,45 @@
+{
+  "when": "20260919T213512Z",
+  "set": "stalls",
+  "model": "/data/local/tmp/qwen/models/Qwen3.5-4B-Q8_0.gguf",
+  "dev": "HTP0",
+  "bindir": "/data/local/tmp/qwen/htpapk/bin",
+  "libdir": "/data/local/tmp/qwen/htpapk/lib",
+  "pp": 128,
+  "tg": 16,
+  "reps": 1,
+  "device_before": {
+    "serial": "192.168.14.130:5555",
+    "model": "PJZ110",
+    "charging": false,
+    "thermal": 0,
+    "battery": 70
+  },
+  "device_after": {
+    "serial": "192.168.14.130:5555",
+    "model": "PJZ110",
+    "charging": false,
+    "thermal": 0,
+    "battery": 70
+  },
+  "passes": [
+    {
+      "pass": 1,
+      "events": [
+        "COMMITTED_PKT_ANY",
+        "COMMITTED_INSTS",
+        "DU_CACHE_MISS_PVIEW_CYCLES",
+        "CU_BUSY_PVIEW_CYCLES",
+        "COPROC_BUSY_PVIEW_CYCLES",
+        "IU_NO_PKT_PVIEW_CYCLES",
+        "DU_BUSY_OTHER_PVIEW_CYCLES",
+        "SYSTEM_BUSY_PVIEW_CYCLES"
+      ],
+      "events_hex": "0x3,0x2a,0xe9,0xeb,0xed,0xe8,0xea,0xef",
+      "seconds": 8.9,
+      "log": "20260919T213512Z-stalls-p1.log",
+      "log_bytes": 3845943,
+      "tail": "rc=0\nggml-hex: HTP0 profile-op GET_ROWS|h_nextn x HTP0#leaf_498#0 -> result_norm|2560:1 x 1:1 -> 2560:1|f32 x i32 -> f32|4:10240 x 4:4 -> 4:10240|----|usec 5 cycles 12550 start 3442094521 mhz 2510.0 pmu [3083,5238,786,1643,0,6585,747,687]\nggml-hex: HTP0 profile-op MUL_MAT|token_embd.weight x result_norm -> result_output|2560:248320 x 2560:1 -> 248320:1|q8_0 x f32 -> f32|34:2720 x 4:10240 -> 4:993280|hvx-tiled vtcm 5509632|usec 12967 cycles 27387074 start 3442107152 mhz 2112.1 pmu [21153847,48376434,9534193,4121962,3539003,17605,759937,20540987]\n| qwen35 4B Q8_0                 |   4.40 GiB |     4.33 B | OpenCL,HTP |  99 | HTP0         |            tg16 |         10.63 \u00b1 0.00 |\nllama_perf_context_print:        load time =    6999.43 ms\nllama_perf_context_print: prompt eval time =       0.00 ms /     1 tokens (    0.00 ms per token,      inf tokens per second)\nllama_perf_context_print:        eval time =       0.00 ms /    17 runs   (    0.00 ms per token,      inf tokens per second)\nllama_perf_context_print:       total time =    8504.29 ms /    18 tokens\nllama_perf_context_print:    graphs reused =         15\n~llama_context:       HTP0 compute buffer size is  15.4773 MiB, matches expectation of  15.4773 MiB\n~llama_context:        CPU compute buffer size is   0.3210 MiB, matches expectation of   0.3210 MiB\n\nbuild: c6824a9 (11008)"
+    }
+  ]
+}

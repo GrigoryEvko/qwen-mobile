@@ -1,0 +1,45 @@
+{
+  "when": "20260919T213436Z",
+  "set": "stalls",
+  "model": "/data/local/tmp/qwen/models/Qwen3.5-4B-Q8_0.gguf",
+  "dev": "HTP0",
+  "bindir": "/data/local/tmp/qwen/htpapk/bin",
+  "libdir": "/data/local/tmp/qwen/htpapk/lib",
+  "pp": 128,
+  "tg": 16,
+  "reps": 1,
+  "device_before": {
+    "serial": "192.168.14.130:5555",
+    "model": "PJZ110",
+    "charging": false,
+    "thermal": 0,
+    "battery": 70
+  },
+  "device_after": {
+    "serial": "192.168.14.130:5555",
+    "model": "PJZ110",
+    "charging": false,
+    "thermal": 0,
+    "battery": 70
+  },
+  "passes": [
+    {
+      "pass": 1,
+      "events": [
+        "COMMITTED_PKT_ANY",
+        "COMMITTED_INSTS",
+        "DU_CACHE_MISS_PVIEW_CYCLES",
+        "CU_BUSY_PVIEW_CYCLES",
+        "COPROC_BUSY_PVIEW_CYCLES",
+        "IU_NO_PKT_PVIEW_CYCLES",
+        "DU_BUSY_OTHER_PVIEW_CYCLES",
+        "SYSTEM_BUSY_PVIEW_CYCLES"
+      ],
+      "events_hex": "0x3,0x2a,0xe9,0xeb,0xed,0xe8,0xea,0xef",
+      "seconds": 18.5,
+      "log": "20260919T213436Z-stalls-p1.log",
+      "log_bytes": 1176,
+      "tail": "rc=0\nggml-hex: batch cache on\nggml-hex: FASTRPC_GET_DOMAINS query failed (0x6c), using static CDSP domains\nggml-hex: Profiling mode 2 : pmu-evt [ 0x3,0x2a,0xe9,0xeb,0xed,0xe8,0xea,0xef ]\nggml-hex: Hexagon backend (experimental) : allocating new registry : ndev 1\nggml-hex: Hexagon Arch version v79\nggml-hex: device 0: HTP0 (phys=0, virt=0, domain=cdsp:3)\n| model                          |       size |     params | backend    | ngl | dev          |            test |                  t/s |\n| ------------------------------ | ---------: | ---------: | ---------- | --: | ------------ | --------------: | -------------------: |\n| qwen35 4B Q8_0                 |   4.40 GiB |     4.33 B | OpenCL,HTP |  99 | HTP0         |           pp128 |        512.87 \u00b1 0.00 |\n| qwen35 4B Q8_0                 |   4.40 GiB |     4.33 B | OpenCL,HTP |  99 | HTP0         |            tg16 |          9.66 \u00b1 0.00 |\n\nbuild: c6824a9 (11008)"
+    }
+  ]
+}
