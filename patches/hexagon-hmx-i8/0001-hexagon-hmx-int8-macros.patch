@@ -1,0 +1,131 @@
+hexagon: add the int8 HMX inline asm macros for the v79 core
+
+The HMX has a second data path that multiplies an unsigned 8-bit activation by
+a signed 8-bit weight into an int32 accumulator. Its tile is 64 activation rows
+by 32 channels against a 32 by 32 weight tile, thus it covers twice the rows of
+the f16 tile, and the measured marginal cost of one issue is the same: 33.839
+processor cycles against 34.735 for f16 (tools/hmx-bench, v79, 2026-09-20).
+That is 2.05 times the multiply-accumulate rate.
+
+This patch adds the macros only. No kernel uses them yet, thus the patch has no
+effect on any result. It records what the core accepts, so that a later kernel
+does not have to find it again.
+
+Every form here comes from a probe of hexagon-llvm-mc at
+-mcpu=hexagonv79 -mattr=+hvxv79,+hvx-length128b,+hmx, and each one also occurs
+in the Qualcomm HexKL micro library built for the same core. The probe found the
+complete weight type set of the core: hf, b, n (4-bit), c, sc, sm, f8, sbit and
+ubit. Only ub assembles for an int activation, and only b for an int weight.
+
+Two facts a kernel author must know, because they decide whether the int8 path
+can carry a given weight format:
+
+1. The int32 accumulator has no f16 and no f32 store. It leaves only as u8 or as
+   u16. The full int32 value needs four stores of ":after:retain:cm.ub", each
+   with its own scale in the bias register. The same measurement puts that read
+   at approximately 711 processor cycles for one 64 by 32 tile, where the f16
+   read costs nothing that the fit can see.
+
+2. The accumulation cannot hold a scale. Thus the weight scale must be constant
+   over the whole k range of one accumulation. A format with one scale for each
+   32 k, for example Q8_0, needs one four-store read for each k tile, and that
+   cost grows with k while the multiply gain does not. A format with one scale
+   for each output row needs one read for the whole row.
+
+The suffix order matters and the assembler is the only reference: ":deep:cm"
+assembles and ":cm:deep" does not.
+
+--- a/ggml/src/ggml-hexagon/htp/hmx-utils.h
++++ b/ggml/src/ggml-hexagon/htp/hmx-utils.h
+@@ -219,4 +219,91 @@
+ #define HMX_CLRACC_F16() \
+     "mxclracc.hf\n"
+ 
++// --- HMX inline asm macros for the int8 pipeline ---
++//
++// The HMX has a second data path that multiplies an unsigned 8-bit activation by a
++// signed 8-bit weight and accumulates into int32. One int8 tile is 64 activation rows
++// by 32 channels against a 32 by 32 weight tile, thus it covers twice the rows of the
++// f16 tile. The activation is unsigned and the weight is signed; no other pair of
++// types assembles for the v79 core.
++//
++// Each form here comes from a probe of hexagon-llvm-mc at
++// -mcpu=hexagonv79 -mattr=+hvxv79,+hvx-length128b,+hmx, and each one also occurs in
++// the Qualcomm HexKL micro library for the same core. Do not change a suffix or the
++// order of two suffixes without a new probe: ":deep:cm" assembles and ":cm:deep" does
++// not.
++//
++// The int32 accumulator has no f16 and no f32 store. It leaves only as u8 or as u16.
++// Thus a caller that wants the full int32 value reads it as four u8 byte planes:
++// four stores of ":after:retain:cm.ub", each with its own scale in the bias register,
++// with ":retain" holding the accumulator alive across the first three. The four
++// scales come from the conversion table that HMX_I32_READ_SCALES gives.
++//
++// The consequence for a quantized matmul: the scale of the weight must be constant
++// over the whole k dimension of one accumulation, because the accumulation cannot
++// hold a scale. A format with one scale for each 32 k, for example Q8_0, thus needs
++// one four-store read for each k tile. A format with one scale for each output row
++// needs one read for the whole row.
++
++#define HMX_I8_TILE_N_ROWS 64
++#define HMX_I8_TILE_N_COLS 32
++#define HMX_I8_TILE_N_ELMS 2048
++#define HMX_I8_WEIGHT_TILE_SIZE 1024
++
++// The range operand of the int8 activation load. The vendor library uses 0x1f for one
++// tile of 32 channels.
++#define HMX_I8_ACT_RANGE_ONE_TILE 0x1fu
++
++// The range operand of the int8 weight load for one 32 by 32 tile.
++#define HMX_I8_WT_RANGE_ONE_TILE 0x380u
++
++// Multiply one u8 activation tile by one s8 weight tile into the int32 accumulator.
++// The activation load is channel major, which is what the int8 path needs.
++#define HMX_LOAD_MPY_I8(act, wt, act_range, wt_range)      \
++    "{\n"                                                  \
++    "    activation.ub = mxmem(" act ", " act_range "):cm\n" \
++    "    weight.b = mxmem(" wt ", " wt_range ")\n"         \
++    "}\n"
++
++// The same multiplication with the deep flag, which chains the k tiles of one output
++// tile without a store between them.
++#define HMX_LOAD_MPY_DEEP_I8(act, wt, act_range, wt_range)       \
++    "{\n"                                                        \
++    "    activation.ub = mxmem(" act ", " act_range "):deep:cm\n" \
++    "    weight.b = mxmem(" wt ", " wt_range ")\n"               \
++    "}\n"
++
++// The same multiplication with a 4-bit weight tile. Two weights share one byte.
++#define HMX_LOAD_MPY_DEEP_I4(act, wt, act_range, wt_range)       \
++    "{\n"                                                        \
++    "    activation.ub = mxmem(" act ", " act_range "):deep:cm\n" \
++    "    weight.n = mxmem(" wt ", " wt_range ")\n"               \
++    "}\n"
++
++// Clear the int32 accumulator.
++#define HMX_CLRACC_I32() \
++    "mxclracc\n"
++
++// Load the output conversion table of the int path. The table is one word for each
++// output channel, not two, thus this is mxmem and not mxmem2.
++#define HMX_SET_BIAS_I32(scales) \
++    "bias = mxmem(" scales ")\n"
++
++// Store one byte plane of the int32 accumulator and keep the accumulator.
++#define HMX_STORE_PLANE_I32(out, range) \
++    "mxmem(" out ", " range "):after:retain:cm.ub = acc\n"
++
++// Store the last byte plane of the int32 accumulator and release it.
++#define HMX_STORE_PLANE_LAST_I32(out, range) \
++    "mxmem(" out ", " range "):after:cm.ub = acc\n"
++
++// The four scales of the conversion table that read the four byte planes of the int32
++// accumulator, as f16 bit patterns in the low half of each word. They are 2^9, 2^1,
++// 2^-7 and 2^-15, thus each plane is 8 bits lower than the one before it.
++#define HMX_I32_READ_SCALES { 0x00006000u, 0x00004000u, 0x00002000u, 0x00000000u }
++
++// Size in bytes of the HMX configuration region that the int32 read needs. The region
++// holds the four conversion tables at 1 KiB intervals.
++#define HMX_I32_READ_CONFIG_SIZE 0x4000u
++
+ #endif // HMX_UTILS_H

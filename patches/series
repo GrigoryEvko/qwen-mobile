@@ -92,3 +92,6 @@ hexagon-spec/0003-llama-one-recurrent-snapshot-group-for-a-prompt-ubatch.patch
 # The drafter reads a frequency-ranked subset of the head. A model without the
 # three tensors takes the full head, thus the patch is inert for a plain GGUF.
 draft-head/0001-llama-qwen35-reduced-mtp-draft-head.patch
+
+# The int8 HMX macros. No kernel uses them yet, thus the patch is inert.
+hexagon-hmx-i8/0001-hexagon-hmx-int8-macros.patch
