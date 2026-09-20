@@ -29,6 +29,12 @@ T6 paired seeds. The tests T1, T3 and T5 again, at the sampler of the
    land inside the probability shift between the arms. A seed shared by all
    prompts would replay one sequence of draws for the whole set, thus each
    prompt takes its own seed.
+T7 CPU pair (--cpu-pair). A plain decode against a speculative decode, both
+   on the CPU path of the same binary, greedy and with paired seeds. The CPU
+   batched and single-token paths accumulate in fp32 and agree to about
+   1e-4, thus a divergence here comes from the speculative path itself
+   (the state rollback, the penalty window, the draw stream) and not from
+   the kernels. This test tells a defect from the CUDA rounding of T6.
 
 A greedy decode on a GPU is deterministic only when the batch composition is
 the same, because the CUDA kernels select their path by batch size and the
@@ -77,8 +83,9 @@ FORMULAIC = [
 
 
 def launch(binary: str, model: str, gpu: int, port: int, spec: str, np: int, ctx: int,
-           ngl: int, threads: int) -> subprocess.Popen:
-    """Launch one llama-server with its output discarded.
+           ngl: int, threads: int, draft: int = 3, lv: int = 1,
+           log: Path | None = None) -> subprocess.Popen:
+    """Launch one llama-server, with its output discarded or written to a file.
 
     Args:
         binary: The llama-server of the build under test
@@ -90,6 +97,9 @@ def launch(binary: str, model: str, gpu: int, port: int, spec: str, np: int, ctx
         ctx: The total context
         ngl: The number of layers on the GPU, 0 for the CPU reference
         threads: The CPU threads, which matter for the CPU reference only
+        draft: The draft depth
+        lv: The log verbosity
+        log: The file that takes the output, or None to discard it
 
     Returns:
         The server process
@@ -97,9 +107,10 @@ def launch(binary: str, model: str, gpu: int, port: int, spec: str, np: int, ctx
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu))
     cmd = [binary, "-m", model, "--spec-type", spec, "-ngl", str(ngl), "-fa", "on",
            "-np", str(np), "-c", str(ctx), "--host", "127.0.0.1", "--port", str(port),
-           "-lv", "1", "--metrics", "-t", str(threads), "-tb", str(threads),
-           "--spec-draft-n-max", "3"]
-    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, env=env)
+           "-lv", str(lv), "--metrics", "-t", str(threads), "-tb", str(threads),
+           "--spec-draft-n-max", str(draft)]
+    out = log.open("wb") if log is not None else subprocess.DEVNULL
+    return subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, env=env)
 
 
 def render(port: int, user: str) -> str:
@@ -342,8 +353,181 @@ def acceptance(port: int, texts: list[str], n: int) -> tuple[list[float], float,
     return rates, (accepted / drafted if drafted else 0.0), resps
 
 
+def cpu_pair(a: argparse.Namespace, prompts: list[str], seeds: list[int]) -> int:
+    """Run T7: a plain and a speculative decode on the CPU path, greedy and paired.
+
+    Args:
+        a: The parsed arguments
+        prompts: The user turns to decode
+        seeds: The base seeds of the paired rounds
+
+    Returns:
+        The exit status
+    """
+    p_plain, p_spec = a.base_port, a.base_port + 1
+    procs = [
+        launch(a.bin, a.model, a.gpu, p_plain, "none", 1, 4096, 0, a.cpu_threads),
+        launch(a.bin, a.model, a.gpu, p_spec, "draft-mtp", 1, 4096, 0, a.cpu_threads),
+    ]
+    try:
+        for port in (p_plain, p_spec):
+            if not wait_health(port, 900):
+                raise RuntimeError(f"the server on port {port} did not become ready")
+        print("verify: 2 CPU servers ready (plain np1, mtp np1)", flush=True)
+        texts = [render(p_plain, t) for t in prompts]
+        t0 = time.time()
+        plain = [greedy(p_plain, t, a.cpu_gen) for t in texts]
+        spec = [greedy(p_spec, t, a.cpu_gen) for t in texts]
+        print(f"verify: greedy pair in {time.time() - t0:.0f} s", flush=True)
+        compare("T7 cpu greedy   ", plain, spec, "plain", "mtp")
+        t0 = time.time()
+        paired("T7 cpu paired   ", p_plain, p_spec, texts, a.cpu_gen, seeds, "plain", "mtp")
+        print(f"verify: paired rounds in {time.time() - t0:.0f} s", flush=True)
+        rates, overall, _ = acceptance(p_spec, texts, a.cpu_gen)
+        print(f"T7 cpu drafter: per depth {rates}, overall {overall:.3f}", flush=True)
+    finally:
+        stop_servers(procs)
+    return 0
+
+
+def cpu_probe(a: argparse.Namespace, prompts: list[str], fillers: list[str]) -> int:
+    """Run T8: locate the source of the CPU divergence of the speculative path.
+
+    Four CPU servers: plain np1, plain np4 for the busy control, speculative
+    at depth 3 with its log kept, and speculative at depth 1. Greedy only.
+
+    Args:
+        a: The parsed arguments
+        prompts: The user turns to decode
+        fillers: The user turns that hold the other slots of the busy server
+
+    Returns:
+        The exit status
+    """
+    p_plain, p_busy, p_d3, p_d1 = (a.base_port + i for i in range(4))
+    log = Path(a.log_dir) / "cpu-mtp-depth3.log"
+    procs = [
+        launch(a.bin, a.model, a.gpu, p_plain, "none", 1, 4096, 0, a.cpu_threads),
+        launch(a.bin, a.model, a.gpu, p_busy, "none", 4, 16384, 0, a.cpu_threads),
+        launch(a.bin, a.model, a.gpu, p_d3, "draft-mtp", 1, 4096, 0, a.cpu_threads, draft=3, lv=5, log=log),
+        launch(a.bin, a.model, a.gpu, p_d1, "draft-mtp", 1, 4096, 0, a.cpu_threads, draft=1),
+    ]
+    try:
+        for port in (p_plain, p_busy, p_d3, p_d1):
+            if not wait_health(port, 900):
+                raise RuntimeError(f"the server on port {port} did not become ready")
+        print("verify: 4 CPU servers ready (plain np1, plain np4, mtp depth 3, mtp depth 1)", flush=True)
+        texts = [render(p_plain, t) for t in prompts]
+        plain = [greedy(p_plain, t, a.cpu_gen) for t in texts]
+
+        # (a) the control: the same prompts while three fillers hold the other slots.
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            fill = [pool.submit(greedy, p_busy, render(p_plain, f), 256) for f in fillers[:3]]
+            time.sleep(2.0)
+            busy = [greedy(p_busy, t, a.cpu_gen) for t in texts]
+            for f in fill:
+                f.result()
+        compare("T8 cpu alone vs busy   ", plain, busy, "alone", "busy")
+
+        # (b) a rollback of at most one token.
+        d1 = [greedy(p_d1, t, a.cpu_gen) for t in texts]
+        compare("T8 cpu plain vs depth 1", plain, d1, "plain", "mtp1")
+
+        # (c) depth 3 on formulaic prompts, where a rejection is rare.
+        form_texts = [render(p_plain, u) for u in FORMULAIC]
+        form_plain = [greedy(p_plain, t, a.cpu_gen) for t in form_texts]
+        form_d3 = [greedy(p_d3, t, a.cpu_gen) for t in form_texts]
+        compare("T8 cpu formulaic depth 3", form_plain, form_d3, "plain", "mtp3")
+
+        # (d) depth 3 on the free prompts again, with the log of the server kept.
+        d3 = [greedy(p_d3, t, a.cpu_gen) for t in texts]
+        compare("T8 cpu plain vs depth 3", plain, d3, "plain", "mtp3")
+    finally:
+        stop_servers(procs)
+    text = log.read_text(errors="ignore") if log.exists() else ""
+    restored = text.count("restoring speculative checkpoint")
+    accepted = sum(1 for line in text.splitlines() if "accepted" in line and "draft tokens" in line)
+    print(f"T8 depth-3 server log: {restored} checkpoint restores, {accepted} accept lines, "
+          f"{len(text.splitlines())} lines in {log}", flush=True)
+    for line in text.splitlines():
+        if "seq_rm" in line or "rollback" in line.lower() or "n_rs_seq" in line:
+            print("   ", line.strip()[:160])
+            break
+    return 0
+
+
+def tokenize(port: int, text: str) -> list[int]:
+    """Give the token ids of a rendered prompt, from the server's own tokenizer.
+
+    Args:
+        port: The port of a server
+        text: The rendered prompt
+
+    Returns:
+        The ids, with the special tokens parsed
+    """
+    body = {"content": text, "add_special": False, "with_pieces": False}
+    return post(port, "/tokenize", body, 60.0).get("tokens", [])
+
+
+def cpu_split(a: argparse.Namespace, prompts: list[str]) -> int:
+    """Run T9: the multi-token path against the single-token path with no speculation.
+
+    The prompt and the first k tokens of a plain greedy decode go through
+    one batched prefill, then the server predicts the next tokens one at a
+    time. The plain decode produced those k tokens one at a time. A
+    different next token at the same margins as T7 shows that the batched
+    kernels, not the speculative loop, move the logits.
+
+    Args:
+        a: The parsed arguments
+        prompts: The user turns to decode
+
+    Returns:
+        The exit status
+    """
+    port = a.base_port
+    procs = [launch(a.bin, a.model, a.gpu, port, "none", 1, 4096, 0, a.cpu_threads)]
+    try:
+        if not wait_health(port, 900):
+            raise RuntimeError(f"the server on port {port} did not become ready")
+        texts = [render(port, t) for t in prompts]
+        plain = [greedy(port, t, a.cpu_gen) for t in texts]
+        splits = [8, 16, 24, 32, 48, 64, 96]
+        same = total = 0
+        margins: list[float] = []
+        drift_all: list[float] = []
+        for i, (text, resp) in enumerate(zip(texts, plain)):
+            ids = tokenize(port, text)
+            toks = resp.get("tokens", [])
+            for k in splits:
+                if k + 4 > len(toks):
+                    continue
+                again = post(port, "/completion", {"prompt": ids + toks[:k], "n_predict": 4,
+                                                   "cache_prompt": False, "return_tokens": True, **GREEDY}, 600.0)
+                got = again.get("tokens", [])
+                total += 1
+                pl, pr = probs_at(resp, k), probs_at(again, 0)
+                for tok in (toks[k],):
+                    if tok in pl and tok in pr:
+                        drift_all.append(abs(pl[tok] - pr[tok]))
+                if got[:1] == toks[k:k + 1]:
+                    same += 1
+                    continue
+                b = got[0] if got else -1
+                margins.append(round(abs(pl.get(toks[k], 0.0) - pl.get(b, 0.0)), 3))
+                print(f"   prompt {i} split {k}: single path took {toks[k]} with p {pl.get(toks[k], 0.0):.3f}, "
+                      f"batched prefill took {b} with p {pr.get(b, 0.0):.3f} "
+                      f"(p {pl.get(b, 0.0):.3f} in the single path)", flush=True)
+        print(f"T9 cpu prefill vs single: {same}/{total} next tokens identical, margins at the differences "
+              f"{sorted(margins)}, drift of the chosen token's probability {quantiles(drift_all)}", flush=True)
+    finally:
+        stop_servers(procs)
+    return 0
+
+
 def main() -> int:
-    """Run the five tests and print the report.
+    """Run the tests and print the report.
 
     Returns:
         The exit status
@@ -362,6 +546,13 @@ def main() -> int:
     ap.add_argument("--seeds", default="1,2,3",
                     help="the base seeds of the paired sampled test, each prompt derives its own from them")
     ap.add_argument("--greedy", action="store_true", help="run the greedy tests T1, T3 and T5 as well")
+    ap.add_argument("--cpu-pair", action="store_true",
+                    help="run only T7: plain against speculative on the CPU path, greedy and paired")
+    ap.add_argument("--cpu-probe", action="store_true",
+                    help="run only T8: locate the CPU divergence (busy control, depth 1, formulaic)")
+    ap.add_argument("--cpu-split", action="store_true",
+                    help="run only T9: a batched prefill of the plain decode against its single-token path")
+    ap.add_argument("--log-dir", default=".", help="where T8 keeps the server log")
     a = ap.parse_args()
     seeds = [int(s) for s in a.seeds.split(",") if s]
 
@@ -371,6 +562,13 @@ def main() -> int:
     tests = pool_prompts[:a.n_test]
     fillers = pool_prompts[a.n_test:a.n_test + 24]
     long_prompt = pool_prompts[a.n_test + 24]
+
+    if a.cpu_pair:
+        return cpu_pair(a, tests[:a.cpu_prompts], seeds)
+    if a.cpu_probe:
+        return cpu_probe(a, tests[:a.cpu_prompts], fillers)
+    if a.cpu_split:
+        return cpu_split(a, tests[:a.cpu_prompts])
 
     p_plain, p_batch, p_spec, p_cpu = (a.base_port + i for i in range(4))
     procs = [

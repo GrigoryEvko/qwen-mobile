@@ -214,8 +214,13 @@ def wait_health(port: int, timeout: float) -> bool:
 
 
 def launch(model: str, binary: str, gpu: int, port: int, np: int, ctx: int, lv: int,
-           spec: str, extra: list[str]) -> subprocess.Popen:
+           spec: str, ubatch: int, extra: list[str]) -> subprocess.Popen:
     """Launch one llama-server pinned to one GPU, with its output on a pipe.
+
+    The micro batch holds a whole decode step: the slots plus the longest
+    prompt. With a prompt split over two micro batches the copy of the MTP
+    hidden state can race the next graph and the drafter proposes garbage
+    (llama.cpp issue 27572), which would pollute the histogram.
 
     Args:
         model: The GGUF with the full MTP head
@@ -226,6 +231,7 @@ def launch(model: str, binary: str, gpu: int, port: int, np: int, ctx: int, lv: 
         ctx: The total context, split over the slots
         lv: The log verbosity, 5 to emit the draft candidate of every position
         spec: The speculation type, draft-mtp to harvest proposals
+        ubatch: The micro batch, also the batch
         extra: More server flags, for example the thread counts
 
     Returns:
@@ -233,7 +239,8 @@ def launch(model: str, binary: str, gpu: int, port: int, np: int, ctx: int, lv: 
     """
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu))
     cmd = [binary, "-m", model, "--spec-type", spec, "-ngl", "99", "-fa", "on",
-           "-np", str(np), "-c", str(ctx), "--host", "127.0.0.1", "--port", str(port),
+           "-np", str(np), "-c", str(ctx), "-b", str(ubatch), "-ub", str(ubatch),
+           "--host", "127.0.0.1", "--port", str(port),
            "-lv", str(lv), "--metrics", *extra]
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             env=env, bufsize=1024 * 1024)
@@ -391,6 +398,8 @@ def account(resp: dict, state: dict, dump: TextIO | None) -> None:
         state["reasoning"] += 1
     if dump is not None and resp.get("tokens"):
         dump.write(json.dumps({"prompt": resp.get("_prompt", ""), "seed": resp.get("_seed", 0),
+                               "draft_n": int(t.get("draft_n", 0) or 0),
+                               "draft_accepted": int(t.get("draft_n_accepted", 0) or 0),
                                "tokens": resp["tokens"]}) + "\n")
 
 
@@ -566,6 +575,8 @@ def main() -> int:
     ap.add_argument("--np", type=int, default=32, help="parallel slots per server")
     ap.add_argument("--ctx", type=int, default=0,
                     help="total context per server, 0 = np times the slot context of its profile")
+    ap.add_argument("--ubatch", type=int, default=2048,
+                    help="the micro batch of a server, at least the slots plus the longest prompt")
     ap.add_argument("--lv", type=int, default=5, help="5 emits the draft candidates")
     ap.add_argument("--spec", default="draft-mtp")
     ap.add_argument("--extra", default="-t 4 -tb 8", help="more server flags, space separated")
@@ -619,7 +630,7 @@ def main() -> int:
 
     extra = [*a.extra.split(), "--spec-draft-n-max", str(a.draft_n_max)]
     ctx_of = {n: a.ctx or a.np * PROFILES[n]["slot_ctx"] for n in names}
-    procs = [launch(a.model, a.bin, g, p, a.np, ctx_of[n], a.lv, a.spec, extra)
+    procs = [launch(a.model, a.bin, g, p, a.np, ctx_of[n], a.lv, a.spec, a.ubatch, extra)
              for g, p, n in zip(gpus, ports, bound)]
     readers = [threading.Thread(target=read_proposals, args=(pr, sk), daemon=True)
                for pr, sk in zip(procs, sinks)]
@@ -628,13 +639,15 @@ def main() -> int:
 
     stop = threading.Event()
     table_lock = threading.Lock()
+    last_metrics: dict[str, dict] = {n: empty_metrics() for n in names}
     t0 = time.time()
 
     def checkpoint() -> None:
         """Write every profile table and print one line per profile.
 
         The lock keeps the monitor thread and the final call apart, because
-        the two rename the same temporary file.
+        the two rename the same temporary file. The final call runs after
+        the servers stopped, thus it keeps the last counters they gave.
         """
         with table_lock:
             el = time.time() - t0
@@ -643,6 +656,10 @@ def main() -> int:
                 if dump is not None:
                     dump.flush()
                 metrics = sum_metrics(ports_of[n])
+                if metrics["verify_steps"] > 0:
+                    last_metrics[n] = metrics
+                else:
+                    metrics = last_metrics[n]
                 pos, dis = write_table(tables[n], sinks_of[n], n, PROFILES[n], a.model, el,
                                        state_of[n], metrics)
                 st = state_of[n]
