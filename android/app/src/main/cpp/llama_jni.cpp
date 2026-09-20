@@ -112,11 +112,20 @@ constexpr size_t kStateDiskBytes = 256u << 20;
 /** The nice value of the compute threads. The display thread keeps its priority. */
 constexpr int kComputeNice = 10;
 
-/** The batch of the contexts. The Hexagon backend wants 512. */
-constexpr int kBatch = 512;
+/**
+ * The batch of the contexts. A prompt longer than this value goes to the
+ * backend as more than one ubatch, and each ubatch pays the dispatch cost
+ * one time. No Hexagon kernel puts an upper bound on the tokens of one op.
+ */
+constexpr int kBatch = 1024;
+/** Not a llama_decode code: a stop request arrived between two batches of a prompt. */
+constexpr int kDecodeStopped = 1 << 16;
 
 /** The number of free positions that a prompt must leave in the context. */
 constexpr size_t kContextHeadroom = 8;
+
+/** Working local references of a call, above the one that each image takes. */
+constexpr jint kLocalRefHeadroom = 16;
 
 /** The sequence of the conversation in each context. */
 constexpr llama_seq_id kSeqMain = 0;
@@ -140,9 +149,17 @@ void lower_priority(int32_t tid) {
 
 /** The counters of one turn, for the stats line. Times are in microseconds. */
 struct TurnStats {
-    /** The tokens of the prompt that decoded, and the time of these decodes. */
+    /**
+     * The tokens of the prompt that decoded in batches, and the time of those
+     * batches. The generation prompt is not here: it decodes after the
+     * snapshot, at the speed of a single token, and one rate over the two
+     * would depend on the length of the prompt.
+     */
     int64_t prefill_tokens = 0;
     int64_t prefill_us     = 0;
+    /** The generation prompt: its tokens and the time of its decode. */
+    int64_t tail_tokens    = 0;
+    int64_t tail_us        = 0;
     /** The tokens of the prompt that the memory held already. From a snapshot, or from the live memory. */
     int64_t reused_tokens  = 0;
     bool    from_snapshot  = false;
@@ -159,6 +176,8 @@ struct TurnStats {
     int64_t image_tokens   = 0;
     int64_t gen_tokens     = 0;
     int64_t gen_us         = 0;
+    /** The part of gen_us in the sampler chain: one call for each position with logits. */
+    int64_t sample_us      = 0;
     /** The tokens that the MTP draft context proposed, and the ones that the target sampler accepted. */
     int64_t drafted        = 0;
     int64_t accepted       = 0;
@@ -231,8 +250,13 @@ struct Engine {
     std::atomic<bool> stop_requested{false};
     /** True while the thinking of the answer is open: the generation prompt or a generated tag opened it. */
     bool think_open = false;
-    /** True after the end of the answer: the end token, a stop, or the context limit. */
-    bool answer_done = false;
+    /**
+     * True until chatStart decodes a prompt, and again after the end of the
+     * answer: the end token, a stop, an error, or the context limit. While
+     * it is true the context can hold no logits, thus generateNext samples
+     * nothing.
+     */
+    bool answer_done = true;
     /**
      * The tokens of the answer that the app did not receive, and the next of
      * them. One speculative step gives up to kSpecDraftMax + 1 tokens, and
@@ -304,11 +328,25 @@ void log_to_logcat(ggml_log_level level, const char * text, void *) {
 
 std::string jstring_to_std(JNIEnv * env, jstring s);
 
-/** Throw a java.lang.RuntimeException with the message. */
+/**
+ * Throw a java.lang.RuntimeException with the message.
+ *
+ * A pending exception stays: it carries the first failure, and the class
+ * lookup below would fail again while it stands. FindClass returns null
+ * when the Java heap is full, and ThrowNew on a null class is a crash,
+ * thus the result is checked.
+ */
 void throw_java(JNIEnv * env, const std::string & msg) {
     LOGE("%s", msg.c_str());
+    if (env->ExceptionCheck()) {
+        return;
+    }
     jclass cls = env->FindClass("java/lang/RuntimeException");
+    if (cls == nullptr) {
+        return;
+    }
     env->ThrowNew(cls, msg.c_str());
+    env->DeleteLocalRef(cls);
 }
 
 /** Read the kernel thread identifiers of this process from /proc/self/task. */
@@ -346,7 +384,10 @@ size_t utf8_complete_prefix(const std::string & s) {
     while (i < s.size()) {
         const unsigned char c = s[i];
         size_t len = 1;
-        if (c >= 0xF0) len = 4;
+        // 0xF8 and above, and 0xC0 and 0xC1, start no sequence: a byte-fallback
+        // token carries them alone, thus they must not hold later bytes back.
+        if (c >= 0xF8 || c < 0xC2) len = 1;
+        else if (c >= 0xF0) len = 4;
         else if (c >= 0xE0) len = 3;
         else if (c >= 0xC0) len = 2;
         if (i + len > s.size()) {
@@ -439,11 +480,17 @@ void spec_disable(Engine & e) {
 /**
  * Decode text tokens into sequence kSeqMain of a context, in chunks of
  * kBatch, at explicit positions from pos0. Only the last token gives logits,
- * and only with logits_last. Returns the llama_decode code, 0 on success.
+ * and only with logits_last. With stoppable, a stop request ends the call
+ * before its next chunk with kDecodeStopped: the chunks before it are in the
+ * memory. Returns the llama_decode code, 0 on success.
  */
-int decode_text(Engine & e, llama_context * lctx, const llama_token * tokens, int n, llama_pos pos0, bool logits_last) {
+int decode_text(Engine & e, llama_context * lctx, const llama_token * tokens, int n, llama_pos pos0, bool logits_last,
+                bool stoppable) {
     llama_batch & b = e.batch;
     for (int i = 0; i < n; i += kBatch) {
+        if (stoppable && e.stop_requested.load()) {
+            return kDecodeStopped;
+        }
         const int count = std::min(kBatch, n - i);
         for (int j = 0; j < count; ++j) {
             b.token[j]     = tokens[i + j];
@@ -483,7 +530,7 @@ void commit_token(Engine & e, llama_token token) {
 /** Decode one token of the answer on the decode context. Returns the llama_decode code. */
 int decode_one(Engine & e, llama_token token) {
     TraceSection trace("decode-step");
-    const int rc = decode_text(e, e.ctx, &token, 1, e.n_past, true);
+    const int rc = decode_text(e, e.ctx, &token, 1, e.n_past, true, false);
     if (rc == 0) {
         commit_token(e, token);
     }
@@ -735,29 +782,36 @@ const float * image_embd(Engine & e, const mtmd_input_chunk * chunk, std::string
     return kept != nullptr ? kept : out;
 }
 
+/** The outcome of a prompt decode. */
+enum class DecodeOutcome { kDone, kStopped, kFailed };
+
 /**
  * Decode the items [start, end) into sequence kSeqMain of a context. Text
  * runs go in batches, an image chunk goes through its encoder output with
- * the M-RoPE positions of the helper. pos advances. Returns false with the
- * error text set.
+ * the M-RoPE positions of the helper. pos advances. A stop request stops
+ * the decode before the next batch or image and gives kStopped. Gives
+ * kFailed with the error text set.
  */
-bool decode_items(Engine & e, llama_context * lctx, const std::vector<MemItem> & items,
-                  const std::vector<const mtmd_input_chunk *> & chunk_of, size_t start, size_t end,
-                  llama_pos & pos, bool logits_last, std::string & error) {
+DecodeOutcome decode_items(Engine & e, llama_context * lctx, const std::vector<MemItem> & items,
+                           const std::vector<const mtmd_input_chunk *> & chunk_of, size_t start, size_t end,
+                           llama_pos & pos, bool logits_last, std::string & error) {
     std::vector<llama_token> run;
     run.reserve(end - start);
     auto flush = [&](bool last) {
         if (run.empty()) {
-            return true;
+            return DecodeOutcome::kDone;
         }
-        const int rc = decode_text(e, lctx, run.data(), (int) run.size(), pos, last);
+        const int rc = decode_text(e, lctx, run.data(), (int) run.size(), pos, last, true);
+        if (rc == kDecodeStopped) {
+            return DecodeOutcome::kStopped;
+        }
         if (rc != 0) {
             error = "llama_decode failed on the prompt with code " + std::to_string(rc);
-            return false;
+            return DecodeOutcome::kFailed;
         }
         pos += (llama_pos) run.size();
         run.clear();
-        return true;
+        return DecodeOutcome::kDone;
     };
     for (size_t i = start; i < end; ++i) {
         const mtmd_input_chunk * chunk = chunk_of[i];
@@ -765,12 +819,17 @@ bool decode_items(Engine & e, llama_context * lctx, const std::vector<MemItem> &
             run.push_back(items[i].token);
             continue;
         }
-        if (!flush(false)) {
-            return false;
+        const DecodeOutcome flushed = flush(false);
+        if (flushed != DecodeOutcome::kDone) {
+            return flushed;
+        }
+        // The encoder runs for up to a second, thus a stop request takes effect before it and not after.
+        if (e.stop_requested.load()) {
+            return DecodeOutcome::kStopped;
         }
         const float * embd = image_embd(e, chunk, error);
         if (embd == nullptr) {
-            return false;
+            return DecodeOutcome::kFailed;
         }
         llama_pos new_pos = pos;
         const int64_t t0 = now_us();
@@ -780,11 +839,16 @@ bool decode_items(Engine & e, llama_context * lctx, const std::vector<MemItem> &
         report_hint(e, t0);
         if (rc != 0) {
             error = "The image did not decode, code " + std::to_string(rc);
-            return false;
+            return DecodeOutcome::kFailed;
         }
         pos = new_pos;
     }
-    return flush(logits_last);
+    const DecodeOutcome last = flush(logits_last);
+    if (last == DecodeOutcome::kDone) {
+        // A backend can run the batch asynchronously: the wait belongs to the prefill time, not to the snapshot after it.
+        llama_synchronize(lctx);
+    }
+    return last;
 }
 
 /** The number of tokens of the items [start, end): one per text item, the token count of an image chunk. */
@@ -802,8 +866,9 @@ int64_t count_tokens(const std::vector<const mtmd_input_chunk *> & chunk_of, siz
  * reusable prefix comes from the live memory of the prefill context, or
  * from the snapshot store, and only the remaining items decode. The state
  * before the generation prompt goes into the store, and on the hybrid
- * backend also into the decode context. Returns false with the error
- * text set, and the memory empty.
+ * backend also into the decode context. Gives kFailed with the error
+ * text set, or kStopped after a stop request, and then the memory is
+ * empty.
  *
  * Exactness: a snapshot holds the state after exactly its items, with the
  * positions of each KV cell (the M-RoPE x and y of an image token
@@ -812,8 +877,8 @@ int64_t count_tokens(const std::vector<const mtmd_input_chunk *> & chunk_of, siz
  * the logits after the prompt are the same as after one decode of the
  * whole prompt on the same device.
  */
-bool prefill(Engine & e, const std::vector<MemItem> & items, const std::vector<const mtmd_input_chunk *> & chunk_of,
-             size_t base_len, std::string & error) {
+DecodeOutcome prefill(Engine & e, const std::vector<MemItem> & items,
+                      const std::vector<const mtmd_input_chunk *> & chunk_of, size_t base_len, std::string & error) {
     TraceSection trace("prefill");
     // The draft context cannot follow a prompt that a snapshot restores or
     // that an image gives, because it reads the hidden state of each token
@@ -863,10 +928,16 @@ bool prefill(Engine & e, const std::vector<MemItem> & items, const std::vector<c
     e.turn.reused_tokens = count_tokens(chunk_of, 0, start);
 
     const int64_t t1 = now_us();
-    if (!decode_items(e, pctx, items, chunk_of, start, base_len, pos, false, error)) {
+    const DecodeOutcome base = decode_items(e, pctx, items, chunk_of, start, base_len, pos, false, error);
+    if (base != DecodeOutcome::kDone) {
         clear_all(e);
-        return false;
+        return base;
     }
+    // The batches of the prompt end here. What follows is the generation
+    // prompt, a handful of tokens that decode at the speed of one token and
+    // not at the speed of a batch, thus the two carry their own times.
+    e.turn.prefill_tokens = count_tokens(chunk_of, start, base_len);
+    e.turn.prefill_us     = now_us() - t1;
     live.assign(items.begin(), items.begin() + (ptrdiff_t) base_len);
     live_pos = pos;
 
@@ -883,7 +954,7 @@ bool prefill(Engine & e, const std::vector<MemItem> & items, const std::vector<c
             base_bytes = take_state(pctx, error);
             if (!base_bytes) {
                 clear_all(e);
-                return false;
+                return DecodeOutcome::kFailed;
             }
             e.turn.snapshot_us = now_us() - t2;
             e.states->put(std::move(key), pos, base_bytes);
@@ -900,28 +971,32 @@ bool prefill(Engine & e, const std::vector<MemItem> & items, const std::vector<c
             error = "The state did not move from the prefill context to the decode context (" +
                     std::to_string(base_bytes ? base_bytes->size : 0) + " bytes)";
             clear_all(e);
-            return false;
+            return DecodeOutcome::kFailed;
         }
         e.turn.transfer_us = now_us() - t3;
         e.cache.assign(items.begin(), items.begin() + (ptrdiff_t) base_len);
         e.n_past = pos;
     }
-    if (!decode_items(e, e.ctx, items, chunk_of, base_len, items.size(), pos, true, error)) {
+    const int64_t t4 = now_us();
+    const DecodeOutcome tail = decode_items(e, e.ctx, items, chunk_of, base_len, items.size(), pos, true, error);
+    if (tail != DecodeOutcome::kDone) {
         clear_all(e);
-        return false;
+        return tail;
     }
     e.cache  = items;
     e.n_past = pos;
-    e.turn.prefill_tokens = count_tokens(chunk_of, start, items.size());
-    e.turn.prefill_us     = now_us() - t1 - e.turn.snapshot_us - e.turn.transfer_us;
-    LOGI("prefill: %zu of %zu items %s (%lld tokens, %.0f ms), %lld tokens decoded in %.0f ms on %s, "
+    e.turn.tail_tokens = count_tokens(chunk_of, base_len, items.size());
+    e.turn.tail_us     = now_us() - t4;
+    LOGI("prefill: %zu of %zu items %s (%lld tokens, %.0f ms), %lld tokens decoded in %.0f ms on %s "
+         "(generation prompt %lld tokens in %.0f ms), "
          "transfer %.0f ms, images %d (%d known, %d cached, %d encoded), memory %d positions",
          start, items.size(), e.turn.from_snapshot ? "restored" : "kept", (long long) e.turn.reused_tokens,
          e.turn.restore_us / 1000.0, (long long) e.turn.prefill_tokens, e.turn.prefill_us / 1000.0,
          hybrid ? ggml_backend_dev_name(e.device_pf) : e.device ? ggml_backend_dev_name(e.device) : "CPU",
+         (long long) e.turn.tail_tokens, e.turn.tail_us / 1000.0,
          e.turn.transfer_us / 1000.0, e.turn.images_total, e.turn.images_known, e.turn.images_cached,
          e.turn.images_encoded, (int) e.n_past);
-    return true;
+    return DecodeOutcome::kDone;
 }
 
 /**
@@ -959,7 +1034,9 @@ bool plain_step(Engine & e, std::string & error) {
     llama_token token = LLAMA_TOKEN_NULL;
     {
         TraceSection trace("sample");
+        const int64_t t0 = now_us();
         token = llama_sampler_sample(e.smpl, e.ctx, -1);
+        e.turn.sample_us += now_us() - t0;
     }
     if (llama_vocab_is_eog(vocab, token)) {
         // The end token goes into the memory, thus a template that renders it lets the next turn extend this one.
@@ -1002,7 +1079,9 @@ bool spec_step(Engine & e, std::string & error) {
         llama_token first = LLAMA_TOKEN_NULL;
         {
             TraceSection sample("sample");
+            const int64_t t0 = now_us();
             first = llama_sampler_sample(e.smpl, e.ctx, -1);
+            e.turn.sample_us += now_us() - t0;
         }
         if (llama_vocab_is_eog(vocab, first)) {
             decode_one(e, first);
@@ -1054,7 +1133,9 @@ bool spec_step(Engine & e, std::string & error) {
     }
     const bool followed = spec_follow(e, b);
 
+    const int64_t ts = now_us();
     const std::vector<llama_token> ids = sample_and_accept(e, e.draft);
+    e.turn.sample_us += now_us() - ts;
     const int accepted = (int) ids.size() - 1;
     common_speculative_accept(e.spec, kSeqMain, (uint16_t) accepted);
     e.turn.drafted  += (int64_t) e.draft.size();
@@ -1102,18 +1183,22 @@ bool spec_step(Engine & e, std::string & error) {
             return false;
         }
     }
-    // The end token that the draft did not hold decodes now, after the rollback.
+    // The draft context rolls back before the end token decodes. Its memory
+    // holds every position of the verified batch, and the end token writes one
+    // of those positions again: a decode of it while the draft still holds the
+    // position gives the draft context a batch that its memory refuses, and
+    // that one refusal turns the drafting off for the life of the engine.
+    if (followed) {
+        llama_memory_seq_rm(mem_dft, kSeqMain, e.n_past, -1);
+    } else {
+        spec_disable(e);
+    }
     if (eog_at >= 0 && eog_at == accepted) {
         const int rc_eog = decode_one(e, ids.back());
         if (rc_eog != 0) {
             error = "llama_decode failed on the end token with code " + std::to_string(rc_eog);
             return false;
         }
-    }
-    if (followed) {
-        llama_memory_seq_rm(mem_dft, kSeqMain, e.n_past, -1);
-    } else {
-        spec_disable(e);
     }
     return true;
 }
@@ -1160,6 +1245,10 @@ mtmd_bitmap * decode_image(JNIEnv * env, jclass native_class, Engine & e, jbyteA
         return nullptr;
     }
     jintArray dims = env->NewIntArray(3);
+    if (dims == nullptr) {
+        error = "The image dimensions did not allocate: " + take_exception_message(env);
+        return nullptr;
+    }
     jobject buffer = env->CallStaticObjectMethod(native_class, method, image, (jint) e.image_max_tokens, dims);
     if (env->ExceptionCheck()) {
         error = "The image did not decode in the app: " + take_exception_message(env);
@@ -1175,7 +1264,12 @@ mtmd_bitmap * decode_image(JNIEnv * env, jclass native_class, Engine & e, jbyteA
         const int   stride = d[2];
         const auto * px    = static_cast<const unsigned char *>(env->GetDirectBufferAddress(buffer));
         const jlong  bytes = env->GetDirectBufferCapacity(buffer);
-        if (px != nullptr && nx > 0 && ny > 0 && stride >= nx * 4 && bytes >= (jlong) stride * ny) {
+        // The dimensions cross the JNI boundary, thus the products go in 64
+        // bits and each side has a limit: nx * 4 as an int overflows at
+        // nx = 2^29 and the guard would then accept a buffer of any length.
+        constexpr jlong kMaxSide = 1 << 16;
+        if (px != nullptr && nx > 0 && ny > 0 && nx <= kMaxSide && ny <= kMaxSide &&
+            (jlong) stride >= (jlong) nx * 4 && bytes >= (jlong) stride * ny) {
             // RGBA rows with the stride to packed RGB, the layout of mtmd.
             std::vector<unsigned char> rgb((size_t) nx * ny * 3);
             for (int y = 0; y < ny; ++y) {
@@ -1349,9 +1443,120 @@ std::pair<double, double> mean_std(const std::vector<double> & v) {
     return {mean, std::sqrt(sq / (v.size() - 1))};
 }
 
-Engine * engine_of(jlong handle) {
-    return reinterpret_cast<Engine *>(handle);
+/**
+ * The table of live engines. A handle is a number that this table gives out
+ * and not an address, thus a handle of a released engine matches nothing and
+ * a late call cannot reach freed memory.
+ *
+ * requestStop runs on the thread of the caller without the mutex of the
+ * engine, and a model switch can release the engine at the same moment. The
+ * table therefore hands out a shared pointer: the engine stays alive while a
+ * call holds it, and the destructor runs when the last holder lets go.
+ * Complexity: O(1) for each operation.
+ */
+class EngineTable {
+public:
+    /** Registers the engine and returns its handle. Never returns 0. */
+    jlong add(std::shared_ptr<Engine> engine) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const jlong handle = next_++;
+        engines_.emplace(handle, std::move(engine));
+        return handle;
+    }
+
+    /** The engine of the handle, or null when the handle is not live. */
+    std::shared_ptr<Engine> get(jlong handle) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = engines_.find(handle);
+        return it == engines_.end() ? nullptr : it->second;
+    }
+
+    /** Drops the engine of the handle. A second call with it does nothing. */
+    void remove(jlong handle) {
+        // The engine leaves the lock before it is destroyed: the destructor
+        // joins the writer thread of the state store and must not hold the
+        // table against a concurrent lookup.
+        std::shared_ptr<Engine> engine;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = engines_.find(handle);
+            if (it == engines_.end()) {
+                return;
+            }
+            engine = std::move(it->second);
+            engines_.erase(it);
+        }
+    }
+
+private:
+    std::mutex mutex_;
+    std::unordered_map<jlong, std::shared_ptr<Engine>> engines_;
+    jlong next_ = 1;  // The app reads 0 as "no model", thus a handle starts at 1.
+};
+
+EngineTable & engine_table() {
+    static EngineTable table;
+    return table;
 }
+
+/** The engine of the handle, or null when no model of that handle is live. */
+std::shared_ptr<Engine> engine_of(jlong handle) {
+    return engine_table().get(handle);
+}
+
+/**
+ * Runs the body of an entry point and turns a C++ exception into a Java one.
+ * An exception that leaves a JNI function calls std::terminate, which kills
+ * the process with no Java stack. The state snapshot of a turn allocates tens
+ * of megabytes on every answer, thus a failed allocation is a real case and
+ * must not reach the boundary.
+ */
+template <typename T, typename Body>
+T jni_guard(JNIEnv * env, T fallback, Body && body) {
+    try {
+        return body();
+    } catch (const std::exception & ex) {
+        throw_java(env, std::string("Native error: ") + ex.what());
+    } catch (...) {
+        throw_java(env, "Native error: an exception without a message");
+    }
+    return fallback;
+}
+
+/** The same for an entry point that returns nothing. */
+template <typename Body>
+void jni_guard_void(JNIEnv * env, Body && body) {
+    try {
+        body();
+    } catch (const std::exception & ex) {
+        throw_java(env, std::string("Native error: ") + ex.what());
+    } catch (...) {
+        throw_java(env, "Native error: an exception without a message");
+    }
+}
+
+/**
+ * Releases the local references that a call collected, at the end of its
+ * scope. The reference table of a thread is small, thus a conversation with
+ * an image in every message overflows it without this.
+ */
+class LocalRefs {
+public:
+    explicit LocalRefs(JNIEnv * env) : env_(env) {}
+    ~LocalRefs() {
+        for (jobject ref : refs_) {
+            env_->DeleteLocalRef(ref);
+        }
+    }
+    LocalRefs(const LocalRefs &)             = delete;
+    LocalRefs & operator=(const LocalRefs &) = delete;
+
+    void keep(jobject ref) { refs_.push_back(ref); }
+
+private:
+    JNIEnv *             env_;
+    std::vector<jobject> refs_;
+};
 
 /**
  * The result of generateNext: byte 0 is the kind of the token (0 text,
@@ -1361,6 +1566,10 @@ Engine * engine_of(jlong handle) {
 jbyteArray pack_piece(JNIEnv * env, Engine & e, int kind) {
     const size_t complete = utf8_complete_prefix(e.utf8_pending);
     jbyteArray out = env->NewByteArray((jsize) (1 + complete));
+    if (out == nullptr) {
+        // An OutOfMemoryError is pending. The bytes stay for the next piece.
+        return nullptr;
+    }
     const jbyte k = (jbyte) kind;
     env->SetByteArrayRegion(out, 0, 1, &k);
     env->SetByteArrayRegion(out, 1, (jsize) complete, reinterpret_cast<const jbyte *>(e.utf8_pending.data()));
@@ -1395,6 +1604,10 @@ std::string jstring_to_std(JNIEnv * env, jstring s) {
         return {};
     }
     const char * chars = env->GetStringUTFChars(s, nullptr);
+    if (chars == nullptr) {
+        // An OutOfMemoryError is pending: the caller throws nothing more, and the empty text goes nowhere.
+        return {};
+    }
     std::string out(chars);
     env->ReleaseStringUTFChars(s, chars);
     return out;
@@ -1419,8 +1632,7 @@ extern "C" {
  * load from it, and the Hexagon backend finds the DSP library there through
  * ADSP_LIBRARY_PATH.
  */
-JNIEXPORT void JNICALL
-Java_ai_airi_qwenmobile_LlamaNative_init(JNIEnv * env, jclass, jstring jlibdir) {
+static void init_impl(JNIEnv * env, jstring jlibdir) {
     llama_log_set(log_to_logcat, nullptr);
     // Op fusion is correct with the patch of the fused matvec add (patches/hexagon-fusion/0001)
     // and gives the F16 file a faster prefill. The fused recurrent state step is verified: a
@@ -1437,16 +1649,23 @@ Java_ai_airi_qwenmobile_LlamaNative_init(JNIEnv * env, jclass, jstring jlibdir) 
          libdir.c_str(), TraceSection::available() ? "available" : "unavailable");
 }
 
+JNIEXPORT void JNICALL
+Java_ai_airi_qwenmobile_LlamaNative_init(JNIEnv * env, jclass, jstring jlibdir) {
+    jni_guard_void(env, [&] { init_impl(env, jlibdir); });
+}
+
 /**
  * Make the directory the current one. The OpenCL profiling build writes
  * cl_profiling.csv into the current directory when the backend closes.
  */
 JNIEXPORT void JNICALL
 Java_ai_airi_qwenmobile_LlamaNative_setWorkingDirectory(JNIEnv * env, jclass, jstring jpath) {
-    const std::string path = jstring_to_std(env, jpath);
-    if (chdir(path.c_str()) != 0) {
-        LOGE("chdir to %s failed", path.c_str());
-    }
+    jni_guard_void(env, [&] {
+        const std::string path = jstring_to_std(env, jpath);
+        if (chdir(path.c_str()) != 0) {
+            LOGE("chdir to %s failed", path.c_str());
+        }
+    });
 }
 
 /** The driver version and the extensions of the first OpenCL GPU, or an empty string. */
@@ -1482,8 +1701,7 @@ static std::string opencl_device_info() {
 #endif
 }
 
-JNIEXPORT jstring JNICALL
-Java_ai_airi_qwenmobile_LlamaNative_devices(JNIEnv * env, jclass) {
+static jstring devices_impl(JNIEnv * env) {
     std::string out = opencl_device_info();
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -1512,11 +1730,15 @@ Java_ai_airi_qwenmobile_LlamaNative_devices(JNIEnv * env, jclass) {
     return env->NewStringUTF(out.c_str());
 }
 
-JNIEXPORT jlong JNICALL
-Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, jstring jmmproj,
-                                          jstring jdevice, jstring jprefill, jstring jvision, jint gpu_layers,
-                                          jint n_threads, jint n_ctx, jint image_max_tokens, jboolean jspeculative,
-                                          jstring jcache) {
+JNIEXPORT jstring JNICALL
+Java_ai_airi_qwenmobile_LlamaNative_devices(JNIEnv * env, jclass) {
+    return jni_guard<jstring>(env, nullptr, [&] { return devices_impl(env); });
+}
+
+static jlong load_impl(JNIEnv * env, jstring jpath, jstring jmmproj,
+                       jstring jdevice, jstring jprefill, jstring jvision, jint gpu_layers,
+                       jint n_threads, jint n_ctx, jint image_max_tokens, jboolean jspeculative,
+                       jstring jcache) {
     const std::string path    = jstring_to_std(env, jpath);
     const std::string device  = jstring_to_std(env, jdevice);
     const std::string prefill = jstring_to_std(env, jprefill);
@@ -1533,7 +1755,7 @@ Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, js
         return 0;
     }
     // The destructor of the engine releases what loaded when a later step fails.
-    auto e = std::make_unique<Engine>();
+    auto e = std::make_shared<Engine>();
     e->n_threads  = std::max(1, (int) n_threads);
     e->gpu_layers = gpu_layers;
     e->mmproj     = jstring_to_std(env, jmmproj);
@@ -1666,27 +1888,44 @@ Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, js
          path.c_str(), device.empty() ? "cpu" : device.c_str(), prefill.empty() ? "same" : prefill.c_str(),
          gpu_layers, e->n_threads, llama_n_ctx(e->ctx), e->mmproj.empty() ? "none" : e->mmproj.c_str(),
          e->image_max_tokens, e->spec != nullptr ? "on" : e->mtp_ready ? "off" : "absent");
-    return reinterpret_cast<jlong>(e.release());
+    return engine_table().add(std::move(e));
+}
+
+JNIEXPORT jlong JNICALL
+Java_ai_airi_qwenmobile_LlamaNative_load(JNIEnv * env, jclass, jstring jpath, jstring jmmproj,
+                                          jstring jdevice, jstring jprefill, jstring jvision, jint gpu_layers,
+                                          jint n_threads, jint n_ctx, jint image_max_tokens, jboolean jspeculative,
+                                          jstring jcache) {
+    return jni_guard<jlong>(env, 0, [&] {
+        return load_impl(env, jpath, jmmproj, jdevice, jprefill, jvision, gpu_layers,
+                         n_threads, n_ctx, image_max_tokens, jspeculative, jcache);
+    });
 }
 
 JNIEXPORT void JNICALL
-Java_ai_airi_qwenmobile_LlamaNative_free(JNIEnv *, jclass, jlong handle) {
-    delete engine_of(handle);
+Java_ai_airi_qwenmobile_LlamaNative_free(JNIEnv * env, jclass, jlong handle) {
+    jni_guard_void(env, [&] { engine_table().remove(handle); });
 }
 
 JNIEXPORT jstring JNICALL
 Java_ai_airi_qwenmobile_LlamaNative_modelInfo(JNIEnv * env, jclass, jlong handle) {
-    Engine * e = engine_of(handle);
-    char desc[256];
-    llama_model_desc(e->model, desc, sizeof(desc));
-    char line[512];
-    snprintf(line, sizeof(line),
-             "%s, %.2f GiB, %.2f B params, n_ctx %u, gpu layers %d, threads %d, ADPF %s, vision %s, %d image tokens, MTP %s",
-             desc, llama_model_size(e->model) / 1073741824.0, llama_model_n_params(e->model) / 1e9,
-             llama_n_ctx(e->ctx), e->gpu_layers, e->n_threads, e->hint && e->hint->ok() ? "on" : "off",
-             e->mmproj.empty() ? "none" : (e->mctx ? "loaded" : "ready"), e->image_max_tokens,
-             e->spec != nullptr ? "on" : e->mtp_ready ? "off" : "absent");
-    return env->NewStringUTF(line);
+    return jni_guard<jstring>(env, nullptr, [&]() -> jstring {
+        const std::shared_ptr<Engine> e = engine_of(handle);
+        if (e == nullptr) {
+            throw_java(env, "No model is loaded");
+            return nullptr;
+        }
+        char desc[256];
+        llama_model_desc(e->model, desc, sizeof(desc));
+        char line[512];
+        snprintf(line, sizeof(line),
+                 "%s, %.2f GiB, %.2f B params, n_ctx %u, gpu layers %d, threads %d, ADPF %s, vision %s, %d image tokens, MTP %s",
+                 desc, llama_model_size(e->model) / 1073741824.0, llama_model_n_params(e->model) / 1e9,
+                 llama_n_ctx(e->ctx), e->gpu_layers, e->n_threads, e->hint && e->hint->ok() ? "on" : "off",
+                 e->mmproj.empty() ? "none" : (e->mctx ? "loaded" : "ready"), e->image_max_tokens,
+                 e->spec != nullptr ? "on" : e->mtp_ready ? "off" : "absent");
+        return env->NewStringUTF(line);
+    });
 }
 
 /**
@@ -1696,25 +1935,43 @@ Java_ai_airi_qwenmobile_LlamaNative_modelInfo(JNIEnv * env, jclass, jlong handle
  */
 JNIEXPORT jboolean JNICALL
 Java_ai_airi_qwenmobile_LlamaNative_hasMtp(JNIEnv *, jclass, jlong handle) {
-    return engine_of(handle)->mtp_ready ? JNI_TRUE : JNI_FALSE;
+    const std::shared_ptr<Engine> e = engine_of(handle);
+    return e != nullptr && e->mtp_ready ? JNI_TRUE : JNI_FALSE;
 }
 
-JNIEXPORT jint JNICALL
-Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass native_class, jlong handle,
-                                               jobjectArray roles, jobjectArray contents,
-                                               jobjectArray images, jboolean thinking,
-                                               jfloat temperature, jfloat top_p) {
-    Engine * e = engine_of(handle);
+static jint chat_start_impl(JNIEnv * env, jclass native_class, jlong handle,
+                            jobjectArray roles, jobjectArray contents,
+                            jobjectArray images, jboolean thinking,
+                            jfloat temperature, jfloat top_p) {
+    const std::shared_ptr<Engine> engine = engine_of(handle);
+    if (engine == nullptr) {
+        throw_java(env, "No model is loaded");
+        return -1;
+    }
+    Engine * e = engine.get();
     std::lock_guard<std::mutex> lock(e->mutex);
+    // A stop request of the last answer does not stop this one. A request
+    // that arrives after this line stops the prompt decode or the first sample.
+    e->stop_requested = false;
 
     // A message with an image starts with the media marker. mtmd replaces
     // the marker with the vision tokens of that image, in message order.
-    // Each local reference goes away at once: the table holds 512.
+    // The reference of an image lives until tokenize_prompt has read its
+    // bytes, thus LocalRefs releases them all at the end of this call. The
+    // roles and the contents release theirs inside array_string.
     common_chat_templates_inputs inputs;
     std::vector<jbyteArray> image_refs;
+    LocalRefs refs(env);
     const jsize n = env->GetArrayLength(roles);
     if (env->GetArrayLength(contents) != n || (images != nullptr && env->GetArrayLength(images) != n)) {
         throw_java(env, "The roles, contents and images arrays have different lengths");
+        return -1;
+    }
+    // The table of a thread holds a small number of references. A conversation
+    // with an image in every message needs one for each, thus the capacity is
+    // requested before the loop.
+    if (images != nullptr && env->EnsureLocalCapacity(n + kLocalRefHeadroom) != JNI_OK) {
+        throw_java(env, "The local reference table cannot hold " + std::to_string(n) + " images");
         return -1;
     }
     for (jsize i = 0; i < n; ++i) {
@@ -1725,6 +1982,7 @@ Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass native_class,
         if (image != nullptr) {
             msg.content = std::string(mtmd_default_marker()) + "\n" + msg.content;
             image_refs.push_back(image);
+            refs.keep(image);
         }
         inputs.messages.push_back(std::move(msg));
     }
@@ -1758,9 +2016,9 @@ Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass native_class,
     rebuild_sampler(*e, thinking, temperature, top_p);
     e->utf8_pending.clear();
     e->turn           = TurnStats{};
-    e->answer_done    = false;
+    // The answer stays done until the prompt is in the memory: a failure below leaves no logits to sample.
+    e->answer_done    = true;
     e->answer_ends    = false;
-    e->stop_requested = false;
     e->id_last        = LLAMA_TOKEN_NULL;
     e->spec_feed      = true;
     e->draft.clear();
@@ -1782,8 +2040,11 @@ Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass native_class,
     }
     e->turn.image_tokens = n_tokens - (int64_t) std::count(chunk_of.begin(), chunk_of.end(), nullptr);
     size_t base_len = base_length(*e, prompt, tail, items);
-    if (base_len == items.size() && e->ctx_pf != nullptr) {
-        // The decode context must decode the last token itself: the state transfer carries no logits.
+    if (base_len == items.size()) {
+        // The decode context must decode the last item itself: the state
+        // transfer of the hybrid backend carries no logits, and on every
+        // backend an empty tail leaves a context that holds no logits, which
+        // the sampler reads as a null pointer and aborts the process.
         base_len -= 1;
     }
     if (chunk_of.back() != nullptr) {
@@ -1800,9 +2061,15 @@ Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass native_class,
         }
     }
 
-    if (!prefill(*e, items, chunk_of, base_len, error)) {
-        throw_java(env, error);
-        return -1;
+    switch (prefill(*e, items, chunk_of, base_len, error)) {
+        case DecodeOutcome::kFailed:
+            throw_java(env, error);
+            return -1;
+        case DecodeOutcome::kStopped:
+            // The memory is empty and the answer is done: the next generateNext gives null.
+            return 0;
+        case DecodeOutcome::kDone:
+            break;
     }
     if (e->spec != nullptr) {
         // The text tokens of the context, for the draft implementations that read them.
@@ -1815,12 +2082,28 @@ Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass native_class,
         }
         common_speculative_begin(e->spec, kSeqMain, e->spec_prompt);
     }
+    e->answer_done = false;
     return (jint) e->turn.prefill_tokens;
 }
 
-JNIEXPORT jbyteArray JNICALL
-Java_ai_airi_qwenmobile_LlamaNative_generateNext(JNIEnv * env, jclass, jlong handle) {
-    Engine * e = engine_of(handle);
+JNIEXPORT jint JNICALL
+Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass native_class, jlong handle,
+                                               jobjectArray roles, jobjectArray contents,
+                                               jobjectArray images, jboolean thinking,
+                                               jfloat temperature, jfloat top_p) {
+    return jni_guard<jint>(env, -1, [&] {
+        return chat_start_impl(env, native_class, handle, roles, contents, images,
+                               thinking, temperature, top_p);
+    });
+}
+
+static jbyteArray generate_next_impl(JNIEnv * env, jlong handle) {
+    const std::shared_ptr<Engine> engine = engine_of(handle);
+    if (engine == nullptr) {
+        throw_java(env, "No model is loaded");
+        return nullptr;
+    }
+    Engine * e = engine.get();
     std::lock_guard<std::mutex> lock(e->mutex);
     if (e->answer_done) {
         return nullptr;
@@ -1837,6 +2120,12 @@ Java_ai_airi_qwenmobile_LlamaNative_generateNext(JNIEnv * env, jclass, jlong han
     if ((uint32_t) e->n_past >= llama_n_ctx(e->ctx)) {
         e->answer_done = true;
         throw_java(env, "The context is full (" + std::to_string(llama_n_ctx(e->ctx)) + " tokens). Start a new chat.");
+        return nullptr;
+    }
+    if (e->cache.empty()) {
+        // No prompt is in the memory, thus the context holds no logits and a sample would read a null pointer.
+        e->answer_done = true;
+        throw_java(env, "No prompt is decoded. Call chatStart first.");
         return nullptr;
     }
 
@@ -1872,6 +2161,11 @@ Java_ai_airi_qwenmobile_LlamaNative_generateNext(JNIEnv * env, jclass, jlong han
     return pack_piece(env, *e, kind);
 }
 
+JNIEXPORT jbyteArray JNICALL
+Java_ai_airi_qwenmobile_LlamaNative_generateNext(JNIEnv * env, jclass, jlong handle) {
+    return jni_guard<jbyteArray>(env, nullptr, [&] { return generate_next_impl(env, handle); });
+}
+
 /**
  * Ask the running answer to stop. Any thread can call this: the flag is
  * atomic and the call takes no lock. The next generateNext gives the end
@@ -1879,12 +2173,23 @@ Java_ai_airi_qwenmobile_LlamaNative_generateNext(JNIEnv * env, jclass, jlong han
  */
 JNIEXPORT void JNICALL
 Java_ai_airi_qwenmobile_LlamaNative_requestStop(JNIEnv *, jclass, jlong handle) {
-    engine_of(handle)->stop_requested = true;
+    // Runs on the thread of the caller, without the mutex of the engine and
+    // possibly while the engine thread releases the model. The shared pointer
+    // keeps the engine alive for the store below, and a handle that is no
+    // longer live gives null instead of a freed address.
+    const std::shared_ptr<Engine> e = engine_of(handle);
+    if (e != nullptr) {
+        e->stop_requested = true;
+    }
 }
 
-JNIEXPORT jstring JNICALL
-Java_ai_airi_qwenmobile_LlamaNative_stats(JNIEnv * env, jclass, jlong handle) {
-    Engine * e = engine_of(handle);
+static jstring stats_impl(JNIEnv * env, jlong handle) {
+    const std::shared_ptr<Engine> engine = engine_of(handle);
+    if (engine == nullptr) {
+        throw_java(env, "No model is loaded");
+        return nullptr;
+    }
+    Engine * e = engine.get();
     std::lock_guard<std::mutex> lock(e->mutex);
     const TurnStats & t = e->turn;
     char line[512];
@@ -1915,15 +2220,31 @@ Java_ai_airi_qwenmobile_LlamaNative_stats(JNIEnv * env, jclass, jlong handle) {
         extra += ", drafted " + std::to_string(t.drafted) + ", accepted " + std::to_string(t.accepted) +
                  " (" + std::to_string(percent) + " %)";
     }
-    snprintf(line, sizeof(line), "prefill %lld tok in %.0f ms (%.1f t/s on %s)%s, generate %lld tok (%.1f t/s), memory %d pos",
+    // The generation prompt has its own entry: those few tokens decode at the
+    // speed of one token, thus a rate over the prompt and them together would
+    // fall with the length of the prompt and would not be a prefill rate.
+    if (t.tail_tokens > 0) {
+        extra += ", generation prompt " + std::to_string(t.tail_tokens) + " tok in " +
+                 std::to_string(t.tail_us / 1000) + " ms";
+    }
+    snprintf(line, sizeof(line),
+             "prefill %lld tok in %.0f ms (%.1f t/s on %s)%s, generate %lld tok (%.1f t/s, sample %.0f ms), memory %d pos",
              (long long) t.prefill_tokens, t.prefill_us / 1000.0, pp, pf_dev, extra.c_str(),
-             (long long) t.gen_tokens, tg, (int) e->n_past);
+             (long long) t.gen_tokens, tg, t.sample_us / 1000.0, (int) e->n_past);
     return env->NewStringUTF(line);
 }
 
-JNIEXPORT void JNICALL
-Java_ai_airi_qwenmobile_LlamaNative_resetChat(JNIEnv *, jclass, jlong handle) {
-    Engine * e = engine_of(handle);
+JNIEXPORT jstring JNICALL
+Java_ai_airi_qwenmobile_LlamaNative_stats(JNIEnv * env, jclass, jlong handle) {
+    return jni_guard<jstring>(env, nullptr, [&] { return stats_impl(env, handle); });
+}
+
+static void reset_chat_impl(jlong handle) {
+    const std::shared_ptr<Engine> engine = engine_of(handle);
+    if (engine == nullptr) {
+        return;
+    }
+    Engine * e = engine.get();
     std::lock_guard<std::mutex> lock(e->mutex);
     clear_all(*e);
     // The RAM tiers go, the files stay: a conversation on disk continues after a load of the same model.
@@ -1942,15 +2263,23 @@ Java_ai_airi_qwenmobile_LlamaNative_resetChat(JNIEnv *, jclass, jlong handle) {
     clear_queue(*e);
 }
 
+JNIEXPORT void JNICALL
+Java_ai_airi_qwenmobile_LlamaNative_resetChat(JNIEnv * env, jclass, jlong handle) {
+    jni_guard_void(env, [&] { reset_chat_impl(handle); });
+}
+
 /**
  * The llama-bench method: pp tokens in batches of kBatch, then tg tokens
  * one at a time, each on a clean memory, reps times. The chat memory is
  * empty after the benchmark.
  */
-JNIEXPORT jstring JNICALL
-Java_ai_airi_qwenmobile_LlamaNative_bench(JNIEnv * env, jclass, jlong handle,
-                                           jint pp, jint tg, jint reps) {
-    Engine * e = engine_of(handle);
+static jstring bench_impl(JNIEnv * env, jlong handle, jint pp, jint tg, jint reps) {
+    const std::shared_ptr<Engine> engine = engine_of(handle);
+    if (engine == nullptr) {
+        throw_java(env, "No model is loaded");
+        return nullptr;
+    }
+    Engine * e = engine.get();
     std::lock_guard<std::mutex> lock(e->mutex);
     llama_memory_t mem = llama_get_memory(e->ctx);
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(e->model));
@@ -1962,6 +2291,25 @@ Java_ai_airi_qwenmobile_LlamaNative_bench(JNIEnv * env, jclass, jlong handle,
 
     std::vector<double> pp_tps, tg_tps;
     std::string log;
+    // A warmup that no rate holds, as llama-bench does: the first pass of a
+    // fresh memory runs at the boost clocks of an idle phone and measured
+    // 10 % above the passes that follow, thus a mean that holds it reads
+    // about 3 % high at three reps.
+    {
+        llama_context * pctx = e->ctx_pf ? e->ctx_pf : e->ctx;
+        const int n_warm = pp > 0 ? std::min(pp, 32) : 1;
+        std::vector<llama_token> tokens(n_warm);
+        for (auto & t : tokens) t = pick(rng);
+        llama_memory_clear(llama_get_memory(pctx), true);
+        decode_text(*e, pctx, tokens.data(), n_warm, 0, true, false);
+        llama_synchronize(pctx);
+        if (tg > 0) {
+            llama_memory_clear(mem, true);
+            llama_token t = pick(rng);
+            decode_text(*e, e->ctx, &t, 1, 0, true, false);
+            llama_synchronize(e->ctx);
+        }
+    }
     for (int r = 0; r < reps; ++r) {
         if (pp > 0) {
             std::vector<llama_token> tokens(pp);
@@ -1970,7 +2318,7 @@ Java_ai_airi_qwenmobile_LlamaNative_bench(JNIEnv * env, jclass, jlong handle,
             llama_context * pctx = e->ctx_pf ? e->ctx_pf : e->ctx;
             llama_memory_clear(llama_get_memory(pctx), true);
             const int64_t t0 = now_us();
-            const int rc = decode_text(*e, pctx, tokens.data(), pp, 0, true);
+            const int rc = decode_text(*e, pctx, tokens.data(), pp, 0, true, false);
             llama_synchronize(pctx);
             const int64_t dt = now_us() - t0;
             if (rc != 0) {
@@ -1985,7 +2333,7 @@ Java_ai_airi_qwenmobile_LlamaNative_bench(JNIEnv * env, jclass, jlong handle,
             int rc = 0;
             for (int i = 0; i < tg && rc == 0; ++i) {
                 llama_token t = pick(rng);
-                rc = decode_text(*e, e->ctx, &t, 1, i, true);
+                rc = decode_text(*e, e->ctx, &t, 1, i, true, false);
                 llama_synchronize(e->ctx);
             }
             const int64_t dt = now_us() - t0;
@@ -2001,7 +2349,12 @@ Java_ai_airi_qwenmobile_LlamaNative_bench(JNIEnv * env, jclass, jlong handle,
     char desc[128];
     llama_model_desc(e->model, desc, sizeof(desc));
     char line[256];
-    snprintf(line, sizeof(line), "%s | gpu layers %d | threads %d | reps %d\n", desc, e->gpu_layers, e->n_threads, reps);
+    // The configuration belongs with the numbers: a record that names neither
+    // device nor the context length cannot be compared with a llama-bench run.
+    snprintf(line, sizeof(line), "%s | %s%s%s | gpu layers %d | threads %d | ctx %d | reps %d + warmup\n", desc,
+             e->device ? ggml_backend_dev_name(e->device) : "CPU",
+             e->device_pf ? " prefill " : "", e->device_pf ? ggml_backend_dev_name(e->device_pf) : "",
+             e->gpu_layers, e->n_threads, (int) llama_n_ctx(e->ctx), reps);
     log += line;
     if (!pp_tps.empty()) {
         auto [m, s] = mean_std(pp_tps);
@@ -2014,6 +2367,12 @@ Java_ai_airi_qwenmobile_LlamaNative_bench(JNIEnv * env, jclass, jlong handle,
         log += line;
     }
     return env->NewStringUTF(log.c_str());
+}
+
+JNIEXPORT jstring JNICALL
+Java_ai_airi_qwenmobile_LlamaNative_bench(JNIEnv * env, jclass, jlong handle,
+                                           jint pp, jint tg, jint reps) {
+    return jni_guard<jstring>(env, nullptr, [&] { return bench_impl(env, handle, pp, tg, reps); });
 }
 
 } // extern "C"

@@ -286,8 +286,10 @@ void StateCache::make_resident(List::iterator it, std::shared_ptr<const cache_io
     if (it->bytes || !bytes || bytes->size > ram_budget_) {
         return;
     }
+    // byte_size stays the one of the entry: the file, the header and the two
+    // byte counters carry that value already, and the caller of put dropped
+    // an entry whose length differs.
     it->bytes      = std::move(bytes);
-    it->byte_size  = it->bytes->size;
     ram_bytes_    += it->byte_size + it->items.size() * sizeof(MemItem);
     evict_ram(&*it);
 }
@@ -300,8 +302,10 @@ void StateCache::put(std::vector<MemItem> items, int32_t n_pos, std::shared_ptr<
     const uint64_t key = hash_items(items);
     for (auto it = entries_.begin(); it != entries_.end(); ++it) {
         if (it->key == key && it->items == items) {
-            if (it->n_pos != n_pos) {
-                // The same items give the same positions. A different value is a stale file.
+            if (it->n_pos != n_pos || it->byte_size != bytes->size) {
+                // The same items give the same positions and the same number of
+                // state bytes. A different value comes from another model or
+                // another context length, thus the entry and its file are stale.
                 erase(it, true);
                 break;
             }

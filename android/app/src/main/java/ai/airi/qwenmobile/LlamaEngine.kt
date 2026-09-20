@@ -5,6 +5,8 @@ import android.graphics.BitmapFactory
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -172,11 +174,12 @@ object LlamaEngine {
     private const val MAX_ANSWER_TOKENS = 4096
 
     private val dispatcher = Executors.newSingleThreadExecutor { runnable ->
-        // The engine thread runs at the background priority, thus the display thread stays smooth.
-        Thread({
-            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
-            runnable.run()
-        }, "llama-engine")
+        // The engine thread keeps the default priority. The background priority
+        // of the earlier builds gave the same prefill rate (415.3 against 415.0
+        // t/s of pp512 on the 4B), thus it costs nothing that a measurement
+        // shows, but the display thread has the higher priority either way and
+        // the compute threads of the native side carry their own nice level.
+        Thread(runnable, "llama-engine")
     }.asCoroutineDispatcher()
 
     private val engineScope = CoroutineScope(dispatcher + SupervisorJob())
@@ -270,7 +273,8 @@ object LlamaEngine {
     /**
      * Generate the answer to the conversation. Each emitted piece is a part
      * of the answer or a thinking tag. The flow stops at the end token, at
-     * the token limit, or when the collector cancels. The messages are
+     * the token limit, or when the collector cancels. A cancel during the
+     * prompt decode ends the flow before the first sample. The messages are
      * copied on the thread of the caller, thus the engine thread reads no
      * shared text.
      */
@@ -288,6 +292,8 @@ object LlamaEngine {
             LlamaNative.chatStart(h, roles, contents, images, thinking, temperature, topP)
             var count = 0
             while (count < MAX_ANSWER_TOKENS) {
+                // The native call cannot see a cancel, thus the check is here and not inside emit only.
+                currentCoroutineContext().ensureActive()
                 val bytes = LlamaNative.generateNext(h) ?: break
                 count += 1
                 if (bytes.size > 1) {

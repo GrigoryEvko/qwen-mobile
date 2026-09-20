@@ -24,6 +24,8 @@
     <string name="settings_context">Context length</string>
     <string name="settings_generation">Generation</string>
     <string name="settings_thinking">Thinking mode</string>
+    <string name="settings_system_prompt">System prompt</string>
+    <string name="settings_system_prompt_hint">A standing instruction sent before every conversation. Leave it empty for the default behaviour of the model. It costs context on every turn.</string>
     <string name="settings_thinking_hint">The model reasons before the answer. Slower, better on hard tasks.</string>
     <string name="settings_speculative">Speculative decoding (MTP)</string>
     <string name="settings_speculative_hint">The MTP block of the model proposes up to 3 tokens, and one decode verifies them. The answer does not change. Formulaic text becomes faster, free-form text does not, thus the engine measures the acceptance and stops the proposals when they do not pay. A change loads the model again.</string>

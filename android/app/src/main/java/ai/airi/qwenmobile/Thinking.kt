@@ -27,10 +27,15 @@ class AnswerStream(val answer: ChatMessage, private val clock: () -> Long) {
                 // The answer starts without the blank lines of the template.
                 answer.appendContent(if (answer.hasContent) piece.text else piece.text.trimStart())
             }
-            Piece.ThinkOpen -> {
+            Piece.ThinkOpen -> if (!answer.hasContent) {
+                // A tag that the model emits after the answer text has begun is
+                // part of that text, not a new thinking block: a move back into
+                // THINKING would end the turn as interrupted and drop the text.
                 answer.phase = ChatMessage.Phase.THINKING
                 answer.thinkingExpanded = null
                 thinkingStart = clock()
+            } else {
+                answer.appendContent("<think>")
             }
             Piece.ThinkClose -> {
                 answer.thinkingMs = clock() - thinkingStart
@@ -45,17 +50,20 @@ class AnswerStream(val answer: ChatMessage, private val clock: () -> Long) {
      * failure, or null. [cancelled] tells that the user stopped the answer.
      */
     fun finish(error: String?, cancelled: Boolean) {
+        if (answer.phase == ChatMessage.Phase.THINKING) {
+            answer.thinkingMs = clock() - thinkingStart
+        }
+        // The answer text decides first: a turn that produced text is done,
+        // whatever phase it stopped in. Then the error, thus a failure inside
+        // an open thinking still shows its message instead of the word
+        // Interrupted. A thinking that produced nothing else is interrupted.
         answer.phase = when {
-            answer.phase == ChatMessage.Phase.THINKING -> {
-                answer.thinkingMs = clock() - thinkingStart
-                ChatMessage.Phase.INTERRUPTED
-            }
             answer.hasContent -> ChatMessage.Phase.DONE
             error != null -> {
                 answer.content = error
                 ChatMessage.Phase.FAILED
             }
-            cancelled -> ChatMessage.Phase.INTERRUPTED
+            cancelled || answer.phase == ChatMessage.Phase.THINKING -> ChatMessage.Phase.INTERRUPTED
             else -> ChatMessage.Phase.DONE
         }
         answer.thinkingExpanded = null

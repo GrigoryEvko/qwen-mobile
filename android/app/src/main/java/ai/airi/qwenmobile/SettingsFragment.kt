@@ -73,7 +73,13 @@ class SettingsFragment : Fragment() {
         refreshModels()
     }
 
+    override fun onPause() {
+        binding?.let { saveSystemPrompt(it) }
+        super.onPause()
+    }
+
     override fun onDestroyView() {
+        binding?.let { saveSystemPrompt(it) }
         super.onDestroyView()
         modelRows.clear()
         binding = null
@@ -226,6 +232,21 @@ class SettingsFragment : Fragment() {
                 store.update { it.copy(topP = value) }
             }
         }
+        // The prompt is saved when the field loses the focus and when the
+        // screen stops, not on every keystroke: a write per character would
+        // touch the disk and rebuild the prompt of the next turn each time.
+        b.systemPromptInput.setOnFocusChangeListener { _, focused ->
+            if (!focused) saveSystemPrompt(b)
+        }
+    }
+
+    /** Copy the system prompt of the field into the store, when it changed. */
+    private fun saveSystemPrompt(b: FragmentSettingsBinding) {
+        if (applying) return
+        val text = b.systemPromptInput.text?.toString().orEmpty().trim()
+        if (text != store.state.value.systemPrompt) {
+            store.update { it.copy(systemPrompt = text) }
+        }
     }
 
     // --- About ---
@@ -273,6 +294,12 @@ class SettingsFragment : Fragment() {
             b.temperatureValue.text = String.format(Locale.US, "%.2f", s.temperature)
             b.topPSlider.value = snap(s.topP, SettingsStore.MIN_TOP_P, 0.01f)
             b.topPValue.text = String.format(Locale.US, "%.2f", s.topP)
+            // A running edit wins over the store, thus typing is never cut off.
+            if (!b.systemPromptInput.hasFocus() &&
+                b.systemPromptInput.text?.toString() != s.systemPrompt
+            ) {
+                b.systemPromptInput.setText(s.systemPrompt)
+            }
         } finally {
             applying = false
         }

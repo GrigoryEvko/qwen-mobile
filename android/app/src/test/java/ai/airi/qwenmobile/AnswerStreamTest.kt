@@ -69,12 +69,41 @@ class AnswerStreamTest {
     }
 
     @Test
-    fun anErrorInsideTheThinkingAlsoLeavesAnInterruptedMessage() {
+    fun anErrorInsideTheThinkingShowsTheError() {
+        // The message of a failure reaches the user whatever phase the answer
+        // stopped in: the errors that matter most, the full context and the
+        // long conversation, both arrive while the thinking is open.
         val s = stream(thinkingMode = true)
         s.accept(Piece.Text("thought"))
-        s.finish(error = "llama_decode failed", cancelled = false)
-        assertEquals(ChatMessage.Phase.INTERRUPTED, s.answer.phase)
-        assertFalse(s.answer.hasContent)
+        s.finish(error = "The context is full (8192 tokens). Start a new chat.", cancelled = false)
+        assertEquals(ChatMessage.Phase.FAILED, s.answer.phase)
+        assertEquals("The context is full (8192 tokens). Start a new chat.", s.answer.content)
+        assertEquals("thought", s.answer.thinking)
+    }
+
+    @Test
+    fun aThinkTagAfterTheAnswerTextIsText() {
+        // One stray tag must not move a finished answer back into the thinking:
+        // that phase would end the turn as interrupted and drop its text.
+        val s = stream(thinkingMode = false)
+        s.accept(Piece.Text("The answer is 4."))
+        s.accept(Piece.ThinkOpen)
+        s.accept(Piece.Text(" And more."))
+        s.finish(error = null, cancelled = false)
+        assertEquals(ChatMessage.Phase.DONE, s.answer.phase)
+        assertEquals("The answer is 4.<think> And more.", s.answer.content)
+    }
+
+    @Test
+    fun aStopAfterSomeAnswerTextKeepsTheText() {
+        val s = stream(thinkingMode = true)
+        s.markStart()
+        s.accept(Piece.Text("thought"))
+        s.accept(Piece.ThinkClose)
+        s.accept(Piece.Text("the answer"))
+        s.finish(error = null, cancelled = true)
+        assertEquals(ChatMessage.Phase.DONE, s.answer.phase)
+        assertEquals("the answer", s.answer.content)
     }
 
     @Test

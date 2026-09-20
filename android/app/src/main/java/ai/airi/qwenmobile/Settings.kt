@@ -45,6 +45,12 @@ data class AppSettings(
      * context keeps the state snapshots of a draft.
      */
     val speculative: Boolean = false,
+    /**
+     * A standing instruction that leads every conversation. The chat
+     * template of Qwen3.5 puts it in a system turn. An empty value sends
+     * no system turn at all, thus the model keeps its own default.
+     */
+    val systemPrompt: String = "",
 )
 
 /**
@@ -93,6 +99,7 @@ class SettingsStore private constructor(context: Context) {
             temperature = prefs.getFloat(KEY_TEMPERATURE, 0.7f),
             topP = prefs.getFloat(KEY_TOP_P, 0.8f),
             speculative = prefs.getBoolean(KEY_SPECULATIVE, false),
+            systemPrompt = prefs.getString(KEY_SYSTEM_PROMPT, null) ?: "",
         ),
     )
 
@@ -108,6 +115,7 @@ class SettingsStore private constructor(context: Context) {
             .putFloat(KEY_TEMPERATURE, s.temperature)
             .putFloat(KEY_TOP_P, s.topP)
             .putBoolean(KEY_SPECULATIVE, s.speculative)
+            .putString(KEY_SYSTEM_PROMPT, s.systemPrompt)
             .apply()
     }
 
@@ -123,6 +131,7 @@ class SettingsStore private constructor(context: Context) {
         private const val KEY_TEMPERATURE = "temperature"
         private const val KEY_TOP_P = "top_p"
         private const val KEY_SPECULATIVE = "speculative"
+        private const val KEY_SYSTEM_PROMPT = "system_prompt"
 
         /** The permitted context lengths, in tokens. */
         val CONTEXT_LENGTHS: List<Int> = listOf(2048, 4096, 8192, 16384)
@@ -131,6 +140,9 @@ class SettingsStore private constructor(context: Context) {
         const val MAX_THREADS = 8
         const val MAX_TEMPERATURE = 1.5f
         const val MIN_TOP_P = 0.5f
+
+        /** The character ceiling of the system prompt, about 500 tokens. */
+        const val MAX_SYSTEM_PROMPT = 2000
 
         @Volatile
         private var instance: SettingsStore? = null
@@ -154,6 +166,9 @@ class SettingsStore private constructor(context: Context) {
             nCtx = if (s.nCtx in CONTEXT_LENGTHS) s.nCtx else 8192,
             temperature = s.temperature.coerceIn(0f, MAX_TEMPERATURE),
             topP = s.topP.coerceIn(MIN_TOP_P, 1f),
+            // The prompt costs context on every turn and is prefilled again
+            // whenever it changes, thus it is bounded.
+            systemPrompt = s.systemPrompt.trim().take(MAX_SYSTEM_PROMPT),
         )
     }
 }

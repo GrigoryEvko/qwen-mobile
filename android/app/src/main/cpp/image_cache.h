@@ -42,8 +42,14 @@ public:
      */
     ImageCache(size_t ram_budget, size_t disk_budget, std::string dir);
 
-    /** The dimensions of a known image (in RAM or on disk). Returns false for an unknown id. */
-    bool info(const std::string & id, ImageInfo & out) const;
+    /**
+     * The dimensions of a known image, from RAM or from a file that is
+     * still there. The entry becomes the most recent of the two tiers,
+     * thus the evictions of the turn take other entries first. Returns
+     * false for an unknown id, or when the file is gone, and then the
+     * entry is gone too.
+     */
+    bool info(const std::string & id, ImageInfo & out);
 
     /**
      * The encoder output of an image, from RAM or read from its file into
@@ -53,7 +59,7 @@ public:
      */
     const float * get(const std::string & id);
 
-    /** Keep the encoder output of an image. The data is copied. */
+    /** Keep the encoder output of an image. The data is copied. An output larger than the RAM budget is not kept. */
     void put(const std::string & id, const ImageInfo & info, const float * data);
 
     /** Remove every entry from RAM, and with disk_too also every file. */

@@ -104,7 +104,8 @@ object LlamaNative {
      * @param thinking     Enable the thinking mode of the chat template
      * @param temperature  The sampling temperature, 0 for greedy
      * @param topP         The nucleus probability mass
-     * @return The number of prompt tokens that this call decoded
+     * @return The number of prompt tokens that this call decoded, or 0 after a stop request during the
+     *   decode: then the memory is empty and [generateNext] gives null
      * @throws RuntimeException If the template, an image, or the decode fails
      */
     @JvmStatic external fun chatStart(
@@ -127,9 +128,10 @@ object LlamaNative {
     @JvmStatic external fun generateNext(handle: Long): ByteArray?
 
     /**
-     * Ask the answer to stop. Any thread can call this while [generateNext]
-     * runs on the engine thread: the next [generateNext] gives null without
-     * a sample. [chatStart] clears the request.
+     * Ask the answer to stop. Any thread can call this while [chatStart] or
+     * [generateNext] runs on the engine thread: the prompt decode stops
+     * before its next batch or image, and the next [generateNext] gives
+     * null without a sample. [chatStart] clears the request at its start.
      */
     @JvmStatic external fun requestStop(handle: Long)
 

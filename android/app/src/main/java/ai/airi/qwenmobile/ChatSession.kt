@@ -25,6 +25,39 @@ import java.io.File
 import java.util.IdentityHashMap
 
 /**
+ * The messages that the model sees: the completed exchanges, and the user
+ * message of the current turn at the end. A user message with an answer
+ * that is not DONE (interrupted, failed, or absent after a restart) goes
+ * with that answer, thus the model never sees two user turns in a row. A
+ * system message always stays.
+ *
+ * A non-blank [systemPrompt] leads the list as one system message. It is not
+ * part of [messages], thus it never reaches the conversation store and a
+ * change to it applies from the next turn. O(n).
+ */
+internal fun modelHistory(
+    messages: List<ChatMessage>,
+    systemPrompt: String = "",
+): List<ChatMessage> {
+    val out = ArrayList<ChatMessage>(messages.size + 1)
+    if (systemPrompt.isNotBlank()) {
+        out += ChatMessage("system", systemPrompt)
+    }
+    for ((i, m) in messages.withIndex()) {
+        val keep = when (m.role) {
+            "user" -> i == messages.lastIndex ||
+                (messages[i + 1].role == "assistant" && messages[i + 1].phase == ChatMessage.Phase.DONE)
+            "assistant" -> m.phase == ChatMessage.Phase.DONE
+            else -> true
+        }
+        if (keep) {
+            out += m
+        }
+    }
+    return out
+}
+
+/**
  * The conversation of the process: the messages, the running answer, and
  * the model life cycle. It lives in an application scope, thus an answer
  * continues while the app is in the background or on another tab. The
@@ -279,9 +312,8 @@ object ChatSession {
             return
         }
         messages += ChatMessage("user", text, image)
-        // An interrupted or failed answer is not part of the conversation the model sees.
-        val history = messages.filter { it.phase == ChatMessage.Phase.DONE }
         val s = SettingsStore.of(app).state.value
+        val history = modelHistory(messages, s.systemPrompt)
         val answer = ChatMessage("assistant", "")
         // In thinking mode the chat template opens the thinking, thus the answer starts in it.
         answer.phase = if (s.thinking) ChatMessage.Phase.THINKING else ChatMessage.Phase.ANSWERING

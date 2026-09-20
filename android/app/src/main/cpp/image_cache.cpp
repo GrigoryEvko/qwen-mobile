@@ -22,6 +22,9 @@ constexpr char     kMagic[4]    = {'Q', 'M', 'I', 'E'};
 constexpr uint32_t kFileVersion = 1;
 constexpr size_t   kHeaderBytes = 32;
 constexpr const char * kSuffix  = ".embd";
+/** The limits of one encoder output: the token budget of an image and the width of the model. */
+constexpr uint32_t kMaxTokens   = 1u << 16;
+constexpr uint32_t kMaxEmbd     = 1u << 16;
 
 /** The header of an entry as bytes. */
 std::vector<uint8_t> encode_head(const ImageInfo & info) {
@@ -43,6 +46,13 @@ bool read_head(const std::string & path, ImageInfo & info) {
     uint32_t fields[5];
     memcpy(fields, head + 4, sizeof(fields));
     if (fields[0] != kFileVersion) {
+        return false;
+    }
+    // The shape must stay inside the limits of the encoder, thus n_tokens x
+    // n_embd cannot overflow the length check below. Without this, a 32-byte
+    // file of two huge dimensions passes the check and every later read of it
+    // throws on the allocation of the vector.
+    if (fields[3] == 0 || fields[3] > kMaxTokens || fields[4] == 0 || fields[4] > kMaxEmbd) {
         return false;
     }
     info.nx       = fields[1];
@@ -76,7 +86,10 @@ void ImageCache::scan_dir() {
         Entry entry;
         entry.id = name.substr(0, name.size() - strlen(kSuffix));
         cache_io::FileStat st;
-        if (!cache_io::is_hex(entry.id) || !read_head(path, entry.info) || !cache_io::stat_file(path, st)) {
+        // A file of an entry that does not fit in RAM comes from a build with
+        // another budget. It could never be served, thus it goes.
+        if (!cache_io::is_hex(entry.id) || !read_head(path, entry.info) || !cache_io::stat_file(path, st) ||
+            entry.bytes() > ram_budget_) {
             cache_io::remove_file(path);
             continue;
         }
@@ -95,12 +108,25 @@ void ImageCache::scan_dir() {
     evict_disk(nullptr);
 }
 
-bool ImageCache::info(const std::string & id, ImageInfo & out) const {
+bool ImageCache::info(const std::string & id, ImageInfo & out) {
     const auto found = index_.find(id);
     if (found == index_.end()) {
         return false;
     }
-    out = found->second->info;
+    auto it = found->second;
+    if (it->data.empty()) {
+        // The system or the user can clear the cache directory while the index stands.
+        ImageInfo on_file;
+        if (!it->on_disk || !read_head(path_of(it->id), on_file) || on_file.n_floats() != it->info.n_floats()) {
+            erase(it, true);
+            return false;
+        }
+    }
+    entries_.splice(entries_.begin(), entries_, it);
+    if (it->on_disk) {
+        it->disk_stamp = ++stamp_;
+    }
+    out = it->info;
     return true;
 }
 
@@ -139,11 +165,23 @@ const float * ImageCache::get(const std::string & id) {
         evict_ram(&*it);
     }
     entries_.splice(entries_.begin(), entries_, it);
+    if (it->on_disk) {
+        // A read counts as a use for the disk tier too, thus the eviction of
+        // the files takes the entry that no turn asked for.
+        it->disk_stamp = ++stamp_;
+    }
     return it->data.data();
 }
 
 void ImageCache::put(const std::string & id, const ImageInfo & info, const float * data) {
-    if (!cache_io::is_hex(id) || info.n_floats() == 0 || data == nullptr) {
+    if (!cache_io::is_hex(id) || info.n_floats() == 0 || data == nullptr ||
+        info.n_tokens > kMaxTokens || info.n_embd > kMaxEmbd) {
+        return;
+    }
+    // An entry that does not fit in RAM cannot be given to a caller, because
+    // get returns a pointer into the entry. Such an entry on disk would say
+    // yes to info and null to get on every turn, thus it never enters.
+    if (info.n_floats() * sizeof(float) > ram_budget_) {
         return;
     }
     auto found = index_.find(id);

@@ -115,13 +115,16 @@ private:
 
     void run();
 
-    std::thread              thread_;
+    // The thread is the last member: a member starts before the members that
+    // follow it, thus a thread declared first runs while the mutex, the queue
+    // and the flags of this object are still raw memory.
     std::mutex               mutex_;
     std::condition_variable  cv_;
     std::deque<Job>          jobs_;
     std::vector<std::string> failed_;
     size_t                   active_ = 0;
     bool                     stop_   = false;
+    std::thread              thread_;
 };
 
 } // namespace cache_io
