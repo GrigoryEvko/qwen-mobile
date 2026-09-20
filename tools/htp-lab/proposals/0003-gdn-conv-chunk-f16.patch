@@ -1,0 +1,510 @@
+The batch conv of the gated delta net: the precision modes and the packed path (lab proposal)
+
+GDN_CONV_CHUNK is the largest op of a 512-token prefill of the 4B (27 % of the DSP time, 1.27
+instructions per packet). Its hot loop is one chain of about 70 dependent qfloat operations for
+each 32 channels. On the v79 a packet costs 2 cycles, and a multiply result is ready 2 packets
+later, thus one chain waits at each step and leaves the packets almost empty.
+
+gdn_conv_f16_mode selects the path, and tools/htp-lab (target gdn_chunk, --f16 N) measures the
+cycles and the error of each against a scalar reference. Mode 0 is the code of the checkout.
+Modes 1 to 3 keep the chain and change the precision only. Mode 4 is the packed path: 4 token
+rows in each iteration as independent chains, f16 taps with a 32-bit accumulator, and the int16
+SiLU of hvx-silu-i16.h (2 int16 multiplies fit one packet, 1 qfloat multiply does).
+
+diff -urN a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
+--- a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c	2026-09-20 01:19:34.138624337 +0300
++++ b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c	2026-09-20 03:11:02.170390366 +0300
+@@ -35,6 +35,7 @@
+ #include <string.h>
+ 
+ #include "hvx-utils.h"
++#include "hvx-silu-i16.h"
+ #include "hex-fastdiv.h"
+ #include "hex-common.h"
+ #include "hex-profile.h"
+@@ -171,12 +172,93 @@
+ // The convolution of one block of 32 channels from its four tap planes and its four weight planes,
+ // and the SiLU. The sum keeps the order of the CPU reference, and the two functions are the
+ // arithmetic of the ADD and MUL ops of this backend (hvx-base.h, per architecture).
+-static inline HVX_Vector gdn_conv_tap_silu(HVX_Vector t0, HVX_Vector t1, HVX_Vector t2, HVX_Vector t3,
+-                                           HVX_Vector wt0, HVX_Vector wt1, HVX_Vector wt2, HVX_Vector wt3) {
++// The precision of the batch conv. The taps are 4 products, thus the accumulator choice is cheap to
++// measure, and tools/htp-lab (target gdn_chunk, --f16 N) reports the cycles and the error of each.
++//   0  f32 taps, f32 accumulate, f32 SiLU (the reference path)
++//   1  f32 taps, f32 accumulate, f16 SiLU
++//   2  f16 taps, 32-bit accumulate, f16 SiLU. The f16 multiply of the HVX is a widening multiply,
++//      its products are qf32, thus the wide accumulator needs no conversion.
++//   3  f16 taps, f16 accumulate, f16 SiLU. Every product goes back to f16 before the sum.
++//   4  the packed path: f16 taps, 32-bit accumulate, int16 SiLU, 4 token rows in each iteration.
++#ifndef GDN_CONV_F16_MODE
++#define GDN_CONV_F16_MODE 0
++#endif
++static int gdn_conv_f16_mode = GDN_CONV_F16_MODE;
++
++// the 4 taps of one block, f32
++static inline HVX_Vector gdn_conv_tap_acc(HVX_Vector t0, HVX_Vector t1, HVX_Vector t2, HVX_Vector t3,
++                                          HVX_Vector wt0, HVX_Vector wt1, HVX_Vector wt2, HVX_Vector wt3) {
+     HVX_Vector acc = hvx_vec_mul_f32_f32(t0, wt0);
+     acc = hvx_vec_add_f32_f32(acc, hvx_vec_mul_f32_f32(t1, wt1));
+     acc = hvx_vec_add_f32_f32(acc, hvx_vec_mul_f32_f32(t2, wt2));
+-    acc = hvx_vec_add_f32_f32(acc, hvx_vec_mul_f32_f32(t3, wt3));
++    return hvx_vec_add_f32_f32(acc, hvx_vec_mul_f32_f32(t3, wt3));
++}
++
++// t = e / (1 + e) with e = exp(-|x|), 64 lanes of f16. t lies in (0, 0.5], thus f16 holds it to a
++// relative 2.4e-4 with no cancellation, where 1 - sigmoid(|x|) loses every bit for a large |x|.
++// The input is clamped: |x| >= 32 gives t = 0 in f16, and an f32 above the f16 range must not
++// reach the conversion.
++static inline HVX_Vector gdn_conv_silu_t_f16(HVX_Vector h) {
++    const HVX_Vector v_one       = hvx_vec_splat_f16(1.0f);
++    const HVX_Vector v_neg_log2e = hvx_vec_splat_f16(-EXP_LOG2E_F);
++    const HVX_Vector em_mask     = Q6_Vh_vsplat_R(0x7FFF);
++
++    const HVX_Vector u = hvx_vec_mul_f16_f16(Q6_V_vand_VV(h, em_mask), v_neg_log2e);
++    const HVX_Vector e = hvx_vec_exp2_f16(u);
++    return hvx_vec_mul_f16_f16(e, hvx_vec_inverse_f16(hvx_vec_add_f16_f16(v_one, e)));
++}
++
++// The SiLU of two f32 blocks through one f16 vector: x * t for a negative x, x - x * t for the rest.
++// The products with x stay in f32, thus the error is relative to t and not to a sigmoid near 1.
++static inline void gdn_conv_silu2_f16(HVX_Vector a, HVX_Vector b, HVX_Vector * ya, HVX_Vector * yb) {
++    const HVX_Vector lim_hi = hvx_vec_splat_f32(32.0f);
++    const HVX_Vector lim_lo = hvx_vec_splat_f32(-32.0f);
++    const HVX_Vector zero   = Q6_V_vzero();
++
++    const HVX_Vector ca = Q6_Vsf_vmin_VsfVsf(Q6_Vsf_vmax_VsfVsf(a, lim_lo), lim_hi);
++    const HVX_Vector cb = Q6_Vsf_vmin_VsfVsf(Q6_Vsf_vmax_VsfVsf(b, lim_lo), lim_hi);
++
++    const HVX_VectorPair t32 = hvx_vec_f16_to_f32(gdn_conv_silu_t_f16(hvx_vec_f32_to_f16(ca, cb)));
++    const HVX_Vector pa = hvx_vec_mul_f32_f32(a, Q6_V_lo_W(t32));
++    const HVX_Vector pb = hvx_vec_mul_f32_f32(b, Q6_V_hi_W(t32));
++
++    // the sign bit decides: a negative f32 is a negative int32
++    *ya = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VwVw(zero, a), pa, hvx_vec_sub_f32_f32(a, pa));
++    *yb = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VwVw(zero, b), pb, hvx_vec_sub_f32_f32(b, pb));
++}
++
++// Mode 2: the taps of two blocks as f16 in the interleaved lane order, thus the widening multiply
++// gives block a in the low half and block b in the high half. The sum stays in qf32.
++static inline void gdn_conv_tap_acc2_f16_wide(const HVX_Vector * th, const HVX_Vector * wh,
++                                              HVX_Vector * acc_a, HVX_Vector * acc_b) {
++    HVX_VectorPair p = Q6_Wqf32_vmpy_VhfVhf(th[0], wh[0]);
++    HVX_Vector lo = Q6_V_lo_W(p);
++    HVX_Vector hi = Q6_V_hi_W(p);
++    for (int j = 1; j < 4; j++) {
++        p  = Q6_Wqf32_vmpy_VhfVhf(th[j], wh[j]);
++        lo = Q6_Vqf32_vadd_Vqf32Vqf32(lo, Q6_V_lo_W(p));
++        hi = Q6_Vqf32_vadd_Vqf32Vqf32(hi, Q6_V_hi_W(p));
++    }
++    *acc_a = Q6_Vsf_equals_Vqf32(lo);
++    *acc_b = Q6_Vsf_equals_Vqf32(hi);
++}
++
++// Mode 3: as mode 2, but every product and the sum are f16. The SiLU stays in f16 as well.
++static inline HVX_Vector gdn_conv_tap_silu2_f16_narrow(const HVX_Vector * th, const HVX_Vector * wh) {
++    HVX_Vector acc = hvx_vec_mul_f16_f16(th[0], wh[0]);
++    for (int j = 1; j < 4; j++) {
++        acc = hvx_vec_add_f16_f16(acc, hvx_vec_mul_f16_f16(th[j], wh[j]));
++    }
++    const HVX_Vector t   = gdn_conv_silu_t_f16(acc);
++    const HVX_Vector p   = hvx_vec_mul_f16_f16(acc, t);
++    const HVX_Vector em  = Q6_Vh_vsplat_R(0x7FFF);
++    const HVX_VectorPred neg = Q6_Q_vcmp_gt_VhVh(Q6_V_vand_VV(acc, em), acc);
++    return Q6_V_vmux_QVV(neg, p, hvx_vec_sub_f16_f16(acc, p));
++}
++
++static inline HVX_Vector gdn_conv_tap_silu(HVX_Vector t0, HVX_Vector t1, HVX_Vector t2, HVX_Vector t3,
++                                           HVX_Vector wt0, HVX_Vector wt1, HVX_Vector wt2, HVX_Vector wt3) {
++    HVX_Vector acc = gdn_conv_tap_acc(t0, t1, t2, t3, wt0, wt1, wt2, wt3);
+ 
+     // the SiLU of the SILU op: x * sigmoid(x)
+     const HVX_Vector one     = hvx_vec_splat_f32(1.f);
+@@ -438,6 +520,133 @@
+ // converts a lane layout again. The channels of one token are contiguous, thus each thread walks its
+ // own block of each row, and the four rows that one token reads stay in L2 over the channel sweep.
+ 
++// The packed path. One iteration does 64 channels of G consecutive token rows.
++//
++// The v79 issues one packet of at most 4 instructions every 2 cycles, and a result is ready 2
++// packets after its producer. One chain of dependent operations thus leaves three quarters of
++// each packet empty. The G rows of a band are independent chains: the code does each step for
++// all rows before the next step, thus the scheduler always has G ready instructions.
++//
++// The resource units of one packet decide the minimum: 2 VX (a widening or qfloat multiply takes
++// both, an int16 multiply one), 2 VS (qfloat add, every convert, every shift), 4 VA (the integer
++// ALU), 1 permute (vlut16), 1 load and 1 store. Counting the operations of one unit by class and
++// dividing by the units gives 47.8 packets, bound by the 4 instructions of a packet.
++//
++// S holds the 3 + G f16 rows that the G outputs read: the 3 rows of the history, then the G new
++// rows. The row r reads S[r] to S[r + 3]. The history planes keep the last 3 rows of S for the
++// next band, thus each input element has one f32 to f16 conversion and one read from the DDR.
++// All f16 vectors have the interleaved lane order of the conversion from a pair: the lane 2 * i
++// is the lane i of the first 32 channels. The widening multiply gives that order back as a pair,
++// thus the path has no shuffle.
++//
++// The taps accumulate in 16-bit qfloat and the epilogue is f16. The whole unit thus holds one
++// register for each row where a 32-bit accumulator holds two, and the working set stays inside
++// the 32 vector registers. The measured error of the op is 3e-07, the same order as the chunked
++// gated delta net that reads its output, and far inside the 2e-06 bound of the backend test.
++//
++// x and y are the rows of the first channel of the unit. hist is [3][nh] and wh is [4][nh], the
++// f16 planes of this thread. units is the number of 64-channel units. G is the band height, 1 or
++// 3, and a constant at each call.
++//
++// The band height 3 is measured, not assumed. At 512 channels and 32 tokens the simulator gives
++// 28.99 cycles for each 32-lane block at G = 3, 31.04 at G = 4 and 32.22 at G = 2. A taller band
++// hides more latency but needs more live vectors, and above 3 the working set passes the 32
++// vector registers and the spill traffic costs more than the latency it hides. A shorter band
++// packs each packet better (2.38 cycles per packet at G = 2 against 2.65 at G = 3) and needs
++// 24 % more packets, thus it loses.
++static inline __attribute__((always_inline)) void gdn_conv_band_packed(const float * x, size_t x_stride, float * y, size_t y_stride,
++                                        __fp16 * hist, const __fp16 * wh, size_t nh,
++                                        uint32_t units, const int G) {
++    const HVX_Vector zero  = Q6_V_vzero();
++    const HVX_Vector one   = hvx_vec_splat_f16(1.0f);
++    // h arrives as an integer of the scale 2^16. The f16 of that integer minus 16 exponent steps
++    // is h itself, and the unsigned saturating subtract gives 0 for the values that underflow.
++    const HVX_Vector e16   = Q6_Vh_vsplat_R(0x4000);
++
++    // The addresses advance by one 64-channel unit, thus the loop holds no index arithmetic.
++    const float * xp[4];
++    float *       yp[4];
++    for (int r = 0; r < G; r++) {
++        xp[r] = x + (size_t) r * x_stride;
++        yp[r] = y + (size_t) r * y_stride;
++    }
++    const __fp16 * wp = wh;
++    __fp16 *       hp = hist;
++
++    for (uint32_t i = 0; i < units; i++) {
++        HVX_Vector S[3 + 4];
++        HVX_Vector w[GDN_CONV_D_CONV];
++        HVX_Vector a[4], h16[4];
++
++        for (int k = 0; k < 3; k++) {
++            S[k] = hvx_vmem(hp + k * nh);
++        }
++        for (int r = 0; r < G; r++) {
++            S[3 + r] = hvx_vec_f32_to_f16_shuff(hvx_vmemu(xp[r]), hvx_vmemu(xp[r] + VLEN_FP32));
++        }
++        for (int k = 0; k < 3; k++) {
++            hvx_vmem(hp + k * nh) = S[G + k];
++        }
++        for (int j = 0; j < GDN_CONV_D_CONV; j++) {
++            w[j] = hvx_vmem(wp + j * nh);
++        }
++
++        // The taps of every row, one weight at a time. The 16-bit qfloat multiply gives one vector
++        // where the widening multiply gives a pair, thus the accumulator of a row is one register
++        // and one add, not two of each. That halves both the register pressure of this block and
++        // the add count, and the 4 taps of a conv are too few for the wider accumulator to matter
++        // (the chunked gated delta net after this op rounds to f16 anyway).
++        {
++            HVX_Vector acc[4];
++            for (int r = 0; r < G; r++) {
++                acc[r] = Q6_Vqf16_vmpy_VhfVhf(S[r], w[0]);
++            }
++            for (int j = 1; j < GDN_CONV_D_CONV; j++) {
++                HVX_Vector p[4];
++                for (int r = 0; r < G; r++) {
++                    p[r] = Q6_Vqf16_vmpy_VhfVhf(S[r + j], w[j]);
++                }
++                for (int r = 0; r < G; r++) {
++                    acc[r] = Q6_Vqf16_vadd_Vqf16Vqf16(acc[r], p[r]);
++                }
++            }
++            for (int r = 0; r < G; r++) {
++                a[r] = Q6_Vhf_equals_Vqf16(acc[r]);
++            }
++        }
++
++        hvx_silu_h_i16(a, h16, G);
++
++        // y = relu(x) - h(|x|), in f16, then one widening multiply by 1.0 gives the two f32 halves
++        for (int r = 0; r < G; r++) {
++            const HVX_Vector rel = Q6_Vhf_vmax_VhfVhf(a[r], zero);
++            const HVX_Vector hf  = Q6_Vuh_vsub_VuhVuh_sat(Q6_Vhf_equals_Vh(h16[r]), e16);
++            const HVX_Vector yh  = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vsub_VhfVhf(rel, hf));
++            const HVX_VectorPair y32 = Q6_Wsf_vmpy_VhfVhf(yh, one);
++            hvx_vmemu(yp[r])             = Q6_V_lo_W(y32);
++            hvx_vmemu(yp[r] + VLEN_FP32) = Q6_V_hi_W(y32);
++        }
++
++        for (int r = 0; r < G; r++) {
++            xp[r] += 2 * VLEN_FP32;
++            yp[r] += 2 * VLEN_FP32;
++        }
++        wp += 2 * VLEN_FP32;
++        hp += 2 * VLEN_FP32;
++    }
++}
++
++// The two band heights of the chunk op. They are functions of their own, thus a profile shows them.
++static __attribute__((noinline)) void gdn_conv_band_packed_4(const float * x, size_t x_stride, float * y, size_t y_stride,
++                                                             __fp16 * hist, const __fp16 * wh, size_t nh, uint32_t units) {
++    gdn_conv_band_packed(x, x_stride, y, y_stride, hist, wh, nh, units, 3);
++}
++
++static __attribute__((noinline)) void gdn_conv_band_packed_1(const float * x, size_t x_stride, float * y, size_t y_stride,
++                                                             __fp16 * hist, const __fp16 * wh, size_t nh, uint32_t units) {
++    gdn_conv_band_packed(x, x_stride, y, y_stride, hist, wh, nh, units, 1);
++}
++
+ struct htp_gdn_conv_chunk_context {
+     struct htp_ops_context * octx;
+     const float * src_slot;   // source slot, DDR, three floats per channel
+@@ -473,6 +682,11 @@
+     float * planes = (float *) (cctx->vtcm + cctx->vtcm_per_thread * ith);
+     float * wt     = planes;             // [4][n] the weight planes
+     float * st     = planes + 4 * n;     // [3][n] the state planes
++    // [4][n] f16 weight planes in the interleaved order of a block pair. One f16 vector holds two
++    // blocks, thus plane j starts at wh + j * n and the pair of block i sits at the offset of block i.
++    __fp16 * wh    = (__fp16 *) (planes + 7 * n);
++    // the stride of an f16 plane: a multiple of one f16 vector, thus every pair is aligned
++    const size_t nh = hex_round_up(n, 2 * VLEN_FP32);
+ 
+     const float * w_ptr = cctx->w + (size_t) c0 * GDN_CONV_D_CONV;
+     const float * s_ptr = cctx->src_slot + (size_t) c0 * (GDN_CONV_D_CONV - 1);
+@@ -501,6 +715,49 @@
+         hvx_vmem(st + 2 * n + i * VLEN_FP32) = p2;
+     }
+ 
++    // The packed path does the 64-channel units of all tokens here. An odd last block of 32 channels
++    // stays for the f32 path of the token loop.
++    uint32_t i_first = 0;
++    if (gdn_conv_f16_mode == 4 && nb >= 2) {
++        __fp16 *       hist  = wh + 4 * nh;          // [3][nh] the last 3 rows as f16
++        const uint32_t units = nb / 2;
++
++        for (uint32_t i = 0; i < units; i++) {
++            const uint32_t o = i * 2 * VLEN_FP32;
++            for (uint32_t j = 0; j < 4; j++) {
++                hvx_vmem(wh + (size_t) j * nh + o) =
++                    hvx_vec_f32_to_f16_shuff(hvx_vmem(wt + j * n + o), hvx_vmem(wt + j * n + o + VLEN_FP32));
++            }
++            for (uint32_t k = 0; k < 3; k++) {
++                hvx_vmem(hist + (size_t) k * nh + o) =
++                    hvx_vec_f32_to_f16_shuff(hvx_vmem(st + k * n + o), hvx_vmem(st + k * n + o + VLEN_FP32));
++            }
++        }
++
++        uint32_t t = 0;
++        for (; t + 3 <= T; t += 3) {
++            gdn_conv_band_packed_4(cctx->x + (size_t) t * cctx->x_stride + c0, cctx->x_stride,
++                                   cctx->y + (size_t) t * cctx->y_stride + c0, cctx->y_stride,
++                                   hist, wh, nh, units);
++        }
++        for (; t < T; t++) {
++            gdn_conv_band_packed_1(cctx->x + (size_t) t * cctx->x_stride + c0, cctx->x_stride,
++                                   cctx->y + (size_t) t * cctx->y_stride + c0, cctx->y_stride,
++                                   hist, wh, nh, units);
++        }
++        i_first = units * 2;
++    }
++
++    if (gdn_conv_f16_mode == 2 || gdn_conv_f16_mode == 3) {
++        for (uint32_t i = 0; i + 1 < nb; i += 2) {
++            const uint32_t o = i * VLEN_FP32;
++            for (uint32_t j = 0; j < 4; j++) {
++                hvx_vmem(wh + (size_t) j * nh + o) =
++                    hvx_vec_f32_to_f16_shuff(hvx_vmem(wt + j * n + o), hvx_vmem(wt + j * n + o + VLEN_FP32));
++            }
++        }
++    }
++
+     // the tokens. Tap j of token t reads the row t - 3 + j, or the state plane of that index when the
+     // row is before the batch.
+     for (uint32_t t = 0; t < T; t++) {
+@@ -513,7 +770,46 @@
+ 
+         float * out = cctx->y + (size_t) t * cctx->y_stride + c0;
+ 
+-        for (uint32_t i = 0; i < nb; i++) {
++        uint32_t i = i_first;
++        if (gdn_conv_f16_mode >= 1 && gdn_conv_f16_mode <= 3) {
++            for (; i + 1 < nb; i += 2) {
++                const uint32_t o  = i * VLEN_FP32;
++                const uint32_t o1 = o + VLEN_FP32;
++                HVX_Vector ya, yb;
++
++                if (gdn_conv_f16_mode == 1) {
++                    const HVX_Vector a = gdn_conv_tap_acc(hvx_vmemu(tap[0] + o), hvx_vmemu(tap[1] + o),
++                                                          hvx_vmemu(tap[2] + o), hvx_vmemu(tap[3] + o),
++                                                          hvx_vmem(wt + 0 * n + o), hvx_vmem(wt + 1 * n + o),
++                                                          hvx_vmem(wt + 2 * n + o), hvx_vmem(wt + 3 * n + o));
++                    const HVX_Vector b = gdn_conv_tap_acc(hvx_vmemu(tap[0] + o1), hvx_vmemu(tap[1] + o1),
++                                                          hvx_vmemu(tap[2] + o1), hvx_vmemu(tap[3] + o1),
++                                                          hvx_vmem(wt + 0 * n + o1), hvx_vmem(wt + 1 * n + o1),
++                                                          hvx_vmem(wt + 2 * n + o1), hvx_vmem(wt + 3 * n + o1));
++                    gdn_conv_silu2_f16(a, b, &ya, &yb);
++                } else {
++                    HVX_Vector th[4];
++                    HVX_Vector wv[4];
++                    for (int j = 0; j < 4; j++) {
++                        th[j] = hvx_vec_f32_to_f16_shuff(hvx_vmemu(tap[j] + o), hvx_vmemu(tap[j] + o1));
++                        wv[j] = hvx_vmem(wh + (size_t) j * nh + o);
++                    }
++                    if (gdn_conv_f16_mode == 2) {
++                        HVX_Vector a, b;
++                        gdn_conv_tap_acc2_f16_wide(th, wv, &a, &b);
++                        gdn_conv_silu2_f16(a, b, &ya, &yb);
++                    } else {
++                        // the interleaved order goes through the widening multiply of the conversion
++                        const HVX_VectorPair y32 = hvx_vec_f16_to_f32_shuff(gdn_conv_tap_silu2_f16_narrow(th, wv));
++                        ya = Q6_V_lo_W(y32);
++                        yb = Q6_V_hi_W(y32);
++                    }
++                }
++                hvx_vmemu(out + o)  = ya;
++                hvx_vmemu(out + o1) = yb;
++            }
++        }
++        for (; i < nb; i++) {
+             const uint32_t o = i * VLEN_FP32;
+             HVX_Vector r = gdn_conv_tap_silu(hvx_vmemu(tap[0] + o), hvx_vmemu(tap[1] + o),
+                                              hvx_vmemu(tap[2] + o), hvx_vmemu(tap[3] + o),
+@@ -629,7 +925,7 @@
+     const uint32_t chunk     = hex_round_up(fastdiv(n_ch + n_threads - 1, &octx->n_threads_div), VLEN_FP32);
+ 
+     // the weight planes and the state planes of one thread
+-    const size_t vtcm_per_thread = hex_round_up((size_t) 7 * chunk * sizeof(float), 128);
++    const size_t vtcm_per_thread = hex_round_up((size_t) 11 * chunk * sizeof(float) + 512, 128);
+     if (octx->ctx->vtcm_size < vtcm_per_thread * n_threads) {
+         FARF(ERROR, "gdn-conv-chunk: VTCM %zu is too small, needed %zu\n",
+              octx->ctx->vtcm_size, vtcm_per_thread * n_threads);
+diff -urN a/ggml/src/ggml-hexagon/htp/hvx-silu-i16.h b/ggml/src/ggml-hexagon/htp/hvx-silu-i16.h
+--- a/ggml/src/ggml-hexagon/htp/hvx-silu-i16.h	1970-01-01 03:00:00.000000000 +0300
++++ b/ggml/src/ggml-hexagon/htp/hvx-silu-i16.h	2026-09-20 03:04:07.863095252 +0300
+@@ -0,0 +1,132 @@
++// The SiLU in int16 for the HVX. tools/htp-lab/gen/silu_i16.py of the qwen-mobile repository
++// generates this file, do not edit it.
++//
++// SiLU(x) = relu(x) - h(|x|) with h(u) = u / (1 + e^u). h is a smooth bump in [0, 0.2785], thus it
++// fits an int16 with the scale 2^16, and relu(x) stays exact in the float domain.
++//
++// One polynomial piece of degree 4 covers one octave [2^e, 2^(e+1)) of u, for e = -12 to 3.
++// The piece index is the exponent field of the f16 value of u, and the local coordinate is its
++// 10-bit mantissa, thus the routine has no float to integer conversion. All coefficients have the
++// scale 2^16, thus Horner has no shift between its steps. vlut16 reads the coefficients: an index
++// byte out of the page 0 gives 0, thus h is 0 below 2^-12 (the error is below 1.3e-4). The
++// input is limited to values below 16, where h is 1.8e-6.
++//
++// The measured error of relu(x) - h(|x|) against the exact SiLU: max 1.6e-4, NMSE 4e-11. Most
++// of that is the f16 rounding of |x|, not the polynomial.
++//
++// Why int16: a v79 packet holds 2 int16 multiplies or 1 qfloat multiply, 4 selects or integer adds,
++// and each packet costs 2 cycles. A multiply result is ready 2 packets after its packet. Thus
++// the caller must give the routine 2 or 4 independent vectors, and the routine does each step
++// for all vectors before the next step.
++
++#ifndef HVX_SILU_I16_H
++#define HVX_SILU_I16_H
++
++#include <stdint.h>
++
++#include "hvx-base.h"
++
++#define HVX_SILU_I16_DEGREE 4
++#define HVX_SILU_I16_SCALE  16
++
++// vlut16 in the 128-byte mode, from the full map that tools/htp-lab measures (target f16math, all
++// 32 values of Rt and all 256 byte values, equal to the documented form at each point):
++//   - An index byte matches when its high nibble is equal to Rt & 15. The entry is the table word
++//     (byte % 32), and the bit 1 of Rt selects the odd halfword of that word. A byte that does not
++//     match gives 0.
++//   - The output pair is divided by the byte position: lo holds the results of the even bytes and
++//     hi the results of the odd bytes.
++// Thus with Rt = 0 the coefficient of the octave k (0 to 15) is the halfword 2 * k. One 16-bit lane
++// holds the index of one vector in its low byte and the index of a second vector in its high
++// byte, and one lookup gives the coefficients of the two vectors. The row d holds the coefficient
++// of v^d.
++static const int16_t hvx_silu_i16_table[HVX_SILU_I16_DEGREE + 1][64] __attribute__((aligned(128))) = {
++    // the coefficient of v^0
++    { 8, 0, 16, 0, 32, 0, 64, 0, 128, 0, 255, 0, 508, 0, 1008, 0, 1984, 0, 3840, 0, 7173, 0, 12371, 0, 17625, 0, 15628, 0, 4715, 0, 173, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++    // the coefficient of v^1
++    { 8, 0, 16, 0, 32, 0, 64, 0, 128, 0, 254, 0, 504, 0, 992, 0, 1920, 0, 3585, 0, 6165, 0, 8522, 0, 4753, 0, -12093, 0, -13805, 0, -1052, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++    // the coefficient of v^2
++    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0, -4, 0, -16, 0, -64, 0, -254, 0, -993, 0, -3623, 0, -10021, 0, -4974, 0, 17479, 0, 2468, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++    // the coefficient of v^3
++    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 21, 0, 326, 0, 3720, 0, 9630, 0, -11149, 0, -2546, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++    // the coefficient of v^4
++    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 30, 0, -453, 0, -3479, 0, 2938, 0, 959, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++};
++
++// h(|a|) * 2^16 as int16 for n vectors of 64 f16 lanes. n is 1, 2 or 4 and a constant at the call.
++// The lane order of h is the lane order of a.
++// The routine must be inline: n is then a constant, the loops unroll, and the vectors stay in registers.
++static inline __attribute__((always_inline)) void hvx_silu_h_i16(const HVX_Vector * a, HVX_Vector * h, const int n) {
++    const HVX_Vector u_max  = Q6_Vh_vsplat_R(0x4bff);              // the largest f16 below 16
++    const HVX_Vector e_base = Q6_Vh_vsplat_R(3);                  // the exponent field of 2^-12
++    const HVX_Vector m_byte = Q6_Vh_vsplat_R(0x00ff);
++
++    // The table address is opaque to the compiler, thus it reloads a coefficient vector where it
++    // needs one instead of holding all 5 in registers across the loop of the caller. Loads are the
++    // cheap resource here and registers are the scarce one.
++    const int16_t (* tbl)[64] = hvx_silu_i16_table;
++    __asm__("" : "+r"(tbl));
++
++    HVX_Vector u[4], idx[4], v[4], acc[4];
++    HVX_Vector ib[2];
++    const int np = (n + 1) / 2;
++
++    for (int r = 0; r < n; r++) {
++        u[r] = Q6_Vh_vmin_VhVh(Q6_Vhf_vabs_Vhf(a[r]), u_max);
++    }
++    // k = the octave number, 0 to 15. Below the table k is -1 to -3, its byte is 0xfd to 0xff, and
++    // that byte does not match the page 0, thus each coefficient and h are 0.
++    for (int r = 0; r < n; r++) {
++        idx[r] = Q6_Vh_vsub_VhVh(Q6_Vuh_vlsr_VuhR(u[r], 10), e_base);
++    }
++    // The mantissa as Q15. A left shift of 6 drops the sign and the exponent, and the logical
++    // right shift of 1 puts the 10 mantissa bits at the bits 14 to 5. No mask register is needed.
++    for (int r = 0; r < n; r++) {
++        v[r] = Q6_Vuh_vlsr_VuhR(Q6_Vh_vasl_VhR(u[r], 6), 1);
++    }
++    // The low byte of a lane is an even byte and the high byte is an odd byte, thus the first vector
++    // of a pair comes out in lo and the second in hi.
++    for (int p = 0; p < np; p++) {
++        const HVX_Vector second = idx[(2 * p + 1 < n) ? 2 * p + 1 : 2 * p];
++        ib[p] = Q6_V_vor_VV(Q6_V_vand_VV(idx[2 * p], m_byte), Q6_Vh_vasl_VhR(second, 8));
++    }
++    for (int p = 0; p < np; p++) {
++        const HVX_VectorPair c = Q6_Wh_vlut16_VbVhR(ib[p], hvx_vmem(tbl[HVX_SILU_I16_DEGREE]), 0);
++        acc[2 * p] = Q6_V_lo_W(c);
++        if (2 * p + 1 < n) {
++            acc[2 * p + 1] = Q6_V_hi_W(c);
++        }
++    }
++    _Pragma("clang loop unroll(full)")
++    for (int d = HVX_SILU_I16_DEGREE - 1; d >= 0; d--) {
++        HVX_Vector c[4];
++        for (int p = 0; p < np; p++) {
++            const HVX_VectorPair cp = Q6_Wh_vlut16_VbVhR(ib[p], hvx_vmem(tbl[d]), 0);
++            c[2 * p] = Q6_V_lo_W(cp);
++            if (2 * p + 1 < n) {
++                c[2 * p + 1] = Q6_V_hi_W(cp);
++            }
++        }
++        for (int r = 0; r < n; r++) {
++            acc[r] = Q6_Vh_vmpy_VhVh_s1_rnd_sat(acc[r], v[r]);
++        }
++        for (int r = 0; r < n; r++) {
++            acc[r] = Q6_Vh_vadd_VhVh_sat(acc[r], c[r]);
++        }
++    }
++    for (int r = 0; r < n; r++) {
++        h[r] = acc[r];
++    }
++}
++
++// -h as a qf32 pair, from h * 2^16 as int16. The int16 becomes an f16 number, an unsigned
++// saturating subtract of 2 from its exponent field divides it by 4 and keeps a zero a zero,
++// and the widening multiply by -2^-14 gives the scale and the 32-bit form in one step.
++static inline __attribute__((always_inline)) HVX_VectorPair hvx_silu_neg_h_qf32(HVX_Vector h16) {
++    const HVX_Vector quarter = Q6_Vh_vsplat_R(0x0800);
++    const HVX_Vector k       = Q6_Vh_vsplat_R(0x8400);             // -2^-14 as f16
++    const HVX_Vector hf      = Q6_Vuh_vsub_VuhVuh_sat(Q6_Vhf_equals_Vh(h16), quarter);
++    return Q6_Wqf32_vmpy_VhfVhf(hf, k);
++}
++
++#endif /* HVX_SILU_I16_H */

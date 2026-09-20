@@ -1,0 +1,215 @@
+Fuse the binary elementwise chains, and make hvx-arith.h self-contained
+
+THE MEASUREMENT (tools/htp-lab, target binary, 1 MB buffers so that DDR and not the L2 answers,
+cycles for each 32-lane f32 vector of output):
+
+  case                    vectors moved   VTCM    DDR    DDR GB/s
+  copy        1 read            2         2.00    6.83    79.1
+  mul_f32     2 reads           3         6.00   13.78    58.9
+  mul_mul     3 reads, fused    4         6.00   20.39    53.0
+  mul4        4 reads, fused    5         8.00   22.15    61.0
+  mul + mul   two passes        6        12.00   27.35    59.3
+  mul + add   two passes        6        12.00   27.44    59.1
+
+In DDR the cost is linear in the vectors moved, about 4.55 cycles for each 128-byte vector,
+which is 28 bytes for each cycle or 59 GB/s at 2112 MHz. That agrees with the 51 to 55 GB/s
+that the phone gives, thus the simulator models this part of the memory system correctly and
+the numbers above transfer.
+
+A chain of two ops through a temporary moves 6 vectors for each output vector. The same chain
+in one pass moves 4, thus it moves two thirds of the bytes. Measured: 27.35 cycles against
+20.39, which is 1.34 times faster in DDR, and 12.00 against 6.00, which is 2.0 times faster
+when the rows are already in the VTCM. The op loop of binary-ops.c stages its rows through the
+VTCM with a DMA double buffer, thus it sees the second regime for the arithmetic and the first
+for the DMA traffic. Both favour one pass.
+
+Two effects keep the DDR gain below the byte ratio of 1.5. The bandwidth falls as the number of
+concurrent streams grows (79 GB/s for one input, 58.9 for two, 53.0 for three), and a pass has
+a fixed cost. Neither reverses the conclusion: work added inside a pass is nearly free, because
+a third input costs 0.00 extra cycles in the VTCM, while a second pass costs a full 6.00.
+
+This patch adds hvx_mul_add_f32, hvx_add_mul_f32 and hvx_scale_add_f32 for the chains that the
+graph runs as separate ops today, and hvx_mul4_f32_aa and hvx_copy_f32_aa, which the lab uses
+to measure the scaling above. Every routine agrees with a float64 reference to the rounding of
+f32 (NMSE 1.1e-15 to 2.4e-15).
+
+It also corrects a defect: hvx_mul_mul_f32_aa calls HVX_OP_MUL, which hvx-sqrt.h defines and
+hvx-arith.h does not include. The file builds today only because another header pulls hvx-sqrt.h
+in first, and a new translation unit that includes hvx-arith.h on its own fails to compile with
+"call to undeclared function 'HVX_OP_MUL'". This was hit while writing the lab target. The call
+becomes HVX_OP_MUL_F32, which this file defines and which expands to the same instructions.
+
+diff -urN a/ggml/src/ggml-hexagon/htp/hvx-arith.h b/ggml/src/ggml-hexagon/htp/hvx-arith.h
+--- a/ggml/src/ggml-hexagon/htp/hvx-arith.h	2026-09-20 02:59:34.579371015 +0300
++++ b/ggml/src/ggml-hexagon/htp/hvx-arith.h	2026-09-20 03:05:29.355710868 +0300
+@@ -154,7 +154,7 @@
+     _Pragma("unroll(4)")
+     for (; i < nvec; i++) {
+         HVX_Vector v1 = HVX_OP_MUL_F32(vsrc0[i], vsrc1[i]);
+-        vdst[i] = HVX_OP_MUL(v1, vsrc2[i]);
++        vdst[i] = HVX_OP_MUL_F32(v1, vsrc2[i]);
+     }
+ 
+     if (nloe) {
+@@ -164,6 +164,161 @@
+     }
+ }
+ 
++// Fused chains
++//
++// A two-input elementwise op moves 384 bytes for each f32 vector (two reads and one write) and
++// needs 2 packets of work, because one packet holds one load. At the 24 bytes per cycle that the
++// DDR of this part gives, the bytes cost about 16 cycles and the packets about 4, thus the op is
++// about four times memory bound and the only lever is the number of passes.
++//
++// A chain of two ops through a temporary costs 4 reads and 2 writes for each output vector. The
++// same chain in one pass costs 3 reads and 1 write, thus it moves two thirds of the bytes. The
++// arithmetic is unchanged and free. Each routine below is one such pass.
++//
++// The loops carry 4 independent chains (the unroll), thus no packet waits for the 2-packet
++// latency of a multiply.
++
++// dst = src0 * src1 + src2, one pass. Every pointer is 128-byte aligned.
++static inline void hvx_mul_add_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src0,
++                                      const uint8_t * restrict src1, const uint8_t * restrict src2,
++                                      const uint32_t num_elems) {
++    assert((unsigned long) dst % 128 == 0);
++    assert((unsigned long) src0 % 128 == 0);
++    assert((unsigned long) src1 % 128 == 0);
++    assert((unsigned long) src2 % 128 == 0);
++
++    HVX_Vector * restrict vdst  = (HVX_Vector *) dst;
++    const HVX_Vector * restrict vsrc0 = (const HVX_Vector *) src0;
++    const HVX_Vector * restrict vsrc1 = (const HVX_Vector *) src1;
++    const HVX_Vector * restrict vsrc2 = (const HVX_Vector *) src2;
++
++    const uint32_t epv  = 128 / sizeof(float);
++    const uint32_t nvec = num_elems / epv;
++    const uint32_t nloe = num_elems % epv;
++
++    uint32_t i = 0;
++
++    _Pragma("unroll(4)")
++    for (; i < nvec; i++) {
++        vdst[i] = HVX_OP_ADD_F32(HVX_OP_MUL_F32(vsrc0[i], vsrc1[i]), vsrc2[i]);
++    }
++    if (nloe) {
++        HVX_Vector v = HVX_OP_ADD_F32(HVX_OP_MUL_F32(vsrc0[i], vsrc1[i]), vsrc2[i]);
++        hvx_vec_store_a((void *) &vdst[i], nloe * sizeof(float), v);
++    }
++}
++
++// dst = (src0 + src1) * src2, one pass. Every pointer is 128-byte aligned.
++static inline void hvx_add_mul_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src0,
++                                      const uint8_t * restrict src1, const uint8_t * restrict src2,
++                                      const uint32_t num_elems) {
++    assert((unsigned long) dst % 128 == 0);
++    assert((unsigned long) src0 % 128 == 0);
++    assert((unsigned long) src1 % 128 == 0);
++    assert((unsigned long) src2 % 128 == 0);
++
++    HVX_Vector * restrict vdst  = (HVX_Vector *) dst;
++    const HVX_Vector * restrict vsrc0 = (const HVX_Vector *) src0;
++    const HVX_Vector * restrict vsrc1 = (const HVX_Vector *) src1;
++    const HVX_Vector * restrict vsrc2 = (const HVX_Vector *) src2;
++
++    const uint32_t epv  = 128 / sizeof(float);
++    const uint32_t nvec = num_elems / epv;
++    const uint32_t nloe = num_elems % epv;
++
++    uint32_t i = 0;
++
++    _Pragma("unroll(4)")
++    for (; i < nvec; i++) {
++        vdst[i] = HVX_OP_MUL_F32(HVX_OP_ADD_F32(vsrc0[i], vsrc1[i]), vsrc2[i]);
++    }
++    if (nloe) {
++        HVX_Vector v = HVX_OP_MUL_F32(HVX_OP_ADD_F32(vsrc0[i], vsrc1[i]), vsrc2[i]);
++        hvx_vec_store_a((void *) &vdst[i], nloe * sizeof(float), v);
++    }
++}
++
++// dst = src0 * scale + src1, one pass, with the scale a broadcast value. Two reads and one write.
++static inline void hvx_scale_add_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src0,
++                                        const float scale, const uint8_t * restrict src1,
++                                        const uint32_t num_elems) {
++    assert((unsigned long) dst % 128 == 0);
++    assert((unsigned long) src0 % 128 == 0);
++    assert((unsigned long) src1 % 128 == 0);
++
++    HVX_Vector * restrict vdst  = (HVX_Vector *) dst;
++    const HVX_Vector * restrict vsrc0 = (const HVX_Vector *) src0;
++    const HVX_Vector * restrict vsrc1 = (const HVX_Vector *) src1;
++
++    // the splat is a slot 2 or 3 instruction, thus it stays out of the loop
++    const HVX_Vector vscale = hvx_vec_splat_f32(scale);
++
++    const uint32_t epv  = 128 / sizeof(float);
++    const uint32_t nvec = num_elems / epv;
++    const uint32_t nloe = num_elems % epv;
++
++    uint32_t i = 0;
++
++    _Pragma("unroll(4)")
++    for (; i < nvec; i++) {
++        vdst[i] = HVX_OP_ADD_F32(HVX_OP_MUL_F32(vsrc0[i], vscale), vsrc1[i]);
++    }
++    if (nloe) {
++        HVX_Vector v = HVX_OP_ADD_F32(HVX_OP_MUL_F32(vsrc0[i], vscale), vsrc1[i]);
++        hvx_vec_store_a((void *) &vdst[i], nloe * sizeof(float), v);
++    }
++}
++
++// dst = src0 * src1 * src2 * src3, one pass. Four reads and one write. The routine exists to
++// measure how the cost of a pass grows with the number of inputs: the answer is that it barely
++// does, thus a chain is always cheaper fused than split.
++static inline void hvx_mul4_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src0,
++                                   const uint8_t * restrict src1, const uint8_t * restrict src2,
++                                   const uint8_t * restrict src3, const uint32_t num_elems) {
++    HVX_Vector * restrict vdst  = (HVX_Vector *) dst;
++    const HVX_Vector * restrict v0 = (const HVX_Vector *) src0;
++    const HVX_Vector * restrict v1 = (const HVX_Vector *) src1;
++    const HVX_Vector * restrict v2 = (const HVX_Vector *) src2;
++    const HVX_Vector * restrict v3 = (const HVX_Vector *) src3;
++
++    const uint32_t nvec = num_elems / (128 / sizeof(float));
++
++    _Pragma("unroll(4)")
++    for (uint32_t i = 0; i < nvec; i++) {
++        const HVX_Vector p01 = HVX_OP_MUL_F32(v0[i], v1[i]);
++        const HVX_Vector p23 = HVX_OP_MUL_F32(v2[i], v3[i]);
++        vdst[i] = HVX_OP_MUL_F32(p01, p23);
++    }
++}
++
++// dst = src0, one pass. One read and one write: the cheapest pass there is.
++static inline void hvx_copy_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src,
++                                   const uint32_t num_elems) {
++    HVX_Vector * restrict vdst = (HVX_Vector *) dst;
++    const HVX_Vector * restrict vsrc = (const HVX_Vector *) src;
++
++    const uint32_t nvec = num_elems / (128 / sizeof(float));
++
++    _Pragma("unroll(4)")
++    for (uint32_t i = 0; i < nvec; i++) {
++        vdst[i] = vsrc[i];
++    }
++}
++
++// The unaligned-tolerant entry points. The aligned form is the one the op loop of binary-ops.c
++// reaches, because its scratchpad rows are 128-byte aligned by construction.
++static inline void hvx_mul_add_f32(uint8_t * restrict dst, const uint8_t * restrict src0,
++                                   const uint8_t * restrict src1, const uint8_t * restrict src2,
++                                   const uint32_t num_elems) {
++    hvx_mul_add_f32_aa(dst, src0, src1, src2, num_elems);
++}
++
++static inline void hvx_add_mul_f32(uint8_t * restrict dst, const uint8_t * restrict src0,
++                                   const uint8_t * restrict src1, const uint8_t * restrict src2,
++                                   const uint32_t num_elems) {
++    hvx_add_mul_f32_aa(dst, src0, src1, src2, num_elems);
++}
++
+ // Scalar Operations
+ 
+ #define hvx_scalar_loop_body(dst_type, src_type, elem_size, vec_store, scalar_op_macro) \

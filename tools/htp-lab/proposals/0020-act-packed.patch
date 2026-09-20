@@ -1,0 +1,372 @@
+The activation family in one pass and in int16: SIGMOID, SILU and SWIGLU (lab proposal)
+
+The elementwise family is 114 ms of the 536 ms of DSP op time of a 512-token prefill of the 4B
+(measured 2026-09-20), and SWIGLU, SIGMOID and SILU are most of it. Two costs make it that
+large, and this proposal removes both.
+
+The first is the evaluation. hvx_vec_fast_sigmoid_f32 is a chain of about 25 qfloat operations,
+of which 14 are multiplies, and hvx_vec_inverse_f32 holds 6 of those on its own. A v79 packet
+holds one qfloat multiply and a result is ready two packets after its producer, thus the chain
+cannot fill the machine whatever the compiler does. hvx-act-i16.h evaluates the same functions
+as a piecewise polynomial in int16 read by vlut16: a packet holds two int16 multiplies or four
+integer adds, and the routine works on two vectors at once so no packet waits for its producer.
+
+The second is the number of passes. silu_f32 and swiglu_f32 call the sigmoid over the whole row
+and then walk the row again to multiply, thus each element is loaded two or four times where
+once is enough. A v79 packet holds one load and one store, thus the pass count is the memory
+cost. The kernels here read each input once and write the output once.
+
+The forms keep the sign and the linear part in the float domain, where they are exact, and
+never compute a small result as the difference of two near-equal numbers:
+
+  sigmoid(x) = x < 0 ? g(|x|) : 1 - g(|x|)   g(u) = 1 / (1 + e^u)
+  silu(x)    = relu(x) - h(|x|)              h(u) = u / (1 + e^u)
+  swiglu     = silu(x0) * x1
+
+tools/htp-lab/gen/act_i16.py generates the header and its --check mode reports the error. A new
+activation needs one entry of its FUNCS table and no new code.
+
+diff -urN a/ggml/src/ggml-hexagon/htp/hvx-act-i16.h b/ggml/src/ggml-hexagon/htp/hvx-act-i16.h
+--- a/ggml/src/ggml-hexagon/htp/hvx-act-i16.h	1970-01-01 03:00:00.000000000 +0300
++++ b/ggml/src/ggml-hexagon/htp/hvx-act-i16.h	2026-09-20 03:32:49.580382715 +0300
+@@ -0,0 +1,340 @@
++// The activation family in int16 for the HVX. tools/htp-lab/gen/act_i16.py of the qwen-mobile
++// repository generates this file, do not edit it.
++//
++// A chain of qfloat operations costs about 4 cycles for each operation, because a v79 packet
++// holds one qfloat multiply and a result is ready two packets after its producer. A piecewise
++// polynomial in int16 costs about 1 cycle for each operation: a packet holds two int16
++// multiplies or four integer adds, and one vlut16 reads the coefficients of 128 lanes.
++//
++// Each function is written for u >= 0. The caller keeps the sign and the linear part in the
++// float domain, where they are exact:
++//   sigmoid(x) = x < 0 ? g(|x|) : 1 - g(|x|)   with g(u) = 1 / (1 + e^u)
++//   silu(x)    = relu(x) - h(|x|)              with h(u) = u / (1 + e^u)
++//   swiglu     = silu(x0) * x1
++//
++// Each form gives a small result directly and never as the difference of two near-equal
++// numbers. The measured error of all three against a double reference is 1.1e-4 at worst and
++// the f16 rounding of the input is the whole of it.
++//
++// One polynomial piece of degree 4 covers one octave [2^e, 2^(e+1)) of u, for e = -12 to 3.
++// The piece index is the exponent field of the f16 value of u and the local coordinate is its
++// 10-bit mantissa, thus the evaluator has no float to integer conversion and no permute. All
++// coefficients share the scale 2^16, thus Horner has no shift between its steps.
++//
++// vlut16 in the 128-byte mode, from the full map that tools/htp-lab measures (target f16math):
++//   - An index byte matches when its high nibble is equal to Rt & 15. The entry is the table word
++//     (byte % 32), and the bit 1 of Rt selects the odd halfword of that word. A byte that does
++//     not match gives 0, thus a u below the first octave gives 0, which is the limit of each
++//     function at 0.
++//   - The output pair is divided by the byte position: lo holds the results of the even bytes
++//     and hi the results of the odd bytes. Thus one 16-bit lane carries the index of one vector
++//     in its low byte and of a second vector in its high byte, and one lookup serves two
++//     vectors. The coefficient of the octave k is the halfword 2 * k.
++//
++// The int16 result goes to f32 through a sign extend and a word to float convert, which is
++// exact. An f16 step would be 4 times cheaper and would cost 2.4e-4 of absolute error, which is
++// more than the polynomial itself, thus this file does not take it.
++
++#ifndef HVX_ACT_I16_H
++#define HVX_ACT_I16_H
++
++#include <stdint.h>
++
++#include "hvx-base.h"
++
++#define HVX_ACT_I16_DEGREE 4
++#define HVX_ACT_I16_SCALE  16
++#define HVX_ACT_I16_EBASE  3
++
++// h(u) = u / (1 + e^u), the bump of the SiLU
++static const int16_t hvx_act_i16_tab_h[HVX_ACT_I16_DEGREE + 1][64] __attribute__((aligned(128))) = {
++    // the coefficient of v^0
++    { 8, 0, 16, 0, 32, 0, 64, 0, 128, 0, 255, 0, 508, 0, 1008, 0, 1984, 0, 3840, 0, 7173, 0, 12371, 0, 17625, 0, 15628, 0, 4715, 0, 173, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++    // the coefficient of v^1
++    { 8, 0, 16, 0, 32, 0, 64, 0, 128, 0, 254, 0, 504, 0, 992, 0, 1920, 0, 3585, 0, 6165, 0, 8522, 0, 4753, 0, -12093, 0, -13805, 0, -1052, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++    // the coefficient of v^2
++    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0, -4, 0, -16, 0, -64, 0, -254, 0, -993, 0, -3623, 0, -10021, 0, -4974, 0, 17479, 0, 2468, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++    // the coefficient of v^3
++    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 21, 0, 326, 0, 3720, 0, 9630, 0, -11149, 0, -2546, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++    // the coefficient of v^4
++    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 30, 0, -453, 0, -3479, 0, 2938, 0, 959, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++};
++
++// g(u) = 1 / (1 + e^u), the sigmoid of -u
++static const int16_t hvx_act_i16_tab_g[HVX_ACT_I16_DEGREE + 1][64] __attribute__((aligned(128))) = {
++    // the coefficient of v^0
++    { 32764, 0, 32760, 0, 32752, 0, 32736, 0, 32704, 0, 32640, 0, 32512, 0, 32256, 0, 31744, 0, 30723, 0, 28693, 0, 24743, 0, 17625, 0, 7812, 0, 1175, 0, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++    // the coefficient of v^1
++    { -4, 0, -8, 0, -16, 0, -32, 0, -64, 0, -128, 0, -256, 0, -512, 0, -1023, 0, -2040, 0, -4033, 0, -7701, 0, -12891, 0, -13786, 0, -4457, 0, -142, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++    // the coefficient of v^2
++    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 8, 0, 63, 0, 471, 0, 3025, 0, 10719, 0, 7401, 0, 353, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++    // the coefficient of v^3
++    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 20, 0, 134, 0, 257, 0, -4295, 0, -6063, 0, -378, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++    // the coefficient of v^4
++    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0, -21, 0, -204, 0, 728, 0, 1968, 0, 146, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++};
++
++
++// The evaluator. `a` holds n f16 vectors of the input, `out` takes n int16 vectors of the value
++// times 2^16, in the lane order of `a`. n is 1, 2 or 4 and a constant at the call site, thus the
++// loops unroll and every vector stays in a register. The routine does each step for all n
++// vectors before the next step, thus no packet waits for its own producer.
++//
++// It must be inline: the table pointer and n are then constants.
++static inline __attribute__((always_inline))
++void hvx_act_i16_eval(const HVX_Vector * a, HVX_Vector * out,
++                      const int16_t tab[HVX_ACT_I16_DEGREE + 1][64], const int n,
++                      const int low_clamp) {
++    const HVX_Vector m_abs  = Q6_Vh_vsplat_R(0x7fff);
++    const HVX_Vector u_max  = Q6_Vh_vsplat_R(0x4bff);   // the largest f16 below 16
++    const HVX_Vector u_min  = Q6_Vh_vsplat_R(HVX_ACT_I16_EBASE << 10);  // 2^E_LO
++    const HVX_Vector e_base = Q6_Vh_vsplat_R(HVX_ACT_I16_EBASE);
++    const HVX_Vector m_mant = Q6_Vh_vsplat_R(0x03ff);
++    const HVX_Vector m_byte = Q6_Vh_vsplat_R(0x00ff);
++
++    HVX_Vector u[4], idx[4], v[4], acc[4], ib[2];
++    const int np = (n + 1) / 2;
++
++    for (int r = 0; r < n; r++) {
++        u[r] = Q6_Vh_vmin_VhVh(Q6_V_vand_VV(a[r], m_abs), u_max);
++    }
++    // A function that is not 0 at u = 0 needs every lane inside the table, thus the clamp. A
++    // function that is 0 at u = 0 skips it and lets the miss give 0.
++    if (low_clamp) {
++        for (int r = 0; r < n; r++) {
++            u[r] = Q6_Vh_vmax_VhVh(u[r], u_min);
++        }
++    }
++    // k is the octave number, 0 to 15. Below the first octave k is negative, its index byte is
++    // 0xfd to 0xff, that byte does not match the page 0, and every coefficient comes back 0.
++    for (int r = 0; r < n; r++) {
++        idx[r] = Q6_Vh_vsub_VhVh(Q6_Vuh_vlsr_VuhR(u[r], 10), e_base);
++    }
++    for (int r = 0; r < n; r++) {
++        v[r] = Q6_Vh_vasl_VhR(Q6_V_vand_VV(u[r], m_mant), 5);   // the mantissa as Q15
++    }
++    // The low byte of a lane is an even byte and the high byte is an odd byte, thus the first
++    // vector of a pair comes back in lo and the second in hi.
++    for (int p = 0; p < np; p++) {
++        const HVX_Vector second = idx[(2 * p + 1 < n) ? 2 * p + 1 : 2 * p];
++        ib[p] = Q6_V_vor_VV(Q6_V_vand_VV(idx[2 * p], m_byte), Q6_Vh_vasl_VhR(second, 8));
++    }
++    for (int p = 0; p < np; p++) {
++        const HVX_VectorPair c = Q6_Wh_vlut16_VbVhR(ib[p], hvx_vmem(tab[HVX_ACT_I16_DEGREE]), 0);
++        acc[2 * p] = Q6_V_lo_W(c);
++        if (2 * p + 1 < n) {
++            acc[2 * p + 1] = Q6_V_hi_W(c);
++        }
++    }
++    for (int d = HVX_ACT_I16_DEGREE - 1; d >= 0; d--) {
++        HVX_Vector c[4];
++        for (int p = 0; p < np; p++) {
++            const HVX_VectorPair cp = Q6_Wh_vlut16_VbVhR(ib[p], hvx_vmem(tab[d]), 0);
++            c[2 * p] = Q6_V_lo_W(cp);
++            if (2 * p + 1 < n) {
++                c[2 * p + 1] = Q6_V_hi_W(cp);
++            }
++        }
++        for (int r = 0; r < n; r++) {
++            acc[r] = Q6_Vh_vmpy_VhVh_s1_rnd_sat(acc[r], v[r]);
++        }
++        for (int r = 0; r < n; r++) {
++            acc[r] = Q6_Vh_vadd_VhVh_sat(acc[r], c[r]);
++        }
++    }
++    for (int r = 0; r < n; r++) {
++        out[r] = acc[r];
++    }
++}
++
++// One int16 vector of a value times 2^16 becomes two qf32 vectors of the value times k * 2^16.
++// The sign extend and the word to float convert are exact, thus this step adds no error. lo
++// holds the even lanes of v16 and hi the odd lanes, which is the order that a pair of f16
++// vectors came from.
++static inline __attribute__((always_inline))
++HVX_VectorPair hvx_act_i16_to_qf32(HVX_Vector v16, HVX_Vector k_sf) {
++    const HVX_VectorPair w = Q6_Ww_vsxt_Vh(v16);
++    const HVX_Vector lo = Q6_Vsf_equals_Vw(Q6_V_lo_W(w));
++    const HVX_Vector hi = Q6_Vsf_equals_Vw(Q6_V_hi_W(w));
++    return Q6_W_vcombine_VV(Q6_Vqf32_vmpy_VsfVsf(hi, k_sf), Q6_Vqf32_vmpy_VsfVsf(lo, k_sf));
++}
++
++// Two f32 vectors become one f16 vector in the interleaved lane order of the conversion, which
++// is the order that hvx_act_i16_to_qf32 gives back.
++static inline __attribute__((always_inline))
++HVX_Vector hvx_act_f32_pair_to_f16(HVX_Vector a, HVX_Vector b) {
++    const HVX_Vector zero = Q6_V_vzero();
++    const HVX_Vector qa = Q6_Vqf32_vadd_VsfVsf(a, zero);
++    const HVX_Vector qb = Q6_Vqf32_vadd_VsfVsf(b, zero);
++    return Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(qb, qa));
++}
++
++// The three row kernels. Each reads its inputs once and writes the output once, thus a row costs
++// one pass and not the two that the sigmoid pass plus the multiply pass of the checkout cost.
++//
++// A block is `ns` f16 streams, which is 2 * ns f32 vectors. The number of streams decides the
++// speed: the chain from the input to the output is about 18 dependent steps and a result is ready
++// two packets after its producer, thus one stream leaves three of every four slots empty and the
++// loop waits on itself. Four streams fill the packets. The block must not hold the input vectors
++// across the evaluator: eight of them plus the working set do not fit the 32 vector registers,
++// the compiler spills them to the stack, and the spill costs both a store and the reload. The
++// blocks read the input again from the scratch pad instead, which costs the same load and no
++// store, thus `vsrc` is indexed a second time and never kept.
++#define HVX_ACT_I16_STREAMS 4
++#define HVX_ACT_I16_UNROLL  (2 * HVX_ACT_I16_STREAMS)
++
++// silu(x) = relu(x) - h(|x|). The scale of the conversion is negative, thus the combine is one
++// add and the subtract costs nothing.
++static inline __attribute__((always_inline))
++void hvx_silu_i16_block(const HVX_Vector * restrict vsrc, HVX_Vector * restrict vdst, uint32_t i,
++                        HVX_Vector k_sf, HVX_Vector zero, const int ns) {
++    HVX_Vector a[HVX_ACT_I16_STREAMS], h16[HVX_ACT_I16_STREAMS];
++
++    for (int s = 0; s < ns; s++) {
++        a[s] = hvx_act_f32_pair_to_f16(vsrc[i + 2 * s], vsrc[i + 2 * s + 1]);
++    }
++    hvx_act_i16_eval(a, h16, hvx_act_i16_tab_h, ns, 0);
++    for (int s = 0; s < ns; s++) {
++        const HVX_VectorPair nh = hvx_act_i16_to_qf32(h16[s], k_sf);
++        // a negative f32 is a negative int32, thus the signed max is the relu
++        const HVX_Vector r0 = Q6_Vw_vmax_VwVw(vsrc[i + 2 * s], zero);
++        const HVX_Vector r1 = Q6_Vw_vmax_VwVw(vsrc[i + 2 * s + 1], zero);
++        vdst[i + 2 * s]     = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_V_lo_W(nh), r0));
++        vdst[i + 2 * s + 1] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_V_hi_W(nh), r1));
++    }
++}
++
++static inline void hvx_silu_i16_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src,
++                                       uint32_t n) {
++    HVX_Vector * restrict vdst = (HVX_Vector *) dst;
++    const HVX_Vector * restrict vsrc = (const HVX_Vector *) src;
++
++    const HVX_Vector k_sf = hvx_vec_splat_f32(-1.0f / 65536.0f);
++    const HVX_Vector zero = Q6_V_vzero();
++
++    const uint32_t nvec = n / 32;
++    uint32_t i = 0;
++
++    for (; i + HVX_ACT_I16_UNROLL <= nvec; i += HVX_ACT_I16_UNROLL) {
++        hvx_silu_i16_block(vsrc, vdst, i, k_sf, zero, HVX_ACT_I16_STREAMS);
++    }
++    for (; i + 2 <= nvec; i += 2) {
++        hvx_silu_i16_block(vsrc, vdst, i, k_sf, zero, 1);
++    }
++    if (i < nvec) {
++        // one vector left: the second half of the stream repeats the first and its result is dropped
++        HVX_Vector a = hvx_act_f32_pair_to_f16(vsrc[i], vsrc[i]);
++        HVX_Vector h16;
++        hvx_act_i16_eval(&a, &h16, hvx_act_i16_tab_h, 1, 0);
++        const HVX_VectorPair nh = hvx_act_i16_to_qf32(h16, k_sf);
++        vdst[i] = Q6_Vsf_equals_Vqf32(
++            Q6_Vqf32_vadd_Vqf32Vsf(Q6_V_lo_W(nh), Q6_Vw_vmax_VwVw(vsrc[i], zero)));
++    }
++}
++
++// swiglu(x0, x1) = silu(x0) * x1, in one pass over the two rows.
++static inline __attribute__((always_inline))
++void hvx_swiglu_i16_block(const HVX_Vector * restrict vsrc0, const HVX_Vector * restrict vsrc1,
++                          HVX_Vector * restrict vdst, uint32_t i,
++                          HVX_Vector k_sf, HVX_Vector zero, const int ns) {
++    HVX_Vector a[HVX_ACT_I16_STREAMS], h16[HVX_ACT_I16_STREAMS];
++
++    for (int s = 0; s < ns; s++) {
++        a[s] = hvx_act_f32_pair_to_f16(vsrc0[i + 2 * s], vsrc0[i + 2 * s + 1]);
++    }
++    hvx_act_i16_eval(a, h16, hvx_act_i16_tab_h, ns, 0);
++    for (int s = 0; s < ns; s++) {
++        const HVX_VectorPair nh = hvx_act_i16_to_qf32(h16[s], k_sf);
++        const uint32_t j0 = i + 2 * s;
++        const uint32_t j1 = j0 + 1;
++        const HVX_Vector s0 = Q6_Vsf_equals_Vqf32(
++            Q6_Vqf32_vadd_Vqf32Vsf(Q6_V_lo_W(nh), Q6_Vw_vmax_VwVw(vsrc0[j0], zero)));
++        const HVX_Vector s1 = Q6_Vsf_equals_Vqf32(
++            Q6_Vqf32_vadd_Vqf32Vsf(Q6_V_hi_W(nh), Q6_Vw_vmax_VwVw(vsrc0[j1], zero)));
++        vdst[j0] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(s0, vsrc1[j0]));
++        vdst[j1] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(s1, vsrc1[j1]));
++    }
++}
++
++static inline void hvx_swiglu_i16_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src0,
++                                         const uint8_t * restrict src1, uint32_t n) {
++    HVX_Vector * restrict vdst = (HVX_Vector *) dst;
++    const HVX_Vector * restrict vsrc0 = (const HVX_Vector *) src0;
++    const HVX_Vector * restrict vsrc1 = (const HVX_Vector *) src1;
++
++    const HVX_Vector k_sf = hvx_vec_splat_f32(-1.0f / 65536.0f);
++    const HVX_Vector zero = Q6_V_vzero();
++
++    const uint32_t nvec = n / 32;
++    uint32_t i = 0;
++
++    for (; i + HVX_ACT_I16_UNROLL <= nvec; i += HVX_ACT_I16_UNROLL) {
++        hvx_swiglu_i16_block(vsrc0, vsrc1, vdst, i, k_sf, zero, HVX_ACT_I16_STREAMS);
++    }
++    for (; i + 2 <= nvec; i += 2) {
++        hvx_swiglu_i16_block(vsrc0, vsrc1, vdst, i, k_sf, zero, 1);
++    }
++    if (i < nvec) {
++        HVX_Vector a = hvx_act_f32_pair_to_f16(vsrc0[i], vsrc0[i]);
++        HVX_Vector h16;
++        hvx_act_i16_eval(&a, &h16, hvx_act_i16_tab_h, 1, 0);
++        const HVX_VectorPair nh = hvx_act_i16_to_qf32(h16, k_sf);
++        const HVX_Vector sv = Q6_Vsf_equals_Vqf32(
++            Q6_Vqf32_vadd_Vqf32Vsf(Q6_V_lo_W(nh), Q6_Vw_vmax_VwVw(vsrc0[i], zero)));
++        vdst[i] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(sv, vsrc1[i]));
++    }
++}
++
++// sigmoid(x) = x < 0 ? g(|x|) : 1 - g(|x|). Both branches give their result directly, thus a
++// large |x| keeps its value instead of coming out of the difference of two numbers near 0.5.
++static inline __attribute__((always_inline))
++HVX_Vector hvx_sigmoid_i16_combine(HVX_Vector g_qf32, HVX_Vector x, HVX_Vector one) {
++    const HVX_Vector     g_sf = Q6_Vsf_equals_Vqf32(g_qf32);
++    const HVX_Vector     comp = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(one, g_sf));
++    const HVX_VectorPred neg  = Q6_Q_vcmp_gt_VwVw(Q6_V_vzero(), x);
++    return Q6_V_vmux_QVV(neg, g_sf, comp);
++}
++
++static inline __attribute__((always_inline))
++void hvx_sigmoid_i16_block(const HVX_Vector * restrict vsrc, HVX_Vector * restrict vdst, uint32_t i,
++                           HVX_Vector k_sf, HVX_Vector one, const int ns) {
++    HVX_Vector a[HVX_ACT_I16_STREAMS], g16[HVX_ACT_I16_STREAMS];
++
++    for (int s = 0; s < ns; s++) {
++        a[s] = hvx_act_f32_pair_to_f16(vsrc[i + 2 * s], vsrc[i + 2 * s + 1]);
++    }
++    hvx_act_i16_eval(a, g16, hvx_act_i16_tab_g, ns, 1);
++    for (int s = 0; s < ns; s++) {
++        const HVX_VectorPair g32 = hvx_act_i16_to_qf32(g16[s], k_sf);
++        vdst[i + 2 * s]     = hvx_sigmoid_i16_combine(Q6_V_lo_W(g32), vsrc[i + 2 * s], one);
++        vdst[i + 2 * s + 1] = hvx_sigmoid_i16_combine(Q6_V_hi_W(g32), vsrc[i + 2 * s + 1], one);
++    }
++}
++
++static inline void hvx_sigmoid_i16_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src,
++                                          uint32_t n) {
++    HVX_Vector * restrict vdst = (HVX_Vector *) dst;
++    const HVX_Vector * restrict vsrc = (const HVX_Vector *) src;
++
++    const HVX_Vector k_sf = hvx_vec_splat_f32(1.0f / 65536.0f);
++    const HVX_Vector one  = hvx_vec_splat_f32(1.0f);
++
++    const uint32_t nvec = n / 32;
++    uint32_t i = 0;
++
++    for (; i + HVX_ACT_I16_UNROLL <= nvec; i += HVX_ACT_I16_UNROLL) {
++        hvx_sigmoid_i16_block(vsrc, vdst, i, k_sf, one, HVX_ACT_I16_STREAMS);
++    }
++    for (; i + 2 <= nvec; i += 2) {
++        hvx_sigmoid_i16_block(vsrc, vdst, i, k_sf, one, 1);
++    }
++    if (i < nvec) {
++        HVX_Vector a = hvx_act_f32_pair_to_f16(vsrc[i], vsrc[i]);
++        HVX_Vector g16;
++        hvx_act_i16_eval(&a, &g16, hvx_act_i16_tab_g, 1, 1);
++        const HVX_VectorPair g32 = hvx_act_i16_to_qf32(g16, k_sf);
++        vdst[i] = hvx_sigmoid_i16_combine(Q6_V_lo_W(g32), vsrc[i], one);
++    }
++}
++
++#endif /* HVX_ACT_I16_H */

@@ -1,0 +1,93 @@
+The conv step of the gated delta net: four chains in flight (lab proposal)
+
+The single-token conv is the input path of every gated delta net layer, and repository task #101
+measures it at 245 us per layer. In the lab it costs 592.3 cycles for each block of 32 channels
+and commits 0.66 instructions per packet, where a packet holds 4. COPROC_BUSY is 51.3 % of its
+cycles.
+
+The slot holds 3 floats for each channel and the arithmetic needs one lane for each channel, thus
+the kernel expands 3 lanes to 4 with a masked rotate for each channel of a window and reverses
+that at the end: 83 permutes for each block. The permute unit takes 1 operation per packet, thus
+those permutes alone are a floor of 166 cycles. The measured 592.3 is 3.6 times that floor,
+because each window is one chain of dependent operations and a result is ready only 2 packets
+after its producer.
+
+The two alternatives are measured and both fail:
+  - A cheaper permute does not exist. tools/htp-lab (target perm3) applies vdelta and vrdelta with
+    the control i ^ j at each output byte to all 21 lane patterns that this kernel could want, and
+    every one of them is wrong in 4 to 21 of its 32 lanes: those networks realize power-of-2
+    strides only, thus the masked rotate is the available primitive and not a naive choice.
+  - A plane layout would remove almost every permute, but the slot is the recurrent state cache.
+    The graph of src/models/delta-net-base.cpp builds it as a CONCAT of [d_conv - 1, n_ch], every
+    chain that the Hexagon matcher refuses reads it with the generic ops, and
+    llama_memory_recurrent::state_write_data writes those bytes into the state file that the app
+    stores. Thus the host, the CPU reference and the state file would have to change together,
+    and at one token a conversion at the two ends costs the same permutes again.
+
+What is left is the dependency structure, and that is what this patch changes. The four windows of
+a block are independent, thus the kernel takes one step of all four before the next step of any.
+That keeps four chains in flight for three more live vectors.
+
+Measured in the simulator, one thread, n_ch 6144, 20 iterations, against the same program without
+the patch: 592.3 to 398.4 cycles for each block, 1.49 times faster, 53.85 us to 36.22 us for the
+whole op (8.97 us to 6.04 us at 6 threads). The output is bit-identical: the slot bytes match
+exactly and y keeps the same maximum error of 9.54e-07 against the scalar reference.
+
+Two variants are measured and rejected. A tree over the eight terms of a window shortens the chain
+further but needs eight live vectors for each window, and the kernel then spills: 1472 cycles for
+each block, with HVX_LD_L2_OUTSTANDING at 19.8 %. Two blocks in one iteration give 401.5 cycles,
+which is no gain, and COPROC_BUSY returns to 49 %, thus the permutes are now the limit.
+
+diff -urN a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
+--- a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c	2026-09-20 03:02:40.404555444 +0300
++++ b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c	2026-09-20 03:07:56.500179921 +0300
+@@ -158,13 +158,24 @@
+     xs[2] = gdn_lane_rot_up(Q6_V_lo_W(q1), 3);
+     xs[3] = gdn_lane_rot_up(Q6_V_hi_W(q1), 3);
+ 
+-    // the 4-lane layout: c[g] lane 4k + t = tap t of channel 8g + k
++    // the 4-lane layout: c[g] lane 4k + t = tap t of channel 8g + k.
++    //
++    // The four windows are independent. A vor gives its result 2 packets after its packet, thus
++    // one window alone advances its sum once every 4 cycles and leaves the other slots of each
++    // packet empty. Taking one step of all four windows before the next step of any keeps four
++    // chains in flight at the cost of three more live vectors. A tree over the eight terms would
++    // shorten the chain further, but it needs eight live vectors for each window and the kernel
++    // then spills: there are 32 vector registers and the masks already hold 14 of them.
+     for (uint32_t g = 0; g < 4; g++) {
+-        HVX_Vector v = Q6_V_vand_VV(sw[g], mk->ms[0]);
+-        for (uint32_t k = 1; k < 8; k++) {
+-            v = Q6_V_vor_VV(v, Q6_V_vand_VV(gdn_lane_rot_up(sw[g], k), mk->ms[k]));
++        c[g] = Q6_V_vand_VV(sw[g], mk->ms[0]);
++    }
++    for (uint32_t k = 1; k < 8; k++) {
++        for (uint32_t g = 0; g < 4; g++) {
++            c[g] = Q6_V_vor_VV(c[g], Q6_V_vand_VV(gdn_lane_rot_up(sw[g], k), mk->ms[k]));
+         }
+-        c[g] = Q6_V_vor_VV(v, Q6_V_vand_VV(xs[g], mk->mx));
++    }
++    for (uint32_t g = 0; g < 4; g++) {
++        c[g] = Q6_V_vor_VV(c[g], Q6_V_vand_VV(xs[g], mk->mx));
+     }
+ }
+ 
+@@ -191,13 +202,15 @@
+ static inline void gdn_conv_c_to_slot(const struct gdn_conv_masks * mk, const HVX_Vector * c,
+                                       HVX_Vector * n0, HVX_Vector * n1, HVX_Vector * n2) {
+     // the new slot windows: nw[g] lane 3k + t = c[g] lane 4k + 1 + t
++    // the same four chains in flight as in gdn_conv_lanes_to_c
+     HVX_Vector nw[4];
+     for (uint32_t g = 0; g < 4; g++) {
+-        HVX_Vector v = Q6_V_vand_VV(gdn_lane_rot_down(c[g], 1), mk->mn[0]);
+-        for (uint32_t k = 1; k < 8; k++) {
+-            v = Q6_V_vor_VV(v, Q6_V_vand_VV(gdn_lane_rot_down(c[g], k + 1), mk->mn[k]));
++        nw[g] = Q6_V_vand_VV(gdn_lane_rot_down(c[g], 1), mk->mn[0]);
++    }
++    for (uint32_t k = 1; k < 8; k++) {
++        for (uint32_t g = 0; g < 4; g++) {
++            nw[g] = Q6_V_vor_VV(nw[g], Q6_V_vand_VV(gdn_lane_rot_down(c[g], k + 1), mk->mn[k]));
+         }
+-        nw[g] = v;
+     }
+ 
+     // the 96 new slot lanes: window g goes to lanes 24g .. 24g + 23
