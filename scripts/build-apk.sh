@@ -4,6 +4,12 @@
 #
 #   scripts/build-apk.sh
 #
+# Do not run this script on its own. Use scripts/build-all.sh, which runs
+# scripts/build-native.sh first and stops at the first failure. This script
+# packages whatever sits in android/snapdragon/jniLibs, thus a native build
+# that failed leaves the libraries of the run before it. Step 0 refuses that
+# case.
+#
 # The native libraries must exist: scripts/build-native.sh writes them to
 # android/snapdragon/jniLibs. The steps:
 #
@@ -47,6 +53,31 @@ cd "$REPO_ROOT"
 
 jnilibs="android/snapdragon/jniLibs/arm64-v8a"
 [[ -f "$jnilibs/libqwenmobile.so" ]] || die "no native libraries in $jnilibs: scripts/build-native.sh"
+
+# 0. The libraries must come from the last native build.
+#
+# scripts/build-native.sh writes build/hashes-native.txt from the files that it
+# put in jniLibs. This script packages whatever sits in that directory. Thus a
+# native build that stops at a compile error leaves the libraries of the run
+# before it, and an APK built after it carries code that nobody measured. That
+# happened twice on 2026-09-19: the APK held libggml-hexagon.so d70a73b3 where
+# the build output held 0566d66d, and the numbers of that session described the
+# previous build.
+#
+# The check compares the two tables and stops when they differ. Run
+# scripts/build-all.sh, which chains the two scripts and stops at the first
+# failure.
+native_hashes="build/hashes-native.txt"
+[[ -f "$native_hashes" ]] || die "no $native_hashes: run scripts/build-native.sh (or scripts/build-all.sh)"
+if ! diff -u "$native_hashes" <(sha256_table "$jnilibs"/*.so) > build/hashes-native.diff; then
+    echo "apk: $jnilibs does not match $native_hashes" >&2
+    echo "apk: the last native build did not produce these libraries, thus the APK would" >&2
+    echo "apk: carry code that no measurement describes. The difference:" >&2
+    cat build/hashes-native.diff >&2
+    die "stale native libraries; run scripts/build-all.sh"
+fi
+rm -f build/hashes-native.diff
+echo "apk: native libraries match $native_hashes"
 
 # 1. The image.
 image=$(ensure_apk_image)
