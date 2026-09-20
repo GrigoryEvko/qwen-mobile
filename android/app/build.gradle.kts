@@ -4,7 +4,8 @@ plugins {
     id("com.android.application")
 }
 
-// The llama.cpp checkout is outside the project. local.properties gives its path.
+// The llama.cpp checkout is the submodule third_party/llama.cpp, which holds the patch series.
+// llama.dir in local.properties, or LLAMA_CPP_DIR, selects a different checkout.
 val localProperties = Properties().apply {
     val file = rootProject.file("local.properties")
     if (file.exists()) {
@@ -13,11 +14,11 @@ val localProperties = Properties().apply {
 }
 val llamaDir: String = localProperties.getProperty("llama.dir")
     ?: System.getenv("LLAMA_CPP_DIR")
-    ?: error("Set llama.dir in local.properties to the llama.cpp checkout")
+    ?: rootProject.file("../third_party/llama.cpp").canonicalPath
 
 // ./gradlew assembleRelease -Pprebuilt=true packages the libraries of the Snapdragon
 // container build (CPU, OpenCL and Hexagon backends) from snapdragon/jniLibs, made by
-// snapdragon/build.sh, and does not run the CMake build of llama.cpp.
+// scripts/build-native.sh, and does not run the CMake build of llama.cpp.
 val prebuilt: Boolean = project.findProperty("prebuilt") == "true"
 
 // ./gradlew assembleRelease -Punsigned=true writes app-release-unsigned.apk, the
@@ -55,6 +56,7 @@ android {
             abiFilters += listOf("arm64-v8a")
         }
         if (!prebuilt) {
+            logger.lifecycle("llama.cpp: $llamaDir")
             externalNativeBuild {
                 cmake {
                     // The native code is always an optimized build. A -O0 ggml is not measurable.

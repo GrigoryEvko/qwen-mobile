@@ -20,7 +20,7 @@ readonly LLAMA_COMMIT=c6824a9e42ceeda5d58089fa274ddd816e59e68e
 readonly LLAMA_BUILD_NUMBER=11008
 readonly SNAPDRAGON_IMAGE=ghcr.io/snapdragon-toolchain/arm64-android@sha256:c012b8174f4154088ee027077e9cb80e68cc9a494d46f63454a050fa4789897b
 
-# The libraries that the app ships, in the order of android/snapdragon/build.sh.
+# The libraries that the app ships.
 readonly LLAMA_LIBS="llama ggml ggml-base ggml-cpu ggml-opencl ggml-hexagon mtmd llama-common"
 readonly HTP_DSP=v79
 

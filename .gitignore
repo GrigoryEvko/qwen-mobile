@@ -16,3 +16,6 @@ android/.device-lock
 /build/
 .venv-repro/
 tools/htp-lab/out/
+tools/htp-lab/out-*/
+tools/hmx-bench/build/
+/docs/report/

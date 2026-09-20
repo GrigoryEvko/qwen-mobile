@@ -20,8 +20,7 @@
 #      to the root of the submodule. llama.cpp does not track that file.
 #   4. In the container, CMake configures llama.cpp with the preset
 #      arm64-android-snapdragon-release into build/native/llama, then the JNI
-#      library from android/snapdragon/CMakeLists.txt into build/native/jni,
-#      with the flags of android/snapdragon/build.sh.
+#      library from android/snapdragon/CMakeLists.txt into build/native/jni.
 #   5. The script copies the libraries into android/snapdragon/jniLibs and
 #      writes build/hashes-native.txt with the SHA-256 of each library.
 #
