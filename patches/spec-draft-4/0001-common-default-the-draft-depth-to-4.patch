@@ -1,0 +1,38 @@
+common: default the speculative draft depth to 4
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+Measured on the phone on 2026-09-21, 4B Q8_0 on HTP0 with the 32768-row draft head and the
+REPEAT splat, greedy, one free-form prompt, 128 tokens, thermal 0 and off the charger:
+
+    depth 3  17.223 t/s   depth 5  17.275 t/s   depth 7  16.005 t/s
+    depth 4  17.441 t/s   depth 6  16.951 t/s
+
+Depth 4 is the peak, and the break-even agrees: position 4 adds 0.271 tokens per step
+against a threshold of 0.232, and position 5 adds 0.240 against 0.272. Depth 4 is also
+where the verify batch reaches 5 rows and crosses HTP_MM_HMX_MIN_NROWS, thus the fourth
+position costs less than the third.
+
+The value is a ceiling. A caller that measures its own acceptance takes the draft down when
+the acceptance falls, which the application does with SpecPolicy.
+
+Files:
+    common/common.h
+
+How to apply, from the llama.cpp root:
+
+    git apply patches/spec-draft-4/0001-common-default-the-draft-depth-to-4.patch
+
+diff --git a/common/common.h b/common/common.h
+index 63d0bad..b835494 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -323,7 +323,7 @@ struct common_params_model {
+ 
+ // draft-model-based speculative decoding parameters
+ struct common_params_speculative_draft {
+-    int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
++    int32_t n_max = 4; // maximum number of tokens to draft during speculative decoding
+     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
+ 
+     float p_split = 0.1f; // speculative decoding split probability

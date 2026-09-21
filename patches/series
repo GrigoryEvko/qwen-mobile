@@ -95,3 +95,5 @@ draft-head/0001-llama-qwen35-reduced-mtp-draft-head.patch
 
 # The int8 HMX macros. No kernel uses them yet, thus the patch is inert.
 hexagon-hmx-i8/0001-hexagon-hmx-int8-macros.patch
+hexagon-repeat-splat/0001-hexagon-htp-splat-the-scalar-broadcast-of-repeat.patch
+spec-draft-4/0001-common-default-the-draft-depth-to-4.patch

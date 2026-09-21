@@ -1,0 +1,134 @@
+hexagon: splat the scalar broadcast of REPEAT instead of one memcpy per element
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+The MTP draft head of patch draft-head/0001 builds the background of its scatter with
+ggml_repeat_4d, which broadcasts one f32 into a vector of n_vocab. On the 4B that shape is
+1:1 -> 248320:1, thus nr0 is 248320 and the destination holds one row.
+
+The generic loop of repeat_job_per_thread calls memcpy once for each destination element,
+with row_bytes of 4. Measured on the phone with GGML_HEXAGON_PROFILE=1, that op costs
+**5.45 ms** to write 993280 bytes, which is 182 MB/s, about 280 times below the memory
+bandwidth of this part. One destination row also leaves the row split with nothing to give
+the other threads, thus it all runs on one thread.
+
+The change has two parts:
+
+- A typed store loop replaces the per-element memcpy when the source row holds one element
+  and the destination row is contiguous. The compiler then uses HVX.
+- A destination of one row splits along dimension 0, so that every thread works.
+
+Measured after the change, 4B Q8_0 on HTP0, greedy, the same prompt, thermal 0 and off the
+charger: the marginal cost of one draft position falls from 23.95 ms to 19.0 ms, and the
+draft-3 speed goes from 15.81 to 17.23 t/s. The remaining gap to the byte model is the
+SET_ROWS scatter at 1.5 ms.
+
+Files:
+    ggml/src/ggml-hexagon/htp/repeat-ops.c
+
+How to apply, from the llama.cpp root:
+
+    git apply patches/hexagon-repeat-splat/0001-hexagon-htp-splat-the-scalar-broadcast-of-repeat.patch
+
+diff --git a/ggml/src/ggml-hexagon/htp/repeat-ops.c b/ggml/src/ggml-hexagon/htp/repeat-ops.c
+index 530279d..cc5bf56 100644
+--- a/ggml/src/ggml-hexagon/htp/repeat-ops.c
++++ b/ggml/src/ggml-hexagon/htp/repeat-ops.c
+@@ -30,6 +30,17 @@ struct htp_repeat_context {
+     uint32_t row_start;
+ 
+     size_t   type_size;
++
++    // A broadcast of one element along dimension 0, which the MTP draft head
++    // uses to build the background of the scatter. The generic loop calls
++    // memcpy once for each destination element, thus a row of 248320 floats
++    // costs 5.4 ms. A typed store loop lets the compiler use HVX instead.
++    bool     splat;
++
++    // Destination elements per thread. The generic split gives one thread the
++    // whole row when the destination holds one row, thus a splat of one row
++    // splits along dimension 0 instead.
++    uint32_t elems_per_thread;
+ };
+ 
+ static void repeat_job_per_thread(unsigned int nth, unsigned int ith, void * data) {
+@@ -71,6 +82,29 @@ static void repeat_job_per_thread(unsigned int nth, unsigned int ith, void * dat
+     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, row_start);
+ 
++    // One destination row, split along dimension 0 so that every thread works.
++    if (rctx->splat && rctx->elems_per_thread) {
++        const uint32_t e_beg = rctx->elems_per_thread * ith;
++        const uint32_t e_end = MIN(e_beg + rctx->elems_per_thread, ne0);
++        if (e_beg < e_end) {
++            if (rctx->type_size == 4) {
++                const uint32_t   v = *(const uint32_t *) src->data;
++                uint32_t * restrict p = (uint32_t *) dst->data;
++                for (uint32_t i0 = e_beg; i0 < e_end; i0++) {
++                    p[i0] = v;
++                }
++            } else {
++                const uint16_t   v = *(const uint16_t *) src->data;
++                uint16_t * restrict p = (uint16_t *) dst->data;
++                for (uint32_t i0 = e_beg; i0 < e_end; i0++) {
++                    p[i0] = v;
++                }
++            }
++        }
++        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, row_start);
++        return;
++    }
++
+     for (uint32_t dst_row = row_start; dst_row < row_end; dst_row++) {
+         // Decompose flat dst row index into (i1, i2, i3)
+         const uint32_t i1 = dst_row % ne1;
+@@ -86,9 +120,25 @@ static void repeat_job_per_thread(unsigned int nth, unsigned int ith, void * dat
+         uint8_t * dst_base      = (uint8_t *) dst->data + i1 * nb1 + i2 * nb2 + i3 * nb3;
+ 
+         // Tile along dimension 0
+-        for (uint32_t i0 = 0; i0 < nr0; i0++) {
+-            uint8_t * dst_ptr = dst_base + i0 * ne00 * nb0;
+-            memcpy(dst_ptr, src_row, row_bytes);
++        if (rctx->splat) {
++            if (rctx->type_size == 4) {
++                const uint32_t   v = *(const uint32_t *) src_row;
++                uint32_t * restrict p = (uint32_t *) dst_base;
++                for (uint32_t i0 = 0; i0 < nr0; i0++) {
++                    p[i0] = v;
++                }
++            } else {
++                const uint16_t   v = *(const uint16_t *) src_row;
++                uint16_t * restrict p = (uint16_t *) dst_base;
++                for (uint32_t i0 = 0; i0 < nr0; i0++) {
++                    p[i0] = v;
++                }
++            }
++        } else {
++            for (uint32_t i0 = 0; i0 < nr0; i0++) {
++                uint8_t * dst_ptr = dst_base + i0 * ne00 * nb0;
++                memcpy(dst_ptr, src_row, row_bytes);
++            }
+         }
+     }
+ 
+@@ -146,8 +196,20 @@ int op_repeat(struct htp_ops_context * octx) {
+ 
+     const uint32_t n_threads = octx->n_threads;
+ 
++    // One source element per row and a contiguous destination row, thus the
++    // tile along dimension 0 is a splat and needs no memcpy for each element.
++    const bool splat = (src0->ne[0] == 1) && (dst->nb[0] == type_size);
++
++    // A destination of one row leaves the row split with nothing to give the
++    // other threads, thus a splat of one row splits along dimension 0.
++    const uint32_t elems_per_thread = (splat && nrows == 1 && row_start == 0)
++                                          ? (dst->ne[0] + n_threads - 1) / n_threads
++                                          : 0;
++
+     struct htp_repeat_context rctx = {
+         .octx             = octx,
++        .splat            = splat,
++        .elems_per_thread = elems_per_thread,
+         .nr0              = dst->ne[0] / src0->ne[0],
+         .nr1              = dst->ne[1] / src0->ne[1],
+         .nr2              = dst->ne[2] / src0->ne[2],

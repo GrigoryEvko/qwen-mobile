@@ -20,8 +20,17 @@ public:
     /** The number of drafts that the acceptance rate looks back on. */
     static constexpr int kWindow = 32;
 
-    /** The draft length above kRateHigh, and the length of a probe. */
-    static constexpr int kDraftMax = 3;
+    /**
+     * The draft length above kRateHigh, and the length of a probe.
+     *
+     * Measured on the phone on 2026-09-21, 4B Q8_0 on HTP0 with the 32768-row
+     * draft head: depth 4 gives 17.44 t/s, against 17.22 at depth 3, 17.28 at
+     * 5, 16.95 at 6 and 16.01 at 7. Depth 4 is also where the verify batch
+     * reaches 5 rows and crosses HTP_MM_HMX_MIN_NROWS, thus the fourth
+     * position costs less than the third. This value is the ceiling, and the
+     * rate window below takes the draft down when the acceptance falls.
+     */
+    static constexpr int kDraftMax = 4;
     static constexpr int kDraftMin = 1;
 
     /** Above this acceptance rate a step drafts kDraftMax tokens. */
