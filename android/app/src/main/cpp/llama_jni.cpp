@@ -181,6 +181,13 @@ struct TurnStats {
     /** The tokens that the MTP draft context proposed, and the ones that the target sampler accepted. */
     int64_t drafted        = 0;
     int64_t accepted       = 0;
+    /**
+     * The steps of the answer, with and without a draft.
+     *
+     * The mean draft length is drafted / gen_steps. Without this field a reader
+     * must compute the steps as gen_tokens - accepted, which is not obvious.
+     */
+    int64_t gen_steps      = 0;
 };
 
 struct Engine {
@@ -2138,12 +2145,18 @@ static jbyteArray generate_next_impl(JNIEnv * env, jlong handle) {
         const int64_t t0 = now_us();
         std::string error;
         const bool ok = e->spec != nullptr ? spec_step(*e, error) : plain_step(*e, error);
-        e->turn.gen_us += now_us() - t0;
+        const int64_t step_us = now_us() - t0;
+        e->turn.gen_us += step_us;
         if (!ok) {
             e->answer_done = true;
             throw_java(env, error);
             return nullptr;
         }
+        // The policy predicts the throughput of each draft length from the
+        // measured step time and acceptance, thus the step that ran must give
+        // it its time.
+        e->policy.observe(step_us);
+        e->turn.gen_steps += 1;
         if (e->out_queue.empty()) {
             return finish_answer(env, *e);
         }
@@ -2219,6 +2232,15 @@ static jstring stats_impl(JNIEnv * env, jlong handle) {
         const int percent = t.drafted > 0 ? (int) ((t.accepted * 100 + t.drafted / 2) / t.drafted) : 0;
         extra += ", drafted " + std::to_string(t.drafted) + ", accepted " + std::to_string(t.accepted) +
                  " (" + std::to_string(percent) + " %)";
+        // The mean draft length and the length that the policy settled on. The
+        // two differ when the policy changed its choice inside the answer, and
+        // together they say why the drafted count is what it is.
+        if (t.gen_steps > 0) {
+            char mean[32];
+            snprintf(mean, sizeof(mean), "%.2f", (double) t.drafted / (double) t.gen_steps);
+            extra += " over " + std::to_string(t.gen_steps) + " steps (mean draft " + mean +
+                     ", policy " + std::to_string(e->policy.best_draft()) + ")";
+        }
     }
     // The generation prompt has its own entry: those few tokens decode at the
     // speed of one token, thus a rate over the prompt and them together would
