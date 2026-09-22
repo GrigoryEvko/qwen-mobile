@@ -1,0 +1,50 @@
+hexagon: enable the HVX IEEE float instructions on v73 and v75
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+The HVX IEEE float instructions (vadd, vsub and vmpy on sf and hf, and the
+widening vmpy of hf into sf) exist in the ISA from v68. The compiler enables
+them on v79 and a subsequent version. On v73 and v75 they are an option,
+-mhvx-ieee-fp, that is off. Before this change the v75 link stopped with
+"Cannot select: intrinsic %llvm.hexagon.V6.vmpy.sf.hf.128B", thus the series
+did not build for any core before v79.
+
+With the option, libggml-htp-v73.so and libggml-htp-v75.so build. They hold
+29 IEEE instructions in 5 functions: softmax_job_f32 (12 vmpy sf, 12 vadd sf),
+gdn_conv_band_packed_4 and _1 (4 vmpy hf into sf) and gdn_ch_phase_a (1 vsub
+sf). Every other float instruction takes the qf path of upstream.
+
+Verified on hexagon-sim of the toolchain image on 2026-09-22: on the v73 and
+the v75 core models, vadd, vsub and vmpy of sf and hf and vmpy of hf into sf
+agree bit for bit with the scalar IEEE unit, over 12800 to 25600 lanes each,
+with zeros, infinities, NaN, subnormals and cancellation in the inputs.
+
+Not verified on silicon. Qualcomm's own IEEE float library (QHL, the _af
+functions) uses only qf instructions on these cores. If a part does not have
+the option, the first of these 29 instructions stops the DSP session. Run
+test-backend-ops on a v75 phone before a release depends on this patch.
+
+Files:
+    ggml/src/ggml-hexagon/htp/CMakeLists.txt
+
+How to apply, from the llama.cpp root:
+
+    git apply patches/hexagon-ieee-pre79/0001-hexagon-htp-enable-hvx-ieee-fp-on-v73-and-v75.patch
+
+diff --git a/ggml/src/ggml-hexagon/htp/CMakeLists.txt b/ggml/src/ggml-hexagon/htp/CMakeLists.txt
+index 3382ca0..d93c940 100644
+--- a/ggml/src/ggml-hexagon/htp/CMakeLists.txt
++++ b/ggml/src/ggml-hexagon/htp/CMakeLists.txt
+@@ -52,6 +52,12 @@ target_compile_definitions(${HTP_LIB} PRIVATE
+     $<IF:$<BOOL:${HEXAGON_HTP_DEBUG}>,HTP_DEBUG=1,NDEBUG=1>
+     $<IF:$<BOOL:${HEXAGON_HTP_DEBUG}>,FARF_HIGH=1,>)
+ 
++# v73 and v75 have the HVX IEEE float instructions as an option that the compiler does not enable, v79 enables them.
++if(DSP_VERSION STREQUAL "v73" OR DSP_VERSION STREQUAL "v75")
++    target_compile_options(${HTP_LIB} PRIVATE -mhvx-ieee-fp)
++    target_link_options(${HTP_LIB} PRIVATE -mhvx-ieee-fp)
++endif()
++
+ 
+ build_idl(htp_iface.idl ${HTP_LIB})
+ 

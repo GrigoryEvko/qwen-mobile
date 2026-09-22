@@ -97,3 +97,6 @@ draft-head/0001-llama-qwen35-reduced-mtp-draft-head.patch
 hexagon-hmx-i8/0001-hexagon-hmx-int8-macros.patch
 hexagon-repeat-splat/0001-hexagon-htp-splat-the-scalar-broadcast-of-repeat.patch
 spec-draft-4/0001-common-default-the-draft-depth-to-4.patch
+
+# The IEEE float option for the cores before v79. Verified on the simulator, not on silicon.
+hexagon-ieee-pre79/0001-hexagon-htp-enable-hvx-ieee-fp-on-v73-and-v75.patch
