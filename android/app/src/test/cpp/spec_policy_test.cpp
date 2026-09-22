@@ -150,8 +150,10 @@ void test_the_policy_finds_the_best_length() {
         SpecPolicy      p;
         const RunResult r    = run(p, m, 600, 200, 12345u);
         const int       best = model_best(m);
-        // The plain decode that the loop must not lose to, and the ceiling that
-        // a policy with no warmup and no probe would reach.
+        // The step with no draft inside the speculative context, which the loop
+        // must not lose to, and the ceiling that a policy with no warmup and no
+        // probe would reach. The intercept a is that step, not the plain decode
+        // of a context without a draft, which is cheaper.
         const double plain_us_per_token = m.a;
         const double ideal_us_per_token =
             (m.a + m.b * (double) best) / model_tokens(m, best);

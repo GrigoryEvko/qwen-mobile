@@ -31,8 +31,12 @@
  * - The predicted tokens of a step of length d, which is
  *   1 + sum over i of the product of the acceptances up to i.
  *
- * Candidate 0 is a step with no draft, thus the policy can always fall back to
- * plain decode and the loop has no net loss against it.
+ * Candidate 0 is a step with no draft inside the speculative context, thus the
+ * policy can always fall back to it and the loop has no net loss against it.
+ * That step is not the plain decode of a context without a draft: it still
+ * pays the rollback slots of the recurrent state and the follow of the draft
+ * context, measured at 108.3 ms against 92.6 ms on the 4B Q8_0. No net loss
+ * against the switch that turns speculation off needs that cost removed.
  *
  * The caller must call record() one time for each step, and then observe() with
  * the time of that step.
