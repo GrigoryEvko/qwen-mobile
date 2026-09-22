@@ -32,6 +32,10 @@
 #   SIM_ARGS   More options for hexagon-sim, for example "--plimit 60000000"
 #   TAG        The name of the output directory suffix of "run" (out/<target>-<tag>). Default: run
 #   MODE       "functional" runs "run" without the timing model. Default: timing
+#   ARCH       The Hexagon version of the build and of the simulated core: v73, v75, v79 or v81.
+#              Default: v79. A version other than v79 builds in out/build-<ARCH> and writes its
+#              results to out/<target>-<ARCH>-<tag>, thus the four versions of one target can
+#              exist side by side for a comparison.
 #   NO_BUILD   Set to 1 to skip the build step of "run" (for parallel runs of built programs)
 #   LAB_OUT    The output directory, relative to the repository. Default: tools/htp-lab/out.
 #              Each concurrent user of the lab needs its own, because the build directory and the
@@ -87,6 +91,11 @@ SIM_ARGS="${SIM_ARGS:-}"
 OUT_REL="${LAB_OUT:-tools/htp-lab/out}"
 PROPOSALS="${PROPOSALS:-}"
 LAB_TARGETS="${LAB_TARGETS:-}"
+ARCH="${ARCH:-v79}"
+case "${ARCH}" in
+    v73|v75|v79|v81) ;;
+    *) echo "error: ARCH=${ARCH} is not one of v73, v75, v79, v81" >&2; exit 1 ;;
+esac
 SUBMODULE_DIR="${REPO_DIR}/third_party/llama.cpp"
 HTP_REL="ggml/src/ggml-hexagon/htp"
 
@@ -140,7 +149,7 @@ in_container() {
     podman run --rm --userns=keep-id --security-opt label=disable \
         -v "${REPO_DIR}:/repo" -v "${LLAMA_DIR}:/llama" -w /repo \
         -e "SIM_ARGS=${SIM_ARGS}" -e "LAB_TREE=${LAB_TREE}" -e "LAB_PROPOSALS=${LAB_PROPOSALS}" \
-        -e "OUT_REL=${OUT_REL}" -e "PROPOSALS=${PROPOSALS}" -e "LAB_TARGETS=${LAB_TARGETS}" \
+        -e "OUT_REL=${OUT_REL}" -e "PROPOSALS=${PROPOSALS}" -e "LAB_TARGETS=${LAB_TARGETS}" -e "ARCH=${ARCH}" \
         "${IMAGE}" bash -c "$1"
 }
 
@@ -154,6 +163,8 @@ ln -sf /usr/lib/x86_64-linux-gnu/libncurses.so.6 /tmp/shim/libncurses.so.5
 ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /tmp/shim/libtinfo.so.5
 export LD_LIBRARY_PATH=/tmp/shim
 OUT="/repo/${OUT_REL}"
+# v79 keeps the build directory of the lab before the ARCH switch
+if [ "${ARCH}" = "v79" ]; then BUILD_DIR="$OUT/build"; else BUILD_DIR="$OUT/build-${ARCH}"; fi
 EOF
 
 # Builds all programs. The proposal patches are applied to a copy of the kernel directory.
@@ -177,11 +188,11 @@ for p in $list; do
     git -C /repo apply -p5 --directory="${OUT_REL}/htp-proposed" "$p"
     PROPOSED="$OUT/htp-proposed"
 done
-cmake -G Ninja -S /repo/tools/htp-lab -B "$OUT/build" \
-    -DCMAKE_TOOLCHAIN_FILE=/repo/tools/htp-lab/toolchain.cmake \
-    -DLLAMA_DIR=/llama -DHTP_PROPOSED_DIR="$PROPOSED" -DLAB_TARGETS="${LAB_TARGETS:-}" > "$OUT/cmake.log"
+cmake -G Ninja -S /repo/tools/htp-lab -B "$BUILD_DIR" \
+    -DCMAKE_TOOLCHAIN_FILE=/repo/tools/htp-lab/toolchain.cmake -DHEXAGON_ARCH="${ARCH}" \
+    -DLLAMA_DIR=/llama -DHTP_PROPOSED_DIR="$PROPOSED" -DLAB_TARGETS="${LAB_TARGETS:-}" > "$OUT/cmake-${ARCH}.log"
 # -k 0 keeps going after a failure, thus a target that another agent is editing cannot stop yours.
-ninja -k 0 -C "$OUT/build" || echo "lab: NOTE: at least one target did not build. The others did."
+ninja -k 0 -C "$BUILD_DIR" || echo "lab: NOTE: at least one target did not build. The others did."
 EOF
 
 # Runs one program under the simulator and writes the profile files.
@@ -191,19 +202,20 @@ read -r -d '' RUNFN <<'EOF' || true
 run_target() {
     local target="$1"; local tag="$2"; shift 2
     local dir="$OUT/$target-$tag"
-    local elf="$OUT/build/lab_$target"
+    [ "${ARCH}" = "v79" ] || dir="$OUT/$target-${ARCH}-$tag"
+    local elf="$BUILD_DIR/lab_$target"
     [ -x "$elf" ] || { echo "no program $elf"; return 1; }
     rm -rf "$dir"; mkdir -p "$dir"; cd "$dir"
     echo "== run $target-$tag: $*"
     # the source of the numbers, as the first lines of the output and thus of the report
-    echo "lab: tree ${LAB_TREE}" > tree.txt
+    echo "lab: tree ${LAB_TREE} arch ${ARCH}" > tree.txt
     case "$target" in *_after) echo "lab: proposals ${LAB_PROPOSALS}" >> tree.txt ;; esac
     if [ "${MODE:-timing}" = "functional" ]; then
-        { cat tree.txt; hexagon-sim --mv79 $SIM_ARGS "$elf" -- "$@"; } 2>&1 | tee stdout.txt
+        { cat tree.txt; hexagon-sim --m${ARCH} $SIM_ARGS "$elf" -- "$@"; } 2>&1 | tee stdout.txt
         grep "^lab:" stdout.txt > report.txt || true
         return 0
     fi
-    { cat tree.txt; hexagon-sim --mv79 --timing --profile --packet_analyze pa.json --pmu_statsfile pmu.txt $SIM_ARGS \
+    { cat tree.txt; hexagon-sim --m${ARCH} --timing --profile --packet_analyze pa.json --pmu_statsfile pmu.txt $SIM_ARGS \
         "$elf" -- "$@"; } 2>&1 | tee stdout.txt
     hexagon-profiler --packet_analyze --json=pa.json --elf="$elf" -o pa.html > /dev/null 2>&1 || true
     hexagon-nm -S -n "$elf" > symbols.txt
