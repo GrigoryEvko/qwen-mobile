@@ -8,9 +8,9 @@
 #   KEEP_BUILD=1     Keep build/native from the previous run (an incremental build).
 #                    Without it, the script removes build/native first.
 #   NATIVE_TARGETS   The llama.cpp targets, space separated. The default is the
-#                    set of libraries that the app ships plus the v79 DSP
-#                    library. "all" builds every target, with the tools and
-#                    the tests of llama.cpp.
+#                    set of libraries that the app ships plus one DSP library
+#                    for each version in HTP_DSPS. "all" builds every target,
+#                    with the tools and the tests of llama.cpp.
 #
 # The steps:
 #   1. scripts/apply-patches.sh puts the series on the submodule.
@@ -44,7 +44,11 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 readonly REPRO_FLAGS="-ffile-prefix-map=/workspace=. -fdebug-prefix-map=/workspace=. -Werror=date-time"
-readonly DEFAULT_TARGETS="$LLAMA_LIBS htp-$HTP_DSP"
+htp_targets=""
+for dsp in $HTP_DSPS; do
+    htp_targets+=" htp-$dsp"
+done
+readonly DEFAULT_TARGETS="$LLAMA_LIBS$htp_targets"
 NATIVE_TARGETS=${NATIVE_TARGETS:-$DEFAULT_TARGETS}
 
 cd "$REPO_ROOT"
@@ -123,7 +127,9 @@ cp build/native/jni/libqwenmobile.so "$out/"
 for lib in $LLAMA_LIBS; do
     cp "build/native/llama/bin/lib$lib.so" "$out/"
 done
-cp "build/native/llama/ggml/src/ggml-hexagon/libggml-htp-$HTP_DSP.so" "$out/"
+for dsp in $HTP_DSPS; do
+    cp "build/native/llama/ggml/src/ggml-hexagon/libggml-htp-$dsp.so" "$out/"
+done
 
 sha256_table "$out"/*.so > build/hashes-native.txt
 echo "native: build/hashes-native.txt"

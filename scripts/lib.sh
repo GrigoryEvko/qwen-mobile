@@ -22,7 +22,11 @@ readonly SNAPDRAGON_IMAGE=ghcr.io/snapdragon-toolchain/arm64-android@sha256:c012
 
 # The libraries that the app ships.
 readonly LLAMA_LIBS="llama ggml ggml-base ggml-cpu ggml-opencl ggml-hexagon mtmd llama-common"
-readonly HTP_DSP=v79
+# The DSP libraries, one for each Hexagon version that the app supports. The
+# host loads libggml-htp-v<N>.so for the DSP that it finds. A library for a
+# newer DSP than the chip gives incorrect values with no error, thus each
+# supported version must have its own library.
+readonly HTP_DSPS="v73 v75 v79 v81"
 
 # Write a message to stderr and stop with the code 1.
 die() {
