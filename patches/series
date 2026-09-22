@@ -100,3 +100,7 @@ spec-draft-4/0001-common-default-the-draft-depth-to-4.patch
 
 # The DSP library of the cores before v79: the one IEEE intrinsic of our kernels takes the qf path there.
 hexagon-pre79/0001-hexagon-htp-build-the-dsp-library-for-v73-and-v75.patch
+
+# No HTP device below v73, or when the library of the DSP is missing: a library
+# for a newer DSP than the chip gives incorrect values with no error.
+hexagon-arch/0001-hexagon-no-device-for-an-unsupported-dsp.patch
