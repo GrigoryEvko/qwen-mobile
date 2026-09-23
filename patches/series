@@ -178,3 +178,7 @@ fuzz-hexhost/0009-hexagon-keep-the-fd-map-of-an-op-batch-after-the-buffer-sort.p
 fuzz-hexhost/0010-hexagon-reject-a-gdn-conv-chain-when-a-node-touches-its-moved-bytes.patch
 fuzz-hexhost/0011-hexagon-state-the-split-limit-of-the-fused-gdn-state-chain.patch
 fuzz-hexhost/0012-hexagon-write-the-final-gdn-state-through-the-cache-when-it-shares-a-line.patch
+
+# memory: qwen35 marks its token embedding for the lazy read, thus with LLAMA_LAZY_MODE_ON the embedding
+# stays in a file mapping and takes no anonymous memory.
+memory/0004-llama-qwen35-reads-the-token-embedding-lazily.patch

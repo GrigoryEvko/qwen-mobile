@@ -1,0 +1,202 @@
+llama: qwen35 reads the token embedding lazily with LLAMA_LAZY_MODE_ON
+Fold-into: upstream/loader
+
+The defect
+
+A model with a device that has no mmap support (HTP0, OpenCL) loads with no file mapping, thus
+the token embedding of the CPU takes anonymous memory: 515 MiB for Qwen3.5 2B Q8_0 and 644 MiB
+for the 4B. The embedding is a row lookup, and a decode reads one row of 2176 or 2720 bytes for
+each token. The loader has a lazy read for such a tensor (TENSOR_READ_LAZY), but qwen35 does not
+mark its embedding.
+
+The change
+
+qwen35 creates token_embd.weight with TENSOR_READ_LAZY. With LLAMA_LAZY_MODE_ON the tensor stays
+in a file mapping with POSIX_MADV_RANDOM, and a token reads its row on demand. Its pages are file
+pages that the kernel can reclaim. The other tensors load as the load mode says. The preset mode
+AUTO makes a tensor lazy only above 4 GiB and only when each device has mmap support, thus the
+preset load does not change. On a CPU-only model the output is a copy of the embedding in the
+model buffer, thus the lazy read saves no memory there.
+
+test-lazy-embd loads the generated qwen35 model with the lazy mode off, and on with the load
+modes NONE and MMAP. It requires the same logits in the three loads, and the report of the lazy
+read. Without the flag the test fails. On the host (CPU, the 2B and the 4B Q8_0 files, 300 prompt
+tokens and 8 decodes) the logits hashes are the same with the lazy mode on and off, in the two
+load modes.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    src/models/qwen35.cpp
+    tests/CMakeLists.txt
+    tests/test-lazy-embd.cpp
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 8b239ea..6a047fe 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -37,7 +37,9 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
+     const int trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
+     int mtp_flags = !ml.load_mtp ? TENSOR_SKIP : 0;
+ 
+-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
++    // The input embedding is a row lookup: with LLAMA_LAZY_MODE_ON its rows stay in the file mapping
++    // and a token reads its row on demand, thus the tensor takes no anonymous memory.
++    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_READ_LAZY);
+ 
+     // output
+     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index c8d5ddc..3627762 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -151,6 +151,7 @@ endif ()
+ llama_build(test-recurrent-state-rollback.cpp)
+ llama_build(test-output-limit.cpp)
+ llama_build(test-kv-quant-auto-fa.cpp)
++llama_build(test-lazy-embd.cpp)
+ llama_build(test-save-load-state.cpp)
+ 
+ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+@@ -236,6 +237,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+         FIXTURES_REQUIRED generate-models
+     )
+ 
++    llama_test(
++        test-lazy-embd
++        LABEL main
++        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
++    )
++    set_tests_properties(test-lazy-embd PROPERTIES
++        FIXTURES_REQUIRED generate-models
++    )
++
+     llama_test(
+         test-recurrent-state-rollback
+         NAME test-recurrent-state-rollback-nemotron-h
+diff --git a/tests/test-lazy-embd.cpp b/tests/test-lazy-embd.cpp
+new file mode 100644
+index 0000000..7e86e45
+--- /dev/null
++++ b/tests/test-lazy-embd.cpp
+@@ -0,0 +1,121 @@
++// The lazy token embedding of qwen35: with LLAMA_LAZY_MODE_ON the loader keeps token_embd.weight in
++// a file mapping and reads its rows on demand. The logits must be those of the load that reads the
++// whole tensor, for the load modes NONE (the load of a device with no mmap support) and MMAP.
++
++#include "arg.h"
++#include "common.h"
++#include "ggml-backend.h"
++#include "llama.h"
++
++#include <clocale>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <vector>
++
++// Set by the log callback when the loader reports the lazy read of the token embedding.
++static bool g_embd_lazy = false;
++
++static void log_callback(ggml_log_level level, const char * text, void * user_data) {
++    (void) level;
++    (void) user_data;
++    if (std::strstr(text, "token_embd.weight") != nullptr && std::strstr(text, "lazy read enabled") != nullptr) {
++        g_embd_lazy = true;
++    }
++}
++
++// Load the model with one load mode and one lazy mode, decode a prompt of 12 tokens in one batch,
++// then 4 tokens one at a time, and return the logits of each step. An empty result is a failure.
++static std::vector<float> run(const std::string & path, llama_load_mode load_mode, llama_lazy_mode lazy_mode) {
++    llama_model_params mparams = llama_model_default_params();
++    mparams.n_gpu_layers = 0;
++    mparams.load_mode    = load_mode;
++    mparams.lazy_mode    = lazy_mode;
++    llama_model * model = llama_model_load_from_file(path.c_str(), mparams);
++    if (model == nullptr) {
++        fprintf(stderr, "run : failed to load the model\n");
++        return {};
++    }
++
++    llama_context_params cparams = llama_context_default_params();
++    cparams.n_ctx     = 64;
++    cparams.n_batch   = 16;
++    cparams.n_ubatch  = 16;
++    cparams.n_seq_max = 1;
++    llama_context * ctx = llama_init_from_model(model, cparams);
++    if (ctx == nullptr) {
++        fprintf(stderr, "run : failed to create the context\n");
++        llama_model_free(model);
++        return {};
++    }
++
++    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
++    std::vector<float> out;
++    llama_batch batch = llama_batch_init(16, 0, 1);
++    bool ok = true;
++
++    for (int i = 0; i < 12; ++i) {
++        common_batch_add(batch, (llama_token) ((i * 7 + 3) % n_vocab), i, { 0 }, i == 11);
++    }
++    ok = llama_decode(ctx, batch) == 0;
++    for (int step = 0; ok && step < 5; ++step) {
++        const float * logits = llama_get_logits_ith(ctx, -1);
++        out.insert(out.end(), logits, logits + n_vocab);
++        if (step == 4) {
++            break;
++        }
++        common_batch_clear(batch);
++        common_batch_add(batch, (llama_token) ((step * 13 + 5) % n_vocab), 12 + step, { 0 }, true);
++        ok = llama_decode(ctx, batch) == 0;
++    }
++
++    llama_batch_free(batch);
++    llama_free(ctx);
++    llama_model_free(model);
++    if (!ok) {
++        fprintf(stderr, "run : a decode failed\n");
++        return {};
++    }
++    return out;
++}
++
++int main(int argc, char ** argv) {
++    std::setlocale(LC_NUMERIC, "C");
++
++    common_params params;
++    common_init();
++    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
++        return 1;
++    }
++    ggml_backend_load_all();
++    llama_log_set(log_callback, nullptr);
++
++    int failures = 0;
++
++    const std::vector<float> ref = run(params.model.path, LLAMA_LOAD_MODE_NONE, LLAMA_LAZY_MODE_OFF);
++    if (ref.empty()) {
++        return 1;
++    }
++    if (g_embd_lazy) {
++        fprintf(stderr, "%s : the token embedding was lazy with LLAMA_LAZY_MODE_OFF\n", __func__);
++        failures++;
++    }
++
++    const llama_load_mode modes[] = { LLAMA_LOAD_MODE_NONE, LLAMA_LOAD_MODE_MMAP };
++    for (llama_load_mode mode : modes) {
++        g_embd_lazy = false;
++        const std::vector<float> got = run(params.model.path, mode, LLAMA_LAZY_MODE_ON);
++        const char * name = mode == LLAMA_LOAD_MODE_NONE ? "none" : "mmap";
++        if (!g_embd_lazy) {
++            fprintf(stderr, "%s : load mode %s: the token embedding was not lazy with LLAMA_LAZY_MODE_ON\n", __func__, name);
++            failures++;
++        }
++        if (got.size() != ref.size() || std::memcmp(got.data(), ref.data(), ref.size() * sizeof(float)) != 0) {
++            fprintf(stderr, "%s : load mode %s: the logits with the lazy embedding differ\n", __func__, name);
++            failures++;
++        }
++    }
++
++    fprintf(stderr, "%s : %s\n", __func__, failures == 0 ? "OK" : "FAILED");
++    return failures == 0 ? 0 : 1;
++}
