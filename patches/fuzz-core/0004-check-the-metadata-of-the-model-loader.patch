@@ -1,0 +1,70 @@
+Check the metadata of the model loader before its conversions
+Fold-into: upstream/loader
+
+The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
+
+- The loader leaks the metadata context when get_key throws.
+
+  The loader reads general.architecture with get_key before it puts the ggml context of the
+  metadata in its list. get_key throws for a key of the wrong type, and the context then leaks.
+
+  The change: The loader puts the context in its list first (the file path and the FILE path).
+
+  The reproducer: tests/fuzz/core/regress/fuzz_model_load--loader-meta-leak.
+
+- The loader stores general.file_type in llama_ftype with no range check.
+
+  The loader converts general.file_type to llama_ftype with no range check.
+
+  The change: A value above LLAMA_FTYPE_GUESSED keeps the guessed type.
+
+  The reproducer: tests/fuzz/core/regress/fuzz_model_load--loader-ftype-enum.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    src/llama-model-loader.cpp
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -572,12 +572,14 @@
+         if (metadata == nullptr) {
+             throw std::runtime_error(format("%s: failed to load model from %s", __func__, fname.c_str()));
+         }
++        // the contexts own the ggml context from here: get_key below throws for a key of the
++        // wrong type, and a context that is not in the list then leaks
++        contexts.emplace_back(ctx);
+ 
+         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
+         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+ 
+         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+-        contexts.emplace_back(ctx);
+ 
+         // Save tensors data offset of the main file.
+         // For subsidiary files, `meta` tensor data offset must not be used,
+@@ -684,12 +686,13 @@
+         if (metadata == nullptr) {
+             throw std::runtime_error(format("%s: failed to load model from file pointer", __func__));
+         }
++        // the contexts own the ggml context from here (see the file path above)
++        contexts.emplace_back(ctx);
+ 
+         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
+         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+ 
+         files.emplace_back(new llama_file(file));
+-        contexts.emplace_back(ctx);
+ 
+         // Save tensors data offset info of the main file.
+         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+@@ -784,7 +787,9 @@
+ 
+         {
+             uint32_t ftype_val = 0;
+-            if (get_key(LLM_KV_GENERAL_FILE_TYPE, ftype_val, false)) {
++            // the enum holds only the values of its range: a value of the file outside
++            // [0, LLAMA_FTYPE_GUESSED] keeps the guessed type
++            if (get_key(LLM_KV_GENERAL_FILE_TYPE, ftype_val, false) && ftype_val <= (uint32_t) LLAMA_FTYPE_GUESSED) {
+                 ftype = (llama_ftype) ftype_val;
+             }
+         }

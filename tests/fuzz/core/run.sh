@@ -59,6 +59,11 @@
 #                       in the fuzz mode. 0 turns them off.
 #   FUZZ_MODEL_SRC      The Qwen3.5 GGUF of the data mode (default
 #                       weights/gguf/Qwen3.5-2B-Q8_0.gguf).
+#   FUZZ_LLAMA_DIR      A private llama.cpp tree for the test and fuzz modes (the
+#                       test of a fix before it lands). The default is the submodule.
+#   FUZZ_TREE_TAG       The name of that tree. The build directory gets it as a
+#                       suffix: build/fuzz/core-<profile>-<config>-<tag>. It is
+#                       necessary with FUZZ_LLAMA_DIR.
 #   ADB_SERIAL          The phone of phone-commands (default 192.168.14.130:5555).
 #
 # Each fuzz run uses nice 10, -rss_limit_mb=4096 and -timeout=30. libFuzzer stops
@@ -80,6 +85,8 @@ BUDGET=${FUZZ_BUDGET:-600}
 JOBS=${FUZZ_JOBS:-4}
 BUILD_JOBS=${FUZZ_BUILD_JOBS:-8}
 KNOWN=${FUZZ_KNOWN:-1}
+LLAMA_DIR=${FUZZ_LLAMA_DIR:-}
+TREE_TAG=${FUZZ_TREE_TAG:-}
 ADB_SERIAL=${ADB_SERIAL:-192.168.14.130:5555}
 PHONE_BASE=/data/local/tmp/qwen/fuzz/core
 SHIPPED_MARCH="-march=armv8.7a+fp16+dotprod+i8mm"
@@ -92,8 +99,6 @@ PHONE_TARGETS="fuzz_npu_decode fuzz_recurrent"
 declare -A SWITCH=(
     [gguf-enum-load]=FUZZ_GGUF_KNOWN_ENUM_LOAD
     [gguf-reader-uninit-type]=FUZZ_GGUF_KNOWN_ENUM_LOAD
-    [loader-ftype-enum]=FUZZ_MODEL_LOAD_KNOWN_FTYPE
-    [loader-meta-leak]=FUZZ_MODEL_LOAD_KNOWN_META_LEAK
     [jinja-float-cast]=FUZZ_CHAT_KNOWN_JINJA
     [jinja-parser-assert]=FUZZ_CHAT_KNOWN_JINJA
     [tokenizer-codepoint]=FUZZ_TOKENIZER_KNOWN_CODEPOINT
@@ -128,8 +133,6 @@ declare -A EXPECT=(
     [gguf-key-nul]='GGML_ASSERT\(!key\.empty\(\)|does not return its index'
     [gguf-nelements-overflow]='GGML_ASSERT\(info\.t\.data\)|gguf\.cpp:[0-9]+:[0-9]+: runtime error: signed integer overflow|ggml\.c:[0-9]+:[0-9]+: runtime error: signed integer overflow'
     [gguf-zero-dim]='the reader refuses the metadata that the writer wrote'
-    [loader-ftype-enum]="not a valid value for type '(enum )?llama_ftype'"
-    [loader-meta-leak]='LeakSanitizer: detected memory leaks'
     [spm-byte-tokens]='unordered_map::at'
     [vocab-byte-type]='llama-vocab\.cpp:[0-9]+: fatal error|token_to_byte'
     [vocab-dup-tokens]='GGML_ASSERT\(id_to_token\.size\(\) == token_to_id\.size\(\)\)'
@@ -208,13 +211,21 @@ signature() {
         | head -n 1 || true
 }
 
+# The build directory of the profile $1 and the configuration $2 (with the suffix of a private tree).
+tree_dir() {
+    echo "$REPO/build/fuzz/core-$1-$2${TREE_TAG:+-$TREE_TAG}"
+}
+
 # Configure and build the host tree of the profile $1 and the configuration $2 with the targets $3.
 build_tree() {
     local profile=$1 san=$2 targets=$3
-    local dir="$REPO/build/fuzz/core-$profile-$san"
+    local dir
+    dir=$(tree_dir "$profile" "$san")
     [[ -f "$SHARED/profile-$profile.cmake" && -f "$SHARED/$san.cmake" ]] \
         || die "the shared files $SHARED/profile-$profile.cmake and $SHARED/$san.cmake are necessary"
-    cmake -G Ninja -S "$HERE" -B "$dir" \
+    local -a src=()
+    [[ -n $LLAMA_DIR ]] && src=(-DFUZZ_LLAMA_DIR="$LLAMA_DIR")
+    cmake -G Ninja -S "$HERE" -B "$dir" "${src[@]}" \
         -DFUZZ_TARGETS="${targets// /;}" \
         -DCMAKE_AR="$(command -v llvm-ar)" -DCMAKE_RANLIB="$(command -v llvm-ranlib)" \
         -C "$SHARED/profile-$profile.cmake" -C "$SHARED/$san.cmake" > "$dir.configure.log" 2>&1 \
@@ -240,7 +251,8 @@ result_line() {
 # Fuzz one target for the budget. $1 is the profile, $2 the configuration, $3 the target.
 fuzz_one() {
     local profile=$1 san=$2 fz=$3
-    local dir="$REPO/build/fuzz/core-$profile-$san"
+    local dir
+    dir=$(tree_dir "$profile" "$san")
     local out="$dir/runs/$fz"
     mkdir -p "$out/corpus" "$out/artifacts"
     local log="$out/log.txt"
@@ -278,7 +290,7 @@ fuzz_one() {
     local -a arts=()
     mapfile -t arts < <(find "$out/artifacts" -type f | sort)
     result_line "$dir" "$fz" "$san" "$profile" fuzz "$(( SECONDS - start ))" "$execs" "${#arts[@]}" "${arts[@]}"
-    echo "core-$profile-$san $fz: $(( SECONDS - start )) s, $starts starts, $execs executions, $cov, corpus $(find "$out/corpus" -type f | wc -l), crash files ${#arts[@]}"
+    echo "core-$profile-$san${TREE_TAG:+-$TREE_TAG} $fz: $(( SECONDS - start )) s, $starts starts, $execs executions, $cov, corpus $(find "$out/corpus" -type f | wc -l), crash files ${#arts[@]}"
 }
 
 # Test one target. The seeds run with all the switches on: a failure is a finding with no switch.
@@ -289,7 +301,8 @@ fuzz_one() {
 # switches, and it must pass.
 test_one() {
     local profile=$1 san=$2 fz=$3
-    local dir="$REPO/build/fuzz/core-$profile-$san"
+    local dir
+    dir=$(tree_dir "$profile" "$san")
     local out="$dir/runs/$fz"
     mkdir -p "$out"
     local log="$out/test-log.txt"
@@ -382,7 +395,7 @@ test_one() {
     done
     rm -rf "$tmp" "$art"
     result_line "$dir" "$fz" "$san" "$profile" test "$(( SECONDS - start ))" "$execs" "$findings" "${failed[@]}"
-    echo "core-$profile-$san $fz: $execs runs, $findings findings |$notes"
+    echo "core-$profile-$san${TREE_TAG:+-$TREE_TAG} $fz: $execs runs, $findings findings |$notes"
 }
 
 # Run the mode $1 (test or fuzz) with the profile $2 and the configuration $3 on the targets that
@@ -397,7 +410,8 @@ run_mode() {
     fi
     [[ -f "$DATA/tiny-qwen35-f32.gguf" && -f "$DATA/qwen35-vocab.gguf" ]] || die "no data in $DATA. Run 'tests/fuzz/core/run.sh data' first."
     build_tree "$profile" "$san" "$targets"
-    local dir="$REPO/build/fuzz/core-$profile-$san"
+    local dir
+    dir=$(tree_dir "$profile" "$san")
     local summary="$dir/$mode-summary.txt"
     : > "$summary"
     local fz
@@ -426,8 +440,8 @@ make_data() {
     local src=${FUZZ_MODEL_SRC:-$REPO/weights/gguf/Qwen3.5-2B-Q8_0.gguf}
     (cd "$REPO" && uv run --frozen python "$HERE/make_data.py" --model "$src" --data-dir "$DATA" --no-seeds)
     build_tree release none make_tiny_model
-    "$REPO/build/fuzz/core-release-none/make_tiny_model" "$DATA/tiny-qwen35-f32.gguf" f32 > /dev/null
-    "$REPO/build/fuzz/core-release-none/make_tiny_model" "$DATA/tiny-qwen35-q8_0.gguf" q8_0 > /dev/null
+    "$(tree_dir release none)/make_tiny_model" "$DATA/tiny-qwen35-f32.gguf" f32 > /dev/null
+    "$(tree_dir release none)/make_tiny_model" "$DATA/tiny-qwen35-q8_0.gguf" q8_0 > /dev/null
     ls -l "$DATA"
 }
 
@@ -579,6 +593,8 @@ case $mode in
     test|fuzz|phone-build|phone-commands)
         san=${1:-}
         shift || true
+        [[ -z $LLAMA_DIR || -n $TREE_TAG ]] || die "FUZZ_LLAMA_DIR needs FUZZ_TREE_TAG (the suffix of the build directory)"
+        [[ -z $LLAMA_DIR || -f $LLAMA_DIR/include/llama.h ]] || die "FUZZ_LLAMA_DIR=$LLAMA_DIR holds no include/llama.h"
         profiles="debug release"
         targets=()
         while (( $# > 0 )); do

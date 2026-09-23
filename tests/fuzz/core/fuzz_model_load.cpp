@@ -18,8 +18,8 @@
 //   - the chat template of the model is a C string
 //
 // The switches of the known findings: FUZZ_GGUF_KNOWN_ENUM_LOAD (gguf-enum-load),
-// FUZZ_MODEL_LOAD_KNOWN_DUP_TOKENS, _BYTE_TYPE, _FTYPE, _META_LEAK (known_bad_file),
-// _NONE_VOCAB and _SPM_BYTES (check_vocab).
+// FUZZ_MODEL_LOAD_KNOWN_DUP_TOKENS, _BYTE_TYPE (known_bad_file), _NONE_VOCAB and
+// _SPM_BYTES (check_vocab).
 
 #include "fuzz_common.h"
 
@@ -49,8 +49,6 @@ const char * const kTexts[] = {
 struct KnownSwitches {
     bool dup;        // FUZZ_MODEL_LOAD_KNOWN_DUP_TOKENS: vocab-dup-tokens
     bool byte;       // FUZZ_MODEL_LOAD_KNOWN_BYTE_TYPE: vocab-byte-type
-    bool ftype;      // FUZZ_MODEL_LOAD_KNOWN_FTYPE: loader-ftype-enum
-    bool meta_leak;  // FUZZ_MODEL_LOAD_KNOWN_META_LEAK: loader-meta-leak
 };
 
 /**
@@ -58,10 +56,6 @@ struct KnownSwitches {
  *   - dup:       a token text two times in tokenizer.ggml.tokens (vocab-dup-tokens)
  *   - byte:      a token of type BYTE (6) in a WPM vocabulary, or a BYTE token with a text of
  *                fewer than 5 bytes (vocab-byte-type: token_to_byte aborts or throws during the load)
- *   - ftype:     general.file_type is an integer above LLAMA_FTYPE_GUESSED (loader-ftype-enum: the
- *                loader converts it to llama_ftype, a UBSan report for a value outside the enum range)
- *   - meta_leak: general.architecture is not a string (loader-meta-leak: get_key throws before the
- *                loader owns the ggml context of the metadata, and the context leaks)
  * The caller must first make sure that the GGUF reader can read data without a known finding
  * (fuzz::gguf_bad_enum). O(n log n) in the count of tokens.
  */
@@ -72,20 +66,6 @@ bool known_bad_file(const uint8_t * data, size_t size, const KnownSwitches & sw)
     }
     const bool dup = sw.dup, byte = sw.byte;
     bool bad = false;
-    const int64_t fkey = gguf_find_key(ctx, "general.file_type");
-    if (sw.ftype && fkey >= 0) {
-        switch (gguf_get_kv_type(ctx, fkey)) {
-            case GGUF_TYPE_UINT32: bad = gguf_get_val_u32(ctx, fkey) > (uint32_t) LLAMA_FTYPE_GUESSED; break;
-            case GGUF_TYPE_INT32:  bad = gguf_get_val_i32(ctx, fkey) < 0 || gguf_get_val_i32(ctx, fkey) > LLAMA_FTYPE_GUESSED; break;
-            case GGUF_TYPE_UINT64: bad = gguf_get_val_u64(ctx, fkey) > (uint64_t) LLAMA_FTYPE_GUESSED; break;
-            case GGUF_TYPE_INT64:  bad = gguf_get_val_i64(ctx, fkey) < 0 || gguf_get_val_i64(ctx, fkey) > LLAMA_FTYPE_GUESSED; break;
-            default: break;
-        }
-    }
-    const int64_t akey = gguf_find_key(ctx, "general.architecture");
-    if (sw.meta_leak && akey >= 0 && gguf_get_kv_type(ctx, akey) != GGUF_TYPE_STRING) {
-        bad = true;
-    }
     const int64_t key = gguf_find_key(ctx, "tokenizer.ggml.tokens");
     const bool tokens_ok = key >= 0 && gguf_get_kv_type(ctx, key) == GGUF_TYPE_ARRAY && gguf_get_arr_type(ctx, key) == GGUF_TYPE_STRING;
     if (dup && tokens_ok) {
@@ -243,11 +223,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
     static const KnownSwitches sw = {
         fuzz::env_long("FUZZ_MODEL_LOAD_KNOWN_DUP_TOKENS", 0) != 0,
         fuzz::env_long("FUZZ_MODEL_LOAD_KNOWN_BYTE_TYPE", 0) != 0,
-        fuzz::env_long("FUZZ_MODEL_LOAD_KNOWN_FTYPE", 0) != 0,
-        fuzz::env_long("FUZZ_MODEL_LOAD_KNOWN_META_LEAK", 0) != 0,
     };
     // the pre-parse uses the GGUF reader too, thus it comes after the enum check
-    if ((sw.dup || sw.byte || sw.ftype || sw.meta_leak) && known_bad_file(data, size, sw)) {
+    if ((sw.dup || sw.byte) && known_bad_file(data, size, sw)) {
         return 0;
     }
 
