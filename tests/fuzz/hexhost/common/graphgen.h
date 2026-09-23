@@ -47,6 +47,7 @@ struct graph_spec {
     ggml_context *              ctx    = nullptr;   // the nodes and the inputs of the graph
     ggml_cgraph *               gf     = nullptr;
     ggml_gallocr_t              galloc = nullptr;
+    ggml_backend_buffer_t       buf    = nullptr;   // the buffer of the nodes when world::no_reuse is true
     std::vector<ggml_tensor *>  order;               // the node order that ggml built (before graph_optimize)
     std::vector<input_spec>     inputs;
     std::vector<ggml_tensor *>  outputs;
@@ -129,6 +130,10 @@ struct world {
     // true: the weights hold values for a numeric compare (the phone driver). The input bytes
     // that the generator reads do not change, thus one input gives the same graph in the two modes.
     bool                               numeric = false;
+    // true: each node of a graph gets its own bytes (no ggml-alloc reuse), and the bytes start
+    // at zero. The phone driver then reads each node after a step. This changes the addresses
+    // but not the nodes, the node order or the fusions.
+    bool                               no_reuse = false;
 };
 
 // Reads the session of one graph input: the hardware of the fake DSP and the switches of the

@@ -585,10 +585,26 @@ bool build_graph(FuzzedDataProvider & fdp, world & w, graph_spec & g, int64_t T,
         g.optimized = true;
     }
 
-    g.galloc = ggml_gallocr_new(hexhost::device_buft(w.dev));
-    if (!ggml_gallocr_alloc_graph(g.galloc, g.gf)) {
-        fakedsp::count("gen fail: allocation");
-        return false;
+    if (w.no_reuse) {
+        g.buf = ggml_backend_alloc_ctx_tensors_from_buft(g.ctx, hexhost::device_buft(w.dev));
+        if (!g.buf) {
+            fakedsp::count("gen fail: allocation");
+            return false;
+        }
+        ggml_backend_buffer_set_usage(g.buf, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        ggml_backend_buffer_clear(g.buf, 0);
+        // A view of a cache has its data at creation but no buffer; ggml-alloc gives it one
+        for (ggml_tensor * t = ggml_get_first_tensor(g.ctx); t; t = ggml_get_next_tensor(g.ctx, t)) {
+            if (t->view_src && !t->buffer && t->view_src->buffer) {
+                ggml_backend_view_init(t);
+            }
+        }
+    } else {
+        g.galloc = ggml_gallocr_new(hexhost::device_buft(w.dev));
+        if (!ggml_gallocr_alloc_graph(g.galloc, g.gf)) {
+            fakedsp::count("gen fail: allocation");
+            return false;
+        }
     }
     fakedsp::count("gen ok");
     g.desc ="graph T=" + std::to_string(T) + " nodes=" + std::to_string(n) + " splits=" + std::to_string(g.cuts.size() - 1);
@@ -599,6 +615,9 @@ bool build_graph(FuzzedDataProvider & fdp, world & w, graph_spec & g, int64_t T,
 void free_graph(graph_spec & g) {
     if (g.galloc) {
         ggml_gallocr_free(g.galloc);
+    }
+    if (g.buf) {
+        ggml_backend_buffer_free(g.buf);
     }
     if (g.ctx) {
         ggml_free(g.ctx);
