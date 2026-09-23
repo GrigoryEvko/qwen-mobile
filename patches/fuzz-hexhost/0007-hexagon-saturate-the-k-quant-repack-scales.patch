@@ -1,0 +1,88 @@
+hexagon: saturate the FP16 tile scales of the Q4_K and Q6_K repack
+Fold-into: upstream/hexagon-host
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+The repack of Q4_K and Q6_K into the tiled layout of the DSP writes each
+product of the block scale and a sub-block scale as an FP16 value. A product
+above 65504 became Inf in the tile, and the DSP multiplied with Inf. The read
+back divides the sub-block scales by the block scale, and for an Inf or NaN
+ratio it converted NaN to an integer, which is undefined behavior.
+
+This patch saturates each FP16 scale of the tile to +-65504 and writes 0 for
+NaN. The read back gives 0 for a ratio that is not finite, and rounds and
+clamps each other ratio to the range of its field. A product in the FP16
+range gives the same bytes as before, thus the repacked bytes of real weights
+do not change.
+
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 70f1d61..53d0f4a 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -1530,6 +1530,23 @@ static inline uint8_t q6_K_get_quant(const block_q6_K * b, int e) {
+     return (uint8_t) (lo | (hi << 4));
+ }
+ 
++// A product of block scales as the FP16 scale of a tile. A product outside the FP16 range
++// saturates to +-65504 (else the tile holds Inf and the DSP multiplies with it), and NaN gives 0.
++static inline ggml_half repack_scale_to_fp16(float x) {
++    if (std::isnan(x)) {
++        return GGML_FP32_TO_FP16(0.0f);
++    }
++    return GGML_FP32_TO_FP16(std::min(std::max(x, -65504.0f), 65504.0f));
++}
++
++// Rounds a scale ratio of the read back to an integer in [lo, hi]. A value that is not finite gives 0.
++static inline int repack_round_clamp(float x, int lo, int hi) {
++    if (!std::isfinite(x)) {
++        return 0;
++    }
++    return (int) roundf(std::min(std::max(x, (float) lo), (float) hi));
++}
++
+ // tile layout: see HTP_MM_WEIGHT_TILE_SIZE_Q6_K in htp/matmul-ops.h
+ static void repack_q6_K_tiled(ggml_tensor * t, const void * data, size_t offset, size_t size) {
+     GGML_ASSERT(offset == 0);
+@@ -1581,7 +1598,7 @@ static void repack_q6_K_tiled(ggml_tensor * t, const void * data, size_t offset,
+                         hi_pl[(g >> 2) * 128 + pos] |= (uint8_t) ((q6 >> 4) << ((g & 3) * 2));
+                     }
+                     for (int sub = 0; sub < 2; sub++) {
+-                        sc_pl[sub * 32 + row] = GGML_FP32_TO_FP16(d * (float) b->scales[kt_local * 2 + sub]);
++                        sc_pl[sub * 32 + row] = repack_scale_to_fp16(d * (float) b->scales[kt_local * 2 + sub]);
+                     }
+                 }
+             }
+@@ -1687,8 +1704,7 @@ static void repack_tiled_q6_K(void * data, const ggml_tensor * t, size_t offset,
+                         float d_actual = GGML_FP16_TO_FP32(b->d);
+                         float inv_d = (d_actual != 0.0f) ? (1.0f / d_actual) : 0.0f;
+                         for (int s = 0; s < 16; s++) {
+-                            int sc = (int) roundf(sub_scales[s] * inv_d);
+-                            b->scales[s] = (int8_t) (std::max)(-128, (std::min)(127, sc));
++                            b->scales[s] = (int8_t) repack_round_clamp(sub_scales[s] * inv_d, -128, 127);
+                         }
+                     }
+                 }
+@@ -1766,8 +1782,8 @@ static void repack_q4_K_tiled(ggml_tensor * t, const void * data, size_t offset,
+                     }
+ 
+                     ggml_half * scale_dst = (ggml_half *) (tile_dst + 512);
+-                    scale_dst[2 * row + 0] = GGML_FP32_TO_FP16(D);
+-                    scale_dst[2 * row + 1] = GGML_FP32_TO_FP16(M);
++                    scale_dst[2 * row + 0] = repack_scale_to_fp16(D);
++                    scale_dst[2 * row + 1] = repack_scale_to_fp16(M);
+                 }
+             }
+         }
+@@ -1862,10 +1878,8 @@ static void repack_tiled_q4_K(void * data, const ggml_tensor * t, size_t offset,
+                     }
+ 
+                     for (int j = 0; j < 8; j++) {
+-                        uint8_t ls = (uint8_t) roundf(inv_scale * sub_scales[j]);
+-                        uint8_t lm = (uint8_t) roundf(inv_min * sub_mins[j]);
+-                        ls = (std::min)((uint8_t) 63, ls);
+-                        lm = (std::min)((uint8_t) 63, lm);
++                        const uint8_t ls = (uint8_t) repack_round_clamp(inv_scale * sub_scales[j], 0, 63);
++                        const uint8_t lm = (uint8_t) repack_round_clamp(inv_min * sub_mins[j], 0, 63);
+                         if (j < 4) {
+                             b->scales[j]     = ls;
+                             b->scales[j + 4] = lm;
