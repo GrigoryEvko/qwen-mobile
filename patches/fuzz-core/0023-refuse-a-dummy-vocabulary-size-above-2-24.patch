@@ -1,0 +1,38 @@
+Refuse a dummy vocabulary size above 2^24
+Fold-into: upstream/vocab
+
+The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
+
+- A "no_vocab" model file sizes an allocation of up to about 200 GB.
+
+  For the tokenizer model "no_vocab" or "none", the loader reads the vocabulary size from the file
+  and makes that many dummy tokens. Each one takes about 48 bytes, thus a size of 2^32 - 1 asks for
+  about 200 GB, and the fuzzer saw allocations of 24 to 171 GB from files of 5 KB.
+
+  The change: The loader refuses a size above 2^24 (about 800 MB of dummy tokens) with an error.
+  No released vocabulary has more than a few million tokens.
+
+  The reproducer: tests/fuzz/core/regress/fuzz_model_load--vocab-dummy-count.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    src/llama-vocab.cpp
+--- a/src/llama-vocab.cpp
++++ b/src/llama-vocab.cpp
+@@ -1962,8 +1962,15 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
+             linefeed_id     = LLAMA_TOKEN_NULL;
+ 
+             // read vocab size from metadata
++            // The file gives the count, and each dummy token takes about 48 bytes: a count of 2^32 - 1
++            // would ask for about 200 GB. No released vocabulary has more than a few million tokens,
++            // thus the load refuses a count above 2^24 (about 800 MB of dummy tokens).
++            constexpr uint32_t max_dummy_tokens = 1u << 24;
+             uint32_t n_tokens = 0;
+             if (ml.get_key(LLM_KV_VOCAB_SIZE, n_tokens, false)) {
++                if (n_tokens > max_dummy_tokens) {
++                    throw std::runtime_error(format("the vocabulary size %u is larger than %u", n_tokens, max_dummy_tokens));
++                }
+                 LLAMA_LOG_WARN("%s: adding %u dummy tokens\n", __func__, n_tokens);
+                 id_to_token.resize(n_tokens);
+             }
