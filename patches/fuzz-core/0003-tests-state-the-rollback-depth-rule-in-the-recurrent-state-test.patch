@@ -1,0 +1,107 @@
+tests: state the rollback depth rule in test-recurrent-state-rollback
+Fold-into: hexagon-spec/0002-llama-bound-the-recurrent-rollback-by-the-last-ubatch.patch
+
+The defect
+
+The test rolls back past the tokens of the last ubatch of a sequence at two places:
+test_rollback rolls back 3 tokens after three decodes of one token each, and
+test_multi_seq_split_replay rolls back all the tokens of a tail ubatch of 3 tokens. The slot
+groups that such a rollback reads hold the states of an earlier ubatch. The test passes without
+the depth bound of seq_rm only because its replay decodes the same tokens as that earlier ubatch,
+thus the old groups hold the correct states by chance. With the depth bound, seq_rm refuses the
+two rollbacks, and the test stops at "partial rollback failed" and at "multi-seq prefill/rollback
+failed".
+
+The change
+
+At the two places, the test asserts that seq_rm refuses the rollback, with a comment that gives
+the rule: a rollback may not go deeper than the tokens of the last ubatch of the sequence. Then
+test_rollback clears the sequence, decodes the prompt again as one ubatch and rolls back inside
+it, and test_multi_seq_split_replay decodes the sequence again with a last ubatch that starts one
+token before the rollback point. The partial checkpoint and the split replay then cover a pending
+rollback (rs_idx != 0), as the test intends. The reference context of the split replay keeps its
+one prefill ubatch.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    tests/test-recurrent-state-rollback.cpp
+--- a/tests/test-recurrent-state-rollback.cpp
++++ b/tests/test-recurrent-state-rollback.cpp
+@@ -138,23 +138,34 @@
+ 
+     bool ok = true;
+ 
+-    // both contexts decode the identical [0, p0) prefill; only ctx_roll decodes
+-    // the tail, which is then rolled back so its restore is pending at replay
+-    for (uint32_t s = 0; s < n_seqs && ok; ++s) {
++    // decode the tokens [from, to) of sequence s as one batch
++    const auto decode_range = [&](llama_context * ctx, uint32_t s, llama_pos from, llama_pos to) {
+         llama_batch batch = llama_batch_init(n_prompt, 0, 1);
+-        for (llama_pos pos = 0; pos < (llama_pos) p0; ++pos) {
++        for (llama_pos pos = from; pos < to; ++pos) {
+             common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
+         }
+-        ok = ok && llama_decode(ctx_roll, batch) == 0;
+-        ok = ok && llama_decode(ctx_ref,  batch) == 0;
+-
+-        common_batch_clear(batch);
+-        for (llama_pos pos = p0; pos < (llama_pos) n_prompt; ++pos) {
+-            common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
+-        }
+-        ok = ok && llama_decode(ctx_roll, batch) == 0;
++        const bool res = llama_decode(ctx, batch) == 0;
+         llama_batch_free(batch);
++        return res;
++    };
+ 
++    // both contexts decode the identical [0, p0) prefill; only ctx_roll decodes
++    // the tail, which is then rolled back so its restore is pending at replay
++    for (uint32_t s = 0; s < n_seqs && ok; ++s) {
++        ok = ok && decode_range(ctx_roll, s, 0, p0);
++        ok = ok && decode_range(ctx_ref,  s, 0, p0);
++        ok = ok && decode_range(ctx_roll, s, p0, n_prompt);
++
++        // A rollback may not go deeper than the tokens of the last ubatch of the sequence, because
++        // the older slot groups hold the states of an earlier ubatch. The tail is one ubatch of
++        // n_rollback tokens, thus a rollback of all of them must be refused.
++        ok = ok && !llama_memory_seq_rm(llama_get_memory(ctx_roll), (llama_seq_id) s, p0, -1);
++
++        // Decode the sequence again with a last ubatch that starts one token before p0: the
++        // rollback to p0 then stays inside that ubatch, and its restore is pending at replay.
++        ok = ok && llama_memory_seq_rm(llama_get_memory(ctx_roll), (llama_seq_id) s, -1, -1);
++        ok = ok && decode_range(ctx_roll, s, 0, p0 - 1);
++        ok = ok && decode_range(ctx_roll, s, p0 - 1, n_prompt);
+         ok = ok && llama_memory_seq_rm(llama_get_memory(ctx_roll), (llama_seq_id) s, p0, -1);
+ 
+         // a second partial removal while one is pending must be refused
+@@ -353,12 +364,26 @@
+         return 1;
+     }
+ 
+-    if (!llama_memory_seq_rm(llama_get_memory(ctx_src), 0, rollback_pos, -1) ||
+-        !llama_memory_seq_rm(llama_get_memory(ctx_dst), 0, rollback_pos, -1)) {
+-        fprintf(stderr, "%s : partial rollback failed\n", __func__);
++    // A rollback may not go deeper than the tokens of the last ubatch of the sequence, because the
++    // older slot groups hold the states of an earlier ubatch. The replay above decoded one token
++    // at a time, thus a rollback of n_rollback tokens must be refused here.
++    if (llama_memory_seq_rm(llama_get_memory(ctx_src), 0, rollback_pos, -1) ||
++        llama_memory_seq_rm(llama_get_memory(ctx_dst), 0, rollback_pos, -1)) {
++        fprintf(stderr, "%s : a rollback deeper than the last ubatch was accepted\n", __func__);
+         return 1;
+     }
+ 
++    // Decode the prompt again as one ubatch on the two contexts, then roll back. The slot groups
++    // of that ubatch hold the state at rollback_pos, thus the partial checkpoint below covers a
++    // rolled-back state (rs_idx != 0).
++    for (llama_context * ctx : { ctx_src, ctx_dst }) {
++        llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1);
++        if (!decode_tokens(ctx, tokens, n_tokens) || !llama_memory_seq_rm(llama_get_memory(ctx), 0, rollback_pos, -1)) {
++            fprintf(stderr, "%s : partial rollback failed\n", __func__);
++            return 1;
++        }
++    }
++
+     constexpr llama_state_seq_flags partial_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+     common_prompt_checkpoint ckpt_partial;
+     ckpt_partial.update_tgt(ctx_src, 0, partial_flags);

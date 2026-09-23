@@ -134,3 +134,4 @@ fuzz-core/0002-clear-the-rollback-index-of-a-removed-sequence.patch
 # The fixes of the defects that the sanitizer matrix of tests/run-suite.sh finds in the tests of llama.cpp.
 # The header of each patch describes its defect and the change.
 fuzz-matrix/0001-tests-free-the-compute-context-of-test-opt.patch
+fuzz-core/0003-tests-state-the-rollback-depth-rule-in-the-recurrent-state-test.patch
