@@ -387,9 +387,9 @@ int cmd_compare(int argc, char ** argv) {
         const case_cmp cc   = compare_case(c, rec.rr.outs, it->second.outs, fast);
         if (list_runs) {
             // one line for each run: the evidence for a single case (FUZZ_OPS_COMPARE_LIST=1)
-            std::printf("RUN %u %s %s %s verdict=%s special=%d ratio=%.3g ulp=%.3g | %s\n", rec.idx, rec.tag.c_str(),
-                        c.kind->name, c.path.c_str(), verdict_name(cc.v), (int) c.special, cc.ratio, cc.ulp,
-                        c.desc.c_str());
+            std::printf("RUN %u %s %s %s verdict=%s special=%d ratio=%.3g ulp=%.3g err=%.3g ref=%.3g | %s\n", rec.idx,
+                        rec.tag.c_str(), c.kind->name, c.path.c_str(), verdict_name(cc.v), (int) c.special, cc.ratio,
+                        cc.ulp, cc.err, cc.ref, c.desc.c_str());
         }
         rw.verdicts[cc.v]++;
         rw.special += c.special ? 1 : 0;

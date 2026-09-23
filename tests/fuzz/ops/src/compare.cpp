@@ -149,6 +149,8 @@ case_cmp compare_case(const built_case & c, const std::vector<std::vector<uint8_
         cc.v     = (verdict) std::max((int) cc.v, v);
         cc.ratio = std::max(cc.ratio, oc.max_ratio);
         cc.ulp   = std::max(cc.ulp, oc.max_ulp);
+        cc.err   = std::max(cc.err, oc.max_err);
+        cc.ref   = std::max(cc.ref, oc.max_ref_fin);
         char buf[512];
         std::snprintf(buf, sizeof(buf),
                       "%s: n=%lld strict=%lld loose=%lld nonfinite=%lld subnormal=%lld max_err=%.3g ratio=%.3g "

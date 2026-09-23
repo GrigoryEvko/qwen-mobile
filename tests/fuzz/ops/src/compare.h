@@ -48,6 +48,8 @@ struct case_cmp {
     verdict              v     = V_PASS;
     double               ratio = 0.0; // the max strict ratio over the outputs
     double               ulp   = 0.0; // the max ulp error over the outputs
+    double               err   = 0.0; // the max absolute error of a finite pair over the outputs
+    double               ref   = 0.0; // the max |reference| with a finite result over the outputs
     std::string          text;        // a readable summary
 };
 
