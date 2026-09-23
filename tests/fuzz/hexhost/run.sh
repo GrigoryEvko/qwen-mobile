@@ -47,6 +47,28 @@ ASAN_RT=libclang_rt.asan-aarch64-android.so
 #                       paths of the 2B and the 4B (graphs mode of this script).
 KNOWN_IDS="dsp-vtcm-size-wrap,gdn-state-tail-later-split"
 
+# The known properties of the NPU in the phone runs. The phone driver compares HTP0 with the CPU
+# backend of the phone, thus each property shows as a difference:
+#
+#   stale L2 line   A DMA transfer of the DSP bypasses the L2 cache. The dirty range tracker
+#                   (htp/htp-tensor.c) writes back and invalidates lines with a dccleaninva loop,
+#                   which does not reach the lines of L2 on the v79. Thus inside one op batch, an
+#                   op can read an old line of L2 after a DMA write, or the write-back of an old
+#                   line can go over the bytes of a DMA write. The op then gets the value of an
+#                   earlier op, thus the difference is large. A batch of one op cannot have this
+#                   property, because each batch starts and ends with a full write-back and
+#                   invalidate of the data cache. Thus each run replays the random inputs that it
+#                   saved with GGML_HEXAGON_OPBATCH=1 (the file NAME-batch1.txt), and the run
+#                   batch1q1 runs the corpus in the same mode. An input that differs in a run and
+#                   passes with one op for each batch has this property. regress/graph holds five
+#                   such inputs (l2-stale-line-*.bin). On the model graphs of the app, the logits
+#                   with coherent DMA equal the logits of the shipped library. A DMA transfer
+#                   through L2 costs prefill time, thus the property stays.
+#   flush to zero   The HVX and HMX kernels give 0 for a result below the smallest normal FP16
+#                   value, where the CPU keeps a very small float. The driver accepts a
+#                   difference below that value (k_abs_tol of phone/driver.cpp).
+#   state tail      gdn-state-tail-later-split of KNOWN_IDS. The x86 target graph reports it.
+
 # The host switches of the phone runs: a name and the GGML_HEXAGON_* variables of each run
 PHONE_RUNS=(
     "default:"
@@ -404,6 +426,9 @@ phone_commands() {
             echo "adb -s $PHONE shell 'cd $d && mkdir -p out/save-$name && timeout -s KILL 100 env LD_LIBRARY_PATH=$d/lib ADSP_LIBRARY_PATH=$d/dsp $san $vars ./bin/hexhost_phone --seconds $PHONE_SECONDS --random $PHONE_RANDOM --save out/save-$name in > out/$name.txt 2> out/$name.err; echo exit=\$? >> out/$name.txt'"
             echo "adb -s $PHONE shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
             echo "adb -s $PHONE shell 'pgrep -a hexhost_phone; tail -n 2 $d/out/$name.txt'"
+            # The saved random inputs again with one op for each batch (the stale L2 line property)
+            echo "adb -s $PHONE shell 'cd $d && if [ -z \"\$(ls out/save-$name)\" ]; then echo \"no saved input\" > out/$name-batch1.txt; else timeout -s KILL 100 env LD_LIBRARY_PATH=$d/lib ADSP_LIBRARY_PATH=$d/dsp $san $vars GGML_HEXAGON_OPBATCH=1 GGML_HEXAGON_OPQUEUE=1 ./bin/hexhost_phone --seconds $PHONE_SECONDS out/save-$name > out/$name-batch1.txt 2> out/$name-batch1.err; echo exit=\$? >> out/$name-batch1.txt; fi'"
+            echo "adb -s $PHONE shell 'pgrep -a hexhost_phone; tail -n 2 $d/out/$name-batch1.txt'"
         done
         echo "# ==== $prof $cfg: pull the results"
         echo "adb -s $PHONE pull $d/out ${stage%/stage}/phone-out"
