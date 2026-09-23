@@ -116,3 +116,4 @@ fuzz-ops/0001-ggml-graph-size-with-integers.patch
 fuzz-quant/0001-gguf-py-check-the-byte-ranges-and-the-shapes-of-the-reader.patch
 fuzz-ops/0002-ggml-thunks-for-the-type-trait-functions.patch
 fuzz-quant/0002-perplexity-write-the-queued-log-lines-before-the-exit.patch
+fuzz-ops/0003-ggml-cpu-keep-the-sse2-exp-steps-under-fast-math.patch

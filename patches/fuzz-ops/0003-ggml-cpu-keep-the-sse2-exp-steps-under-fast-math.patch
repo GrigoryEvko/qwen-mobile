@@ -1,0 +1,53 @@
+ggml-cpu: keep the steps of the SSE2 ggml_v_expf under fast math
+Fold-into: upstream/ggml-cpu
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+Finding F-FM-1 of fuzz-ops, task #174. The SSE2 form of ggml_v_expf (x86
+without AVX2 and FMA) rounds x*log2(e) to an integer with the magic constant
+r = 0x1.8p23: n = (x*log2(e) + r) - r. With -ffast-math or -ffp-model=fast,
+the compiler folds that sum into x*log2(e), and it also joins the two parts of
+the ln(2) product. Then exp(x) has a relative error of up to 38 % (clang 22:
+exp(-0.3) gives 1, exp(-2.4) gives 0.125). SOFT_MAX, SILU, SWIGLU and the GDN
+conv chain use this function in such a build. The MSan builds of the op
+fuzzer (SIMD off, the release flags) found it.
+
+This patch adds three empty asm statements that make z, n and the first ln(2)
+step opaque to the optimizer. The line count of vec.h does not change, thus
+no __LINE__ of the other code changes.
+
+Evidence and measurement (2026-09-23):
+- clang 22, 16001 points in [-80, 80]: the worst relative error is 2.1e-7
+  with -ffp-model=precise; with -ffp-model=fast it is 0.38 before and 2.1e-7
+  with this patch (gcc -ffast-math: 2.2e-7).
+- The op fuzzer, an SSE2 release build with -ffp-model=fast, the 86 seeds and
+  regression inputs: 11 runs above the loose bound before, 0 with this patch.
+- The MSan test suite of the op fuzzer: release 0 findings (7 before); debug
+  only the 3 value asserts of task #128 (10 before).
+- No change where the fast-math fold does not occur: an SSE2 build with
+  -ffp-model=precise gives bit-identical outputs for the 86 inputs. An AVX2
+  and FMA build (the __m256 form) links to the same .text and .rodata. The
+  arm64 libggml-cpu.so and libggml-base.so of the shipped recipe are
+  byte-identical with and without this patch. Thus the phone does not change.
+
+diff --git a/ggml/src/ggml-cpu/vec.h b/ggml/src/ggml-cpu/vec.h
+index 5de9cb5..883ef50 100644
+--- a/ggml/src/ggml-cpu/vec.h
++++ b/ggml/src/ggml-cpu/vec.h
+@@ -1276,11 +1276,11 @@ inline static __m256 ggml_v_silu(__m256 x) {
+ // numbers above 88.38 will flush to infinity
+ // numbers beneath -103.97 will flush to zero
+ inline static __m128 ggml_v_expf(__m128 x) {
+-    const __m128 r = _mm_set1_ps(0x1.8p23f);
+-    const __m128 z = MADD128(x, _mm_set1_ps(0x1.715476p+0f), r);
+-    const __m128 n = _mm_sub_ps(z, r);
+-    const __m128 b =
+-        NMADD128(n, _mm_set1_ps(0x1.7f7d1cp-20f), NMADD128(n, _mm_set1_ps(0x1.62e4p-1f), x));
++    const __m128 r = _mm_set1_ps(0x1.8p23f); // the empty asm statements keep the steps under fast math:
++    __m128 z = MADD128(x, _mm_set1_ps(0x1.715476p+0f), r); __asm__("" : "+x"(z)); // no (x*log2e + r) - r fold,
++    __m128 n = _mm_sub_ps(z, r); __asm__("" : "+x"(n)); // which removes the rounding to an integer,
++    __m128 h = NMADD128(n, _mm_set1_ps(0x1.62e4p-1f), x); __asm__("" : "+x"(h)); // and no join of the two ln2 parts
++    const __m128 b = NMADD128(n, _mm_set1_ps(0x1.7f7d1cp-20f), h);
+     const __m128i e = _mm_slli_epi32(_mm_castps_si128(z), 23);
+     const __m128 k = _mm_castsi128_ps(_mm_add_epi32(e, _mm_castps_si128(_mm_set1_ps(1))));
+     const __m128i c =
