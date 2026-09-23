@@ -2,6 +2,7 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -305,6 +306,13 @@ std::vector<std::string> AsyncWriter::take_failed() {
 }
 
 void AsyncWriter::run() {
+    // A snapshot file holds 20 to 44 MB, and its write takes CPU time after
+    // each prompt. The display thread must keep the cores, thus this thread
+    // runs at the nice value of the compute threads of the engine
+    // (kComputeNice in llama_jni.cpp). On Linux the nice value belongs to
+    // the thread, and a higher value needs no permission.
+    constexpr int kWriterNice = 10;
+    setpriority(PRIO_PROCESS, 0, kWriterNice);
     std::unique_lock<std::mutex> lock(mutex_);
     while (true) {
         cv_.wait(lock, [this] { return stop_ || !jobs_.empty(); });
