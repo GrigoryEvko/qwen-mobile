@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -211,7 +212,10 @@ def test_tied_transform_keeps_the_function(d: int, block: int | None) -> None:
     assert "lm_head.weight" not in tied and OUTPUT_ROT not in untied
     m = tied[OUTPUT_ROT]
     assert m.shape == (d, d) and m.dtype == torch.float32
-    torch.testing.assert_close(m, m.T, atol=0, rtol=0)
+    # The float64 products (γ_k q_ki) q_kj and (γ_k q_kj) q_ki can round to different float32 values, thus M
+    # is symmetric within one float32 ulp; an orientation defect gives a difference of order one.
+    ulp = torch.from_numpy(np.spacing(torch.maximum(m.abs(), m.T.abs()).numpy()))
+    assert ((m - m.T).abs() <= ulp).all(), f"M is not symmetric: {float((m - m.T).abs().max()):.3e}"
     after = toy_forward(tied, layer_types, ids, None)
     torch.testing.assert_close(after, before, atol=2e-4 * before.abs().max().item(), rtol=0)
     assert torch.equal(tied[LM + "norm.weight"], torch.zeros(d))
