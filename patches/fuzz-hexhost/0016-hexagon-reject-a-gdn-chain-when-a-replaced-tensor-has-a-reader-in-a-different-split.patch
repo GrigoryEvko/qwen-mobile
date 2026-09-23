@@ -1,0 +1,137 @@
+hexagon: reject a GDN chain when a replaced tensor has a reader in a different split
+Fold-into: patches/hexagon-fusion/0007-hexagon-htp-gdn-fusions-with-rollback-slots.patch
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+The fused GDN_CONV_STEP does not write the GET_ROWS, the CONCAT and the
+SSM_CONV of its chain. The fused GDN_STATE_STEP does not write the
+GET_ROWS of its chain or the state tail of the GATED_DELTA_NET output. The
+matcher looked for other readers of these tensors only in the nodes of the
+split that graph_compute gets. Thus a reader in a later split got bytes
+that no op wrote. For example, a SCALE of the CONCAT in a later split read
+the bytes of an earlier tensor, and a reader of the state tail in a later
+split read bytes that no op wrote.
+
+The split that graph_compute gets is a view of the full graph
+(ggml_graph_view), and the view shares the hash set and the use counts of
+the full graph. ggml_build_forward_expand counts the uses, and the splits
+of ggml_backend_sched are views of that graph. This patch compares the use
+count of each such tensor, and of each member view of it, with its uses in
+the split. When the two counts are different, a node of a different split
+uses the tensor, and the matcher rejects the chain. A graph with no use
+counts gets no fused GDN op.
+
+The count of the uses in the split occurs in the loop that the matcher
+already has, and only for a source of an intermediate or of the output.
+Thus the time of the match does not change: the first packing of the
+decode graph takes the same time with and without this patch (about 630
+us for the 2B and 1050 us for the 4B on x86). The model graphs of the app
+have no such reader. hexhost_graphs gives the same ops with and without
+this patch on the decode, prefill, MTP and image paths of the 2B and the
+4B. The comment at the top of htp-gdn-match.h describes this rule in place
+of the split limit of the state chain.
+
+diff --git a/ggml/src/ggml-hexagon/htp-gdn-match.h b/ggml/src/ggml-hexagon/htp-gdn-match.h
+index 910dcaa..8b25def 100644
+--- a/ggml/src/ggml-hexagon/htp-gdn-match.h
++++ b/ggml/src/ggml-hexagon/htp-gdn-match.h
+@@ -13,10 +13,12 @@
+ // other reader of the replaced tensors, and no other node that touches the cache inside the chain span.
+ // The state_zero SCALE of build_rs comes before the chain, thus it stays a separate op and runs first.
+ //
+-// The matcher sees only the nodes of the split that graph_compute gets. The fused state op does not
+-// write the state tail of the GATED_DELTA_NET output, thus the only permitted reader of that tail is
+-// the CPY into the cache in the same split. A reader in a later split gets bytes that no op wrote. The
+-// model graphs have no such reader: tests/fuzz/hexhost/run.sh graphs checks the paths of the app.
++// The matcher sees only the nodes of the split that graph_compute gets. The fused ops do not write the
++// replaced tensors (GET_ROWS, CONCAT, SSM_CONV) or the state tail of the GATED_DELTA_NET output. Thus a
++// reader of such a tensor in a different split gets bytes that no op wrote. The split is a view of the
++// full graph, and it has the use counts of the full graph. The match compares the use count of each
++// such tensor with its uses in the split, and it rejects the chain when a use is in a different split.
++// A graph with no use counts gets no fused op.
+ //
+ // This header depends on ggml only. A host program can run the same checks on a graph. Each check
+ // returns nullptr when the chain matches, or a short text for the first failed condition.
+@@ -123,8 +125,24 @@ static inline std::unordered_map<const ggml_tensor *, int> ggml_hexagon_gdn_inde
+     return index;
+ }
+ 
++// The use count of t in the full graph, or -1 when the graph has no use count for t. The split that
++// graph_compute gets is a view of the full graph (ggml_graph_view), and the view shares the hash set
++// and the use counts of the full graph. Thus the count includes the uses in the other splits.
++static inline int32_t ggml_hexagon_gdn_graph_uses(const ggml_cgraph * gf, const ggml_tensor * t) {
++    if (!gf->use_counts || !gf->visited_hash_set.used || gf->visited_hash_set.size == 0) {
++        return -1;
++    }
++    const size_t pos = ggml_hash_find(&gf->visited_hash_set, t);
++    if (pos == GGML_HASHSET_FULL || !ggml_bitset_get(gf->visited_hash_set.used, pos)) {
++        return -1;
++    }
++    return gf->use_counts[pos];
++}
++
+ // Every node that reads an intermediate (also through a view) must be a member of the chain. A view of
+-// `out` is permitted for any node when the view lies in the first `out_head_bytes` bytes of `out`.
++// `out` is permitted for any node when the view lies in the first `out_head_bytes` bytes of `out`. No
++// node of a different split can use an intermediate or `out`, or a member view of them.
++// O(nodes * GGML_MAX_SRC * members).
+ static inline const char * ggml_hexagon_gdn_chain_is_private(const ggml_cgraph * gf,
+                                                              const std::vector<ggml_tensor *> & intermediates,
+                                                              const std::vector<ggml_tensor *> & members,
+@@ -137,6 +155,21 @@ static inline const char * ggml_hexagon_gdn_chain_is_private(const ggml_cgraph *
+     if (out && (out->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+         return "the output is a graph output";
+     }
++    // The fused op does not write these tensors: the members with an intermediate or `out` as root.
++    // Each one gets the count of its uses in this split. Such a use has an intermediate or `out` as
++    // root, thus only the two branches of the loop below count.
++    std::vector<std::pair<const ggml_tensor *, int32_t>> unwritten;
++    for (ggml_tensor * m : members) {
++        ggml_tensor * root = ggml_hexagon_gdn_root(m);
++        if (ggml_hexagon_gdn_contains(intermediates, root) || (out && root == out)) {
++            unwritten.emplace_back(m, 0);
++        }
++    }
++    auto count_use = [&unwritten](const ggml_tensor * src) {
++        for (auto & u : unwritten) {
++            u.second += u.first == src ? 1 : 0;
++        }
++    };
+     for (int i = 0; i < gf->n_nodes; i++) {
+         ggml_tensor * n = gf->nodes[i];
+         for (int s = 0; s < GGML_MAX_SRC; s++) {
+@@ -146,6 +179,7 @@ static inline const char * ggml_hexagon_gdn_chain_is_private(const ggml_cgraph *
+             }
+             ggml_tensor * root = ggml_hexagon_gdn_root(src);
+             if (out && root == out) {
++                count_use(src);
+                 // The region that the reader touches: the view node itself when n is a view of out
+                 // (its src is the whole tensor), else the view that n reads.
+                 const ggml_tensor * region = (src == out && ggml_hexagon_gdn_is_view_op(n)) ? n : src;
+@@ -157,11 +191,24 @@ static inline const char * ggml_hexagon_gdn_chain_is_private(const ggml_cgraph *
+                 }
+                 return "the state part of the output has a reader outside the chain";
+             }
+-            if (ggml_hexagon_gdn_contains(intermediates, root) && !ggml_hexagon_gdn_contains(members, n)) {
+-                return "an intermediate has a reader outside the chain";
++            if (ggml_hexagon_gdn_contains(intermediates, root)) {
++                if (!ggml_hexagon_gdn_contains(members, n)) {
++                    return "an intermediate has a reader outside the chain";
++                }
++                count_use(src);
+             }
+         }
+     }
++    // A use that the full graph counts and this split does not have is a reader in a different split
++    for (const auto & u : unwritten) {
++        const int32_t uses = ggml_hexagon_gdn_graph_uses(gf, u.first);
++        if (uses < 0) {
++            return "the graph has no use count for a replaced tensor";
++        }
++        if (uses != u.second) {
++            return "a replaced tensor has a reader in a different split";
++        }
++    }
+     return nullptr;
+ }
+ 

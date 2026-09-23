@@ -38,15 +38,9 @@ ASAN_RT=libclang_rt.asan-aarch64-android.so
 # The names of the checks (fake_dsp.cpp: violation) that detect a defect of the backend with no
 # fix in the patch series. In the fuzz mode the harness keeps these conditions off (HEXHOST_IGNORE),
 # thus the fuzzers look for other defects. The test mode does not set them, thus each regression
-# input of such a defect fails. The list is comma-separated, as HEXHOST_IGNORE reads it.
-#
-#   gdn-state-tail-later-split
-#                       The fused GDN state op does not write the state tail of the GATED_DELTA_NET
-#                       output, and the matcher sees only the nodes of one split. Thus a reader of
-#                       that tail in a later split gets bytes that no op wrote. The model graphs have
-#                       no such reader: hexhost_graphs checks the decode, prefill, MTP and image
-#                       paths of the 2B and the 4B (graphs mode of this script).
-KNOWN_IDS="gdn-state-tail-later-split"
+# input of such a defect fails. The list is comma-separated, as HEXHOST_IGNORE reads it. The list is
+# empty: the patch series has a fix for each defect that a check of the harness found.
+KNOWN_IDS=""
 
 # The known properties of the NPU in the phone runs. The phone driver compares HTP0 with the CPU
 # backend of the phone, thus each property shows as a difference:
@@ -68,7 +62,6 @@ KNOWN_IDS="gdn-state-tail-later-split"
 #   flush to zero   The HVX and HMX kernels give 0 for a result below the smallest normal FP16
 #                   value, where the CPU keeps a very small float. The driver accepts a
 #                   difference below that value (k_abs_tol of phone/driver.cpp).
-#   state tail      gdn-state-tail-later-split of KNOWN_IDS. The x86 target graph reports it.
 
 # The host switches of the phone runs: a name and the GGML_HEXAGON_* variables of each run
 PHONE_RUNS=(
