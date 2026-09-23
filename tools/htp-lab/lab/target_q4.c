@@ -165,6 +165,9 @@ static void decode_q8_row(const uint8_t * y_q, uint32_t n_k_tiles, int8_t * q, f
 // The scalar reference of one dot in the arithmetic order of the 32x1 kernel: the int32 sum of
 // one tile, then the float product with the exact f32 product of the two half scales
 static float ref_dot(const struct q4_block * wrow, const int8_t * qa, const float * da, uint32_t n_k_tiles) {
+    // hexagon-clang makes one fused multiply-add of acc += x * y by default. The HVX dot and the
+    // x86 oracle round the product and the sum apart, thus the reference must do the same.
+#pragma clang fp contract(off)
     float acc = 0.0f;
     for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
         const int8_t * q = qa + kt * 32;
@@ -199,11 +202,16 @@ static size_t report_rows(const char * variant, uint32_t n, double tiles, float 
     lab_report(TARGET, key, (double) g_best / tiles, "cycles");
     snprintf(key, sizeof(key), "rows%u_%s_weight_bytes_per_cycle", n, variant);
     lab_report(TARGET, key, (double) Q4_TILE * tiles / (double) g_best, "B/cycle");
-    size_t bad = 0;
+    size_t bad = 0, bits = 0;
     for (uint32_t r = 0; r < n; r++) {
         snprintf(key, sizeof(key), "rows%u_%s_out%u", n, variant, r);
         bad += lab_compare_f32(key, out[r], ref[r], n_w_rows, 1e-3f, 1e-4f);
+        for (uint32_t i = 0; i < n_w_rows; i++) {
+            bits += memcmp(&out[r][i], &ref[r][i], sizeof(float)) != 0;
+        }
     }
+    snprintf(key, sizeof(key), "rows%u_%s_bits_different", n, variant);
+    lab_report(TARGET, key, (double) bits, "of the outputs");
     return bad;
 }
 
@@ -308,6 +316,29 @@ int main(int argc, char ** argv) {
     }
 
     size_t bad = 0;
+
+    // each column of the 32x2 dot against the 32x1 dot of the same row, bit for bit
+    if (n_rows >= 2) {
+        float * o1 = lab_ddr_alloc(n_w_rows * sizeof(float) + 128, 128);
+        float * o2[2];
+        o2[0] = lab_ddr_alloc(n_w_rows * sizeof(float) + 128, 128);
+        o2[1] = lab_ddr_alloc(n_w_rows * sizeof(float) + 128, 128);
+        for (uint32_t ct = 0; ct < n_ct; ct++) {
+            const uint8_t * w_tile = wt + (size_t) ct * n_k_tiles * Q4_TILE_ALN;
+            kernel_q4_0_32x2(k, o2[0] + ct * 32, o2[1] + ct * 32, w_tile, act_q8[0], act_q8[1], 32);
+        }
+        size_t diff = 0;
+        for (uint32_t r = 0; r < 2; r++) {
+            for (uint32_t ct = 0; ct < n_ct; ct++) {
+                const uint8_t * w_tile = wt + (size_t) ct * n_k_tiles * Q4_TILE_ALN;
+                kernel_q4_0_32x1(k, o1 + ct * 32, w_tile, act_q8[r], 32);
+            }
+            for (uint32_t i = 0; i < n_w_rows; i++) {
+                diff += memcmp(&o1[i], &o2[r][i], sizeof(float)) != 0;
+            }
+        }
+        lab_report(TARGET, "x2_against_x1_bits_different", (double) diff, "of the outputs");
+    }
 
     // the sequence of the matmul op for n rows: 32x2 per pair, 32x1 for the last row
     for (uint32_t n = 1; n <= n_rows; n++) {
