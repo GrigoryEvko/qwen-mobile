@@ -4,6 +4,7 @@
 #
 #   tests/fuzz/app/run.sh test <none|asan|ubsan|tsan|msan> [--profile debug|release] [--budget-seconds N] [--jobs N]
 #   tests/fuzz/app/run.sh fuzz <none|asan|ubsan|tsan|msan> [--profile debug|release] [--budget-seconds N] [--jobs N]
+#                             [--workers N]
 #   tests/fuzz/app/run.sh build <none|asan|ubsan|tsan|msan> [--profile debug|release]
 #   tests/fuzz/app/run.sh jvm
 #   tests/fuzz/app/run.sh phone-build <none|asan|hwasan|ubsan> [--profile debug|release]
@@ -19,6 +20,8 @@
 #                   target for the budget (the default is 600 seconds):
 #                   fuzz_jni_api, fuzz_jni_threads, fuzz_jni_threads_free
 #                   (frees from the second thread), fuzz_caches, fuzz_spec_policy.
+#                   --jobs targets run at the same time, and each target runs
+#                   --workers processes (the default is 1) on one corpus.
 #   build           Only build.
 #   jvm             Run the JVM fuzz tests (*FuzzTest) with Gradle in the APK
 #                   container, on a staged copy of android/. The environment
@@ -72,6 +75,8 @@ SNAP="$OUT/llama-snap"
 MODELS="$OUT/models"
 BUILD_JOBS=${FUZZ_BUILD_JOBS:-8}
 PROFILE=debug
+# The libFuzzer processes of one target in the fuzz mode (--workers).
+WORKERS=1
 
 # The build directory of the sanitizer $1 in the current profile.
 bdir() {
@@ -264,11 +269,13 @@ result() {
         >> "$(bdir "$san")/results.jsonl"
 }
 
-# Mutate one target for the budget: $1 the target, $2 the sanitizer, $3 the budget in seconds.
+# Mutate one target for the budget with WORKERS processes on one corpus: $1 the target,
+# $2 the sanitizer, $3 the budget in seconds.
 fuzz_one() {
     local target=$1 san=$2 budget=$3 dir
     dir=$(bdir "$2")
-    local bin corpus art log t0 t1 runs rc
+    local bin corpus art log t0 t1 runs=0 rc w n
+    local -a logs=() pids=() rcs=()
     bin="$dir/$(binary_of "$target")"
     # A corpus for each build, from the seeds: libFuzzer runs the whole corpus before it
     # checks -max_total_time, and a corpus of a faster build can take longer than the budget.
@@ -284,32 +291,52 @@ fuzz_one() {
         [[ -e "$f" ]] && before[$f]=1
     done
     t0=$(date +%s)
-    # shellcheck disable=SC2046
-    env FAKEJNI_RELAX="${FAKEJNI_RELAX-}" \
-        FUZZ_ARTIFACT_DIR="$art" $(env_of "$target" "$san") \
-        nice -n 10 timeout -s KILL $((budget + 300)) "$bin" -max_total_time="$budget" -rss_limit_mb=4096 \
-        -max_len="$(max_len_of "$target")" -timeout=180 -print_final_stats=1 -close_fd_mask=1 \
-        -artifact_prefix="$art/" "$corpus" > "$log" 2>&1 && rc=0 || rc=$?
+    # Each worker is one libFuzzer process with its own log. The workers share the corpus
+    # directory (each one reads it at its start and writes its new inputs there) and the
+    # artifact directory.
+    for ((w = 1; w <= WORKERS; w++)); do
+        ((WORKERS == 1)) && log="$dir/logs/fuzz-$target.log" || log="$dir/logs/fuzz-$target-$w.log"
+        logs+=("$log")
+        # shellcheck disable=SC2046
+        env FAKEJNI_RELAX="${FAKEJNI_RELAX-}" \
+            FUZZ_ARTIFACT_DIR="$art" $(env_of "$target" "$san") \
+            nice -n 10 timeout -s KILL $((budget + 300)) "$bin" -max_total_time="$budget" -rss_limit_mb=4096 \
+            -max_len="$(max_len_of "$target")" -timeout=180 -print_final_stats=1 -close_fd_mask=1 \
+            -artifact_prefix="$art/" "$corpus" > "$log" 2>&1 &
+        pids+=($!)
+    done
+    for w in "${!pids[@]}"; do
+        wait "${pids[$w]}" && rcs[w]=0 || rcs[w]=$?
+    done
     t1=$(date +%s)
-    runs=$(grep -o 'stat::number_of_executed_units: *[0-9]*' "$log" | grep -o '[0-9]*$' || true)
     local -a crashes=()
-    # The outer timeout killed a run that did not stop by itself: a hang (for
-    # example ThreadSanitizer in the death callback of libFuzzer). It is a defect.
-    if ((rc == 137)); then
-        echo "==HARNESS== hang: the run did not stop within $((budget + 300)) s and was killed" >> "$log"
-        crashes+=("$log")
-    fi
+    for w in "${!logs[@]}"; do
+        log=${logs[$w]}
+        rc=${rcs[$w]}
+        n=$(grep -o 'stat::number_of_executed_units: *[0-9]*' "$log" | grep -o '[0-9]*$' || true)
+        runs=$((runs + ${n:-0}))
+        # The outer timeout killed a run that did not stop by itself: a hang (for
+        # example ThreadSanitizer in the death callback of libFuzzer). It is a defect.
+        if ((rc == 137)); then
+            echo "==HARNESS== hang: the run did not stop within $((budget + 300)) s and was killed" >> "$log"
+            crashes+=("$log")
+        fi
+    done
     for f in "$art"/*; do
         # A slow-unit file of libFuzzer is an input that took more than 10 s, not a defect.
         case ${f##*/} in
             crash-* | leak-* | timeout-* | oom-*) [[ -z "${before[$f]:-}" ]] && crashes+=("$f") ;;
         esac
     done
-    if ((${#crashes[@]} == 0)) && grep -qE 'ERROR: (AddressSanitizer|ThreadSanitizer|MemorySanitizer|LeakSanitizer|libFuzzer)|WARNING: (ThreadSanitizer|MemorySanitizer)|runtime error:|==FAKEJNI== [^r]|==FUZZ-' "$log"; then
-        crashes=("$log")
+    if ((${#crashes[@]} == 0)); then
+        for log in "${logs[@]}"; do
+            if grep -qE 'ERROR: (AddressSanitizer|ThreadSanitizer|MemorySanitizer|LeakSanitizer|libFuzzer)|WARNING: (ThreadSanitizer|MemorySanitizer)|runtime error:|==FAKEJNI== [^r]|==FUZZ-' "$log"; then
+                crashes+=("$log")
+            fi
+        done
     fi
-    result "$target" "$san" fuzz $((t1 - t0)) "${runs:-0}" "${crashes[@]}"
-    echo "run.sh: fuzz $PROFILE-$san $target: ${runs:-0} executions in $((t1 - t0)) s, ${#crashes[@]} findings"
+    result "$target" "$san" fuzz $((t1 - t0)) "$runs" "${crashes[@]}"
+    echo "run.sh: fuzz $PROFILE-$san $target: $runs executions in $((t1 - t0)) s with $WORKERS workers, ${#crashes[@]} findings"
 }
 
 # Run each seed and regression input of one target one time: $1 the target, $2 the sanitizer.
@@ -645,6 +672,7 @@ parse_options() {
     PROFILES="debug release"
     BUDGET=600
     JOBS=4
+    WORKERS=1
     while (($# > 0)); do
         case $1 in
             --profile)
@@ -654,6 +682,7 @@ parse_options() {
                 ;;
             --budget-seconds) BUDGET=${2:?"--budget-seconds needs a value"}; shift 2 ;;
             --jobs) JOBS=${2:?"--jobs needs a value"}; shift 2 ;;
+            --workers) WORKERS=${2:?"--workers needs a value"}; shift 2 ;;
             *) die "unknown option '$1'" ;;
         esac
     done
