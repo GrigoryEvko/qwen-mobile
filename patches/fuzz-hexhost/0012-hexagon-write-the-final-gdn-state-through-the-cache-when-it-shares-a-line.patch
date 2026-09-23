@@ -1,0 +1,91 @@
+hexagon: write the final GATED_DELTA_NET state through the cache when it shares a line
+Fold-into: upstream/hexagon-host
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+The output of GATED_DELTA_NET holds the attention output, then the final state
+(snapshot slot 0), then the other snapshot slots. The kernel writes the
+attention output and the slots 1 and up with stores through the L2 cache, and
+the final state with a DMA write to DDR. When the size of the attention output
+(S_v * H * tokens * sequences * 4 bytes) is not a multiple of the 128-byte L2
+line, the last line of the attention output also holds the first bytes of the
+final state. That line is dirty in L2 with the old bytes of the state, and its
+write-back replaces the bytes of the DMA write.
+
+This patch writes the final state through the cache when its first byte is not
+on a line boundary. Each state is S_v * S_v floats, a multiple of the line,
+thus all states of the op then take the same path. With S_v = 128 the
+attention output ends on a line boundary, thus those shapes keep the DMA path.
+
+diff --git a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
+index d65ead9..cb4673e 100644
+--- a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
++++ b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
+@@ -738,6 +738,9 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
+     float * dst_base       = (float *) (uintptr_t) dst->data;
+     float * state_out_base = dst_base + (uint64_t) S_v * H * n_tokens * n_seqs;
+     const float * state_in_base = (const float *) (uintptr_t) state->data;
++    // Each state is S_v * S_v floats (a multiple of the line), thus every state is line aligned
++    // when the first one is
++    const bool state_dma = ((uintptr_t) state_out_base & (HEX_L2_LINE_SIZE - 1)) == 0;
+ 
+     const bool kda = (g->ne[0] == S_v);
+ 
+@@ -833,10 +836,19 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
+             attn_data += (uint64_t) S_v * H;
+         }
+ 
+-        // Push real write-back
+-        dma_queue_push(dma, dma_make_ptr(s_out, s_work_curr),
+-                       S_v * sizeof(float), S_v * sizeof(float),
+-                       S_v * sizeof(float), S_v);
++        // Push real write-back. A final state that shares an L2 line with the attention output
++        // or with snapshot slot 1 (both written through the cache) takes the cache path too: the
++        // write-back of that dirty line would replace the bytes of a DMA write.
++        if (state_dma) {
++            dma_queue_push(dma, dma_make_ptr(s_out, s_work_curr),
++                           S_v * sizeof(float), S_v * sizeof(float),
++                           S_v * sizeof(float), S_v);
++        } else {
++            hvx_copy_f32_uu((uint8_t *) s_out, (const uint8_t *) s_work_curr, S_v * S_v);
++            dma_queue_push(dma, dma_make_ptr(s_out, s_work_curr),
++                           S_v * sizeof(float), S_v * sizeof(float),
++                           S_v * sizeof(float), 0);
++        }
+ 
+         // Prefetch next block (if any)
+         if (ir_prefetch < row_end) {
+@@ -886,6 +898,9 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
+     float *       dst_base       = gctx->attn_base;
+     float *       state_out_base = gctx->state_out_base;
+     const float * state_in_base  = gctx->state_in_base;
++    // Each state is S_v * S_v floats (a multiple of the line), thus every state is line aligned
++    // when the first one is
++    const bool    state_dma      = ((uintptr_t) state_out_base & (HEX_L2_LINE_SIZE - 1)) == 0;
+ 
+     const bool kda = (g->ne[0] == S_v);
+ 
+@@ -965,10 +980,19 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
+ 
+         gdn_step_token_f32(s_work_curr, q_t, k_t, v_t, g_t, beta_val, attn_data, S_v, kda, scale);
+ 
+-        // Push real write-back
+-        dma_queue_push(dma, dma_make_ptr(s_out, s_work_curr),
+-                       S_v * sizeof(float), S_v * sizeof(float),
+-                       S_v * sizeof(float), S_v);
++        // Push real write-back. A final state that shares an L2 line with the attention output
++        // (written through the cache) takes the cache path too: the write-back of that dirty line
++        // would replace the bytes of a DMA write.
++        if (state_dma) {
++            dma_queue_push(dma, dma_make_ptr(s_out, s_work_curr),
++                           S_v * sizeof(float), S_v * sizeof(float),
++                           S_v * sizeof(float), S_v);
++        } else {
++            hvx_copy_f32_uu((uint8_t *) s_out, (const uint8_t *) s_work_curr, S_v * S_v);
++            dma_queue_push(dma, dma_make_ptr(s_out, s_work_curr),
++                           S_v * sizeof(float), S_v * sizeof(float),
++                           S_v * sizeof(float), 0);
++        }
+ 
+         // Prefetch next block (if any)
+         if (ir_prefetch < row_end) {

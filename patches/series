@@ -177,3 +177,4 @@ fuzz-hexhost/0008-hexagon-fuse-mul-mat-and-add-only-for-the-one-reader-of-the-pr
 fuzz-hexhost/0009-hexagon-keep-the-fd-map-of-an-op-batch-after-the-buffer-sort.patch
 fuzz-hexhost/0010-hexagon-reject-a-gdn-conv-chain-when-a-node-touches-its-moved-bytes.patch
 fuzz-hexhost/0011-hexagon-state-the-split-limit-of-the-fused-gdn-state-chain.patch
+fuzz-hexhost/0012-hexagon-write-the-final-gdn-state-through-the-cache-when-it-shares-a-line.patch
