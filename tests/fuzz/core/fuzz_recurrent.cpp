@@ -255,13 +255,6 @@ void run(FuzzedDataProvider & fdp) {
     p.n_seq_max = fdp.ConsumeIntegralInRange<uint32_t>(1, kMaxSeq);
     p.n_rs_seq  = fdp.ConsumeIntegralInRange<uint32_t>(0, 5);
     p.n_ubatch  = kUbatch[fdp.ConsumeIntegralInRange<int>(0, 6)];
-    // FUZZ_RECURRENT_KNOWN_UBATCH_TAIL=1 keeps n_ubatch > n_rs_seq + 1 (finding ubatch-tail: with
-    // n_rs_seq > 0, a smaller n_ubatch fails GGML_ASSERT(n_ubatch > n_keep_tail) in
-    // llama_batch_allocr::split_equal on the first decode)
-    static const bool known_tail = fuzz::env_long("FUZZ_RECURRENT_KNOWN_UBATCH_TAIL", 0) != 0;
-    if (known_tail && p.n_rs_seq > 0 && p.n_ubatch <= p.n_rs_seq + 1) {
-        p.n_ubatch = p.n_rs_seq + 2 + p.n_ubatch % 3;
-    }
     p.unified   = fdp.ConsumeBool();
     p.flash     = fdp.ConsumeIntegralInRange<int>(-1, 1);
     p.threads   = (int) fuzz::env_long("FUZZ_THREADS", 0) > 0 ? (int) fuzz::env_long("FUZZ_THREADS", 0) : fdp.ConsumeIntegralInRange<int>(1, 2);
@@ -272,8 +265,15 @@ void run(FuzzedDataProvider & fdp) {
     // the reference contexts with the flash attention setting of this context (auto is on for the CPU)
     g_ref = g_ref_sets[p.flash == 0 ? 0 : 1];
     llama_context * ctx = make_ctx(p);
-    if (ctx == nullptr && p.n_rs_seq > 0 && p.n_ubatch <= p.n_rs_seq + 1) {
-        return;  // a refusal of this configuration is the correct answer (see finding ubatch-tail)
+    // The recurrent memory keeps the last n_rs_seq + 1 tokens of each sequence in one ubatch, thus the
+    // context must refuse a smaller n_ubatch. A model with no recurrent rollback gets n_rs_seq 0.
+    if (p.n_rs_seq > 0 && p.n_ubatch <= p.n_rs_seq + 1) {
+        if (ctx != nullptr && llama_n_rs_seq(ctx) > 0) {
+            fuzz::fail("llama_init_from_model accepts n_ubatch %u with n_rs_seq %u", p.n_ubatch, llama_n_rs_seq(ctx));
+        }
+        if (ctx == nullptr) {
+            return;
+        }
     }
     if (ctx == nullptr) {
         fuzz::fail("llama_init_from_model fails for n_seq_max %u n_rs_seq %u n_ubatch %u", p.n_seq_max, p.n_rs_seq, p.n_ubatch);

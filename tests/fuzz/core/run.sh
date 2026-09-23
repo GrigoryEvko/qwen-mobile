@@ -100,7 +100,6 @@ PHONE_TARGETS="fuzz_npu_decode fuzz_recurrent"
 
 # The switch of each known finding (rule R8 and R13).
 declare -A SWITCH=(
-    [ubatch-tail]=FUZZ_RECURRENT_KNOWN_UBATCH_TAIL
     [kv-keep-streams]=FUZZ_RECURRENT_KNOWN_KV_KEEP
     [recurrent-shared-rollback]=FUZZ_RECURRENT_KNOWN_SHARED_ROLLBACK
     [copy-into-used-sequence]=FUZZ_RECURRENT_CLEAR_BEFORE_COPY
@@ -112,7 +111,6 @@ declare -A EXPECT=(
     [kv-keep-streams]='P2: after'
     [recurrent-shared-rollback]='cannot write shared recurrent state|P2: after'
     [copy-into-used-sequence]='P2: after'
-    [ubatch-tail]='GGML_ASSERT\(n_ubatch > n_keep_tail\)'
 )
 
 # Print the header comment of this file (from line 2 to the first empty line) as the usage text, then

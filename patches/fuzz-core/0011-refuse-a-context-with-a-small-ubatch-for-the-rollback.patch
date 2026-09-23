@@ -1,0 +1,39 @@
+Refuse a context with an n_ubatch that is not larger than n_rs_seq + 1
+Fold-into: upstream/llama-context
+
+The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
+
+- A context with n_ubatch <= n_rs_seq + 1 stops the process at its first decode.
+
+  The recurrent memory keeps the last n_rs_seq + 1 tokens of each sequence in one ubatch, and
+  llama_batch_allocr::split_equal asserts n_ubatch > n_rs_seq + 1. llama_init_from_model accepts a
+  smaller n_ubatch, and the first decode of a recurrent or hybrid model then stops the process on
+  GGML_ASSERT(n_ubatch > n_keep_tail).
+
+  The change: The context constructor throws std::runtime_error for such parameters, thus
+  llama_init_from_model returns nullptr with an error line.
+
+  The reproducer: tests/fuzz/core/regress/fuzz_recurrent--ubatch-tail.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -246,6 +246,15 @@ llama_context::llama_context(
+ 
+     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+ 
++    // [TAG_RECURRENT_ROLLBACK_SPLITS] the recurrent memory keeps the last n_rs_seq + 1 tokens of
++    // each sequence in one ubatch, and llama_batch_allocr::split_equal asserts
++    // n_ubatch > n_rs_seq + 1 on each decode. Refuse such a context here, with an error that the
++    // caller gets, and not with an abort at the first decode.
++    if (cparams.n_rs_seq > 0 && cparams.n_ubatch <= cparams.n_rs_seq + 1) {
++        throw std::runtime_error("n_ubatch (" + std::to_string(cparams.n_ubatch) + ") must be larger than n_rs_seq + 1 (" +
++                                 std::to_string(cparams.n_rs_seq + 1) + "): the last n_rs_seq + 1 tokens of a sequence stay in one ubatch");
++    }
++
+     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
+     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
+             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
