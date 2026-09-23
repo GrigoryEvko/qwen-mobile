@@ -1,0 +1,95 @@
+opencl: row broadcast of a src1 row that repeats along dim 0
+Fold-into: upstream/ggml-opencl
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+ADD, SUB, MUL and DIV take the row kernels when src1 is one contiguous row with
+ne10 % 4 == 0 and ne00 % 4 == 0. The kernels read src1 at the flat index gid
+modulo ne, and the host set ne = ne00/4. When src1 repeats along dim 0
+(ne10 < ne00), the index goes past the src1 row. The op fuzzer found relative
+errors of 0.52 and 1.0, for example ADD of f16[32,12] and f16[16,1]. The app
+graphs do not reach this condition: no ADD or MUL of their graphs repeats src1
+along dim 0.
+
+This patch sets ne = ne10/4. ggml_can_repeat makes ne00 a multiple of ne10,
+thus the element of the flat index gid is gid % (ne10/4).
+
+The patch also adds bin_bcast cases to test-backend-ops: f16 and f32 src1 rows
+of 16 and 8 elements that repeat two times along dim 0.
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index bd5af9e..d1661d4 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -13339,7 +13339,9 @@ static void ggml_cl_add(ggml_backend_t backend, const ggml_tensor * src0, const
+         GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32);
+         if (bcast_row) {
+             kernel = backend_ctx->kernel_add_row;
+-            const int ne = ne00 / 4;
++            // the length of the src1 row in float4: src1 repeats along dim 0 when ne10 < ne00, and
++            // ne00 % ne10 == 0 (ggml_can_repeat), thus the element of the flat index gid is gid % (ne10/4)
++            const int ne = ne10 / 4;
+             CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
+             CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
+             CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra1->data_device));
+@@ -13387,7 +13389,9 @@ static void ggml_cl_add(ggml_backend_t backend, const ggml_tensor * src0, const
+         const int type_src1 = (src1->type == GGML_TYPE_F32);
+         if (bcast_row) {
+             kernel = backend_ctx->kernel_add_row_f16;
+-            const int ne = ne00 / 4;
++            // the length of the src1 row in float4: src1 repeats along dim 0 when ne10 < ne00, and
++            // ne00 % ne10 == 0 (ggml_can_repeat), thus the element of the flat index gid is gid % (ne10/4)
++            const int ne = ne10 / 4;
+             CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
+             CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
+             CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra1->data_device));
+@@ -13587,7 +13591,9 @@ static void ggml_cl_mul(ggml_backend_t backend, const ggml_tensor * src0, const
+         GGML_ASSERT(ne11 == 1);
+ 
+         bcast_row = true;
+-        int ne = ne00 / 4;
++        // the length of the src1 row in float4: src1 repeats along dim 0 when ne10 < ne00, and
++        // ne00 % ne10 == 0 (ggml_can_repeat), thus the element of the flat index gid is gid % (ne10/4)
++        int ne = ne10 / 4;
+ 
+         if (src0->type == GGML_TYPE_F32) {
+             kernel = backend_ctx->kernel_mul_row;
+@@ -13720,7 +13726,9 @@ static void ggml_cl_div(ggml_backend_t backend, const ggml_tensor * src0, const
+         GGML_ASSERT(ne11 == 1);
+ 
+         bcast_row = true;
+-        int ne = ne00 / 4;
++        // the length of the src1 row in float4: src1 repeats along dim 0 when ne10 < ne00, and
++        // ne00 % ne10 == 0 (ggml_can_repeat), thus the element of the flat index gid is gid % (ne10/4)
++        int ne = ne10 / 4;
+ 
+         if (src0->type == GGML_TYPE_F32) {
+             kernel = backend_ctx->kernel_div_row;
+@@ -13841,7 +13849,9 @@ static void ggml_cl_sub(ggml_backend_t backend, const ggml_tensor * src0, const
+         GGML_ASSERT(ne11 == 1);
+ 
+         bcast_row = true;
+-        int ne = ne00 / 4;
++        // the length of the src1 row in float4: src1 repeats along dim 0 when ne10 < ne00, and
++        // ne00 % ne10 == 0 (ggml_can_repeat), thus the element of the flat index gid is gid % (ne10/4)
++        int ne = ne10 / 4;
+ 
+         if (src0->type == GGML_TYPE_F32) {
+             kernel = backend_ctx->kernel_sub_row;
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 13ae4ad..3721e6d 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9984,6 +9984,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         //add_test_bin_bcast(type, {3, 3, 2560, 1280}, {2, 1, 1, 1});
+     }
+ 
++    // a src1 row that repeats along dim 0 (ne10 < ne00, both multiples of 4)
++    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
++        add_test_bin_bcast(type, {16, 1, 1, 1}, {2, 12, 1, 1});
++        add_test_bin_bcast(type, {8,  1, 1, 1}, {2,  1, 1, 1});
++    }
++
+     // single inplace tests, especially important for WebGPU backend since kernels for inplace vs. not are different
+     test_cases.emplace_back(new test_bin_bcast(ggml_add_inplace, GGML_TYPE_F32, {16, 5, 4, 3}, {1, 1, 1, 1}, 16));
+     test_cases.emplace_back(new test_bin_bcast(ggml_mul_inplace, GGML_TYPE_F32, {16, 5, 4, 3}, {1, 1, 1, 1}, 16));

@@ -160,3 +160,4 @@ fuzz-ops/0007-hexagon-htp-silu-and-swiglu-of-small-inputs-in-the-int16-path.patc
 fuzz-ops/0008-hexagon-htp-get-rows-of-an-f16-row-with-a-tail.patch
 fuzz-ops/0009-hexagon-htp-soft-max-of-a-fully-masked-row-gives-0.patch
 fuzz-ops/0010-opencl-soft-max-of-a-fully-masked-row-gives-0.patch
+fuzz-ops/0011-opencl-row-broadcast-of-a-src1-row-that-repeats-along-dim-0.patch
