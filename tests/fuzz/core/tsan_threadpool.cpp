@@ -181,6 +181,18 @@ Graph build(FuzzedDataProvider & fdp, std::mt19937 & rng) {
     return g;
 }
 
+/**
+ * Fill each output with the byte 0xA5 before a compute. An op can leave a part of its output
+ * unwritten by design (the gated delta net writes min(T, K) snapshot slots of K), and each compute
+ * must start from the same bytes: then a part that one thread count writes and a different one does
+ * not write shows as a difference, and no compare reads memory that nothing wrote. O(output bytes).
+ */
+void poison(const Graph & g) {
+    for (const ggml_tensor * t : g.outs) {
+        memset(t->data, 0xA5, ggml_nbytes(t));
+    }
+}
+
 /** A copy of the bytes of each output. */
 std::vector<std::vector<uint8_t>> snapshot(const Graph & g) {
     std::vector<std::vector<uint8_t>> s;
@@ -231,6 +243,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
     Graph g = build(fdp, rng);
 
     // the reference: one thread, no pool
+    poison(g);
     if (ggml_graph_compute_with_ctx(g.ctx, g.gf, 1) != GGML_STATUS_SUCCESS) {
         fuzz::fail("the compute with 1 thread fails");
     }
@@ -246,6 +259,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
         abort_state.n_left.store(use_abort ? fdp.ConsumeIntegralInRange<int>(0, 8) : -1);
 
         ggml_status st = GGML_STATUS_SUCCESS;
+        poison(g);
         ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads);
         ggml_threadpool * pool = nullptr;
         if (mech == 0) {

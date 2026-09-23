@@ -251,8 +251,9 @@ fuzz_one() {
     execs=$(( execs + prev ))
     local cov
     cov=$(grep -oE 'cov: [0-9]+ ft: [0-9]+' "$log" | tail -n 1 || true)
+    # a slow unit (an input that took more than 10 s, not a crash) is not a finding
     local -a arts=()
-    mapfile -t arts < <(find "$out/artifacts" -type f | sort)
+    mapfile -t arts < <(find "$out/artifacts" -type f ! -name 'slow-unit-*' | sort)
     result_line "$dir" "$fz" "$san" "$profile" fuzz "$(( SECONDS - start ))" "$execs" "${#arts[@]}" "${arts[@]}"
     echo "core-$profile-$san${TREE_TAG:+-$TREE_TAG} $fz: $(( SECONDS - start )) s, $starts starts, $execs executions, $cov, corpus $(find "$out/corpus" -type f | wc -l), crash files ${#arts[@]}"
 }

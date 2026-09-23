@@ -218,7 +218,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
         return 0;
     }
     if (data[size - 1] & 1) {
-        run_jinja(std::string((const char *) data, size - 1));
+        // an empty override asks common_chat_templates_init for the template of the model, and the
+        // jinja mode has no model (the API asserts a model for an empty override)
+        if (size > 1) {
+            run_jinja(std::string((const char *) data, size - 1));
+        }
         return 0;
     }
     FuzzedDataProvider fdp(data, size - 1);

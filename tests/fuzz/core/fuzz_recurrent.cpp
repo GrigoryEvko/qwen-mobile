@@ -258,7 +258,10 @@ void run(FuzzedDataProvider & fdp) {
     p.n_ubatch  = kUbatch[fdp.ConsumeIntegralInRange<int>(0, 6)];
     p.unified   = fdp.ConsumeBool();
     p.flash     = fdp.ConsumeIntegralInRange<int>(-1, 1);
-    p.threads   = (int) fuzz::env_long("FUZZ_THREADS", 0) > 0 ? (int) fuzz::env_long("FUZZ_THREADS", 0) : fdp.ConsumeIntegralInRange<int>(1, 2);
+    // The byte of the thread count is read also when FUZZ_THREADS gives the count, thus an input
+    // gives the same program with and without FUZZ_THREADS (the phone commands set it).
+    const int threads_in = fdp.ConsumeIntegralInRange<int>(1, 2);
+    p.threads   = fuzz::env_long("FUZZ_THREADS", 0) > 0 ? (int) fuzz::env_long("FUZZ_THREADS", 0) : threads_in;
     p.embd_host = fdp.ConsumeBool();
     trace("ctx: n_seq_max %u n_rs_seq %u n_ubatch %u unified %d flash %d threads %d embd_host %d",
           p.n_seq_max, p.n_rs_seq, p.n_ubatch, p.unified, p.flash, p.threads, p.embd_host);
