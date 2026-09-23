@@ -60,8 +60,7 @@ void fill(ggml_tensor * t, std::mt19937 & rng) {
     if (t->type == GGML_TYPE_F32) {
         memcpy(t->data, f.data(), ggml_nbytes(t));
     } else {
-        // ggml_quantize_chunk and not the from_float pointer of the CPU type traits: a call through
-        // that pointer has an incorrect function type (task #127, a UBSan report in the harness)
+        // ggml_quantize_chunk converts the values to each type of the public API that a graph here uses
         const int64_t n_per_row = t->ne[0];
         ggml_quantize_chunk(t->type, f.data(), t->data, 0, ggml_nelements(t) / n_per_row, n_per_row, nullptr);
     }

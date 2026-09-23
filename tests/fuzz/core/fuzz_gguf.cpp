@@ -22,7 +22,7 @@
 // allocates the declared data size. A malloc hook of the sanitizer runtime
 // measures the largest single allocation, thus this check runs in the asan,
 // tsan and msan builds only. FUZZ_GGUF_KNOWN_EARLY_ALLOC=1 turns it off, thus
-// the campaign can continue after the first report.
+// the fuzz suite can continue after the first report.
 //
 // The harness skips reader 4 when the declared data section is larger than
 // FUZZ_GGUF_MAX_DATA bytes (the default is 256 MiB), to keep the RSS below the

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The fuzz campaign of the llama.cpp core and of our patches to it.
+# The fuzz harnesses of the llama.cpp core and of our patches to it.
 #
 # Usage:
 #   tests/fuzz/core/run.sh test <config> [--profile P] [--budget-seconds N] [--jobs N] [target ...]
@@ -68,9 +68,7 @@
 # callback of libFuzzer (seen with TSan). The logs, the corpus and the crash
 # inputs of a target are in build/fuzz/core-<profile>-<config>/runs/<target>. Each
 # run writes one JSON line for each target to build/fuzz/core-<profile>-<config>/results.jsonl:
-# {area, target, sanitizer, profile, mode, seconds, executions, findings, crash_files}, plus
-# blocked_by (a task number) when a known report of a code outside this area stops the target.
-# A blocked record is not a pass.
+# {area, target, sanitizer, profile, mode, seconds, executions, findings, crash_files}.
 
 set -euo pipefail
 
@@ -230,25 +228,15 @@ build_tree() {
 
 # Write one JSON line for a target to results.jsonl. The crash files are the remaining arguments.
 result_line() {
-    local dir=$1 target=$2 san=$3 profile=$4 mode=$5 seconds=$6 execs=$7 findings=$8 blocked=$9
-    shift 9
+    local dir=$1 target=$2 san=$3 profile=$4 mode=$5 seconds=$6 execs=$7 findings=$8
+    shift 8
     local files
     files=$(printf '%s\n' "$@" | jq -R . | jq -sc 'map(select(length > 0))')
     jq -nc --arg area core --arg target "$target" --arg sanitizer "$san" --arg profile "$profile" --arg mode "$mode" \
         --argjson seconds "$seconds" --argjson executions "$execs" --argjson findings "$findings" \
-        --argjson crash_files "$files" --arg blocked "$blocked" \
+        --argjson crash_files "$files" \
         '{area: $area, target: $target, sanitizer: $sanitizer, profile: $profile, mode: $mode, seconds: $seconds,
-          executions: $executions, findings: $findings, crash_files: $crash_files}
-         + (if $blocked == "" then {} else {blocked_by: $blocked} end)' >> "$dir/results.jsonl"
-}
-
-# The task of a known report that stops every run of a target and that this area cannot keep off
-# (the report of a code outside this area), read from a run log on stdin. Empty when there is none.
-#   #127  UBSan "call to function ... through pointer to incorrect function type" in ggml-cpu
-blocker() {
-    if grep -qE 'runtime error: call to function .*through pointer to incorrect function type'; then
-        echo "#127"
-    fi
+          executions: $executions, findings: $findings, crash_files: $crash_files}' >> "$dir/results.jsonl"
 }
 
 # Fuzz one target for the budget. $1 is the profile, $2 the configuration, $3 the target.
@@ -264,7 +252,7 @@ fuzz_one() {
     sanitizer_env "$san"
     local -a known=()
     [[ "$KNOWN" == 1 ]] && read -r -a known <<< "$(known_env)"
-    local start=$SECONDS left starts=0 rc blocked=""
+    local start=$SECONDS left starts=0 rc
     while :; do
         left=$(( BUDGET - (SECONDS - start) ))
         (( left > 5 && starts < 200 )) || break
@@ -277,9 +265,6 @@ fuzz_one() {
                 >> "$log" 2>&1 || rc=$?
         echo "run.sh: start $starts ended with code $rc after $(( SECONDS - start )) s" >> "$log"
         [[ $rc == 0 ]] && break
-        # a report of a code outside this area stops each start at once: record it and stop
-        blocked=$(blocker < "$log")
-        [[ -n $blocked ]] && break
     done
     # the executions: the sum of the last progress count of each start
     local execs=0 prev=0 n
@@ -294,16 +279,16 @@ fuzz_one() {
     cov=$(grep -oE 'cov: [0-9]+ ft: [0-9]+' "$log" | tail -n 1 || true)
     local -a arts=()
     mapfile -t arts < <(find "$out/artifacts" -type f | sort)
-    result_line "$dir" "$fz" "$san" "$profile" fuzz "$(( SECONDS - start ))" "$execs" "${#arts[@]}" "$blocked" "${arts[@]}"
-    echo "core-$profile-$san $fz: $(( SECONDS - start )) s, $starts starts, $execs executions, $cov, corpus $(find "$out/corpus" -type f | wc -l), crash files ${#arts[@]}${blocked:+, blocked by $blocked}"
+    result_line "$dir" "$fz" "$san" "$profile" fuzz "$(( SECONDS - start ))" "$execs" "${#arts[@]}" "${arts[@]}"
+    echo "core-$profile-$san $fz: $(( SECONDS - start )) s, $starts starts, $execs executions, $cov, corpus $(find "$out/corpus" -type f | wc -l), crash files ${#arts[@]}"
 }
 
-# Test one target. The seeds run with all the switches on: a failure is a new finding, or a run
-# blocked by a report of a code outside this area (blocker). Each regression input of a known
-# finding runs two times: (A) with all the switches less the switch of its finding, where it must
-# show its report (EXPECT) or pass when this configuration cannot show the finding, and (B) with all
-# the switches, where it must pass (rule R13: the switch holds). A regression input of a fixed
-# finding (no switch in SWITCH) runs one time with all the switches, and it must pass.
+# Test one target. The seeds run with all the switches on: a failure is a finding with no switch.
+# Each regression input with a switch in SWITCH runs two times: (A) with all the switches less its
+# own, where it must show its report (EXPECT) or pass when this configuration cannot show the
+# defect, and (B) with all the switches, where it must pass (rule R13: the switch holds). A
+# regression input with no switch (its defect has a fix in the code) runs one time with all the
+# switches, and it must pass.
 test_one() {
     local profile=$1 san=$2 fz=$3
     local dir="$REPO/build/fuzz/core-$profile-$san"
@@ -326,16 +311,10 @@ test_one() {
     env "${all[@]}" GGML_NO_BACKTRACE=1 FUZZ_DATA_DIR="$DATA" FUZZ_ARTIFACT_DIR="$art" timeout -s KILL 600 "$dir/$fz" -runs=0 -rss_limit_mb=4096 \
         -timeout=60 -artifact_prefix="$art/" -max_len="$(max_len "$fz")" "$HERE/seeds/$fz" >> "$log" 2>&1 || rc=$?
     execs=$(( execs + $(find "$HERE/seeds/$fz" -type f | wc -l) ))
-    local blocked
-    blocked=$(blocker < "$log")
     if [[ $rc != 0 ]]; then
         findings=$(( findings + 1 ))
         failed+=("$HERE/seeds/$fz")
-        if [[ -n $blocked ]]; then
-            notes+=" seeds:blocked-by-$blocked"
-        else
-            notes+=" seeds:new($(signature < "$log" | tr ' ' _))"
-        fi
+        notes+=" seeds:fail($(signature < "$log" | tr ' ' _))"
     fi
     for f in "$HERE"/regress/"$fz"--*; do
         [[ -f $f ]] || continue
@@ -344,20 +323,20 @@ test_one() {
         sw=${SWITCH[$finding]:-}
         expect=${EXPECT[$finding]:-}
         if [[ -z $sw ]]; then
-            # a fixed finding: its switch is gone, and the input must pass with all the switches
+            # no switch: the code has the fix of the defect, and the input must pass with all the switches
             rc=0
             env "${all[@]}" GGML_NO_BACKTRACE=1 FUZZ_DATA_DIR="$DATA" FUZZ_ARTIFACT_DIR="$art" timeout -s KILL 600 "$dir/$fz" \
                 -rss_limit_mb=4096 -timeout=60 -artifact_prefix="$art/" "$f" > "$tmp" 2>&1 || rc=$?
             cat "$tmp" >> "$log"
             execs=$(( execs + 1 ))
             sig=$(signature < "$tmp")
-            echo "run.sh: $name (fixed) gives the code $rc: $sig" >> "$log"
+            echo "run.sh: $name (no switch) gives the code $rc: $sig" >> "$log"
             if [[ $rc == 0 ]]; then
-                notes+=" $finding:fixed-passes"
+                notes+=" $finding:passes"
             else
                 findings=$(( findings + 1 ))
-                failed+=("$f (a fixed finding fails)")
-                notes+=" $finding:fixed-fails(${sig// /_})"
+                failed+=("$f (a reproducer with no switch fails)")
+                notes+=" $finding:fails(${sig// /_})"
             fi
             continue
         fi
@@ -399,12 +378,12 @@ test_one() {
             notes+="/switch-leaks"
         else
             findings=$(( findings + 1 ))
-            failed+=("$f (a new report with all switches)")
+            failed+=("$f (a different report with all switches)")
             notes+="/switch-holds-then(${sig// /_})"
         fi
     done
     rm -rf "$tmp" "$art"
-    result_line "$dir" "$fz" "$san" "$profile" test "$(( SECONDS - start ))" "$execs" "$findings" "$blocked" "${failed[@]}"
+    result_line "$dir" "$fz" "$san" "$profile" test "$(( SECONDS - start ))" "$execs" "$findings" "${failed[@]}"
     echo "core-$profile-$san $fz: $execs runs, $findings findings |$notes"
 }
 
@@ -505,9 +484,10 @@ phone_build() {
     if [[ $san == asan ]]; then
         # The ASan runtime of NDK r29 traps in each new thread on the phone: bionic resets the PAC key
         # through prctl, and the prctl interceptor then fails its own AUTIASP. The runtime of
-        # compiler-rt 22.1.8 (built by fuzz-ops) has the upstream fix and replaces it.
+        # compiler-rt 22.1.8 (tests/sanitizers/build-asan-android-runtime.sh) has the upstream
+        # correction of the interceptor, thus it replaces the runtime of the NDK.
         local rt22="$REPO/build/fuzz/ops/phone/asan-rt22/libclang_rt.asan-aarch64-android.so"
-        [[ -f $rt22 ]] || die "the fixed ASan runtime $rt22 is missing (tests/sanitizers/build-asan-android-runtime.sh builds it)"
+        [[ -f $rt22 ]] || die "the ASan runtime $rt22 of compiler-rt 22.1.8 is missing (tests/sanitizers/build-asan-android-runtime.sh builds it)"
         [[ $(sha256sum "$rt22" | cut -c1-8) == 546f2a86 ]] || die "the ASan runtime $rt22 does not have the hash 546f2a86"
         install -m 0644 "$rt22" "$REPO/$rel/out/"
     fi

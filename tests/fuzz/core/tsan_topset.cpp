@@ -10,7 +10,7 @@
 // The harness sets LLAMA_SAMPLER_TOPSET before the first sample (the value is
 // read one time). FUZZ_TOPSET_MODE gives it, the default is 2.
 // FUZZ_TOPSET_KNOWN_COUNTERS=1 sets mode 1 (finding topset-counters), thus the
-// campaign can look for other races.
+// fuzz suite can look for other races.
 //
 // One input gives the sampler of each thread (llama_sampler_sample with the
 // chain of the app, or common_sampler_sample with default common parameters),

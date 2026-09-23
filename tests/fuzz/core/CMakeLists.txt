@@ -104,10 +104,8 @@ else()
         set(fuzz_san "-fsanitize=address -fno-optimize-sibling-calls")
         set(fuzz_san_link "-fsanitize=address")
     elseif (FUZZ_SANITIZER STREQUAL "ubsan")
-        # Rule R5: the first report stops the run. pointer-overflow recovers only for the
-        # tracked finding of task #125 (ggml_graph_nbytes, ggml.c:7451, 2026-09-23), which the
-        # shared file tests/sanitizers/ubsan.supp names. halt_on_error=1 stops all other reports.
-        set(fuzz_san "-fsanitize=undefined -fno-sanitize-recover=undefined -fsanitize-recover=pointer-overflow")
+        # Rule R5: the first report stops the run (the flags of tests/sanitizers/ubsan.cmake).
+        set(fuzz_san "-fsanitize=undefined -fno-sanitize-recover=undefined")
         set(fuzz_san_link "-fsanitize=undefined")
     elseif (FUZZ_SANITIZER STREQUAL "tsan")
         set(fuzz_san "-fsanitize=thread")
