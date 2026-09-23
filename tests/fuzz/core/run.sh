@@ -417,14 +417,16 @@ make_data() {
     ls -l "$DATA"
 }
 
-# The runtime library that a phone build needs next to its executables, or nothing.
+# The runtime library that a phone build needs next to its executables. With no sanitizer, the
+# libFuzzer of the NDK links the executables to the UBSan standalone runtime (a NEEDED entry), thus
+# the none build needs that library too.
 phone_runtime() {
     case $1 in
-        asan)   echo libclang_rt.asan-aarch64-android.so ;;
-        hwasan) echo libclang_rt.hwasan-aarch64-android.so ;;
-        tsan)   echo libclang_rt.tsan-aarch64-android.so ;;
-        ubsan)  echo libclang_rt.ubsan_standalone-aarch64-android.so ;;
-        *)      echo "" ;;
+        asan)       echo libclang_rt.asan-aarch64-android.so ;;
+        hwasan)     echo libclang_rt.hwasan-aarch64-android.so ;;
+        tsan)       echo libclang_rt.tsan-aarch64-android.so ;;
+        ubsan|none) echo libclang_rt.ubsan_standalone-aarch64-android.so ;;
+        *)          echo "" ;;
     esac
 }
 
