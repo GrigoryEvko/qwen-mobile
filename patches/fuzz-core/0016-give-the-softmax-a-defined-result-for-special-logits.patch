@@ -1,0 +1,76 @@
+Give the softmax of the samplers a defined result for an infinite or a NaN logit
+Fold-into: upstream/sampling
+
+The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
+
+- The shared softmax gives NaN probabilities for an infinite or a NaN logit.
+
+  llama_sampler_softmax_impl computes exp(l - max_l). For l = max_l = +Inf or -Inf the value is
+  NaN, and a NaN logit gives a NaN. The sum is then NaN. mirostat, mirostat v2 and adaptive-p draw
+  from these probabilities with std::discrete_distribution, which asserts a positive sum
+  (_GLIBCXX_ASSERTIONS) and has no defined result in a release build. A sorted array also takes
+  max_l from the first candidate, which can be a NaN. The dist sampler has its own softmax, which
+  patches/fuzz-core/0008 corrects in the same way.
+
+  The change: max_l comes from a loop that a NaN never wins. When max_l is infinite, each candidate
+  with the logit max_l gets an equal share of the probability. A NaN logit gets the probability 0.
+  When each logit is NaN, each candidate gets an equal share. For finite logits, the probabilities
+  are the same as those of the unpatched code.
+
+  The reproducer: tests/fuzz/core/regress/fuzz_sampler--softmax-non-finite.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    src/llama-sampler.cpp
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -304,21 +304,43 @@ static void llama_sampler_softmax_impl(llama_token_data_array * cur_p, bool do_s
+         llama_token_data_array_partial_sort_inplace(cur_p, cur_p->size);
+     }
+ 
+-    float max_l = cur_p->data[0].logit;
+-    if (!cur_p->sorted) {
+-        for (size_t i = 1; i < cur_p->size; ++i) {
+-            max_l = std::max(max_l, cur_p->data[i].logit);
++    // The largest logit. A NaN logit never wins the compare, and the order of a sorted array with a
++    // NaN is not defined, thus the loop reads each logit.
++    float max_l = -INFINITY;
++    for (size_t i = 0; i < cur_p->size; ++i) {
++        if (cur_p->data[i].logit > max_l) {
++            max_l = cur_p->data[i].logit;
+         }
+     }
+ 
++    // exp(l - max_l) is NaN for l = max_l = +-Inf, and a NaN logit gives a NaN: the sum is then NaN,
++    // and a sampler that draws from the probabilities (std::discrete_distribution) has no valid
++    // weight. A +Inf candidate takes all the probability (an equal share for each one), all -Inf
++    // candidates share it, and a NaN logit gets none. For finite logits the values do not change.
+     float cum_sum = 0.0f;
+ 
+     for (size_t i = 0; i < cur_p->size; ++i) {
+-        float p = expf(cur_p->data[i].logit - max_l);
++        const float l = cur_p->data[i].logit;
++        float p;
++        if (std::isnan(l)) {
++            p = 0.0f;
++        } else if (std::isinf(max_l)) {
++            p = l == max_l ? 1.0f : 0.0f;
++        } else {
++            p = expf(l - max_l);
++        }
+         cur_p->data[i].p = p;
+         cum_sum += p;
+     }
+ 
++    // each logit is NaN: no candidate has information, thus each one gets an equal share
++    if (cum_sum == 0.0f) {
++        for (size_t i = 0; i < cur_p->size; ++i) {
++            cur_p->data[i].p = 1.0f;
++        }
++        cum_sum = (float) cur_p->size;
++    }
++
+     for (size_t i = 0; i < cur_p->size; ++i) {
+         cur_p->data[i].p /= cum_sum;
+     }

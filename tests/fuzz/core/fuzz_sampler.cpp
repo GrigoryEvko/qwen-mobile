@@ -26,9 +26,9 @@
 //       larger than the id before it), each in [0, n_vocab), each with the logit
 //       of the input.
 //   P3  Differential: the two paths select the same token. The check is strict
-//       when no logit and no sampler parameter is NaN. With a NaN, the order is
-//       not defined on either path, thus the harness counts the differences and
-//       FUZZ_SAMPLER_STRICT_NAN=1 makes them failures too.
+//       when no logit is NaN and each sampler parameter is finite. With a NaN,
+//       the order is not defined on either path, thus the harness counts the
+//       differences and FUZZ_SAMPLER_STRICT_NAN=1 makes them failures too.
 //   P4  The dist sampler alone, on 2 to 8 candidates from the input: when
 //       exactly one candidate has the logit +Inf and no logit is NaN, dist
 //       selects that candidate, as greedy does.
@@ -57,7 +57,9 @@ float param(FuzzedDataProvider & fdp, float lo, float hi, bool * nan) {
     } else {
         v = lo + (hi - lo) * fdp.ConsumeProbability<float>();
     }
-    if (std::isnan(v)) {
+    // an infinite parameter also makes NaN logits (Inf / Inf in temp) or ties of all logits (a finite
+    // logit / Inf is 0), thus the order is not defined on either path, as with a NaN
+    if (!std::isfinite(v)) {
         *nan = true;
     }
     return v;
