@@ -119,6 +119,10 @@ suite_record() {
 }
 
 # Run one command with a timeout, write its log, and append its record.
+# The command runs in its own working directory under build/ (the directory
+# of the log, subdirectory work), thus a file that a test writes into its
+# working directory (for example dump_state.bin of test-save-load-state)
+# never goes into the root of the repository.
 # The status is pass only if the exit status is 0 and the log has no
 # sanitizer report.
 # Arguments: file area target profile sanitizer timeout_s log, then the command.
@@ -126,10 +130,11 @@ suite_record() {
 suite_run_record() {
     local file="$1" area="$2" target="$3" profile="$4" san="$5" limit="$6" log="$7"
     shift 7
-    local rc=0 t0 secs findings status reason=""
-    mkdir -p "$(dirname "$log")"
+    local rc=0 t0 secs findings status reason="" work
+    work="$(dirname "$log")/work"
+    mkdir -p "$work"
     t0="$(date +%s.%N)"
-    timeout -s KILL "$limit" "$@" > "$log" 2>&1 || rc=$?
+    (cd "$work" && timeout -s KILL "$limit" "$@") > "$log" 2>&1 || rc=$?
     secs="$(suite_elapsed "$t0")"
     findings="$(suite_count_findings "$log")"
     if [[ $rc -eq 137 ]]; then

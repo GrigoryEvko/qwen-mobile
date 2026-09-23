@@ -27,7 +27,10 @@
 #
 # The steps, in this sequence (--list-steps gives the requirements):
 #   rules        tests/sanitizers/check-rules.sh --no-builds. A violation stops
-#                the driver before each other step.
+#                the driver before each other step. After the other steps,
+#                check-rules.sh runs again with the build directories
+#                (rules-after), thus a stray file in the root of the
+#                repository or a build with the wrong flags fails the run.
 #   llama        tests/suite/llama-ctest.sh: the llama.cpp ctest suite.
 #   app-host     tests/suite/app-host-test.sh: the host unit tests of the app.
 #   probe-host   tests/suite/probe-host-test.sh: the ISA probe host test.
@@ -318,6 +321,9 @@ write_summary() {
 main() {
     parse_args "$@"
     suite_require jq rg yq timeout
+    # One working directory for each start of the driver. Each test of the
+    # suite scripts runs in its own directory under build/.
+    cd "$SUITE_REPO_ROOT"
     RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
     mkdir -p "$MATRIX/logs/$RUN_ID"
     STEP_RECORDS="$MATRIX/steps-$RUN_ID.jsonl"
@@ -355,6 +361,19 @@ main() {
             done
         done
     done
+
+    # The rules again, after the steps: a step that wrote a file into the root
+    # of the repository, or a build with the wrong flags, fails the run.
+    if want_step rules; then
+        local rc_after=0
+        "$SUITE_REPO_ROOT/tests/sanitizers/check-rules.sh" --areas "$AREAS" \
+            > "$MATRIX/logs/$RUN_ID/rules-after.log" 2>&1 || rc_after=$?
+        jq -nc --argjson rc "$rc_after" --arg log "$MATRIX/logs/$RUN_ID/rules-after.log" \
+            '{kind: "step", suite: "test", step: "rules-after", profile: "-", sanitizer: "-",
+              status: (if $rc == 0 then "pass" else "fail" end), exit_code: $rc, seconds: 0, log: $log}' \
+            >> "$STEP_RECORDS"
+        [[ $rc_after -eq 0 ]] || suite_log "check-rules.sh after the steps found violations. Refer to $MATRIX/logs/$RUN_ID/rules-after.log."
+    fi
 
     write_summary
     cat "$MATRIX/summary.txt"
