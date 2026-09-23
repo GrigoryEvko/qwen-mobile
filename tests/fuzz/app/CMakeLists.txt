@@ -131,9 +131,16 @@ else()
     add_compile_options(-g -O1 -fno-omit-frame-pointer ${LLAMA_FP_FLAGS})
 endif()
 
-# llama.cpp as static libraries, CPU backend always, Hexagon backend on
-# Android. OpenMP is off: ThreadSanitizer does not know its runtime.
-set(BUILD_SHARED_LIBS     OFF CACHE BOOL "" FORCE)
+# llama.cpp with the CPU backend always, and the Hexagon backend on Android.
+# OpenMP is off: ThreadSanitizer does not know its runtime.
+# The host builds take BUILD_SHARED_LIBS from the profile (ON). The app ships
+# llama, ggml, mtmd and llama-common as shared libraries, thus no inlining
+# crosses the boundary of a library, and the full LTO of the release profile
+# runs one time for each library, not one time for each executable. The phone
+# builds have no initial cache and link the libraries static.
+if(NOT DEFINED SANMATRIX_PROFILE)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+endif()
 set(GGML_OPENMP           OFF CACHE BOOL "" FORCE)
 set(GGML_LLAMAFILE        OFF CACHE BOOL "" FORCE)
 set(GGML_CPU_KLEIDIAI     OFF CACHE BOOL "" FORCE)
@@ -177,11 +184,12 @@ if(FUZZ_LLAMA_PREBUILT_DIR)
 else()
     add_subdirectory(${LLAMA_CPP_DIR} llama.cpp EXCLUDE_FROM_ALL)
     # In the release profile the libraries are LTO bitcode. With the coverage
-    # of libFuzzer on them as well, the link of clang 22 fails ("ld.lld: error:
-    # undefined symbol: __sancov_gen_.473", from a template of stl_tree.h that
-    # the LTO objects and the other objects both hold). Thus in that profile
-    # the coverage goes to the app sources only.
-    if(NOT FUZZ_PROFILE STREQUAL "release")
+    # of libFuzzer on static libraries as well, the link of clang 22 fails
+    # ("ld.lld: error: undefined symbol: __sancov_gen_.473", from a template
+    # of stl_tree.h that the LTO objects and the other objects both hold).
+    # Thus with static libraries in that profile, the coverage goes to the
+    # app sources only. Each shared library links its own LTO objects.
+    if(NOT FUZZ_PROFILE STREQUAL "release" OR BUILD_SHARED_LIBS)
         foreach(target llama llama-common mtmd)
             target_compile_options(${target} PRIVATE ${COV_FLAGS})
         endforeach()
