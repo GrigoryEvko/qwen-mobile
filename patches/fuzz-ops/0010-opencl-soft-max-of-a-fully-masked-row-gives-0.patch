@@ -1,0 +1,99 @@
+opencl: soft_max of a fully masked row gives 0
+Fold-into: upstream/ggml-opencl
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+When each value of a SOFT_MAX row and the sink are -inf, the row maximum is
+-inf, and the four soft_max kernels compute exp(-inf - (-inf)), which is NaN,
+in each column. The CPU backend gives 0 for such a row (patches/fuzz-ops/0006).
+The app graphs do not reach this condition: their masks have no fully masked
+row.
+
+This patch writes 0 into each column of such a row after the reduction of the
+maximum, in soft_max_f32, soft_max_f16, soft_max_4_f32 and soft_max_4_f16.
+test_soft_max_masked_row of test-backend-ops tests the change.
+
+diff --git a/ggml/src/ggml-opencl/kernels/softmax_4_f16.cl b/ggml/src/ggml-opencl/kernels/softmax_4_f16.cl
+index 571d165..c0b8174 100644
+--- a/ggml/src/ggml-opencl/kernels/softmax_4_f16.cl
++++ b/ggml/src/ggml-opencl/kernels/softmax_4_f16.cl
+@@ -87,6 +87,16 @@ kernel void kernel_soft_max_4_f16(
+ 
+     const float max = sub_group_reduce_max(lmax);
+ 
++    // A fully masked row (each value and the sink are -inf) has no finite value. Its result is 0 in
++    // each column, as on the CPU, and not the NaN of exp(-inf - (-inf)). max comes from
++    // sub_group_reduce_max, thus each work item of the row takes the same branch.
++    if (max == -INFINITY) {
++        for (int i00 = get_local_id(0); i00 < ne00/4; i00 += get_local_size(0)) {
++            pdst4[i00] = 0.0f;
++        }
++        return;
++    }
++
+     // parallel sum
+     float4 lsum4 = 0.0f;
+     for (int i00 = get_local_id(0); i00 < ne00/4; i00 += get_local_size(0)) {
+diff --git a/ggml/src/ggml-opencl/kernels/softmax_4_f32.cl b/ggml/src/ggml-opencl/kernels/softmax_4_f32.cl
+index 1f944b2..539905a 100644
+--- a/ggml/src/ggml-opencl/kernels/softmax_4_f32.cl
++++ b/ggml/src/ggml-opencl/kernels/softmax_4_f32.cl
+@@ -87,6 +87,16 @@ kernel void kernel_soft_max_4(
+ 
+     const float max = sub_group_reduce_max(lmax);
+ 
++    // A fully masked row (each value and the sink are -inf) has no finite value. Its result is 0 in
++    // each column, as on the CPU, and not the NaN of exp(-inf - (-inf)). max comes from
++    // sub_group_reduce_max, thus each work item of the row takes the same branch.
++    if (max == -INFINITY) {
++        for (int i00 = get_local_id(0); i00 < ne00/4; i00 += get_local_size(0)) {
++            pdst4[i00] = 0.0f;
++        }
++        return;
++    }
++
+     // parallel sum
+     float4 lsum4 = 0.0f;
+     for (int i00 = get_local_id(0); i00 < ne00/4; i00 += get_local_size(0)) {
+diff --git a/ggml/src/ggml-opencl/kernels/softmax_f16.cl b/ggml/src/ggml-opencl/kernels/softmax_f16.cl
+index 4baa6c2..8c7bebd 100644
+--- a/ggml/src/ggml-opencl/kernels/softmax_f16.cl
++++ b/ggml/src/ggml-opencl/kernels/softmax_f16.cl
+@@ -85,6 +85,16 @@ kernel void kernel_soft_max_f16(
+     }
+     float max = sub_group_reduce_max(lmax);
+ 
++    // A fully masked row (each value and the sink are -inf) has no finite value. Its result is 0 in
++    // each column, as on the CPU, and not the NaN of exp(-inf - (-inf)). max comes from
++    // sub_group_reduce_max, thus each work item of the row takes the same branch.
++    if (max == -INFINITY) {
++        for (int i00 = get_local_id(0); i00 < ne00; i00 += get_local_size(0)) {
++            pdst[i00] = 0.0f;
++        }
++        return;
++    }
++
+     // parallel sum
+     float lsum = 0.0f;
+     for (int i00 = get_local_id(0); i00 < ne00; i00 += get_local_size(0)) {
+diff --git a/ggml/src/ggml-opencl/kernels/softmax_f32.cl b/ggml/src/ggml-opencl/kernels/softmax_f32.cl
+index d503190..fdc006b 100644
+--- a/ggml/src/ggml-opencl/kernels/softmax_f32.cl
++++ b/ggml/src/ggml-opencl/kernels/softmax_f32.cl
+@@ -85,6 +85,16 @@ kernel void kernel_soft_max(
+     }
+     float max = sub_group_reduce_max(lmax);
+ 
++    // A fully masked row (each value and the sink are -inf) has no finite value. Its result is 0 in
++    // each column, as on the CPU, and not the NaN of exp(-inf - (-inf)). max comes from
++    // sub_group_reduce_max, thus each work item of the row takes the same branch.
++    if (max == -INFINITY) {
++        for (int i00 = get_local_id(0); i00 < ne00; i00 += get_local_size(0)) {
++            pdst[i00] = 0.0f;
++        }
++        return;
++    }
++
+     // parallel sum
+     float lsum = 0.0f;
+     for (int i00 = get_local_id(0); i00 < ne00; i00 += get_local_size(0)) {
