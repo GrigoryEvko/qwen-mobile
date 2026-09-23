@@ -66,8 +66,6 @@ LLAMA_BIN = san_dir() / "llama" / "bin"
 
 # The known defects of the code under test. The regression tests give the file and the minimal example of each.
 KNOWN_DEFECTS = {
-    "dense-map-f16-overflow":
-        "the export casts the dense maps to F16 with no check, thus an overflow gives inf",
     "searched-scale-f16-rounding":
         "the scale search compares float32 scales but stores their F16 rounding, which can lose to the plain scale",
     "only-filter-skips-iq4-nl":

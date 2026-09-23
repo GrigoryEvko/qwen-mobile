@@ -184,9 +184,8 @@ def test_export_refuses_an_unknown_plan_type(tmp_path: Path) -> None:
         export(src, tmp_path / "out.gguf", tmp_path / "no-packs", Plan(n_layers=0, head="Q6_K"), LLAMA_DIR, CPU)
 
 
-@xfail_open("dense-map-f16-overflow", "hnorm_rot / out_norm with an entry 1e-7 overflows F16 to inf with no error")
 def test_export_refuses_a_map_that_overflows_f16(tmp_path: Path) -> None:
-    """quant/export.py (the MTP maps and output_rot): the F16 cast has no finiteness check."""
+    """The export refuses an MTP map beyond F16: hnorm_rot / out_norm with an entry 1e-7 gives inf in F16."""
     import dataclasses
 
     geo = dataclasses.replace(SMALL, n_layer=1, interval=1, mtp=True)

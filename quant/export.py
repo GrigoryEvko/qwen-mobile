@@ -54,6 +54,16 @@ def _check_plan_types(plan: Plan) -> None:
             raise ValueError(f"the plan field {field_name} is {value!r}: the export writes {sorted(PLAN_TYPES)}")
 
 
+def _f16(name: str, a: np.ndarray) -> np.ndarray:
+    """Give ``a`` in F16, or raise ValueError when a value is beyond the F16 range."""
+    out = np.asarray(a).astype(np.float16)
+    bad = ~np.isfinite(out)
+    if bad.any():
+        raise ValueError(f"{name}: {int(bad.sum())} values are not finite in F16, the largest magnitude is "
+                         f"{float(np.nanmax(np.abs(a))):.6g} and F16 permits 65504")
+    return out
+
+
 def _load_gguf_module(llama_dir: Path):
     sys.path.insert(0, str(llama_dir / "gguf-py"))
     import gguf  # noqa: E402
@@ -391,10 +401,10 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
             if tie_head and name == "output_norm.weight":
                 if rot_m.shape != (a.shape[0], a.shape[0]):
                     raise ValueError(f"output_rot has the shape {rot_m.shape}, the hidden size is {a.shape[0]}")
-                writer.add_tensor("output_rot.weight", rot_m.astype(np.float16))
+                writer.add_tensor("output_rot.weight", _f16("output_rot.weight", rot_m))
                 counts["F16 (output_rot)"] = counts.get("F16 (output_rot)", 0) + 1
         elif name.endswith(MTP_MAPS):
-            writer.add_tensor(name, mtp_map(name, _f32_of(t), out_norm).astype(np.float16))
+            writer.add_tensor(name, _f16(name, mtp_map(name, _f32_of(t), out_norm)))
             kind = "F16 (MTP maps)"
         else:
             if t.tensor_type not in (gguf.GGMLQuantizationType.F16, gguf.GGMLQuantizationType.F32):
