@@ -18,7 +18,7 @@ readonly MISC="$REPO_ROOT/build/fuzz/ops"          # the oracle, fixes, phone st
 readonly B_ORACLE_X86="$REPO_ROOT/build/oracle-x86"   # the naive llama.cpp build, read by other areas
 readonly SHARED_SAN="$REPO_ROOT/tests/sanitizers"
 readonly SHIPPED_LIBS="$REPO_ROOT/android/snapdragon/jniLibs/arm64-v8a"
-readonly SYMBOLIZER="$MISC/tools/llvm-symbolizer-android-arm64"   # run.sh symbolizer builds it
+readonly SYMBOLIZER="$REPO_ROOT/build/fuzz/android-symbolizer/llvm-symbolizer"   # of LLVM 22.1.8
 readonly ASAN_RUNTIME="$REPO_ROOT/build/fuzz/asan-android-runtime/libclang_rt.asan-aarch64-android.so"   # of compiler-rt 22.1.8
 # FUZZ_OPS_SRC: a different ggml tree for the host builds, for example the private copy of a fix
 # (never the shared submodule). FUZZ_OPS_TAG: the suffix of the build directories of that tree.
@@ -94,10 +94,11 @@ Other modes:
                            tests/fuzz/ops/regress/KIND/. VERDICT is above-strict, above-loose or nonfinite.
   snapshot                 Take a new private copy of third_party/llama.cpp/ggml. The phone run needs
                            a host library that pairs with the DSP library, thus take it with care.
-  symbolizer               Build llvm-symbolizer for arm64 Android (phone-build does it when it is
+  symbolizer               Build llvm-symbolizer for arm64 Android with
+                           tests/sanitizers/build-android-symbolizer.sh (phone-build does it when it is
                            missing). Without it, a sanitizer report on the phone has no function
                            names, and the function-level entries of tests/sanitizers/ubsan.supp do not
-                           match. It needs llvm-tblgen on the host and an NDK (NDK_HOST).
+                           match.
   asan-runtime             Build the ASan runtime of the phone (compiler-rt 22.1.8) with
                            tests/sanitizers/build-asan-android-runtime.sh, and check it.
   oracle-x86               Build the naive x86 oracle of the full llama.cpp tree in build/oracle-x86:
@@ -828,44 +829,14 @@ suite() {
     return $rc
 }
 
-# Build llvm-symbolizer for arm64 Android into $SYMBOLIZER. The sanitizer runtimes on the phone
-# need it: without it a report frame has no function name, thus no function-level entry of
-# tests/sanitizers/ubsan.supp can match it. The source is a sparse, shallow clone of
-# llvm-project at the tag of the host tablegen (the versions must agree). The tool is not part of
-# the code under test, thus the NDK of the host (NDK_HOST) builds it.
+# The llvm-symbolizer of the phone: tests/sanitizers/build-android-symbolizer.sh builds it when it is
+# missing. The sanitizer runtimes on the phone need it: without it a report frame has no function
+# name, thus no function-level entry of tests/sanitizers/ubsan.supp can match it.
 build_symbolizer() {
-    [[ -x $SYMBOLIZER ]] && { echo "fuzz-ops: $SYMBOLIZER exists"; return 0; }
-    local tools="$MISC/tools" tblgen ver ndk=${NDK_HOST:-}
-    tblgen=$(command -v llvm-tblgen) || die "llvm-tblgen is necessary on the host (the package llvm-devel or llvm)"
-    ver=$("$tblgen" --version | rg -o '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
-    [[ -n $ver ]] || die "cannot read the version of $tblgen"
-    if [[ -z $ndk ]]; then
-        ndk=$(find "$HOME/Android/Sdk/ndk" -mindepth 1 -maxdepth 1 -type d 2> /dev/null | sort -V | tail -n 1)
+    if [[ ! -x $SYMBOLIZER ]]; then
+        "$SHARED_SAN/build-android-symbolizer.sh" --jobs "$BUILD_JOBS" \
+            || die "llvm-symbolizer for Android did not build (tests/sanitizers/build-android-symbolizer.sh)"
     fi
-    [[ -f $ndk/build/cmake/android.toolchain.cmake ]] || die "set NDK_HOST to an Android NDK on the host"
-    mkdir -p "$tools"
-    if [[ ! -d $tools/llvm-src/llvm/lib ]]; then
-        rm -rf "$tools/llvm-src"
-        git clone --quiet --depth 1 --branch "llvmorg-$ver" --filter=blob:none --no-checkout \
-            https://github.com/llvm/llvm-project.git "$tools/llvm-src"
-        git -C "$tools/llvm-src" sparse-checkout set --cone llvm/cmake llvm/include llvm/lib \
-            llvm/tools/llvm-symbolizer llvm/tools/llvm-config llvm/utils llvm/bindings llvm/runtimes \
-            llvm/projects llvm/resources cmake third-party
-        git -C "$tools/llvm-src" checkout --quiet "llvmorg-$ver"
-    fi
-    nice -n 10 cmake -S "$tools/llvm-src/llvm" -B "$tools/sym-build" -G Ninja \
-        -DCMAKE_TOOLCHAIN_FILE="$ndk/build/cmake/android.toolchain.cmake" -DANDROID_ABI=arm64-v8a \
-        -DANDROID_PLATFORM=android-34 -DANDROID_STL=c++_static -DCMAKE_BUILD_TYPE=Release \
-        -DLLVM_ENABLE_ASSERTIONS=OFF -DLLVM_TARGETS_TO_BUILD=AArch64 -DLLVM_HOST_TRIPLE=aarch64-linux-android \
-        -DLLVM_TABLEGEN="$tblgen" -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
-        -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_DOCS=OFF -DLLVM_INCLUDE_UTILS=OFF -DLLVM_BUILD_UTILS=OFF \
-        -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_TERMINFO=OFF \
-        -DLLVM_ENABLE_LIBEDIT=OFF -DLLVM_ENABLE_LIBPFM=OFF -DLLVM_ENABLE_CURL=OFF -DLLVM_ENABLE_HTTPLIB=OFF \
-        -DLLVM_ENABLE_BINDINGS=OFF > "$tools/sym-configure.log" 2>&1 \
-        || die "the configuration of llvm-symbolizer failed, refer to $tools/sym-configure.log"
-    nice -n 10 ninja -C "$tools/sym-build" -j"$BUILD_JOBS" llvm-symbolizer > "$tools/sym-ninja.log" 2>&1 \
-        || die "the build of llvm-symbolizer failed, refer to $tools/sym-ninja.log"
-    "$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" -o "$SYMBOLIZER" "$tools/sym-build/bin/llvm-symbolizer"
     echo "fuzz-ops: $SYMBOLIZER ($(sha256sum "$SYMBOLIZER" | cut -c1-16))"
 }
 
