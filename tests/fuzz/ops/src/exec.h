@@ -25,8 +25,9 @@ enum run_status : uint32_t {
 
 // Defects that the run found in addition to the status.
 enum run_flag : uint32_t {
-    FLAG_GUARD = 1, // a byte of a guard region changed: a write outside a tensor
-    FLAG_INPUT = 2, // an input tensor changed: a write into a source
+    FLAG_GUARD  = 1, // a byte of a guard region changed: a write outside a tensor
+    FLAG_INPUT  = 2, // an input tensor changed: a write into a source
+    FLAG_NONDET = 4, // a repeat of the same case on the same backend gave different output bytes
 };
 
 // The result of one run.

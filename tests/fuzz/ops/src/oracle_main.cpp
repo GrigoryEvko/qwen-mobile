@@ -6,7 +6,7 @@
 //       Serve the libFuzzer harness on stdin and stdout.
 //   ops_oracle gen --out PACK [--group G] [--n N] [--seed S] [--len L] [--max-per-dir M]
 //                  [--corpus GROUP:DIR]... [--tame-corpus GROUP:DIR]... [--cases KIND:DIR]...
-//                  [--max-bytes B]
+//                  [--enumerate KIND:COUNT]... [--max-bytes B]
 //       Write a pack of cases: N random cases of each kind of the group, the inputs of libFuzzer
 //       corpora (decoded with the group of the fuzzer that made them; a --tame-corpus with the
 //       tame values of the fuzz suite), and case files of one kind (a file with the prefix
@@ -20,9 +20,11 @@
 //       Write N valid seed inputs of each kind of the group for the libFuzzer harness.
 //   ops_oracle stats FILE...
 //       Merge the statistics files of the libFuzzer workers and print the tables.
-//   ops_oracle show FILE [--kind K | --group G]
-//       Decode one case file, print it with the facts of its values, and run the oracle on it.
-//       Give FUZZ_OPS_TAME=1 for an input of the fuzz suite.
+//   ops_oracle show FILE [--kind K | --group G | --index N] [--write OUT]
+//       Decode one case file (or case N of a pack), print it with the facts of its values, and run
+//       the oracle on it.
+//       Give FUZZ_OPS_TAME=1 for an input of the fuzz suite. --write (after --index) writes the
+//       bytes of the case to OUT.
 //   ops_oracle same RESULTS_A RESULTS_B
 //       Compare the outputs of two result files run by run (the same pack index and backend).
 //       The exit status is 0 only if each paired run is bit-identical.
@@ -55,13 +57,14 @@ void usage() {
     std::fprintf(stderr,
                  "usage: ops_oracle serve\n"
                  "       ops_oracle gen --out PACK [--group G] [--n N] [--seed S] [--len L] [--max-per-dir M]\n"
-                 "                      [--corpus GROUP:DIR]...\n"
-                 "                      [--cases KIND:DIR]... [--max-bytes B]\n"
+                 "                      [--corpus GROUP:DIR]... [--tame-corpus GROUP:DIR]...\n"
+                 "                      [--cases KIND:DIR]... [--enumerate KIND:COUNT]... [--max-bytes B]\n"
                  "       ops_oracle compare --pack PACK --results FILE... [--findings DIR] [--max-bytes B]\n"
                  "       ops_oracle bounds\n"
                  "       ops_oracle seeds --out DIR [--group G] [--n N] [--len L] [--seed S]\n"
                  "       ops_oracle stats FILE...\n"
-                 "       ops_oracle show FILE [--kind K | --group G]\n");
+                 "       ops_oracle show FILE [--kind K | --group G | --index N] [--write OUT]\n"
+                 "       ops_oracle same RESULTS_A RESULTS_B\n");
 }
 
 // Open the reference CPU backend. Stop the process when it is missing.
@@ -113,6 +116,7 @@ int cmd_gen(int argc, char ** argv) {
     size_t      max_per_dir = 0;
     std::vector<std::pair<std::string, std::string>> corpora, casedirs;
     std::vector<bool>                                corpus_tame;  // one flag for each corpora entry
+    std::vector<std::pair<std::string, int>>         enumerate;    // KIND:COUNT entries
     for (int i = 2; i < argc; i++) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -129,7 +133,15 @@ int cmd_gen(int argc, char ** argv) {
         else if (a == "--seed") seed = std::strtoull(next().c_str(), nullptr, 10);
         else if (a == "--max-bytes") max_bytes = std::strtoull(next().c_str(), nullptr, 10);
         else if (a == "--max-per-dir") max_per_dir = (size_t) std::strtoull(next().c_str(), nullptr, 10);
-        else if (a == "--corpus" || a == "--tame-corpus" || a == "--cases") {
+        else if (a == "--enumerate") {
+            const std::string v = next();
+            const size_t      c = v.find(':');
+            if (c == std::string::npos) {
+                std::fprintf(stderr, "ops_oracle gen: --enumerate takes KIND:COUNT\n");
+                return 2;
+            }
+            enumerate.push_back({ v.substr(0, c), std::atoi(v.substr(c + 1).c_str()) });
+        } else if (a == "--corpus" || a == "--tame-corpus" || a == "--cases") {
             const std::string v = next();
             const size_t      c = v.find(':');
             if (c == std::string::npos) {
@@ -196,6 +208,23 @@ int cmd_gen(int argc, char ** argv) {
             if (f.size() > 4 && f.substr(f.size() - 4) == ".bin" && read_file(f, b)) {
                 add(k | (tame ? FORCED_TAME : 0), f, b);
             }
+        }
+    }
+    // The enumerated cases: 4 threads, the CPU repack buffer, no wild values, a seed of i + 1, and
+    // byte 10 = i (the entry of a table kind such as mm_model).
+    for (const auto & en : enumerate) {
+        const int k = kind_index(en.first);
+        if (k < 0) {
+            std::fprintf(stderr, "ops_oracle gen: %s is not a kind\n", en.first.c_str());
+            return 2;
+        }
+        for (int i = 0; i < en.second; i++) {
+            std::vector<uint8_t> b(11, 0);
+            b[0] = (uint8_t) k;
+            b[1] = 7;
+            b[2] = (uint8_t) (i + 1);
+            b[10] = (uint8_t) i;
+            add(k, std::string("enumerate/") + en.first + "/" + std::to_string(i), b);
         }
     }
     rng r(seed);
@@ -657,6 +686,25 @@ int cmd_show(int argc, char ** argv) {
         } else if (a == "--group") {
             const std::vector<int> g = group_kinds(argv[i + 1]);
             forced = g.empty() ? -1 : g[b[0] % g.size()];
+        } else if (a == "--index") {
+            // FILE is a pack: take its case with this index, with its forced kind and flags
+            std::vector<pack_case> cases;
+            std::string            why;
+            const size_t           idx = (size_t) std::strtoull(argv[i + 1], nullptr, 10);
+            if (!read_pack(argv[2], cases, why) || idx >= cases.size()) {
+                std::fprintf(stderr, "ops_oracle show: no case %zu in the pack %s %s\n", idx, argv[2], why.c_str());
+                return 1;
+            }
+            b      = cases[idx].bytes;
+            forced = cases[idx].forced;
+            std::printf("pack case %zu: %s\n", idx, cases[idx].name.c_str());
+        } else if (a == "--write") {
+            // write the bytes of the case (for example case N of a pack) to a regression file
+            if (!write_file(argv[i + 1], b.data(), b.size())) {
+                std::fprintf(stderr, "ops_oracle show: cannot write %s\n", argv[i + 1]);
+                return 1;
+            }
+            std::printf("wrote %zu bytes to %s\n", b.size(), argv[i + 1]);
         }
     }
     built_case c;

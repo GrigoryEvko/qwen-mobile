@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 
 namespace fo {
@@ -284,6 +285,36 @@ const char * TXT_MUL_MAT =
     "rounding of the activations) and one f16 rounding of each input (the HMX path). The 4 ulp rule of "
     "the decode rows: the reference quantizer gives the same int8 values, the block sums are exact "
     "integers, and an RNE epilogue in the block order of the oracle gives the same bits.";
+
+// The exact matrix shapes of the Qwen3.5 2B and 4B models at 1 to 8 activation rows (n = 4 is the
+// verify step of the speculative decode). Byte 10 of the input selects the entry: the weight type
+// (Q8_0, Q4_0), the (k, m) pair and n. The group "shapes" is not a fuzz group: gen --enumerate makes
+// its cases for the phone runs (task #178, the determinism of HTP0). The shapes are larger than the
+// limits of the fuzz kinds, thus the oracle takes approximately 1 s for each case.
+bool build_mm_model(builder & b) {
+    static const ggml_type types[] = { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 };
+    static const int64_t   km[][2] = {
+        { 2560, 9216 }, { 9216, 2560 }, { 2560, 2560 }, { 2560, 1024 },   // 4B: ffn up, ffn down, attn, kv
+        { 2048, 6144 }, { 6144, 2048 }, { 2048, 2048 }, { 2048, 512 },    // 2B: ffn up, ffn down, attn, kv
+    };
+    const size_t  n_km  = sizeof(km) / sizeof(km[0]);
+    const uint8_t sel   = b.rd.u8();
+    const size_t  entry = sel % (2 * n_km * 8);
+    const ggml_type wt  = types[entry / (n_km * 8)];
+    const int64_t k     = km[entry / 8 % n_km][0];
+    const int64_t m     = km[entry / 8 % n_km][1];
+    const int64_t n     = (int64_t) (entry % 8) + 1;
+    const vspec   v     = b.vs(-0.125f, 0.125f);
+    ggml_tensor * w     = b.typed(wt, k, m, 1, 1, v, leaf_role::WEIGHT);
+    ggml_tensor * x     = b.f32(k, n, 1, 1, b.vs(-4.0f, 4.0f, true));
+    ggml_tensor * y     = ggml_mul_mat(b.ctx, w, x);
+    ggml_build_forward_expand(b.c.gf, y);
+    b.out(y, "y");
+    b.c.desc = fmt("MUL_MAT model w=%s[%lld,%lld] x=f32[%lld,%lld]", ggml_type_name(wt), (long long) k, (long long) m,
+                   (long long) k, (long long) n);
+    b.c.path = fmt("%s/n%lld", ggml_type_name(wt), (long long) n);
+    return true;
+}
 
 bool build_mul_mat_add(builder & b) {
     reader &        rd = b.rd;
@@ -1673,6 +1704,8 @@ const std::vector<kind_def> & kinds() {
         { "set_rows",         "data",    build_set_rows,         bound_cpy,         TXT_CPY },
         { "get_rows",         "data",    build_get_rows,         bound_exact,       TXT_EXACT },
         { "concat",           "data",    build_concat,           bound_exact,       TXT_EXACT },
+        // not a fuzz group: the fixed model shapes of the phone runs (gen --enumerate mm_model:N)
+        { "mm_model",         "shapes",  build_mm_model,         bound_mul_mat,     TXT_MUL_MAT },
     };
     return list;
 }
@@ -1691,7 +1724,9 @@ std::vector<int> group_kinds(const std::string & group) {
     std::vector<int> r;
     const auto &     K = kinds();
     for (size_t i = 0; i < K.size(); i++) {
-        if (group == "all" || group == K[i].group || group == K[i].name) {
+        // "all" means the fuzz groups: the group "shapes" joins only by its own name
+        const bool in_all = group == "all" && std::strcmp(K[i].group, "shapes") != 0;
+        if (in_all || group == K[i].group || group == K[i].name) {
             r.push_back((int) i);
         }
     }

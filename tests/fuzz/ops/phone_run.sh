@@ -20,8 +20,14 @@
 #               prints the pc, the module, the instruction and the backtrace of each fatal signal of
 #               each thread, also when the thread blocks the signal
 #
+# Optional environment of this script:
+#   FUZZ_OPS_PACK   the pack in the work directory (cases.pack)
+#   FUZZ_OPS_EXTRA  more options of ops_replay, for example "--repeat 20 --only mul_mat_id"
+#   FUZZ_OPS_ENV    more environment of ops_replay, for example "GGML_HEXAGON_NHVX=1"
+#
 # ops_replay continues after a crash: a new process records the case that stopped the last one.
 # The loop starts a new process until ops_replay stops with 0 (all runs done) or 3 (the deadline).
+# The exit code 4 is an environment failure (no ASan runtime, or the thread self-test failed).
 
 # FUZZ_OPS_PHONE_DIR replaces the work directory for a test of this script on the host.
 d=${FUZZ_OPS_PHONE_DIR:-/data/local/tmp/qwen/fuzz/ops}
@@ -40,6 +46,9 @@ config=${build#*-}
 [ "$suffix" = "-" ] && suffix=""
 suffix="$suffix-$build"
 [ "$count" = "all" ] && count=""
+pack=${FUZZ_OPS_PACK:-cases.pack}
+extra=${FUZZ_OPS_EXTRA:-}
+xenv=${FUZZ_OPS_ENV:-}
 
 cd "$d" || exit 1
 [ -x "$d/$build/ops_replay" ] || { echo "no build $d/$build/ops_replay"; exit 1; }
@@ -58,15 +67,31 @@ case $config in
         ;;
 esac
 
+# The libraries: the build directory, and for asan the runtime of task #176 first (the runtime of
+# NDK r29 kills each new thread on the SM8750, refer to tests/sanitizers/build-asan-android-runtime.sh).
+libpath="$d/$build"
+if [ "$config" = asan ]; then
+    [ -f "$d/asan-rt/libclang_rt.asan-aarch64-android.so" ] || { echo "no ASan runtime in $d/asan-rt"; exit 4; }
+    libpath="$d/asan-rt:$d/$build"
+    # The first step of an ASan run: one thread must start. A failure is an environment failure,
+    # not a finding, and no case runs.
+    env $san LD_LIBRARY_PATH="$libpath" "$d/$build/ops_replay" --selftest-threads >> "out/log-$build-$tag.txt" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        echo "build=$build tag=$tag ENVIRONMENT FAILURE: the thread self-test gave rc=$rc (task #176), no case ran"
+        exit 4
+    fi
+fi
+
 end=$(( $(date +%s) + seconds ))
 i=0
 rc=1
 while [ $i -lt 50 ]; do
-    env $san LD_LIBRARY_PATH="$d/$build" ADSP_LIBRARY_PATH="$adsp" \
+    env $san $xenv LD_LIBRARY_PATH="$libpath" ADSP_LIBRARY_PATH="$adsp" \
         GGML_HEXAGON_OPFUSION="$fusion" GGML_HEXAGON_OPFUSION_STATE="$fusion" \
-        "$d/$build/ops_replay" $trace --pack cases.pack --out "out/res-$build-$tag.bin" \
+        "$d/$build/ops_replay" $trace --pack "$pack" --out "out/res-$build-$tag.bin" \
         --progress "out/prog-$build-$tag.txt" --backends "$backends" --tag-suffix "$suffix" \
-        --deadline "$end" ${count:+--count "$count"} >> "out/log-$build-$tag.txt" 2>&1
+        --deadline "$end" ${count:+--count "$count"} $extra >> "out/log-$build-$tag.txt" 2>&1
     rc=$?
     [ $rc -eq 0 ] && break
     [ $rc -eq 3 ] && break

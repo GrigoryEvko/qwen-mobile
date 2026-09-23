@@ -3,8 +3,11 @@
 //
 //   ops_replay --pack PACK --out RESULTS --progress FILE --backends CPU,HTP0
 //              [--tag-suffix S] [--deadline EPOCH] [--max-bytes B] [--count N]
+//              [--repeat K] [--only KIND,KIND...]
 //
-// --count N runs only the first N cases of the pack (a short probe run).
+// --count N runs only the first N cases of the pack (a short probe run). --repeat K runs each case K
+// times on each backend, each time with new buffers, and flags the run as nondeterministic
+// (FLAG_NONDET) when a repeat gives different output bytes. --only runs only the cases of the kinds.
 //
 //   ops_replay [--trace] --selftest-threads
 //
@@ -33,6 +36,7 @@
 #include "exec.h"
 #include "wire.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -50,7 +54,8 @@ using namespace fo;
 void usage() {
     std::fprintf(stderr,
                  "usage: ops_replay --pack PACK --out RESULTS --progress FILE --backends CPU,HTP0\n"
-                 "                  [--tag-suffix S] [--deadline EPOCH] [--max-bytes B] [--count N]\n");
+                 "                  [--tag-suffix S] [--deadline EPOCH] [--max-bytes B] [--count N]\n"
+                 "                  [--repeat K] [--only KIND,KIND...]\n");
 }
 
 // Split a comma list. O(length).
@@ -66,6 +71,51 @@ std::vector<std::string> split(const std::string & s) {
         p = e + 1;
     }
     return r;
+}
+
+// Describe the first output difference between two runs of one case: the output, the count of
+// different elements, and the first one with its coordinates (and both values for an f32 output).
+// Return an empty text when the outputs are identical. O(output bytes).
+std::string describe_diff(const built_case & c, const run_result & a, const run_result & b) {
+    if (a.outs.size() != b.outs.size()) {
+        return "a different number of outputs";
+    }
+    for (size_t o = 0; o < a.outs.size(); o++) {
+        if (a.outs[o] == b.outs[o]) {
+            continue;
+        }
+        const ggml_tensor * t  = c.outs[o].t;
+        const size_t        es = t->type == GGML_TYPE_F32 ? 4 : t->type == GGML_TYPE_F16 ? 2 : 1;
+        const size_t        n  = std::min(a.outs[o].size(), b.outs[o].size()) / es;
+        size_t              count = 0, first = SIZE_MAX;
+        for (size_t i = 0; i < n; i++) {
+            if (std::memcmp(a.outs[o].data() + i * es, b.outs[o].data() + i * es, es) != 0) {
+                count++;
+                first = std::min(first, i);
+            }
+        }
+        char buf[256];
+        if (first == SIZE_MAX) {
+            std::snprintf(buf, sizeof(buf), "output %s: the sizes differ", c.outs[o].label.c_str());
+            return buf;
+        }
+        const int64_t ne0 = t->ne[0], ne1 = t->ne[1];
+        const long long i0 = (long long) (es == 1 ? first : first % (size_t) ne0);
+        const long long i1 = (long long) (es == 1 ? 0 : first / (size_t) ne0 % (size_t) ne1);
+        const long long i2 = (long long) (es == 1 ? 0 : first / (size_t) (ne0 * ne1));
+        if (es == 4) {
+            float va, vb;
+            std::memcpy(&va, a.outs[o].data() + first * 4, 4);
+            std::memcpy(&vb, b.outs[o].data() + first * 4, 4);
+            std::snprintf(buf, sizeof(buf), "output %s: %zu of %zu elements differ, the first at [%lld,%lld,%lld]: %.9g and %.9g",
+                          c.outs[o].label.c_str(), count, n, i0, i1, i2, va, vb);
+        } else {
+            std::snprintf(buf, sizeof(buf), "output %s: %zu of %zu elements differ, the first at [%lld,%lld,%lld]",
+                          c.outs[o].label.c_str(), count, n, i0, i1, i2);
+        }
+        return buf;
+    }
+    return "";
 }
 
 // Append one line to the progress file and sync it.
@@ -89,6 +139,8 @@ int replay_main(int argc, char ** argv) {
     double      deadline   = 1e30;
     uint64_t    max_bytes  = uint64_t(64) << 20;
     size_t      count      = SIZE_MAX;
+    int         repeat     = 1;
+    std::string only_arg;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
         if (i + 1 >= argc) {
@@ -104,6 +156,8 @@ int replay_main(int argc, char ** argv) {
         else if (a == "--deadline") deadline = std::atof(v.c_str());
         else if (a == "--max-bytes") max_bytes = std::strtoull(v.c_str(), nullptr, 10);
         else if (a == "--count") count = (size_t) std::strtoull(v.c_str(), nullptr, 10);
+        else if (a == "--repeat") repeat = std::max(1, std::atoi(v.c_str()));
+        else if (a == "--only") only_arg = v;
         else {
             usage();
             return 1;
@@ -121,6 +175,8 @@ int replay_main(int argc, char ** argv) {
         return 1;
     }
     const std::vector<std::string> devs = split(backends_arg);
+    const std::vector<std::string> only_list = split(only_arg);
+    const std::set<std::string>    only(only_list.begin(), only_list.end());
 
     // The runs that are done, the run that stopped the last process, and the backends that cannot
     // open. The progress lines: S (run started), D (run done), O (backend open started), P (backend
@@ -222,13 +278,44 @@ int replay_main(int argc, char ** argv) {
             built_case c;
             if (!build_case(cases[idx].bytes.data(), cases[idx].bytes.size(), cases[idx].forced, max_bytes, c)) {
                 rec.rr.status = RUN_INVALID;
+            } else if (!only.empty() && !only.count(c.kind->name)) {
+                rec.rr.status = RUN_UNSUPPORTED;
+                rec.rr.detail = "not in --only";
             } else {
                 std::printf("run %zu %s %s: %s\n", idx, tag.c_str(), c.kind->name, c.desc.c_str());
                 std::fflush(stdout);
                 rec.rr = run_case(c, bes[d]);
-                std::printf("  -> %s%s%s %.3f ms %s\n", run_status_name(rec.rr.status),
+                // the repeats: the same case with new buffers; the record keeps the first outputs
+                int         n_diff = 0;
+                std::string first_diff;
+                for (int r = 1; r < repeat && rec.rr.status == RUN_OK; r++) {
+                    // a new decode of the same bytes: the tensors of a case get their buffers once
+                    built_case c2;
+                    if (!build_case(cases[idx].bytes.data(), cases[idx].bytes.size(), cases[idx].forced, max_bytes, c2)) {
+                        break;
+                    }
+                    const run_result again = run_case(c2, bes[d]);
+                    if (again.flags & ~rec.rr.flags) {
+                        rec.rr.flags |= again.flags;
+                        rec.rr.detail += "repeat " + std::to_string(r) + ": " + again.detail;
+                    }
+                    const std::string diff = again.status == RUN_OK ? describe_diff(c, rec.rr, again)
+                                                                    : std::string("repeat status ") + run_status_name(again.status);
+                    if (!diff.empty()) {
+                        n_diff++;
+                        if (first_diff.empty()) {
+                            first_diff = "repeat " + std::to_string(r) + ": " + diff;
+                        }
+                    }
+                }
+                if (n_diff > 0) {
+                    rec.rr.flags |= FLAG_NONDET;
+                    rec.rr.detail += "nondeterministic: " + std::to_string(n_diff) + " of " + std::to_string(repeat - 1) +
+                                     " repeats differ from the first run; " + first_diff + "; ";
+                }
+                std::printf("  -> %s%s%s%s %.3f ms %s\n", run_status_name(rec.rr.status),
                             (rec.rr.flags & FLAG_GUARD) ? " GUARD" : "", (rec.rr.flags & FLAG_INPUT) ? " INPUT" : "",
-                            rec.rr.ms, rec.rr.detail.c_str());
+                            (rec.rr.flags & FLAG_NONDET) ? " NONDET" : "", rec.rr.ms, rec.rr.detail.c_str());
                 std::fflush(stdout);
             }
             append_result(out, rec);
