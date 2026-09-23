@@ -67,6 +67,29 @@ double r16(double x) {
     return f16_to_f32(f32_to_f16((float) x));
 }
 
+// The smallest f16 subnormal, 2^-24: the step of the f16 values below 2^-14.
+constexpr double F16_SUB = 5.9604644775390625e-08;
+
+// Replace the n values of x with their Q8_0 round trip through the reference quantizer
+// (quantize_row_q8_0_ref of ggml-quants.c): for each block of 32, d = amax / 127 and q = round(x / d)
+// in f32, and the value q r16(d). The time is O(n).
+void q8_0_round_trip(double * x, int64_t n) {
+    for (int64_t b0 = 0; b0 < n; b0 += 32) {
+        const int64_t b1   = std::min(n, b0 + 32);
+        float         amx  = 0.0f;
+        for (int64_t j = b0; j < b1; j++) {
+            amx = std::max(amx, std::fabs((float) x[j]));
+        }
+        const float  d  = amx / 127.0f;
+        const float  id = d != 0.0f ? 1.0f / d : 0.0f;
+        const double dh = r16(d);
+        for (int64_t j = b0; j < b1; j++) {
+            // a scale that f16 rounds to 0 gives 0, also where x / d overflows
+            x[j] = dh == 0.0 ? 0.0 : (double) std::round((float) x[j] * id) * dh;
+        }
+    }
+}
+
 // Return the max of |x| over a vector.
 double amax(const std::vector<double> & v) {
     double m = 0.0;
@@ -1249,7 +1272,11 @@ void bound_flash_attn(const built_case & c, size_t o, const std::vector<float> &
     const double  m1 = std::pow(2.0, -(mbias / 2.0) / n_head_log2);
     ba.strict.assign(ref.size(), 0.0);
     ba.loose.assign(ref.size(), 0.0);
-    std::vector<double> s((size_t) n_kv), ds((size_t) n_kv), p((size_t) n_kv), qq((size_t) D);
+    // Two forms of Q give two sets of softmax weights: qo, the Q of the oracle (rounded to f16, or the
+    // Q8_0 round trip of the reference quantizer), and qf, the f32 Q (the tiled CPU path and the
+    // backends that do not convert Q). qm is the Q of the mass term.
+    std::vector<double> so((size_t) n_kv), sf((size_t) n_kv), ds((size_t) n_kv), po((size_t) n_kv),
+        pf((size_t) n_kv), qo((size_t) D), qf((size_t) D);
     for (int64_t iq = 0; iq < n_q; iq++) {
         for (int64_t h = 0; h < nh; h++) {
             const int64_t hk    = h / (nh / nhkv);
@@ -1257,57 +1284,67 @@ void bound_flash_attn(const built_case & c, size_t o, const std::vector<float> &
             double qstep = 0.0;
             for (int64_t d = 0; d < D; d++) {
                 const double x = Qv[(size_t) ((h * n_q + iq) * D + d)];
-                qq[(size_t) d] = q8k ? x : r16(x);
+                qf[(size_t) d] = x;
+                qo[(size_t) d] = q8k ? x : r16(x);
                 qstep = std::max(qstep, std::fabs(x) / 127.0);
             }
-            double smax = -INFINITY, dsmax = 0.0;
+            if (q8k) {
+                q8_0_round_trip(qo.data(), D);
+            }
+            const std::vector<double> & qm = q8k ? qf : qo;
+            double smo = -INFINITY, smf = -INFINITY, dsmax = 0.0;
             for (int64_t j = 0; j < n_kv; j++) {
-                double dot = 0.0, mass = 0.0, kabs = 0.0;
+                double doto = 0.0, dotf = 0.0, mass = 0.0, kabs = 0.0;
                 for (int64_t d = 0; d < D; d++) {
                     const double kv = Kv[(size_t) ((hk * n_kv + j) * D + d)];
-                    dot  += qq[(size_t) d] * kv;
-                    mass += std::fabs(qq[(size_t) d] * kv);
+                    doto += qo[(size_t) d] * kv;
+                    dotf += qf[(size_t) d] * kv;
+                    mass += std::fabs(qm[(size_t) d] * kv);
                     kabs += std::fabs(kv);
                 }
-                double sv = dot * scale;
-                if (softcap != 0.0) {
-                    sv = softcap * std::tanh(sv / softcap);
-                }
                 const double mv = mask ? slope * Mv[(size_t) (iq * n_kv + j)] : 0.0;
-                sv += mv;
-                s[(size_t) j]  = sv;
-                ds[(size_t) j] = scale * (2.0 * (double) (D + 4) * EPS32 * mass + (q8k ? kabs * qstep : 0.0)) +
-                                 4.0 * EPS32 * std::fabs(sv);
-                if (sv > smax) {
-                    smax = sv;
+                double       svo = doto * scale, svf = dotf * scale;
+                if (softcap != 0.0) {
+                    svo = softcap * std::tanh(svo / softcap);
+                    svf = softcap * std::tanh(svf / softcap);
                 }
+                so[(size_t) j] = svo + mv;
+                sf[(size_t) j] = svf + mv;
+                ds[(size_t) j] = scale * (2.0 * (double) (D + 4) * EPS32 * mass + (q8k ? kabs * qstep : 0.0)) +
+                                 4.0 * EPS32 * std::max(std::fabs(so[(size_t) j]), std::fabs(sf[(size_t) j]));
+                smo = std::max(smo, so[(size_t) j]);
+                smf = std::max(smf, sf[(size_t) j]);
             }
             if (sinks && std::isfinite(Sv[(size_t) h])) {
-                smax = std::max(smax, Sv[(size_t) h]);
+                smo = std::max(smo, Sv[(size_t) h]);
+                smf = std::max(smf, Sv[(size_t) h]);
             }
-            double sum = 0.0;
+            double sumo = 0.0, sumf = 0.0;
             for (int64_t j = 0; j < n_kv; j++) {
-                p[(size_t) j] = std::isfinite(s[(size_t) j]) ? std::exp(s[(size_t) j] - smax) : 0.0;
-                sum += p[(size_t) j];
-                if (p[(size_t) j] > 0.0) {
+                po[(size_t) j] = std::isfinite(so[(size_t) j]) ? std::exp(so[(size_t) j] - smo) : 0.0;
+                pf[(size_t) j] = std::isfinite(sf[(size_t) j]) ? std::exp(sf[(size_t) j] - smf) : 0.0;
+                sumo += po[(size_t) j];
+                sumf += pf[(size_t) j];
+                if (po[(size_t) j] > 0.0 || pf[(size_t) j] > 0.0) {
                     dsmax = std::max(dsmax, ds[(size_t) j]);
                 }
             }
             if (sinks) {
-                sum += std::exp(Sv[(size_t) h] - smax);
+                sumo += std::exp(Sv[(size_t) h] - smo);
+                sumf += std::exp(Sv[(size_t) h] - smf);
             }
             for (int64_t d = 0; d < DV; d++) {
-                double E = 0.0;
+                double Eo = 0.0, Ef = 0.0;
                 for (int64_t j = 0; j < n_kv; j++) {
-                    if (p[(size_t) j] > 0.0) {
-                        E += p[(size_t) j] * std::fabs(Vv[(size_t) ((hk * n_kv + j) * DV + d)]);
-                    }
+                    const double av = std::fabs(Vv[(size_t) ((hk * n_kv + j) * DV + d)]);
+                    Eo += po[(size_t) j] > 0.0 ? po[(size_t) j] * av : 0.0;
+                    Ef += pf[(size_t) j] > 0.0 ? pf[(size_t) j] * av : 0.0;
                 }
-                E = sum > 0.0 ? E / sum : 0.0;
+                const double E  = std::max(sumo > 0.0 ? Eo / sumo : 0.0, sumf > 0.0 ? Ef / sumf : 0.0);
                 const size_t oi = (size_t) ((iq * nh + h) * DV + d);
                 const double r  = std::fabs((double) ref[oi]);
                 const double st = (2.0 * dsmax + (double) (n_kv + 4) * 4.0 * EPS32) * E +
-                                  (v16 ? (double) (n_kv + 2) * EPS16 * E : 0.0) + 4.0 * EPS32 * r;
+                                  (v16 ? (double) (n_kv + 2) * (EPS16 * E + F16_SUB) : 0.0) + 4.0 * EPS32 * r;
                 ba.strict[oi] = st;
                 ba.loose[oi]  = st + 12.0 * EPS16 * E;
             }
@@ -1316,12 +1353,17 @@ void bound_flash_attn(const built_case & c, size_t o, const std::vector<float> &
 }
 
 const char * TXT_FLASH_ATTN =
-    "strict = (2 max ds + (n_kv+4) 4u) E + [F16 V: (n_kv+2) u16 E] + 4u|y|, loose = strict + 12 u16 E, "
-    "with E = sum_j p_j |v_j| and ds_j = scale (2 (D+4) u sum|q||k| + [Q8_0 K: sum|k| amax(q)/127]) + 4u|s_j|. "
+    "strict = (2 max ds + (n_kv+4) 4u) E + [F16 V: (n_kv+2) (u16 E + 2^-24)] + 4u|y|, loose = strict + "
+    "12 u16 E, with E = sum_j p_j |v_j| and ds_j = scale (2 (D+4) u sum|q||k| + [Q8_0 K: sum|k| amax(q)/127]) "
+    "+ 4u|s_j|. E is the larger of two weightings p: the Q of the oracle, and the f32 Q. "
     "Reason: an error ds in each logit moves the softmax weights by a relative 2 ds, and the output "
-    "is a convex sum of the V rows. The oracle converts Q to f16 (Q8_0 for a Q8_0 K) and, for an F16 V, "
-    "keeps its running V sum in f16 (VKQ16 in ops.cpp), which rounds at each of the n_kv steps: that "
-    "error of the oracle itself is part of the strict bound. Known property (P3, not changed): the "
+    "is a convex sum of the V rows. The oracle converts Q to f16 (Q8_0 for a Q8_0 K), and the tiled "
+    "CPU path keeps Q in f32. When ds is large (a Q of large values), the two weightings differ by "
+    "more than the first order: a V row with a weight of 1e-5 in one form can have 1e-20 in the "
+    "other, thus E takes the larger one. For an F16 V, the oracle keeps its running V sum in f16 "
+    "(VKQ16 in ops.cpp), which rounds at each of the n_kv steps, and a value below 2^-14 rounds to a "
+    "multiple of 2^-24: that error of the oracle itself is part of the strict bound. The absolute "
+    "term is less than the relative term when E >= 2^-13. Known property (P3, not changed): the "
     "f16 V sum of the one-row path overflows when sum_j p_j |v_j| goes past 65504, and the tiled path "
     "(f32) does not. Thus a case with n_kv max|V| >= 32760 and an F16 V is special.";
 
