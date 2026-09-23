@@ -54,6 +54,7 @@ struct graph_spec {
     std::vector<int>            cuts;                // the split points: split k is [cuts[k], cuts[k + 1])
     std::vector<uint64_t>       uids;                // the uid of each split
     bool                        optimized = false;
+    int64_t                     rs_head   = 0;       // the first row of the recurrent cache that the graph writes
     std::string                 desc;                // a short description for the reports
 };
 

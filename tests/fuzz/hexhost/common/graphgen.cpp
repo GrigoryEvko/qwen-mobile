@@ -601,6 +601,7 @@ bool build_graph(FuzzedDataProvider & fdp, world & w, graph_spec & g, int64_t T,
         }
     }
     fakedsp::count("gen ok");
+    g.rs_head = b.rs_head;
     g.desc ="graph T=" + std::to_string(T) + " nodes=" + std::to_string(n) + " splits=" + std::to_string(g.cuts.size() - 1);
     return true;
 }

@@ -9,6 +9,7 @@
 //
 //   hexhost_phone [--seconds S] [--nmse X] [--device NAME] [--random N] [--seed S]
 //                 [--save DIR [--keep]] [--detail] [--nodes] FILE_OR_DIRECTORY...
+//   hexhost_phone [--nmse X] [--device NAME] --gdn-sweep
 //   hexhost_phone --selftest-threads
 //
 // --random N adds N inputs of 64 to 1024 random bytes from the seed (a fixed default), thus a
@@ -16,8 +17,10 @@
 // --save DIR writes each random input that does not give "ok" into DIR (--keep: each random
 // input). --detail prints each tensor that differs, with the model params of the input.
 // --nodes gives each node its own bytes (no ggml-alloc reuse), compares each node, and prints
-// the root nodes of the first step that has a difference. --selftest-threads starts one thread
-// and stops: the first step of a phone ASan run.
+// the root nodes of the first step that has a difference. --gdn-sweep runs single GATED_DELTA_NET
+// graphs of many shapes (S_v, heads, tokens, snapshot slots) on the device and on the CPU, and
+// compares the attention part, each written snapshot slot, and a reader of the first slot.
+// --selftest-threads starts one thread and stops: the first step of a phone ASan run.
 //
 // Output: one line for each input ("ok", "skip", "mismatch" or "error") and a summary line.
 // The exit code is 1 when an input gives a mismatch or an error, else 0.
@@ -123,6 +126,7 @@ struct snapshot {
     size_t             graph = 0;
     int                node  = -1;    // the index in graph_spec::order, or -2 - k for the cache k
     std::vector<int>   srcs;          // the same indices for the owners of the sources, -1 for a weight or an input
+    int64_t            row  = 0;      // the elements of one row (ne[0])
     std::vector<float> v;
 };
 
@@ -173,10 +177,17 @@ std::string describe_params(const graphgen::world & w) {
     const graphgen::model_params & mp = w.mp;
     std::string                    s  = "embd=" + std::to_string(mp.n_embd) + " S_v=" + std::to_string(mp.S_v) +
                      " H_k=" + std::to_string(mp.H_k) + " H_v=" + std::to_string(mp.H_v) + " mem=" + std::to_string(mp.mem) +
-                     " K=" + std::to_string(mp.K) + " mtp=" + std::to_string(mp.mtp) + " out_ids=" + std::to_string(mp.out_ids) +
+                     " K=" + std::to_string(mp.K) + " hd=" + std::to_string(mp.hd) + " n_head=" + std::to_string(mp.n_head) +
+                     " n_kv=" + std::to_string(mp.n_kv) + " mtp=" + std::to_string(mp.mtp) + " out_ids=" + std::to_string(mp.out_ids) +
                      " graphs=" + std::to_string(w.graphs.size());
     for (const auto & g : w.graphs) {
-        s += " [" + g.desc + "]";
+        s += " [" + g.desc + " rs_head=" + std::to_string(g.rs_head) + "]";
+    }
+    s += " matrix types:";
+    for (const ggml_tensor * t : w.weights) {
+        if (t->ne[1] > 1) {
+            s += std::string(" ") + ggml_type_name(t->type);
+        }
     }
     for (int il = 0; il < mp.n_layers; il++) {
         const graphgen::layer_params & lp = mp.layers[il];
@@ -285,7 +296,8 @@ run_result run_on(const uint8_t * data, size_t size, ggml_backend_dev_t dev, con
                     s.srcs.push_back(is == index.end() ? -1 : is->second);
                 }
             }
-            s.v = to_floats(t, b);
+            s.v   = to_floats(t, b);
+            s.row = t->ne[0];
             r.snaps.push_back(std::move(s));
         }
         return true;
@@ -364,6 +376,22 @@ void print_detail(const run_result & a, const run_result & b, double limit, cons
         const error e = compare(a.snaps[i].v, b.snaps[i].v);
         printf("  %c step %u graph %zu #%d nmse %.3g max abs %.3g nonfinite %zu: %s\n", st[i], a.snaps[i].step,
                a.snaps[i].graph, a.snaps[i].node, e.nmse, e.max_abs, e.nonfinite, a.snaps[i].what.c_str());
+        // For a cache: the rows (the slots of the state table) that differ
+        if (a.snaps[i].node < -1 && a.snaps[i].row > 0) {
+            const size_t r = (size_t) a.snaps[i].row;
+            std::string  rows;
+            for (size_t j = 0; (j + 1) * r <= a.snaps[i].v.size() && j * r < b.snaps[i].v.size(); j++) {
+                const std::vector<float> ra(a.snaps[i].v.begin() + j * r, a.snaps[i].v.begin() + (j + 1) * r);
+                const std::vector<float> rb(b.snaps[i].v.begin() + j * r, b.snaps[i].v.begin() + (j + 1) * r);
+                const error              er = compare(ra, rb);
+                if (er.nmse > limit || er.nonfinite > 0) {
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), " row %zu nmse %.3g", j, er.nmse);
+                    rows += buf;
+                }
+            }
+            printf("    rows that differ:%s\n", rows.empty() ? " none" : rows.c_str());
+        }
     }
     printf("  %zu snapshots differ, %zu not written by the NPU, first at step %u\n", n_diff, n_unwritten,
            a.snaps[first].step);
@@ -435,6 +463,141 @@ bool read_file(const std::string & path, std::vector<uint8_t> & out) {
 
 } // namespace
 
+// The results of one GATED_DELTA_NET graph on one device: the attention part of the output, each
+// snapshot slot that the op writes (min(T, K) slots), and a reader of slot 0 in the same graph.
+struct gdn_result {
+    bool                            ok = false;
+    std::vector<float>              attn;
+    std::vector<std::vector<float>> slots;
+    std::vector<float>              reader;
+};
+
+// Runs one GATED_DELTA_NET graph on a device: q and k are unit vectors, v is in [-1, 1], the gate
+// is in [-2, -0.01], beta is in (0, 1), and the state is in [-0.1, 0.1], as in Qwen3.5. A SCALE of
+// slot 0 reads the snapshot part in the same graph. The values come from the seed, thus the two
+// devices get the same inputs. O(S_v * S_v * H * T).
+gdn_result run_gdn(ggml_backend_dev_t dev, int64_t S_v, int64_t H, int64_t T, int64_t K, uint32_t seed) {
+    gdn_result     r;
+    ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
+    if (!be) {
+        return r;
+    }
+    ggml_init_params p   = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+    ggml_context *   ctx = ggml_init(p);
+    ggml_tensor *    q   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, T, 1);
+    ggml_tensor *    k   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, T, 1);
+    ggml_tensor *    v   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, T, 1);
+    ggml_tensor *    g   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, T, 1);
+    ggml_tensor *    b   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, T, 1);
+    ggml_tensor *    s   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, S_v, H, 1);
+    ggml_tensor *    out = ggml_gated_delta_net(ctx, q, k, v, g, b, s, K);
+    const size_t     attn_bytes = (size_t) S_v * H * T * sizeof(float);
+    ggml_tensor *    rd  = ggml_scale(ctx, ggml_view_1d(ctx, out, S_v * S_v * H, attn_bytes), 2.0f);
+    ggml_set_output(out);
+    ggml_set_output(rd);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+    ggml_build_forward_expand(gf, rd);
+
+    bool supported = true;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+        supported &= ggml_backend_dev_supports_op(dev, ggml_graph_node(gf, i));
+    }
+    ggml_backend_buffer_t buf = supported ? ggml_backend_alloc_ctx_tensors(ctx, be) : nullptr;
+    if (buf) {
+        std::mt19937                          rng(seed);
+        std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+        auto fill = [&](ggml_tensor * t, float lo, float hi) {
+            std::vector<float> x(ggml_nelements(t));
+            for (auto & e : x) {
+                e = lo + (hi - lo) * 0.5f * (u(rng) + 1.0f);
+            }
+            ggml_backend_tensor_set(t, x.data(), 0, ggml_nbytes(t));
+        };
+        auto unit = [&](ggml_tensor * t) {
+            std::vector<float> x(ggml_nelements(t));
+            for (size_t i = 0; i < x.size(); i += (size_t) S_v) {
+                double n2 = 0.0;
+                for (int64_t j = 0; j < S_v; j++) {
+                    x[i + j] = u(rng);
+                    n2 += (double) x[i + j] * x[i + j];
+                }
+                for (int64_t j = 0; j < S_v; j++) {
+                    x[i + j] = (float) (x[i + j] / std::sqrt(n2 + 1e-12));
+                }
+            }
+            ggml_backend_tensor_set(t, x.data(), 0, ggml_nbytes(t));
+        };
+        unit(q);
+        unit(k);
+        fill(v, -1.0f, 1.0f);
+        fill(g, -2.0f, -0.01f);
+        fill(b, 0.05f, 0.95f);
+        fill(s, -0.1f, 0.1f);
+        if (ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS) {
+            std::vector<float> all(ggml_nelements(out));
+            ggml_backend_tensor_get(out, all.data(), 0, ggml_nbytes(out));
+            const size_t n_attn = (size_t) S_v * H * T;
+            const size_t n_slot = (size_t) S_v * S_v * H;
+            r.attn.assign(all.begin(), all.begin() + n_attn);
+            for (int64_t sl = 0; sl < std::min(T, K); sl++) {
+                r.slots.emplace_back(all.begin() + n_attn + sl * n_slot, all.begin() + n_attn + (sl + 1) * n_slot);
+            }
+            r.reader.resize(ggml_nelements(rd));
+            ggml_backend_tensor_get(rd, r.reader.data(), 0, ggml_nbytes(rd));
+            r.ok = true;
+        }
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+    ggml_backend_free(be);
+    return r;
+}
+
+// --gdn-sweep: single GATED_DELTA_NET graphs of each shape on the device and on the CPU. Prints
+// one line for each shape: the error of the attention part, of each written snapshot slot, and of
+// the reader of slot 0. Gives the count of the shapes with an error above the limit.
+int gdn_sweep(ggml_backend_dev_t dev, ggml_backend_dev_t cpu, double limit) {
+    auto fmt = [](double x) {
+        char b[32];
+        snprintf(b, sizeof(b), "%.3g", x);
+        return std::string(b);
+    };
+    int n_bad = 0;
+    for (int64_t S_v : { 8, 16, 32, 64, 128 }) {
+        for (int64_t H : { 1, 2, 4 }) {
+            for (int64_t T : { 1, 2, 5, 33 }) {
+                for (int64_t K : { 1, 2, 3, 5 }) {
+                    const uint32_t   seed = (uint32_t) (S_v * 1000003 + H * 10007 + T * 101 + K);
+                    const gdn_result a    = run_gdn(dev, S_v, H, T, K, seed);
+                    const gdn_result c    = run_gdn(cpu, S_v, H, T, K, seed);
+                    if (!a.ok || !c.ok) {
+                        printf("gdn S_v=%lld H=%lld T=%lld K=%lld: skip (%s)\n", (long long) S_v, (long long) H,
+                               (long long) T, (long long) K, a.ok ? "the CPU run failed" : "not supported or failed");
+                        continue;
+                    }
+                    std::string line = "attn " + fmt(compare(a.attn, c.attn).nmse);
+                    bool        bad  = compare(a.attn, c.attn).nmse > limit;
+                    for (size_t sl = 0; sl < a.slots.size(); sl++) {
+                        const error e = compare(a.slots[sl], c.slots[sl]);
+                        line += " slot" + std::to_string(sl) + " " + fmt(e.nmse);
+                        bad |= e.nmse > limit || e.nonfinite > 0;
+                    }
+                    const error er = compare(a.reader, c.reader);
+                    line += " reader " + fmt(er.nmse);
+                    bad |= er.nmse > limit || er.nonfinite > 0;
+                    n_bad += bad;
+                    printf("gdn S_v=%lld H=%lld T=%lld K=%lld: %s %s\n", (long long) S_v, (long long) H, (long long) T,
+                           (long long) K, bad ? "mismatch" : "ok", line.c_str());
+                    fflush(stdout);
+                }
+            }
+        }
+    }
+    printf("gdn summary: %d shapes above the nmse limit %g\n", n_bad, limit);
+    return n_bad ? 1 : 0;
+}
+
 // Starts one thread and waits for it. The first step of each phone ASan run: the ASan runtime of
 // the NDK stops each new thread with SIGILL on the SM8750, thus a failure here is a failure of the
 // environment, not a defect of the backend. Gives the exit code.
@@ -458,6 +621,7 @@ int main(int argc, char ** argv) {
     const char *             save_dir = nullptr;
     bool                     keep     = false;
     run_mode                 mode;
+    bool                     gdn      = false;
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--seconds") && i + 1 < argc) {
@@ -478,6 +642,8 @@ int main(int argc, char ** argv) {
             mode.detail = true;
         } else if (!strcmp(argv[i], "--nodes")) {
             mode.nodes = true;
+        } else if (!strcmp(argv[i], "--gdn-sweep")) {
+            gdn = true;
         } else {
             collect(argv[i], files);
         }
@@ -487,12 +653,13 @@ int main(int argc, char ** argv) {
     for (size_t i = 0; i < n_random; i++) {
         files.push_back("random:" + std::to_string(seed) + ":" + std::to_string(i));
     }
-    if (files.empty()) {
+    if (files.empty() && !gdn) {
         fprintf(stderr,
                 "Usage: %s [--seconds S] [--nmse X] [--device NAME] [--random N] [--seed S] [--save DIR [--keep]]\n"
                 "       [--detail] [--nodes] FILE_OR_DIRECTORY...\n"
+                "       %s [--nmse X] [--device NAME] --gdn-sweep\n"
                 "       %s --selftest-threads\n",
-                argv[0], argv[0]);
+                argv[0], argv[0], argv[0]);
         return 2;
     }
 
@@ -504,6 +671,9 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "hexhost_phone: no %s device. For HTP0, set ADSP_LIBRARY_PATH to the directory of libggml-htp-v79.so.\n",
                 htp ? "CPU" : name);
         return 2;
+    }
+    if (gdn) {
+        return gdn_sweep(htp, cpu, limit);
     }
 
     const auto t0 = std::chrono::steady_clock::now();
