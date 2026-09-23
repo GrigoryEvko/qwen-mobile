@@ -56,10 +56,12 @@ public:
      * The encoder output of an image, from RAM or read from its file into
      * RAM. The shape is part of the key: the caller gives the n_tokens and
      * n_embd of its image chunk, because it reads that number of floats
-     * from the pointer. The pointer stays valid until the next call that
-     * changes the cache. Returns null for an unknown id, for an entry of
-     * another shape, or when the file is not readable. In the last two
-     * conditions, the entry and its file are gone.
+     * from the pointer. A file must match the checksum in its header. The
+     * pointer stays valid until the next call that changes the
+     * cache. Returns null for an unknown id, for an entry of another shape,
+     * or when the file is not readable or does not match. In the last
+     * conditions, the entry and its file are gone (take_damaged gives the
+     * id of a file that did not match).
      */
     const float * get(const std::string & id, uint32_t n_tokens, uint32_t n_embd);
 
@@ -76,6 +78,12 @@ public:
     size_t disk_bytes() const { return disk_bytes_; }
     size_t count() const { return entries_.size(); }
 
+    /** The ids of the entries that get dropped because their files did not match their checksums, since the last call. */
+    std::vector<std::string> take_damaged();
+
+    /** The number of files that the scan of the directory removed: of an older version, damaged, or too large. */
+    size_t removed_at_scan() const { return removed_at_scan_; }
+
 private:
     struct Entry {
         std::string        id;
@@ -90,7 +98,7 @@ private:
 
     std::string path_of(const std::string & id) const;
     void        scan_dir();
-    bool        read_file(Entry & entry) const;
+    bool        read_file(Entry & entry);
     bool        write_file(const Entry & entry) const;
     void        evict_ram(const Entry * keep);
     void        evict_disk(const Entry * keep);
@@ -105,4 +113,6 @@ private:
     size_t                                          ram_bytes_  = 0;
     size_t                                          disk_bytes_ = 0;
     int64_t                                         stamp_      = 0;
+    size_t                                          removed_at_scan_ = 0;
+    std::vector<std::string>                        damaged_;
 };

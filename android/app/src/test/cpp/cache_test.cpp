@@ -1,7 +1,8 @@
 /**
  * The host test of the engine caches: the prefix match and the LRU of the
- * snapshot store, its disk tier, the image cache, and the SHA-256 that
- * gives the image ids. No llama.cpp is necessary.
+ * snapshot store, its disk tier, the image cache, the SHA-256 that gives
+ * the image ids, and the checksum of the cache files. No llama.cpp is
+ * necessary.
  *
  *   cmake -S android/app/src/test/cpp -B /tmp/cache_test && cmake --build /tmp/cache_test && /tmp/cache_test/cache_test
  */
@@ -56,6 +57,39 @@ std::shared_ptr<const cache_io::Blob> blob(size_t n, uint8_t v) {
     auto b = std::make_shared<cache_io::Blob>(n);
     memset(b->data.get(), v, n);
     return b;
+}
+
+/** Add 1 to the byte at the offset of the file. A negative offset counts from the end. */
+bool damage_byte(const std::string & path, long offset) {
+    std::vector<uint8_t> raw;
+    if (!cache_io::read_file(path, raw, 1u << 20) || raw.empty()) {
+        return false;
+    }
+    const long at = offset < 0 ? (long) raw.size() + offset : offset;
+    if (at < 0 || at >= (long) raw.size()) {
+        return false;
+    }
+    raw[(size_t) at] += 1;
+    return cache_io::write_file_atomic(path, {{raw.data(), raw.size()}});
+}
+
+void test_checksum() {
+    // The vectors of the reference XXH64 for three seeds: the empty input, a
+    // short input, and 100 bytes, which take the steps of 32 bytes.
+    std::vector<uint8_t> d(100);
+    for (size_t i = 0; i < d.size(); ++i) {
+        d[i] = (uint8_t) (i * 7 + 3);
+    }
+    CHECK(cache_io::checksum64(nullptr, 0) == 0xef46db3751d8e999ull);
+    CHECK(cache_io::checksum64("123456789", 9) == 0x8cb841db40e6ae83ull);
+    CHECK(cache_io::checksum64(d.data(), d.size()) == 0xa61f8d4c170fe531ull);
+    CHECK(cache_io::checksum64(nullptr, 0, 1) == 0xd5afba1336a3be4bull);
+    CHECK(cache_io::checksum64("123456789", 9, 1) == 0x1a4cc2c9e8079790ull);
+    CHECK(cache_io::checksum64(d.data(), d.size(), 1) == 0x8d8957e68f02c7ceull);
+    const uint64_t seed = 0x0123456789abcdefull;
+    CHECK(cache_io::checksum64(nullptr, 0, seed) == 0x51e24c0e9077a48cull);
+    CHECK(cache_io::checksum64("123456789", 9, seed) == 0x3b48dc2448b0c9efull);
+    CHECK(cache_io::checksum64(d.data(), d.size(), seed) == 0xfe1fce732c97c212ull);
 }
 
 void test_sha256() {
@@ -213,11 +247,11 @@ void test_images() {
         cache.put(id_a, info, a.data());
         cache.put(id_b, info, b.data());
         CHECK(cache.count() == 2 && cache.ram_bytes() == 6400 && cache.disk_bytes() == 6400);
-        CHECK(cache.get(id_a) != nullptr && cache.get(id_a)[0] == 1.0f);
+        CHECK(cache.get(id_a, 100, 8) != nullptr && cache.get(id_a, 100, 8)[0] == 1.0f);
         // The third entry pushes b out of RAM, and b stays on disk.
         cache.put(id_c, info, c.data());
         CHECK(cache.count() == 3 && cache.ram_bytes() == 6400);
-        const float * pb = cache.get(id_b);
+        const float * pb = cache.get(id_b, 100, 8);
         CHECK(pb != nullptr && pb[799] == 2.0f);
         ImageInfo got;
         CHECK(cache.info(id_c, got) && got.nx == 640 && got.n_tokens == 100);
@@ -228,10 +262,65 @@ void test_images() {
     {
         ImageCache cache(1u << 20, 1u << 20, dir.path);
         CHECK(cache.count() == 3 && cache.ram_bytes() == 0);
-        const float * pc = cache.get(id_c);
+        // A request of another shape gets no data, and the entry goes.
+        CHECK(cache.get(id_a, 50, 16) == nullptr && cache.count() == 2);
+        const float * pc = cache.get(id_c, 100, 8);
         CHECK(pc != nullptr && pc[0] == 3.0f && cache.ram_bytes() == 3200);
         cache.clear(true);
         CHECK(cache.count() == 0 && cache_io::list_files(dir.path, ".embd").empty());
+    }
+}
+
+void test_damaged_files() {
+    TempDir dir;
+    const std::vector<MemItem> items = tokens(0, 10);
+    const std::string snap_path = dir.path + "/" + cache_io::hex64(hash_items(items)) + ".snap";
+    // The scan of a directory reads only the header and the items of a file. Thus a damage
+    // of n_pos (offset 20), of the reserved field (28) or of the state bytes (the last byte)
+    // shows at the read of the bytes.
+    for (long offset : {20L, 28L, -1L}) {
+        {
+            StateCache cache(1u << 20, 1u << 20, dir.path);
+            cache.put(items, 10, blob(3000, 1));
+        }
+        CHECK(damage_byte(snap_path, offset));
+        StateCache cache(1u << 20, 1u << 20, dir.path);
+        const Snapshot * s = cache.find(items);
+        CHECK(s != nullptr && !cache.bytes(s));
+        CHECK(cache.find(items) == nullptr);
+        const std::vector<uint64_t> damaged = cache.take_damaged();
+        CHECK(damaged.size() == 1 && damaged[0] == hash_items(items));
+        CHECK(cache.take_damaged().empty());
+        cache.drain();
+        CHECK(cache_io::list_files(dir.path, ".snap").empty());
+    }
+    {
+        // A file of another version goes at the scan.
+        {
+            StateCache cache(1u << 20, 1u << 20, dir.path);
+            cache.put(items, 10, blob(3000, 1));
+        }
+        CHECK(damage_byte(snap_path, 4));
+        StateCache cache(1u << 20, 1u << 20, dir.path);
+        CHECK(cache.count() == 0 && cache.removed_at_scan() == 1);
+        CHECK(cache_io::list_files(dir.path, ".snap").empty());
+    }
+    // A damage of the side nx of the bitmap (offset 8) or of the last float.
+    const std::string id(64, 'e');
+    ImageInfo info;
+    info.nx = 640; info.ny = 480; info.n_tokens = 100; info.n_embd = 8;
+    const std::vector<float> data(800, 1.5f);
+    for (long offset : {8L, -1L}) {
+        {
+            ImageCache cache(1u << 20, 1u << 20, dir.path);
+            cache.put(id, info, data.data());
+        }
+        CHECK(damage_byte(dir.path + "/" + id + ".embd", offset));
+        ImageCache cache(1u << 20, 1u << 20, dir.path);
+        CHECK(cache.count() == 1 && cache.get(id, 100, 8) == nullptr);
+        CHECK(cache.count() == 0 && cache_io::list_files(dir.path, ".embd").empty());
+        const std::vector<std::string> damaged = cache.take_damaged();
+        CHECK(damaged.size() == 1 && damaged[0] == id);
     }
 }
 
@@ -239,10 +328,12 @@ void test_images() {
 
 int main() {
     test_sha256();
+    test_checksum();
     test_prefix_match();
     test_lru();
     test_disk();
     test_images();
+    test_damaged_files();
     if (g_failed != 0) {
         std::fprintf(stderr, "%d checks failed\n", g_failed);
         return 1;

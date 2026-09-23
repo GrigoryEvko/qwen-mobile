@@ -1385,6 +1385,55 @@ std::string greedy_answer(Program & p, LoadSpec s, bool speculative, int fault_a
     return text;
 }
 
+/**
+ * The greedy answer of one load to a conversation, as bytes: load, chatStart,
+ * up to limit pieces, free. The free waits for the queued file writes of the
+ * caches. O(limit) generateNext calls and one load.
+ */
+std::string answer_of(Program & p, const LoadSpec & s, const std::vector<Msg> & chat, int limit, const char * what) {
+    const jlong h = api_load(s);
+    if (h == 0) {
+        fail("%s: the tiny model did not load", what);
+    }
+    if (api_chat_start(p, h, chat, false, 0.0f, 0.8f, false, false) < 0) {
+        fail("%s: chatStart failed", what);
+    }
+    LiveEngine le;
+    le.handle = h;
+    start_tracking(le);
+    std::string text;
+    drain_answer(le, limit, &text);
+    api_free(h);
+    return text;
+}
+
+/**
+ * Write 0xFF over 256 bytes in the last quarter of each file of the tree whose
+ * name ends with suffix, and over its last 256 bytes. A float of 0xFFFFFFFF is
+ * NaN. The headers stay intact, thus only a check of the data finds the
+ * damage. Returns the number of files.
+ */
+int damage_data(const std::string & dir, const std::string & suffix) {
+    std::vector<std::string> files;
+    list_tree(dir, files);
+    int n = 0;
+    for (const std::string & path : files) {
+        if (path.size() < suffix.size() || path.compare(path.size() - suffix.size(), suffix.size(), suffix) != 0) {
+            continue;
+        }
+        std::vector<uint8_t> bytes;
+        if (!cache_io::read_file(path, bytes, 256u << 20) || bytes.size() < 1024) {
+            continue;
+        }
+        const size_t mid = bytes.size() * 3 / 4;
+        std::fill(bytes.begin() + (ptrdiff_t) mid, bytes.begin() + (ptrdiff_t) (mid + 256), 0xFF);
+        std::fill(bytes.end() - 256, bytes.end(), 0xFF);
+        cache_io::write_file_atomic(path, {{bytes.data(), bytes.size()}});
+        n += 1;
+    }
+    return n;
+}
+
 }  // namespace
 
 int run_scenario(const Options & opt, const std::string & name) {
@@ -1502,6 +1551,45 @@ int run_scenario(const Options & opt, const std::string & name) {
         fprintf(stderr, "scenario spec-image: text turn %d pieces with %lld drafted, image turn %d pieces, no abort\n",
                 n_text, (long long) drafted, n_image);
         api_free(h);
+    } else if (name == "snapshot-damage" || name == "image-damage") {
+        // A file of the cache with damaged data and an intact header: the next load
+        // reads it, and its answer must be the answer of a load without a cache.
+        const bool image = name == "image-damage";
+        if (image) {
+            p.images.push_back(make_bmp(32, 32, 13));
+        } else {
+            s.mmproj.clear();
+        }
+        std::vector<Msg> chat = {user(u"Hello, how are you? Tell me about the cat.", image ? 0 : -1)};
+        LoadSpec cached = s;
+        cached.cache = p.cache_a;
+        LoadSpec plain = s;
+        plain.cache.clear();
+        const std::string what = "scenario " + name;
+        answer_of(p, cached, chat, 16, what.c_str());
+        if (image) {
+            // Without the snapshots, the next prefill decodes the image from its cache entry.
+            std::vector<std::string> files;
+            list_tree(p.cache_a, files);
+            for (const std::string & path : files) {
+                if (path.size() > 5 && path.compare(path.size() - 5, 5, ".snap") == 0) {
+                    cache_io::remove_file(path);
+                }
+            }
+        }
+        const int n = damage_data(p.cache_a, image ? ".embd" : ".snap");
+        if (n == 0) {
+            fail("%s: the first load wrote no cache file", what.c_str());
+        }
+        const std::string got  = answer_of(p, cached, chat, 48, what.c_str());
+        const std::string want = answer_of(p, plain, chat, 48, what.c_str());
+        if (got != want) {
+            fail("%s: the answer after the damage of %d files has %zu bytes and differs from the %zu bytes of a load "
+                 "without a cache",
+                 what.c_str(), n, got.size(), want.size());
+        }
+        fprintf(stderr, "scenario %s: %d files damaged, %zu bytes, the same text as without a cache\n", name.c_str(), n,
+                got.size());
     } else if (name == "sampler-nan") {
         // A NaN temperature (a damaged settings file can hold one) reaches the sampler chain.
         s.mmproj.clear();
@@ -1519,7 +1607,7 @@ int run_scenario(const Options & opt, const std::string & name) {
     } else {
         fprintf(stderr,
                 "unknown scenario %s: image-shape, image-twice, jni-pending, spec-disable, spec-parity, spec-image, "
-                "sampler-nan, priority\n",
+                "snapshot-damage, image-damage, sampler-nan, priority\n",
                 name.c_str());
         result = 2;
     }

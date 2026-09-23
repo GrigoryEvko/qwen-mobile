@@ -83,7 +83,7 @@ bdir() {
     echo "$REPO/build/fuzz/app-$PROFILE-$1"
 }
 TARGETS="fuzz_jni_api fuzz_jni_threads fuzz_jni_threads_free fuzz_caches fuzz_spec_policy"
-SCENARIOS="image-shape image-twice jni-pending spec-disable spec-parity spec-image sampler-nan priority"
+SCENARIOS="image-shape image-twice jni-pending spec-disable spec-parity spec-image snapshot-damage image-damage sampler-nan priority"
 
 export FUZZ_APP_MODEL_DIR="$MODELS"
 export FUZZ_APP_WORK="$OUT/work"
@@ -672,7 +672,7 @@ phone_commands() {
         "cd $d && timeout -s KILL 100 env $envs FUZZ_APP_DEVICE=HTP0 FUZZ_APP_MAX_OPS=24 bin/fuzz_jni_api -max_total_time=80 -rss_limit_mb=3072 -max_len=1024 -artifact_prefix=logs/ > logs/fuzz_jni_api-htp0.log 2>&1"
     local sc dev
     for dev in cpu HTP0; do
-        for sc in image-shape spec-disable spec-parity spec-image sampler-nan jni-pending priority; do
+        for sc in image-shape spec-disable spec-parity spec-image snapshot-damage image-damage sampler-nan jni-pending priority; do
             one "9. The scenario $sc on $dev (its log ends with its report, or with a line that has \"no\")." \
                 "cd $d && timeout -s KILL 100 env $envs FUZZ_APP_DEVICE=${dev/cpu/} bin/app_fuzz_driver --scenario $sc > logs/scenario-$sc-$dev.log 2>&1"
         done

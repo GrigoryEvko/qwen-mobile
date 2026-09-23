@@ -86,9 +86,10 @@ public:
     /**
      * The bytes of a snapshot, from RAM or read from its file into RAM.
      * When the file is not there yet, the read waits one time for the
-     * queued writes. The snapshot becomes the most recently used one.
-     * Returns null when the file is not readable, and then the snapshot is
-     * gone from the store.
+     * queued writes. A file must match the checksum in its header. The
+     * snapshot becomes the most recently used one. Returns null when the
+     * file is not readable or does not match, and then the snapshot is gone
+     * from the store (take_damaged gives its key).
      */
     std::shared_ptr<const cache_io::Blob> bytes(const Snapshot * snap);
 
@@ -110,6 +111,12 @@ public:
 
     /** Wait until the queued file writes are done. For tests. */
     void drain();
+
+    /** The keys of the snapshots that bytes() dropped because their files did not match their checksums, since the last call. */
+    std::vector<uint64_t> take_damaged();
+
+    /** The number of files that the scan of the directory removed: of an older version, or damaged. */
+    size_t removed_at_scan() const { return removed_at_scan_; }
 
     size_t ram_bytes() const { return ram_bytes_; }
     size_t disk_bytes() const { return disk_bytes_; }
@@ -137,6 +144,8 @@ private:
     std::string dir_;
     size_t      ram_bytes_  = 0;
     size_t      disk_bytes_ = 0;
+    size_t      removed_at_scan_ = 0;
+    std::vector<uint64_t> damaged_;
     int64_t     stamp_      = 0;
     std::unique_ptr<cache_io::AsyncWriter> writer_;
 };

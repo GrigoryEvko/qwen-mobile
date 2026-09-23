@@ -6,7 +6,10 @@
  * The checks after each operation:
  *
  * - The byte counters are the sums over the entries, and the budgets hold.
- * - An entry that the store finds gives the bytes of its last put.
+ * - A snapshot or an image that a cache gives holds the data of a put of
+ *   its key, also after a damage of its file: the checksum of a file
+ *   covers each of its bytes. Without a damage, a snapshot gives the bytes
+ *   of its last put.
  * - best_prefix gives the longest prefix with at most limit items.
  * - A snapshot whose bytes did not read (a null read) is gone from the store,
  *   and a pointer from best_prefix stays valid for the bytes call and the
@@ -74,6 +77,14 @@ std::shared_ptr<const cache_io::Blob> make_blob(size_t n, uint64_t seed) {
         b->data[i] = (uint8_t) ((seed >> ((i % 8) * 8)) + i * 31);
     }
     return b;
+}
+
+/**
+ * The float i of an encoder output of a bitmap with the side nx. The values
+ * are integers less than 2^24, thus a float holds them exactly.
+ */
+float image_value(size_t i, uint32_t nx) {
+    return (float) (i * 3 + nx);
 }
 
 std::vector<MemItem> gen_items(FuzzedDataProvider & fdp) {
@@ -235,6 +246,7 @@ void run_states(FuzzedDataProvider & fdp, const std::string & dir) {
                     break;
                 }
                 const std::vector<MemItem> key = snap->items;
+                const int32_t n_pos = snap->n_pos;
                 // The write of the file can still wait in the queue: bytes() then waits for it.
                 std::shared_ptr<const cache_io::Blob> bytes = store->bytes(snap);
                 if (!bytes) {
@@ -246,8 +258,21 @@ void run_states(FuzzedDataProvider & fdp, const std::string & dir) {
                     }
                     break;
                 }
+                // Also after a damage of its file: the checksum of the file makes a read give
+                // the bytes and the positions of a put of these items, or no bytes.
+                const auto intact = make_blob(bytes->size, hash_items(key));
+                if (memcmp(intact->data.get(), bytes->data.get(), bytes->size) != 0) {
+                    fail("state store: a snapshot of %zu items gave %zu bytes that no put of its items gave%s",
+                         key.size(), bytes->size, damaged ? " (after a damage of a file)" : "");
+                }
+                if (n_pos != (int32_t) key.size()) {
+                    fail("state store: a snapshot of %zu items gave n_pos %d%s", key.size(), n_pos,
+                         damaged ? " (after a damage of a file)" : "");
+                }
+                // A write that failed (case 8) does not change the model, and its removal of
+                // an earlier file can fail too. Then a restart gives that file again.
                 auto m = model.find({hash_items(key), key.size()});
-                if (m != model.end() && m->second.first == key && !damaged) {
+                if (!damaged && m != model.end() && m->second.first == key) {
                     const auto & want = m->second.second;
                     if (want->size != bytes->size || memcmp(want->data.get(), bytes->data.get(), want->size) != 0) {
                         fail("state store: a snapshot gave bytes that are not the bytes of its last put");
@@ -353,7 +378,7 @@ void run_images(FuzzedDataProvider & fdp, const std::string & dir) {
                 info.n_embd = fdp.ConsumeIntegralInRange<uint32_t>(0, 40);
                 std::vector<float> data(info.n_floats());
                 for (size_t i = 0; i < data.size(); ++i) {
-                    data[i] = (float) (i * 3 + info.nx);
+                    data[i] = image_value(i, info.nx);
                 }
                 cache->put(id, info, data.empty() ? nullptr : data.data());
                 // The cache refuses an output larger than its RAM budget, and a bitmap side of
@@ -381,6 +406,17 @@ void run_images(FuzzedDataProvider & fdp, const std::string & dir) {
                 if (got != nullptr && !same) {
                     fail("image cache: get(%s, %u, %u) gave the data of an entry of another shape", id.c_str(), n_tokens,
                          n_embd);
+                }
+                if (got != nullptr) {
+                    // An entry keeps the info and the floats of one put, and a put makes its
+                    // floats from nx. Also after a damage of its file: the checksum covers the header.
+                    const ImageInfo & info = cache->index_.at(id)->info;
+                    for (size_t i = 0; i < info.n_floats(); ++i) {
+                        if (got[i] != image_value(i, info.nx)) {
+                            fail("image cache: get(%s) gave a float %zu that no put of a %ux%u bitmap gave%s", id.c_str(),
+                                 i, info.nx, info.ny, damaged ? " (after a damage of a file)" : "");
+                        }
+                    }
                 }
                 if (had && !same) {
                     if (cache->index_.count(id) != 0) {

@@ -17,12 +17,20 @@ namespace {
  *   items_bytes   u32, the length of the items block
  *   reserved      u32, zero
  *   body_size     u64, the length of the state bytes
+ *   checksum      u64, the checksum of the file
  *   items block:  for each item, token i32, and for an image item id_len u16 then the id
  *   state bytes
+ *
+ * The checksum is cache_io::checksum64 of the header bytes before it, then of
+ * the items block, then of the state bytes. Each part has the checksum of the
+ * part before it as its seed, thus the checksum covers each byte of the file
+ * but its own 8 bytes. A damaged float in a restored state gives NaN in the
+ * next decode, and a damaged n_pos gives the next tokens wrong positions.
  */
 constexpr char     kMagic[4]     = {'Q', 'M', 'S', 'T'};
-constexpr uint32_t kFileVersion  = 1;
-constexpr size_t   kHeaderBytes  = 40;
+constexpr uint32_t kFileVersion  = 2;
+constexpr size_t   kHeaderBytes  = 48;
+constexpr size_t   kChecksumAt   = kHeaderBytes - sizeof(uint64_t);
 constexpr size_t   kMaxItemBytes = 64u << 20;
 constexpr const char * kSuffix   = ".snap";
 
@@ -71,8 +79,11 @@ struct Reader {
     }
 };
 
-/** The header and the items block of a snapshot, without the state bytes. */
-std::shared_ptr<const std::vector<uint8_t>> encode_head(const Snapshot & snap) {
+/**
+ * The header and the items block of a snapshot, without the state bytes, but
+ * with the checksum of the file, thus of the state bytes too. O(items + bytes).
+ */
+std::shared_ptr<const std::vector<uint8_t>> encode_head(const Snapshot & snap, const cache_io::Blob & bytes) {
     Writer items;
     for (const MemItem & item : snap.items) {
         items.put<int32_t>(item.token);
@@ -90,16 +101,24 @@ std::shared_ptr<const std::vector<uint8_t>> encode_head(const Snapshot & snap) {
     w.put<uint32_t>((uint32_t) items.out.size());
     w.put<uint32_t>(0);
     w.put<uint64_t>((uint64_t) snap.byte_size);
+    w.put<uint64_t>(0);
     w.out.insert(w.out.end(), items.out.begin(), items.out.end());
+    uint64_t sum = cache_io::checksum64(w.out.data(), kChecksumAt);
+    sum          = cache_io::checksum64(items.out.data(), items.out.size(), sum);
+    sum          = cache_io::checksum64(bytes.data.get(), bytes.size, sum);
+    memcpy(w.out.data() + kChecksumAt, &sum, sizeof(sum));
     return std::make_shared<const std::vector<uint8_t>>(std::move(w.out));
 }
 
 /**
  * Read the header and the items of a snapshot file into snap, without its
- * bytes. Returns false when the file is not a snapshot file, or its length
- * does not agree with its header.
+ * bytes. checksum gets the checksum of the file, and head_sum gets the
+ * checksum of the header and the items: the seed of the checksum of the
+ * state bytes. Returns false when the file is not a snapshot file of this
+ * version, or its length does not agree with its header. O(items).
  */
-bool read_head(const std::string & path, Snapshot & snap, uint64_t & body_offset) {
+bool read_head(const std::string & path, Snapshot & snap, uint64_t & body_offset, uint64_t & checksum,
+               uint64_t & head_sum) {
     cache_io::FileStat st;
     if (!cache_io::stat_file(path, st) || st.size < kHeaderBytes) {
         return false;
@@ -120,6 +139,7 @@ bool read_head(const std::string & path, Snapshot & snap, uint64_t & body_offset
     const uint32_t items_bytes = r.get<uint32_t>();
     r.get<uint32_t>();
     const uint64_t body_size   = r.get<uint64_t>();
+    checksum                   = r.get<uint64_t>();
     // Each number of the header limits an allocation, thus each one must agree
     // with the length of the file before it is used. An item takes
     // at least its token, thus n_items has a limit of items_bytes / 4: without
@@ -149,6 +169,8 @@ bool read_head(const std::string & path, Snapshot & snap, uint64_t & body_offset
     if (!items.ok || items.pos != items.n || hash_items(parsed) != key) {
         return false;
     }
+    head_sum        = cache_io::checksum64(head, kChecksumAt);
+    head_sum        = cache_io::checksum64(block.data(), block.size(), head_sum);
     snap.items      = std::move(parsed);
     snap.n_pos      = n_pos;
     snap.key        = key;
@@ -204,8 +226,12 @@ void StateCache::scan_dir() {
         const std::string path = dir_ + "/" + name;
         Snapshot snap;
         uint64_t body_offset = 0;
-        if (!read_head(path, snap, body_offset) || path_of(snap) != path) {
+        uint64_t checksum    = 0;
+        uint64_t head_sum    = 0;
+        if (!read_head(path, snap, body_offset, checksum, head_sum) || path_of(snap) != path) {
+            // A file of an older version or a damaged file.
             cache_io::remove_file(path);
+            removed_at_scan_ += 1;
             continue;
         }
         disk_bytes_ += snap.byte_size;
@@ -268,15 +294,22 @@ std::shared_ptr<const cache_io::Blob> StateCache::bytes(const Snapshot * snap) {
     }
     if (!it->bytes) {
         const std::string path = path_of(*it);
+        bool damaged = false;
         auto read = [&]() -> std::shared_ptr<cache_io::Blob> {
             Snapshot head;
             uint64_t body_offset = 0;
-            if (!it->on_disk || !read_head(path, head, body_offset) || head.key != it->key ||
+            uint64_t checksum    = 0;
+            uint64_t head_sum    = 0;
+            if (!it->on_disk || !read_head(path, head, body_offset, checksum, head_sum) || head.key != it->key ||
                 head.byte_size != it->byte_size) {
                 return nullptr;
             }
             auto blob = std::make_shared<cache_io::Blob>(it->byte_size);
-            return cache_io::read_range(path, body_offset, blob->data.get(), blob->size) ? blob : nullptr;
+            if (!cache_io::read_range(path, body_offset, blob->data.get(), blob->size)) {
+                return nullptr;
+            }
+            damaged = cache_io::checksum64(blob->data.get(), blob->size, head_sum) != checksum;
+            return damaged ? nullptr : blob;
         };
         std::shared_ptr<cache_io::Blob> blob = read();
         if (!blob && it->on_disk && writer_) {
@@ -286,6 +319,9 @@ std::shared_ptr<const cache_io::Blob> StateCache::bytes(const Snapshot * snap) {
             blob = read();
         }
         if (!blob) {
+            if (damaged) {
+                damaged_.push_back(it->key);
+            }
             erase(it, true);
             return nullptr;
         }
@@ -355,7 +391,7 @@ void StateCache::write_file(List::iterator it, const std::shared_ptr<const cache
     it->on_disk    = true;
     it->disk_stamp = ++stamp_;
     disk_bytes_   += it->byte_size;
-    writer_->write(path_of(*it), encode_head(*it), bytes);
+    writer_->write(path_of(*it), encode_head(*it, *bytes), bytes);
     evict_disk(&*it);
 }
 
@@ -456,4 +492,10 @@ void StateCache::drain() {
     if (writer_) {
         writer_->drain();
     }
+}
+
+std::vector<uint64_t> StateCache::take_damaged() {
+    std::vector<uint64_t> out;
+    out.swap(damaged_);
+    return out;
 }

@@ -15,12 +15,18 @@ namespace {
  *   nx, ny     u32 each, the bitmap dimensions
  *   n_tokens   u32
  *   n_embd     u32
- *   reserved   u64, zero
+ *   checksum   u64, the checksum of the file
  *   floats     n_tokens x n_embd x 4 bytes
+ *
+ * The checksum is cache_io::checksum64 of the header bytes before it, then of
+ * the floats with the first checksum as the seed. Thus it covers each byte of
+ * the file but its own 8 bytes. A damaged float goes into the prompt, and a
+ * damaged side of the bitmap gives the image tokens wrong positions.
  */
 constexpr char     kMagic[4]    = {'Q', 'M', 'I', 'E'};
-constexpr uint32_t kFileVersion = 1;
+constexpr uint32_t kFileVersion = 2;
 constexpr size_t   kHeaderBytes = 32;
+constexpr size_t   kChecksumAt  = kHeaderBytes - sizeof(uint64_t);
 constexpr const char * kSuffix  = ".embd";
 /** The limits of one encoder output: the token budget of an image and the width of the model. */
 constexpr uint32_t kMaxTokens   = 1u << 16;
@@ -28,17 +34,27 @@ constexpr uint32_t kMaxEmbd     = 1u << 16;
 /** The limit of each side of a bitmap, the same as the limit of the decode in llama_jni.cpp. */
 constexpr uint32_t kMaxSide     = 1u << 16;
 
-/** The header of an entry as bytes. */
-std::vector<uint8_t> encode_head(const ImageInfo & info) {
+/** The header of an entry as bytes, with the checksum of the file, thus of the floats too. O(floats). */
+std::vector<uint8_t> encode_head(const ImageInfo & info, const float * data) {
     std::vector<uint8_t> out(kHeaderBytes, 0);
     memcpy(out.data(), kMagic, 4);
     const uint32_t fields[5] = {kFileVersion, info.nx, info.ny, info.n_tokens, info.n_embd};
     memcpy(out.data() + 4, fields, sizeof(fields));
+    uint64_t sum = cache_io::checksum64(out.data(), kChecksumAt);
+    sum          = cache_io::checksum64(data, info.n_floats() * sizeof(float), sum);
+    memcpy(out.data() + kChecksumAt, &sum, sizeof(sum));
     return out;
 }
 
-/** Read the header of a file. Returns false when the file is not an image file, or its length is not the header plus the floats. */
-bool read_head(const std::string & path, ImageInfo & info) {
+/**
+ * Read the header of a file. When they are not null, checksum gets the
+ * checksum of the file, and head_sum gets the checksum of the header bytes
+ * before it: the seed of the checksum of the floats. Returns false when the
+ * file is not an image file of this version, or its length is not the header
+ * plus the floats.
+ */
+bool read_head(const std::string & path, ImageInfo & info, uint64_t * checksum = nullptr,
+               uint64_t * head_sum = nullptr) {
     cache_io::FileStat st;
     uint8_t head[kHeaderBytes];
     if (!cache_io::stat_file(path, st) || st.size < kHeaderBytes || !cache_io::read_range(path, 0, head, kHeaderBytes) ||
@@ -67,6 +83,12 @@ bool read_head(const std::string & path, ImageInfo & info) {
     info.ny       = fields[2];
     info.n_tokens = fields[3];
     info.n_embd   = fields[4];
+    if (checksum != nullptr) {
+        memcpy(checksum, head + kChecksumAt, sizeof(*checksum));
+    }
+    if (head_sum != nullptr) {
+        *head_sum = cache_io::checksum64(head, kChecksumAt);
+    }
     return info.n_tokens > 0 && info.n_embd > 0 && st.size == kHeaderBytes + info.n_floats() * sizeof(float);
 }
 
@@ -98,7 +120,9 @@ void ImageCache::scan_dir() {
         // another budget. It could never be served, thus it goes.
         if (!cache_io::is_hex(entry.id) || !read_head(path, entry.info) || !cache_io::stat_file(path, st) ||
             entry.bytes() > ram_budget_) {
+            // A file of an older version, a damaged file, or a file of another budget.
             cache_io::remove_file(path);
+            removed_at_scan_ += 1;
             continue;
         }
         entry.on_disk    = true;
@@ -138,14 +162,20 @@ bool ImageCache::info(const std::string & id, ImageInfo & out) {
     return true;
 }
 
-bool ImageCache::read_file(Entry & entry) const {
+bool ImageCache::read_file(Entry & entry) {
     ImageInfo info;
+    uint64_t checksum = 0;
+    uint64_t head_sum = 0;
     const std::string path = path_of(entry.id);
-    if (!read_head(path, info) || info.n_floats() != entry.info.n_floats()) {
+    if (!read_head(path, info, &checksum, &head_sum) || info.n_floats() != entry.info.n_floats()) {
         return false;
     }
     std::vector<float> data(info.n_floats());
     if (!cache_io::read_range(path, kHeaderBytes, data.data(), data.size() * sizeof(float))) {
+        return false;
+    }
+    if (cache_io::checksum64(data.data(), data.size() * sizeof(float), head_sum) != checksum) {
+        damaged_.push_back(entry.id);
         return false;
     }
     entry.data = std::move(data);
@@ -153,7 +183,7 @@ bool ImageCache::read_file(Entry & entry) const {
 }
 
 bool ImageCache::write_file(const Entry & entry) const {
-    const std::vector<uint8_t> head = encode_head(entry.info);
+    const std::vector<uint8_t> head = encode_head(entry.info, entry.data.data());
     return cache_io::write_file_atomic(path_of(entry.id), {{head.data(), head.size()},
                                                           {entry.data.data(), entry.data.size() * sizeof(float)}});
 }
@@ -315,4 +345,10 @@ void ImageCache::clear(bool disk_too) {
             ++it;
         }
     }
+}
+
+std::vector<std::string> ImageCache::take_damaged() {
+    std::vector<std::string> out;
+    out.swap(damaged_);
+    return out;
 }

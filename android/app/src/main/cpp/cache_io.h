@@ -29,6 +29,15 @@ struct Blob {
 /** The FNV-1a hash of the bytes, 64 bits. O(len). */
 uint64_t fnv1a64(const void * data, size_t len, uint64_t seed = 14695981039346656037ull);
 
+/**
+ * The checksum of the data of a cache file: XXH64 with the seed, as the
+ * reference implementation of xxHash computes it (XXH64 of "" with seed 0
+ * is 0xef46db3751d8e999). The checksum of one part as the seed of the next
+ * part gives one checksum for a file of many parts. It reads 32 bytes for
+ * each step, thus 44 MB take about 2 ms on the host. O(len).
+ */
+uint64_t checksum64(const void * data, size_t len, uint64_t seed = 0);
+
 /** The lowercase hexadecimal text of a 64-bit value, 16 characters. */
 std::string hex64(uint64_t value);
 

@@ -22,6 +22,88 @@ uint64_t fnv1a64(const void * data, size_t len, uint64_t seed) {
     return h;
 }
 
+namespace {
+
+/** The primes of XXH64. */
+constexpr uint64_t kXxP1 = 0x9E3779B185EBCA87ull;
+constexpr uint64_t kXxP2 = 0xC2B2AE3D27D4EB4Full;
+constexpr uint64_t kXxP3 = 0x165667B19E3779F9ull;
+constexpr uint64_t kXxP4 = 0x85EBCA77C2B2AE63ull;
+constexpr uint64_t kXxP5 = 0x27D4EB2F165667C5ull;
+
+uint64_t rotl64(uint64_t x, int r) {
+    return (x << r) | (x >> (64 - r));
+}
+
+/** A little-endian read without an alignment demand. */
+uint64_t load64(const uint8_t * p) {
+    uint64_t v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+uint32_t load32(const uint8_t * p) {
+    uint32_t v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+uint64_t xx_round(uint64_t acc, uint64_t input) {
+    acc += input * kXxP2;
+    acc = rotl64(acc, 31);
+    return acc * kXxP1;
+}
+
+uint64_t xx_merge(uint64_t acc, uint64_t value) {
+    acc ^= xx_round(0, value);
+    return acc * kXxP1 + kXxP4;
+}
+
+} // namespace
+
+uint64_t checksum64(const void * data, size_t len, uint64_t seed) {
+    // Offsets, not pointers: an empty input can come with a null pointer.
+    const auto * p = static_cast<const uint8_t *>(data);
+    size_t       i = 0;
+    uint64_t     h;
+    if (len >= 32) {
+        uint64_t v1 = seed + kXxP1 + kXxP2, v2 = seed + kXxP2, v3 = seed, v4 = seed - kXxP1;
+        for (; len - i >= 32; i += 32) {
+            v1 = xx_round(v1, load64(p + i));
+            v2 = xx_round(v2, load64(p + i + 8));
+            v3 = xx_round(v3, load64(p + i + 16));
+            v4 = xx_round(v4, load64(p + i + 24));
+        }
+        h = rotl64(v1, 1) + rotl64(v2, 7) + rotl64(v3, 12) + rotl64(v4, 18);
+        h = xx_merge(h, v1);
+        h = xx_merge(h, v2);
+        h = xx_merge(h, v3);
+        h = xx_merge(h, v4);
+    } else {
+        h = seed + kXxP5;
+    }
+    h += (uint64_t) len;
+    for (; len - i >= 8; i += 8) {
+        h ^= xx_round(0, load64(p + i));
+        h = rotl64(h, 27) * kXxP1 + kXxP4;
+    }
+    if (len - i >= 4) {
+        h ^= (uint64_t) load32(p + i) * kXxP1;
+        h = rotl64(h, 23) * kXxP2 + kXxP3;
+        i += 4;
+    }
+    for (; i < len; ++i) {
+        h ^= p[i] * kXxP5;
+        h = rotl64(h, 11) * kXxP1;
+    }
+    h ^= h >> 33;
+    h *= kXxP2;
+    h ^= h >> 29;
+    h *= kXxP3;
+    h ^= h >> 32;
+    return h;
+}
+
 std::string hex64(uint64_t value) {
     static const char digits[] = "0123456789abcdef";
     std::string out(16, '0');

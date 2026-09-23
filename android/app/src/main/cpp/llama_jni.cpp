@@ -668,6 +668,26 @@ void open_stores(Engine & e, const std::string & cache_dir, const std::string & 
     LOGI("caches: %zu snapshots (%.0f MB) and %zu images (%.0f MB) on disk in %s",
          e.states->count(), e.states->disk_bytes() / 1048576.0, e.images->count(), e.images->disk_bytes() / 1048576.0,
          cache_dir.empty() ? "no directory" : cache_dir.c_str());
+    if (e.states->removed_at_scan() + e.images->removed_at_scan() > 0) {
+        LOGI("caches: removed %zu snapshot files and %zu image files of an older format or damaged",
+             e.states->removed_at_scan(), e.images->removed_at_scan());
+    }
+}
+
+/**
+ * Write one log line for each cache entry that a read dropped because the
+ * data of its file did not match the checksum of the file. The prompt then
+ * decodes again, or the image encodes again.
+ */
+void log_damaged(Engine & e) {
+    for (uint64_t key : e.states->take_damaged()) {
+        LOGE("snapshot %s: its state bytes do not match the checksum of its file, the entry goes and the prompt decodes again",
+             cache_io::hex64(key).c_str());
+    }
+    for (const std::string & id : e.images->take_damaged()) {
+        LOGE("image %s: its floats do not match the checksum of its file, the entry goes and the image encodes again",
+             id.substr(0, 12).c_str());
+    }
 }
 
 /**
@@ -791,7 +811,9 @@ const float * image_embd(Engine & e, const mtmd_input_chunk * chunk, std::string
     const std::string id       = mtmd_input_chunk_get_id(chunk);
     const uint32_t    n_tokens = (uint32_t) mtmd_input_chunk_get_n_tokens(chunk);
     const uint32_t    n_embd   = (uint32_t) llama_model_n_embd_inp(e.model);
-    if (const float * hit = e.images->get(id, n_tokens, n_embd)) {
+    const float * hit = e.images->get(id, n_tokens, n_embd);
+    log_damaged(e);
+    if (hit != nullptr) {
         e.turn.images_cached += 1;
         return hit;
     }
@@ -953,6 +975,7 @@ DecodeOutcome prefill(Engine & e, const std::vector<MemItem> & items,
         const size_t    n_items = snap->items.size();
         const llama_pos n_pos   = snap->n_pos;
         std::shared_ptr<const cache_io::Blob> bytes = e.states->bytes(snap);
+        log_damaged(e);
         if (bytes && restore_state(pctx, *bytes)) {
             start = n_items;
             pos   = n_pos;
@@ -992,6 +1015,7 @@ DecodeOutcome prefill(Engine & e, const std::vector<MemItem> & items,
         const Snapshot * have = e.states->find(key);
         if (have != nullptr && hybrid) {
             base_bytes = e.states->bytes(have);
+            log_damaged(e);
         }
         if (have == nullptr || (hybrid && !base_bytes)) {
             const int64_t t2 = now_us();
@@ -1491,6 +1515,12 @@ bool tokenize_prompt(JNIEnv * env, jclass native_class, Engine & e, const std::s
                              "the entry goes and the image decodes again",
                              id.substr(0, 12).c_str(), k->second.n_tokens, k->second.n_embd, n_tokens, n_embd);
                         e.images->drop(id);
+                        known.erase(k);
+                        stale = true;
+                    } else if (k != known.end() && e.images->get(id, n_tokens, n_embd) == nullptr) {
+                        // The floats of the file did not match its checksum, or the file is gone: the
+                        // entry is gone, and the second pass decodes the bytes of the image.
+                        log_damaged(e);
                         known.erase(k);
                         stale = true;
                     }
