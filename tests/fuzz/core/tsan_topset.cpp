@@ -9,8 +9,6 @@
 //
 // The harness sets LLAMA_SAMPLER_TOPSET before the first sample (the value is
 // read one time). FUZZ_TOPSET_MODE gives it, the default is 2.
-// FUZZ_TOPSET_KNOWN_COUNTERS=1 sets mode 1 (finding topset-counters), thus the
-// fuzz suite can look for other races.
 //
 // One input gives the sampler of each thread (llama_sampler_sample with the
 // chain of the app, or common_sampler_sample with default common parameters),
@@ -105,9 +103,8 @@ void worker(std::vector<llama_token> prompt, int n_gen, int reps, bool use_commo
 
 extern "C" int LLVMFuzzerInitialize(int * /*argc*/, char *** /*argv*/) {
     fuzz::quiet_logs();
-    const bool known = fuzz::env_long("FUZZ_TOPSET_KNOWN_COUNTERS", 0) != 0;
     const char * mode = getenv("FUZZ_TOPSET_MODE");
-    setenv("LLAMA_SAMPLER_TOPSET", known ? "1" : (mode ? mode : "2"), 1);
+    setenv("LLAMA_SAMPLER_TOPSET", mode ? mode : "2", 1);
     llama_backend_init();
     const char * env = getenv("FUZZ_MODEL");
     const std::string path = env != nullptr ? std::string(env) : fuzz::data_file("tiny-qwen35-f32.gguf");

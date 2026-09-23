@@ -1,0 +1,66 @@
+Make the counters of the top-set verify atomic
+Fold-into: hexagon-host/0003-llama-sampler-topset.patch
+
+The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
+
+- Two contexts that sample in two threads race on the counters of the verify mode.
+
+  The verify mode of the top set (LLAMA_SAMPLER_TOPSET=2) counts the equal and the different
+  selections in function-static int64_t counters, in llama_sampler_topset_verify and in
+  common_sampler_sample. llama.cpp permits two contexts of one model in two threads, and each
+  context has its own sampler. The two threads then write the same counters with no lock, and
+  TSan reports a data race.
+
+  The change: The four counters are std::atomic<int64_t>. The counts only go to a log line.
+
+  The reproducer: tests/fuzz/core/regress/tsan_topset--tsan-topset-counters.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    common/sampling.cpp
+    src/llama-sampler.cpp
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -8,6 +8,7 @@
+ #include "ggml.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cctype>
+ #include <climits>
+ #include <cmath>
+@@ -667,8 +668,9 @@
+     id = cur_p.data[cur_p.selected].id;
+ 
+     if (chain_verify) {
+-        static int64_t n_same = 0;
+-        static int64_t n_diff = 0;
++        // two contexts can sample in two threads, thus the counters are atomic
++        static std::atomic<int64_t> n_same{0};
++        static std::atomic<int64_t> n_diff{0};
+ 
+         const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+         const int n_vocab = llama_vocab_n_tokens(vocab);
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include <array>
+ #include <algorithm>
++#include <atomic>
+ #include <cassert>
+ #include <cfloat>
+ #include <chrono>
+@@ -4590,8 +4591,9 @@
+ // Runs a clone of the chain on all the logits and a clone on the top set, and compares the two selected
+ // tokens. The clones keep the random state of the chain, thus the chain itself is not changed.
+ static void llama_sampler_topset_verify(struct llama_sampler * smpl, const float * logits, int32_t n_vocab, const std::vector<llama_token_data> & top) {
+-    static int64_t n_same = 0;
+-    static int64_t n_diff = 0;
++    // two contexts can sample in two threads, thus the counters are atomic
++    static std::atomic<int64_t> n_same{0};
++    static std::atomic<int64_t> n_diff{0};
+ 
+     struct llama_sampler * chain_full = llama_sampler_clone(smpl);
+     struct llama_sampler * chain_top  = llama_sampler_clone(smpl);

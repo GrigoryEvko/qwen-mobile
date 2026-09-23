@@ -102,7 +102,6 @@ declare -A SWITCH=(
     [kv-keep-streams]=FUZZ_RECURRENT_KNOWN_KV_KEEP
     [recurrent-shared-rollback]=FUZZ_RECURRENT_KNOWN_SHARED_ROLLBACK
     [copy-into-used-sequence]=FUZZ_RECURRENT_CLEAR_BEFORE_COPY
-    [tsan-topset-counters]=FUZZ_TOPSET_KNOWN_COUNTERS
 )
 
 # The report of each known finding, as an extended regular expression on the run log. A
@@ -113,7 +112,6 @@ declare -A EXPECT=(
     [recurrent-shared-rollback]='cannot write shared recurrent state|P2: after'
     [copy-into-used-sequence]='P2: after'
     [ubatch-tail]='GGML_ASSERT\(n_ubatch > n_keep_tail\)'
-    [tsan-topset-counters]='ThreadSanitizer: data race'
 )
 
 # Print the header comment of this file (from line 2 to the first empty line) as the usage text, then
