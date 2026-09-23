@@ -35,7 +35,8 @@
 //       in the scalar part of a loop and multiplies by the reciprocal in the
 //       vector part, thus a token can get a logit 1 ulp different on the two
 //       paths (it has a different place in the two arrays), and near ties at a
-//       cut can go the other way.
+//       cut can go the other way. The same holds for two logits of the same sign
+//       above 1e30 in magnitude, which a temperature below 1 turns into Inf.
 //   P4  The dist sampler alone, on 2 to 8 candidates from the input: when
 //       exactly one candidate has the logit +Inf and no logit is NaN, dist
 //       selects that candidate, as greedy does.
@@ -365,8 +366,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
             llama_sampler_apply(chain, &part_p);
             id_chain = selected(part_p);
             // the input logits of the two tokens are at most 4 ulp apart and the chain divides (P3)
+            // A temperature below 1 also turns two finite logits of the same sign above about 1e30 in
+            // magnitude into the same Inf, thus a tie at the float limit.
             const bool near_tie = g_div && id_chain != id_full && id_chain >= 0 && id_full >= 0 &&
-                                  within_ulp(logits[id_chain], logits[id_full], 4);
+                                  (within_ulp(logits[id_chain], logits[id_full], 4) ||
+                                   (std::fabs(logits[id_chain]) >= 1e30f && std::fabs(logits[id_full]) >= 1e30f &&
+                                    std::signbit(logits[id_chain]) == std::signbit(logits[id_full])));
             if (id_chain != id_full) {
                 if (strict && !near_tie) {
                     // the first candidates of the two arrays after the chain, for the report

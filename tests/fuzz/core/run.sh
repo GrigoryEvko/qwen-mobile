@@ -247,7 +247,9 @@ fuzz_one() {
             execs=$(( execs + prev ))
         fi
         prev=$n
-    done < <(grep -oE '^#[0-9]+' "$log" | tr -d '#')
+    # only the progress lines of libFuzzer ("#N<tab>NEW ..."): a target can write a line that starts
+    # with # and digits (a rendered template), and bash arithmetic overflows on such a number
+    done < <(grep -oE '^#[0-9]{1,15}[[:space:]]+(INITED|NEW|REDUCE|pulse|DONE|RELOAD)' "$log" | grep -oE '^#[0-9]+' | tr -d '#')
     execs=$(( execs + prev ))
     local cov
     cov=$(grep -oE 'cov: [0-9]+ ft: [0-9]+' "$log" | tail -n 1 || true)
@@ -521,8 +523,10 @@ phone_commands() {
         tsan)   sopt="TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1:suppressions=$pd/tsan.supp" ;;
     esac
     local env="cd $pd && LD_LIBRARY_PATH=$pd ADSP_LIBRARY_PATH=$pd GGML_NO_BACKTRACE=1 FUZZ_DATA_DIR=$PHONE_BASE/data FUZZ_ARTIFACT_DIR=$pd/art $sopt"
-    local thermal="$a shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
-    local check="$a shell 'pgrep -a fuzz_; dumpsys thermalservice | grep \"Thermal Status\"'"
+    # each adb command has a hard limit: a short command 30 s, a push, a pull or a run 100 s
+    local q="timeout -s KILL 30 $a"
+    local thermal="$q shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
+    local check="$q shell 'pgrep -a fuzz_; dumpsys thermalservice | grep \"Thermal Status\"'"
     local push_files="$out/fuzz_npu_decode $out/fuzz_recurrent $out/libggml-htp-v79.so $out/$san.supp"
     [[ -n $runtime ]] && push_files+=" $out/$runtime"
     cat <<EOF
@@ -531,11 +535,11 @@ mkdir -p $logs
 
 # 1. Push the build (2 targets, the DSP library, ${runtime:-no runtime library}), the tiny models and the seeds.
 $thermal
-$a shell mkdir -p $PHONE_BASE/data $pd/corpus_npu $pd/corpus_rec $pd/art
+$q shell mkdir -p $PHONE_BASE/data $pd/corpus_npu $pd/corpus_rec $pd/art
 timeout -s KILL 100 $a push $push_files $pd/
 timeout -s KILL 100 $a push $DATA/tiny-qwen35-q8_0.gguf $DATA/tiny-qwen35-f32.gguf $PHONE_BASE/data/
 timeout -s KILL 100 $a push $out/seeds $pd/
-$a shell chmod 755 $pd/fuzz_npu_decode $pd/fuzz_recurrent
+$q shell chmod 755 $pd/fuzz_npu_decode $pd/fuzz_recurrent
 
 # 2. HTP0 against the CPU of the phone, tiny Q8_0 model, coverage-guided for 80 s.
 $thermal
@@ -554,7 +558,7 @@ timeout -s KILL 100 $a shell "$env FUZZ_THREADS=2 $(known_env)timeout -s KILL 90
 $check
 
 # 5. Pull the crash inputs, if any.
-$a shell ls -l $pd/art
+$q shell ls -l $pd/art
 timeout -s KILL 100 $a pull $pd/art $logs/art
 EOF
 }
