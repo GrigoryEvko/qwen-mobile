@@ -11,8 +11,8 @@
 #
 # The flags go to every target, thus the ggml libraries have the same instrumentation as the
 # driver. Only the target hexhost_phone and its dependencies build: the DSP libraries (the
-# ExternalProject targets htp-v73 to htp-v81) do not. The phone uses the DSP library of
-# build/native.
+# ExternalProject targets htp-v73 to htp-v81) do not. run.sh phone-build makes the DSP library of
+# the same tree with the release preset of the app (the release none run stages the shipped one).
 #
 # HEXHOST_PHONE_X86=ON builds the driver for the host with the CPU backend only, as a check of
 # the driver before a phone run (hexhost_phone --device CPU).

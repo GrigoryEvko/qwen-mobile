@@ -16,13 +16,18 @@ JOBS=${JOBS:-4}
 BUILD_JOBS=${BUILD_JOBS:-8}
 KNOWN=${FUZZ_KNOWN:-1}
 PROFILES=$ALL_PROFILES
-LLAMA_DIR=${HEXHOST_LLAMA_DIR:-$REPO/third_party/llama.cpp}
+# The llama.cpp tree: HEXHOST_LLAMA_DIR, or a private copy of the patched tree of HEAD that each
+# build refreshes first (refresh_llama)
+LLAMA_DIR=${HEXHOST_LLAMA_DIR:-$REPO/build/fuzz/$AREA/llama-src}
+LLAMA_COPY=1
+[[ -n ${HEXHOST_LLAMA_DIR:-} ]] && LLAMA_COPY=0
+LLAMA_FRESH=0
 UBSAN_SUPP="$REPO/tests/sanitizers/ubsan.supp"
 PHONE=${PHONE:-192.168.14.130:5555}
 PHONE_DIR=${PHONE_DIR:-/data/local/tmp/qwen/fuzz/hexhost}
 PHONE_SECONDS=${PHONE_SECONDS:-80}
 PHONE_RANDOM=${PHONE_RANDOM:-60}
-DSP_LIB=${DSP_LIB:-$REPO/build/native/llama/ggml/src/ggml-hexagon/libggml-htp-v79.so}
+DSP_LIB=${DSP_LIB:-}
 SHIPPED_LIBS="$REPO/android/snapdragon/jniLibs/arm64-v8a"
 SHIPPED_HASHES="$REPO/build/hashes-native.txt"
 # The Android ASan runtime of compiler-rt 22 (tests/sanitizers/build-asan-android-runtime.sh). The
@@ -116,13 +121,17 @@ Options:
 Environment:
   FUZZ_KNOWN=0        Also fuzz the conditions of the checks of KNOWN_IDS (default 1: keep them off)
   BUILD_JOBS          The parallel build jobs (default $BUILD_JOBS)
-  HEXHOST_LLAMA_DIR   The llama.cpp tree (default: the submodule third_party/llama.cpp with the
-                      patch series applied)
+  HEXHOST_LLAMA_DIR   The llama.cpp tree (default: build/fuzz/hexhost/llama-src, a copy of the
+                      patched tree of HEAD that tests/sanitizers/llama-copy.sh makes or
+                      refreshes at the start of each build)
   FUZZ_MSAN_PREFIX    The MSan libc++ (default build/fuzz/msan-libcxx/install)
   PHONE, PHONE_DIR    The phone serial ($PHONE) and the work directory on the phone ($PHONE_DIR)
   PHONE_SECONDS       The driver time of each phone run (default $PHONE_SECONDS s, under the 100 s kill)
   PHONE_RANDOM        The random inputs of each phone run after the corpus (default $PHONE_RANDOM)
-  DSP_LIB             The DSP library for the phone (default build/native/.../libggml-htp-v79.so)
+  DSP_LIB             The DSP library for the phone. By default, the release none build stages the
+                      shipped library (checked against build/hashes-native.txt), and the other
+                      builds make libggml-htp-v79.so from the llama.cpp tree with the release
+                      preset of the app, thus the DSP code is the code of the host libraries.
 
 Outputs: build/fuzz/hexhost-<profile>-<config>/{results.jsonl,runs/<target>/}. Each run adds
 one JSON line for each target to results.jsonl.
@@ -139,9 +148,20 @@ x86_dir() {
     echo "$REPO/build/fuzz/$AREA-$1-$2"
 }
 
+# Make or refresh the private copy of llama.cpp, one time for each run of this script, when
+# HEXHOST_LLAMA_DIR is not set. The copy comes from the git objects of HEAD, thus a landing during a
+# build does not change the tree of the build, and a change of the series goes into the next build.
+refresh_llama() {
+    [[ $LLAMA_COPY == 1 && $LLAMA_FRESH == 0 ]] || return 0
+    "$REPO/tests/sanitizers/llama-copy.sh" "$LLAMA_DIR" > /dev/null \
+        || die "tests/sanitizers/llama-copy.sh could not make the copy $LLAMA_DIR"
+    LLAMA_FRESH=1
+}
+
 # Configure and build the x86 targets of one profile and one config.
 build_x86() {
     local prof=$1 cfg=$2 dir
+    refresh_llama
     dir=$(x86_dir "$prof" "$cfg")
     if [[ $cfg == ubsan && ! -f $UBSAN_SUPP ]]; then
         die "the shared file $UBSAN_SUPP does not exist. The UBSan runtime of the ubsan runs reads it."
@@ -308,7 +328,16 @@ phone_build_one() {
     dir=$(phone_dir "$prof" "$cfg")
     rel=${dir#"$REPO"/}
     stage="$dir/stage"
-    [[ -f $DSP_LIB ]] || die "the DSP library $DSP_LIB does not exist. Run scripts/build-native.sh first, or set DSP_LIB."
+    [[ -z $DSP_LIB || -f $DSP_LIB ]] || die "the DSP library $DSP_LIB does not exist"
+    refresh_llama
+    # The DSP library: the shipped one for the release none run, else a build of the same tree
+    local shipped=0 dsp_build=0
+    [[ $prof == release && $cfg == none ]] && shipped=1
+    [[ -z $DSP_LIB && $shipped == 0 ]] && dsp_build=1
+    if [[ $dsp_build == 1 ]]; then
+        # The preset of the app, as scripts/build-native.sh uses it
+        cp -f "$REPO/android/snapdragon/CMakeUserPresets.json" "$LLAMA_DIR/CMakeUserPresets.json"
+    fi
     if [[ $cfg == asan ]]; then
         (cd "$ASAN_RT_DIR" 2> /dev/null && sha256sum -c --quiet "$ASAN_RT.sha256") \
             || die "the ASan runtime $ASAN_RT_DIR/$ASAN_RT is missing or does not match its sha256. Run tests/sanitizers/build-asan-android-runtime.sh first."
@@ -326,6 +355,10 @@ cmake -S tests/fuzz/hexhost/phone -B $rel -G Ninja -DCMAKE_BUILD_TYPE=None \
     -DHEXHOST_LLAMA_DIR=/workspace/${LLAMA_DIR#"$REPO"/} -DHEXHOST_FUZZER_INCLUDE=/workspace/$rel/include \
     -DHEXAGON_SDK_ROOT=\$HEXAGON_SDK_ROOT -DHEXAGON_TOOLS_ROOT=\$HEXAGON_TOOLS_ROOT -DPREBUILT_LIB_DIR=android_aarch64
 cmake --build $rel -j$BUILD_JOBS --target hexhost_phone
+if [[ $dsp_build == 1 ]]; then
+    cmake -S /workspace/${LLAMA_DIR#"$REPO"/} --preset arm64-android-snapdragon-release -B $rel/dsp > $rel/dsp.configure.log 2>&1
+    cmake --build $rel/dsp -j$BUILD_JOBS --target htp-v79 > $rel/dsp.build.log 2>&1
+fi
 rm -rf $rel/runtime && mkdir -p $rel/runtime
 case $cfg in
     hwasan) rt=libclang_rt.hwasan-aarch64-android.so ;;
@@ -356,7 +389,17 @@ fi
         fd -t f -e so . "$dir/ggml" -x cp -f {} "$stage/lib/"
     fi
     fd -t f -e so . "$dir/runtime" -x cp -f {} "$stage/lib/" 2> /dev/null || true
-    cp -f "$DSP_LIB" "$stage/dsp/libggml-htp-v79.so"
+    local dsp=$DSP_LIB
+    if [[ -z $dsp && $shipped == 1 ]]; then
+        dsp="$SHIPPED_LIBS/libggml-htp-v79.so"
+        want=$(rg -F "  libggml-htp-v79.so" "$SHIPPED_HASHES" | cut -d' ' -f1)
+        have=$(sha256sum "$dsp" | cut -d' ' -f1)
+        [[ -n $want && $want == "$have" ]] || die "$dsp does not match $SHIPPED_HASHES"
+    elif [[ -z $dsp ]]; then
+        dsp="$dir/dsp/ggml/src/ggml-hexagon/libggml-htp-v79.so"
+        [[ -f $dsp ]] || die "the DSP build made no $dsp. Read $dir/dsp.build.log."
+    fi
+    cp -f "$dsp" "$stage/dsp/libggml-htp-v79.so"
     [[ -f $UBSAN_SUPP ]] && cp -f "$UBSAN_SUPP" "$stage/ubsan.supp"
     # The inputs: the seeds and the regression inputs of fuzz_graph, then the corpus of the x86 runs
     fd -t f . "$HERE/corpus/graph" "$HERE/regress/graph" -x cp -f {} "$stage/in/" 2> /dev/null || true
@@ -439,6 +482,7 @@ phone_commands() {
 # program loads full models, thus it has no sanitizer. Gives the code 1 when a run fails.
 graphs_check() {
     local dir="$REPO/build/fuzz/$AREA-graphs" m model mmproj rc bad=0
+    refresh_llama
     mkdir -p "$dir/out"
     # Shared libraries, as the app ships them
     CC=clang CXX=clang++ cmake -S "$HERE/graphs" -B "$dir" -G Ninja -DCMAKE_BUILD_TYPE=Release \
