@@ -56,8 +56,8 @@
 # The environment:
 #   FUZZ_BUILD_JOBS The jobs of a build (the default is 8).
 #   FAKEJNI_RELAX   The checks of the fake VM that only report in the fuzz mode
-#                   (the default is "pending": finding jni-pending-exception has
-#                   its own scenario and regression). The test mode relaxes none.
+#                   (refer to harness/fake_jni.h). The default relaxes none, and
+#                   the test mode relaxes none.
 #   FUZZ_APP_SKIP_KNOWN  1 (the default of the fuzz mode) keeps the fuzzers away
 #                   from the findings that a scenario reproduces already. The
 #                   test mode uses 0.
@@ -275,7 +275,7 @@ fuzz_one() {
     done
     t0=$(date +%s)
     # shellcheck disable=SC2046
-    env FAKEJNI_RELAX="${FAKEJNI_RELAX-pending}" FUZZ_APP_SKIP_KNOWN="${FUZZ_APP_SKIP_KNOWN:-1}" \
+    env FAKEJNI_RELAX="${FAKEJNI_RELAX-}" FUZZ_APP_SKIP_KNOWN="${FUZZ_APP_SKIP_KNOWN:-1}" \
         FUZZ_ARTIFACT_DIR="$art" $(env_of "$target" "$san") \
         nice -n 10 timeout -s KILL $((budget + 300)) "$bin" -max_total_time="$budget" -rss_limit_mb=4096 \
         -max_len="$(max_len_of "$target")" -timeout=180 -print_final_stats=1 -close_fd_mask=1 \
@@ -596,7 +596,7 @@ phone_commands() {
         ubsan) rt="UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:suppressions=$d/ubsan.supp" ;;
         none) rt="" ;;
     esac
-    local envs="LD_LIBRARY_PATH=$libs ADSP_LIBRARY_PATH=$d/lib FUZZ_APP_LIBDIR=$d/lib FUZZ_APP_MODEL_DIR=$d/models FUZZ_APP_WORK=$d/work FUZZ_ARTIFACT_DIR=$d/logs FUZZ_APP_SKIP_KNOWN=1 FAKEJNI_RELAX=pending $rt"
+    local envs="LD_LIBRARY_PATH=$libs ADSP_LIBRARY_PATH=$d/lib FUZZ_APP_LIBDIR=$d/lib FUZZ_APP_MODEL_DIR=$d/models FUZZ_APP_WORK=$d/work FUZZ_ARTIFACT_DIR=$d/logs FUZZ_APP_SKIP_KNOWN=1 $rt"
     local real="FUZZ_APP_REAL_MODEL=/data/local/tmp/qwen/models/Qwen3.5-2B-Q8_0.gguf FUZZ_APP_REAL_ONLY=1 FUZZ_APP_MAX_OPS=8 FUZZ_APP_MAX_GEN=16 FUZZ_APP_ORACLE=0"
     local thermal="$a shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
     # One run: the thermal status before and after it, and the processes that stay.
@@ -642,7 +642,7 @@ phone_commands() {
     for dev in cpu HTP0; do
         for sc in image-shape spec-disable spec-parity sampler-nan jni-pending priority; do
             one "9. The scenario $sc on $dev (its log ends with its report, or with a line that has \"no\")." \
-                "cd $d && timeout -s KILL 100 env $envs FAKEJNI_RELAX= FUZZ_APP_DEVICE=${dev/cpu/} bin/app_fuzz_driver --scenario $sc > logs/scenario-$sc-$dev.log 2>&1"
+                "cd $d && timeout -s KILL 100 env $envs FUZZ_APP_DEVICE=${dev/cpu/} bin/app_fuzz_driver --scenario $sc > logs/scenario-$sc-$dev.log 2>&1"
         done
     done
     echo "$a pull $d/logs $OUT/phone-logs-$PROFILE-$san"

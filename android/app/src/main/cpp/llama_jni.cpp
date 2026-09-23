@@ -1676,7 +1676,9 @@ void clear_queue(Engine & e) {
 }
 
 std::string jstring_to_std(JNIEnv * env, jstring s) {
-    if (s == nullptr) {
+    // With a pending exception, JNI permits only some calls, and CheckJNI stops
+    // the app on each other call. The caller examines the exception after its reads (task #161).
+    if (s == nullptr || env->ExceptionCheck()) {
         return {};
     }
     const char * chars = env->GetStringUTFChars(s, nullptr);
@@ -1689,8 +1691,11 @@ std::string jstring_to_std(JNIEnv * env, jstring s) {
     return out;
 }
 
-/** The string element i of a Java array, with its local reference released. */
+/** The string element i of a Java array, with its local reference released. Empty with a pending exception. */
 std::string array_string(JNIEnv * env, jobjectArray array, jsize i) {
+    if (env->ExceptionCheck()) {
+        return {};
+    }
     jstring s = (jstring) env->GetObjectArrayElement(array, i);
     std::string out = jstring_to_std(env, s);
     if (s != nullptr) {
@@ -1716,6 +1721,10 @@ static void init_impl(JNIEnv * env, jstring jlibdir) {
     setenv("GGML_HEXAGON_OPFUSION", "1", 0);
     setenv("GGML_HEXAGON_OPFUSION_STATE", "1", 0);
     const std::string libdir = jstring_to_std(env, jlibdir);
+    if (env->ExceptionCheck()) {
+        // The directory did not read (OutOfMemoryError). The exception goes to the app, and no backend loads without it.
+        return;
+    }
     if (!libdir.empty()) {
         setenv("ADSP_LIBRARY_PATH", libdir.c_str(), 1);
         ggml_backend_load_all_from_path(libdir.c_str());
@@ -1738,6 +1747,9 @@ JNIEXPORT void JNICALL
 Java_ai_airi_qwenmobile_LlamaNative_setWorkingDirectory(JNIEnv * env, jclass, jstring jpath) {
     jni_guard_void(env, [&] {
         const std::string path = jstring_to_std(env, jpath);
+        if (env->ExceptionCheck()) {
+            return;
+        }
         if (chdir(path.c_str()) != 0) {
             LOGE("chdir to %s failed", path.c_str());
         }
@@ -1820,6 +1832,11 @@ static jlong load_impl(JNIEnv * env, jstring jpath, jstring jmmproj,
     const std::string prefill = jstring_to_std(env, jprefill);
     const std::string vision  = jstring_to_std(env, jvision);
     const std::string cache   = jstring_to_std(env, jcache);
+    const std::string mmproj  = jstring_to_std(env, jmmproj);
+    if (env->ExceptionCheck()) {
+        // A string did not read (OutOfMemoryError). That exception goes to the app.
+        return 0;
+    }
     if (n_ctx < kBatch) {
         throw_java(env, "The context length must be at least " + std::to_string(kBatch) + " tokens, not " + std::to_string(n_ctx));
         return 0;
@@ -1834,7 +1851,7 @@ static jlong load_impl(JNIEnv * env, jstring jpath, jstring jmmproj,
     auto e = std::make_shared<Engine>();
     e->n_threads  = std::max(1, (int) n_threads);
     e->gpu_layers = gpu_layers;
-    e->mmproj     = jstring_to_std(env, jmmproj);
+    e->mmproj     = mmproj;
     e->vision_device    = vision;
     e->image_max_tokens = image_max_tokens;
     const bool hybrid = !prefill.empty();
@@ -2054,6 +2071,10 @@ static jint chat_start_impl(JNIEnv * env, jclass native_class, jlong handle,
         common_chat_msg msg;
         msg.role    = array_string(env, roles, i);
         msg.content = array_string(env, contents, i);
+        if (env->ExceptionCheck()) {
+            // A string did not read (OutOfMemoryError). That exception goes to the app.
+            return -1;
+        }
         jbyteArray image = images ? (jbyteArray) env->GetObjectArrayElement(images, i) : nullptr;
         if (image != nullptr) {
             msg.content = std::string(mtmd_default_marker()) + "\n" + msg.content;
