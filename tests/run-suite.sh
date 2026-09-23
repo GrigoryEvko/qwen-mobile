@@ -9,7 +9,9 @@
 #   --budget-seconds N            The fuzz time of each fuzz target, in each
 #                                 configuration. The preset value is 300.
 #   --jobs N                      The parallel jobs of each step (compile jobs,
-#                                 ctest tests, fuzzers). The preset value is 8.
+#                                 fuzzers). The preset value is 8.
+#   --test-jobs N                 The parallel ctest tests of the llama step.
+#                                 The preset value is 4.
 #   --areas LIST                  The fuzz areas, comma separated. The preset
 #                                 value is core,ops,hexhost,app,quant.
 #   --steps LIST                  The steps, comma separated. The preset value
@@ -74,6 +76,7 @@ CONFIGS=""
 PROFILES="debug release"
 BUDGET=300
 JOBS=8
+TEST_JOBS=4
 AREAS="core,ops,hexhost,app,quant"
 STEPS="$ALL_STEPS"
 NO_CONTAINER=0
@@ -140,6 +143,7 @@ parse_args() {
                 shift 2 ;;
             --budget-seconds) BUDGET="$2"; shift 2 ;;
             --jobs) JOBS="$2"; shift 2 ;;
+            --test-jobs) TEST_JOBS="$2"; shift 2 ;;
             --areas) AREAS="$2"; shift 2 ;;
             --steps) STEPS="$2"; shift 2 ;;
             --no-container) NO_CONTAINER=1; shift ;;
@@ -148,7 +152,8 @@ parse_args() {
             *) suite_log "The option '$1' is not known. Use --help."; exit 2 ;;
         esac
     done
-    [[ "$BUDGET" =~ ^[0-9]+$ && "$JOBS" =~ ^[0-9]+$ ]] || { suite_log "--budget-seconds and --jobs need integers."; exit 2; }
+    [[ "$BUDGET" =~ ^[0-9]+$ && "$JOBS" =~ ^[0-9]+$ && "$TEST_JOBS" =~ ^[0-9]+$ ]] \
+        || { suite_log "--budget-seconds, --jobs and --test-jobs need integers."; exit 2; }
 }
 
 # Return 0 if the step is selected.
@@ -247,7 +252,7 @@ test_steps() {
     fi
     if want_step llama; then
         run_step test llama "$p" "$c" $((150 * 60)) "$SUITE_REPO_ROOT/build/fuzz/matrix-llama-$p-$c/results.jsonl" \
-            "$SUITE_REPO_ROOT/tests/suite/llama-ctest.sh" "$c" --profile "$p" --jobs "$JOBS" --test-jobs "$(( JOBS > 4 ? 4 : JOBS ))"
+            "$SUITE_REPO_ROOT/tests/suite/llama-ctest.sh" "$c" --profile "$p" --jobs "$JOBS" --test-jobs "$TEST_JOBS"
     fi
     if want_step app-host; then
         run_step test app-host "$p" "$c" $((20 * 60)) "$SUITE_REPO_ROOT/build/fuzz/matrix-app-host-$p-$c/results.jsonl" \

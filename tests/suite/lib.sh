@@ -15,6 +15,10 @@ SUITE_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly SUITE_REPO_ROOT
 readonly SUITE_CONFIGS="none asan ubsan tsan msan"
 readonly SUITE_PROFILES="debug release"
+# The directory of the profile and sanitizer files (cmake -C). The
+# environment variable SUITE_SANITIZER_FILES gives a private copy, for a test
+# of a change of these files before it goes into tests/sanitizers.
+SUITE_SANITIZER_FILES="${SUITE_SANITIZER_FILES:-$SUITE_REPO_ROOT/tests/sanitizers}"
 
 # The report lines of the five sanitizers. Each report of ASan, LSan, TSan
 # and MSan ends with one SUMMARY line. UBSan writes one "runtime error:" line
@@ -58,8 +62,8 @@ suite_is_profile() {
 # Print the -C options of cmake for one profile and one configuration.
 # Arguments: the profile, the configuration.
 suite_cmake_init_args() {
-    printf '%s\n' "-C" "$SUITE_REPO_ROOT/tests/sanitizers/profile-$1.cmake" \
-        "-C" "$SUITE_REPO_ROOT/tests/sanitizers/$2.cmake"
+    printf '%s\n' "-C" "$SUITE_SANITIZER_FILES/profile-$1.cmake" \
+        "-C" "$SUITE_SANITIZER_FILES/$2.cmake"
 }
 
 # Print a fingerprint of the sanitizer and profile files and of the compiler.
@@ -70,9 +74,9 @@ suite_fingerprint() {
     shift 2
     {
         printf '%s\n' "$@"
-        cat "$SUITE_REPO_ROOT/tests/sanitizers/common.cmake" \
-            "$SUITE_REPO_ROOT/tests/sanitizers/profile-$profile.cmake" \
-            "$SUITE_REPO_ROOT/tests/sanitizers/$config.cmake"
+        cat "$SUITE_SANITIZER_FILES/common.cmake" \
+            "$SUITE_SANITIZER_FILES/profile-$profile.cmake" \
+            "$SUITE_SANITIZER_FILES/$config.cmake"
         clang --version | head -1
     } | sha256sum | cut -d' ' -f1
 }
