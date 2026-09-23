@@ -55,9 +55,9 @@ elseif (FUZZ_SANITIZER STREQUAL "hwasan")
     endif()
     set(SAN_FLAGS -fsanitize=hwaddress)
 elseif (FUZZ_SANITIZER STREQUAL "ubsan")
-    # Refer to tests/sanitizers/ubsan.cmake: pointer-overflow recovers for the tracked finding of
-    # task #125 only (ggml_graph_nbytes), and the runtime option halt_on_error=1 stops each other report.
-    set(SAN_FLAGS -fsanitize=undefined -fno-sanitize-recover=undefined -fsanitize-recover=pointer-overflow)
+    # No check recovers: the finding of pointer-overflow (task #125) has its fix in
+    # patches/fuzz-ops/0001, thus each UBSan report stops the run.
+    set(SAN_FLAGS -fsanitize=undefined -fno-sanitize-recover=undefined)
 elseif (FUZZ_SANITIZER STREQUAL "none")
     set(SAN_FLAGS "")
 else()

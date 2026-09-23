@@ -25,6 +25,10 @@ PHONE_RANDOM=${PHONE_RANDOM:-60}
 DSP_LIB=${DSP_LIB:-$REPO/build/native/llama/ggml/src/ggml-hexagon/libggml-htp-v79.so}
 SHIPPED_LIBS="$REPO/android/snapdragon/jniLibs/arm64-v8a"
 SHIPPED_HASHES="$REPO/build/hashes-native.txt"
+# The Android ASan runtime of compiler-rt 22 (tests/sanitizers/build-asan-android-runtime.sh, task
+# #176). The runtime of the NDK stops each new thread with SIGILL on the SM8750.
+ASAN_RT_DIR=${ASAN_RT_DIR:-$REPO/build/fuzz/asan-android-runtime}
+ASAN_RT=libclang_rt.asan-aarch64-android.so
 
 # The ids of the known findings (fake_dsp.cpp: violation). In the fuzz mode the harness keeps these
 # conditions off (HEXHOST_IGNORE), thus the fuzzers look for new defects. The test mode does not
@@ -208,7 +212,7 @@ test_one() {
         rc=0
         # the outer kill: a hang is a finding (code 137)
         timeout -s KILL 300 env "${envs[@]}" nice -n 10 "$dir/fuzz_$t" -rss_limit_mb=4096 -malloc_limit_mb=4096 \
-            -timeout=60 "$f" >> "$log" 2>&1 || rc=$?
+            -timeout=60 -artifact_prefix="$out/" "$f" >> "$log" 2>&1 || rc=$?
         echo "run.sh: $f gives the code $rc" >> "$log"
         [[ $rc != 0 ]] && failed+=("$f")
     done
@@ -271,6 +275,10 @@ phone_build_one() {
     rel=${dir#"$REPO"/}
     stage="$dir/stage"
     [[ -f $DSP_LIB ]] || die "the DSP library $DSP_LIB does not exist. Run scripts/build-native.sh first, or set DSP_LIB."
+    if [[ $cfg == asan ]]; then
+        (cd "$ASAN_RT_DIR" 2> /dev/null && sha256sum -c --quiet "$ASAN_RT.sha256") \
+            || die "the ASan runtime $ASAN_RT_DIR/$ASAN_RT is missing or does not match its sha256. Run tests/sanitizers/build-asan-android-runtime.sh first."
+    fi
     [[ $LLAMA_DIR == "$REPO"/* ]] || die "the llama.cpp tree $LLAMA_DIR is not inside the repository, thus the container cannot see it"
     mkdir -p "$dir/include/fuzzer"
     # FuzzedDataProvider.h is one header; the copy of the host clang is the same file as the NDK copy
@@ -286,7 +294,6 @@ cmake -S tests/fuzz/hexhost/phone -B $rel -G Ninja -DCMAKE_BUILD_TYPE=None \
 cmake --build $rel -j$BUILD_JOBS --target hexhost_phone
 rm -rf $rel/runtime && mkdir -p $rel/runtime
 case $cfg in
-    asan) rt=libclang_rt.asan-aarch64-android.so ;;
     hwasan) rt=libclang_rt.hwasan-aarch64-android.so ;;
     ubsan) rt=libclang_rt.ubsan_standalone-aarch64-android.so ;;
     *) rt= ;;
@@ -295,6 +302,8 @@ if [[ -n \$rt ]]; then
     cp -f \$(find \$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt -name \$rt | head -n 1) $rel/runtime/
 fi
 " > "$dir.build.log" 2>&1 || die "the phone build failed. Read $dir.build.log."
+    # The ASan runtime comes from the shared build (task #176), not from the NDK
+    [[ $cfg == asan ]] && cp -f "$ASAN_RT_DIR/$ASAN_RT" "$dir/runtime/"
 
     rm -rf "$stage"
     mkdir -p "$stage/bin" "$stage/lib" "$stage/dsp" "$stage/in"
@@ -359,6 +368,11 @@ phone_commands() {
         echo "adb -s $PHONE shell 'rm -rf $d && mkdir -p $d/out'"
         echo "adb -s $PHONE push ${stage#"$REPO"/}/. $d/"
         echo "adb -s $PHONE shell 'chmod 755 $d/bin/hexhost_phone'"
+        if [[ $cfg == asan ]]; then
+            # Task #176: a failure of the thread start is a failure of the environment, not a finding
+            echo "# If this line does not give \"thread self-test ok\", stop: record an environment failure."
+            echo "adb -s $PHONE shell 'cd $d && timeout -s KILL 30 env LD_LIBRARY_PATH=$d/lib $san ./bin/hexhost_phone --selftest-threads'"
+        fi
         for run in "${PHONE_RUNS[@]}"; do
             name=${run%%:*}
             vars=${run#*:}

@@ -73,13 +73,10 @@ if (FUZZ_SANITIZER STREQUAL "asan")
     set(SAN_FLAGS -fsanitize=address -fno-optimize-sibling-calls)
     add_compile_definitions(HEXHOST_ASYNC_DSP=0)
 elseif (FUZZ_SANITIZER STREQUAL "ubsan")
-    # -fsanitize-recover=pointer-overflow: a UBSan suppression file has no effect on a check that
-    # cannot recover (the handler stops the process after the report). The known, tracked finding
-    # (task #125): the function incr_ptr_aligned (ggml.c:7447) of ggml_graph_nbytes adds offsets
-    # to a null pointer at each graph allocation. The shared file tests/sanitizers/ubsan.supp skips
-    # only that function. harness.cpp sets halt_on_error=1, thus each other pointer-overflow
-    # report stops the run.
-    set(SAN_FLAGS -fsanitize=undefined -fno-sanitize-recover=undefined -fsanitize-recover=pointer-overflow)
+    # No check recovers: the finding of pointer-overflow (task #125) has its fix in
+    # patches/fuzz-ops/0001, thus each UBSan report stops the run. harness.cpp gives the shared
+    # file tests/sanitizers/ubsan.supp to the runtime for a check that a later task makes recover.
+    set(SAN_FLAGS -fsanitize=undefined -fno-sanitize-recover=undefined)
     set(HEXHOST_UBSAN_SUPP "${CMAKE_CURRENT_SOURCE_DIR}/../../sanitizers/ubsan.supp")
     get_filename_component(HEXHOST_UBSAN_SUPP "${HEXHOST_UBSAN_SUPP}" ABSOLUTE)
     add_compile_definitions(HEXHOST_ASYNC_DSP=0 HEXHOST_UBSAN_SUPP="${HEXHOST_UBSAN_SUPP}")
