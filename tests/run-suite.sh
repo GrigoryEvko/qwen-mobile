@@ -57,6 +57,27 @@
 # options come from tests/sanitizers/env.sh. The fuzz targets use
 # -rss_limit_mb=4096 through their run.sh.
 #
+# The phone (arm64 Android, the SM8750 of the OnePlus 13) is not a step of
+# this driver: each area makes its phone stages (run.sh phone-build and
+# phone-commands), and the owner of the phone runs them. The configurations
+# on the phone:
+#   none, hwasan  Available.
+#   ubsan         Available with the UBSan runtime linked statically
+#                 (-static-libsan). The shared runtime of the NDK has its own
+#                 copy of the libc++abi type_info classes and gives a false
+#                 vptr report at the start.
+#   asan          Available only with the runtime of
+#                 tests/sanitizers/build-asan-android-runtime.sh. The ASan
+#                 runtime of the NDK stops each new thread with SIGILL.
+#   tsan          Not available. The TSan runtime of NDK r29 stops each
+#                 thread with "CHECK failed: tsan_rtl.cpp:1043
+#                 ((thr->ignore_reads_and_writes)) > ((0))", in a program
+#                 with a data race and in the same program with a mutex
+#                 (a phone probe, 2026-09-24). TSan runs on the x86 host only.
+#   msan          Not available: Android has no MSan runtime.
+# A command file for the phone gives each command with literal paths on one
+# line, because the runner runs each line in its own shell.
+#
 # Output:
 #   build/fuzz/matrix/summary.json   One record for each suite, profile,
 #                                    configuration, step and target: status
