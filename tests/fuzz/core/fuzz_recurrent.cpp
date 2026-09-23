@@ -400,15 +400,6 @@ void run(FuzzedDataProvider & fdp) {
         } else if (op == 9) {
             const int src = fdp.ConsumeIntegralInRange<int>(0, n_seq - 1);
             const int dst = fdp.ConsumeIntegralInRange<int>(0, n_seq - 1);
-            // seq_cp does not copy the pending rollback index of the source to the destination,
-            // thus the two sequences share a cell with two indices, and a later
-            // llama_state_get_data aborts, or the destination reads a wrong state (finding
-            // recurrent-shared-rollback). FUZZ_RECURRENT_KNOWN_SHARED_ROLLBACK=1 skips a copy
-            // when the source or the destination has a pending rollback.
-            static const bool known_shared = fuzz::env_long("FUZZ_RECURRENT_KNOWN_SHARED_ROLLBACK", 0) != 0;
-            if (known_shared && src != dst && (sh[src].pending || sh[dst].pending)) {
-                continue;
-            }
             // A copy into a sequence that holds tokens has two meanings in the hybrid memory: the
             // recurrent memory replaces the destination, and the unified KV cache adds the cells of
             // the source to the old cells of the destination. llama.h does not say that the
@@ -425,12 +416,6 @@ void run(FuzzedDataProvider & fdp) {
             }
         } else if (op == 10) {
             const int s = fdp.ConsumeIntegralInRange<int>(0, n_seq - 1);
-            // FUZZ_RECURRENT_KNOWN_KV_KEEP=1 skips seq_keep with a KV cache of one stream per
-            // sequence (finding kv-keep-streams: the other streams keep their cells)
-            static const bool known_keep = fuzz::env_long("FUZZ_RECURRENT_KNOWN_KV_KEEP", 0) != 0;
-            if (known_keep && !p.unified && n_seq > 1) {
-                continue;
-            }
             llama_memory_seq_keep(mem, s);
             trace("keep seq %d", s);
             for (int o = 0; o < n_seq; ++o) {

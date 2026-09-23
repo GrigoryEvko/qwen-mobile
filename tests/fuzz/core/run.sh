@@ -100,16 +100,12 @@ PHONE_TARGETS="fuzz_npu_decode fuzz_recurrent"
 
 # The switch of each known finding (rule R8 and R13).
 declare -A SWITCH=(
-    [kv-keep-streams]=FUZZ_RECURRENT_KNOWN_KV_KEEP
-    [recurrent-shared-rollback]=FUZZ_RECURRENT_KNOWN_SHARED_ROLLBACK
     [copy-into-used-sequence]=FUZZ_RECURRENT_CLEAR_BEFORE_COPY
 )
 
 # The report of each known finding, as an extended regular expression on the run log. A
 # regression input "reproduces" its finding when its log matches this expression.
 declare -A EXPECT=(
-    [kv-keep-streams]='P2: after'
-    [recurrent-shared-rollback]='cannot write shared recurrent state|P2: after'
     [copy-into-used-sequence]='P2: after'
 )
 

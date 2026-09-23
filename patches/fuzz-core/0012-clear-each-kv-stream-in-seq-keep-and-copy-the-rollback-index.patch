@@ -1,0 +1,88 @@
+Clear each KV stream in seq_keep and copy the rollback index with a sequence
+Fold-into: upstream/memory
+
+The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
+
+- seq_keep with one KV stream for each sequence keeps the cells of the other sequences.
+
+  With kv_unified = false, each sequence has its own stream. llama_kv_cache::seq_keep clears only
+  the stream of the kept sequence, and the other sequences are in the other streams. Thus their
+  cells stay, and the next decode of such a sequence also attends to its old cells.
+
+  The change: seq_keep removes each other sequence from each stream.
+
+  The reproducer: tests/fuzz/core/regress/fuzz_recurrent--kv-keep-streams.
+
+- The copy of a sequence with a pending rollback reads the state before the rollback.
+
+  A pending rollback of the source puts its state in the snapshot group rs_idx[src]. seq_cp gives
+  the destination the same cell, but the destination keeps rs_idx 0. The destination then reads
+  the state before the rollback, and state_write stops the process on the shared cell ("cannot
+  write shared recurrent state with different rollback indices").
+
+  The change: seq_cp copies rs_idx of the source to the destination, as it copies rs_depth.
+
+  The reproducer: tests/fuzz/core/regress/fuzz_recurrent--recurrent-shared-rollback.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    src/llama-kv-cache.cpp
+    src/llama-memory-recurrent.cpp
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -548,22 +548,26 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
+ 
+     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+ 
+-    auto & cells = v_cells[seq_to_stream[seq_id]];
+-    auto & head  = v_heads[seq_to_stream[seq_id]];
++    // With one stream for each sequence (kv_unified = false), the other sequences are in the
++    // other streams, thus each stream drops every sequence except seq_id.
++    for (uint32_t s = 0; s < n_stream; ++s) {
++        auto & cells = v_cells[s];
++        auto & head  = v_heads[s];
+ 
+-    uint32_t new_head = cells.size();
++        uint32_t new_head = cells.size();
+ 
+-    for (uint32_t i = 0; i < cells.size(); ++i) {
+-        if (cells.seq_keep(i, seq_id)) {
+-            if (new_head == cells.size()) {
+-                new_head = i;
++        for (uint32_t i = 0; i < cells.size(); ++i) {
++            if (cells.seq_keep(i, seq_id)) {
++                if (new_head == cells.size()) {
++                    new_head = i;
++                }
+             }
+         }
+-    }
+ 
+-    // If we freed up a slot, set head to it so searching can start there.
+-    if (new_head != cells.size() && new_head < head) {
+-        head = new_head;
++        // If we freed up a slot, set head to it so searching can start there.
++        if (new_head != cells.size() && new_head < head) {
++            head = new_head;
++        }
+     }
+ }
+ 
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -307,6 +307,14 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
+         if ((size_t) seq_id_src < rs_depth.size() && (size_t) seq_id_dst < rs_depth.size()) {
+             rs_depth[seq_id_dst] = tail_src.tail >= 0 ? rs_depth[seq_id_src] : 0;
+         }
++
++        // A pending rollback of the source puts its state in snapshot group rs_idx[src]. The
++        // destination shares the cell, thus it reads the same group. With rs_idx[dst] = 0 it
++        // reads the state before the rollback, and state_write aborts on the shared cell
++        // ("cannot write shared recurrent state with different rollback indices").
++        if ((size_t) seq_id_src < rs_idx.size() && (size_t) seq_id_dst < rs_idx.size()) {
++            rs_idx[seq_id_dst] = tail_src.tail >= 0 ? rs_idx[seq_id_src] : 0;
++        }
+     }
+ }
+ 
