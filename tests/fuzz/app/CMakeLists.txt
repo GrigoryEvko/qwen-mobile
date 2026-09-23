@@ -57,6 +57,17 @@ elseif(FUZZ_SANITIZER STREQUAL "ubsan")
     # The flags of tests/sanitizers/ubsan.cmake, for the builds without that
     # initial cache (the phone): every report stops the run.
     set(SAN_COMPILE -fsanitize=undefined -fno-sanitize-recover=undefined)
+    if(ANDROID)
+        # The shared UBSan runtime of the NDK holds a private copy of the
+        # libc++abi type-info classes, and each executable holds the copy of
+        # the static NDK libc++. The vptr check walks the class hierarchy with
+        # a dynamic_cast to the copy of the runtime, which fails for the
+        # type_info objects of the executable. Thus each check of a derived
+        # class gave a false report (for example the __func of a std::function
+        # for its __base). The static runtime uses the one copy of the
+        # executable, and vptr stays on without a recovery.
+        set(SAN_LINK -static-libsan)
+    endif()
 elseif(FUZZ_SANITIZER STREQUAL "tsan")
     set(SAN_COMPILE -fsanitize=thread)
 elseif(FUZZ_SANITIZER STREQUAL "msan")

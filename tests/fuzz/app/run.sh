@@ -484,8 +484,8 @@ android_runtime() {
     case $1 in
         asan) echo libclang_rt.asan-aarch64-android.so ;;
         hwasan) echo libclang_rt.hwasan-aarch64-android.so ;;
-        ubsan) echo libclang_rt.ubsan_standalone-aarch64-android.so ;;
-        none) ;;
+        # The ubsan build links its runtime statically (-static-libsan, refer to the vptr text in CMakeLists.txt).
+        ubsan | none) ;;
         *) die "unknown phone sanitizer '$1': none, asan, hwasan or ubsan (MSan does not exist on Android)" ;;
     esac
 }
