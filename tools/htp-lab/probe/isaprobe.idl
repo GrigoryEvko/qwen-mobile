@@ -1,0 +1,79 @@
+// The FastRPC interface of the ISA silicon probe. The host program isaprobe calls it, and the DSP
+// library libisaprobe_skel.so implements it. Refer to build.sh for the build, and to
+// dsp/isaprobe_dsp.c for the behavior on the DSP.
+
+#ifndef ISAPROBE_IDL
+#define ISAPROBE_IDL
+
+#include "AEEStdDef.idl"
+#include "remote.idl"
+
+// One op of the census table (isa_op_desc of tools/htp-lab/isa/isa_kernels.h). The DSP library
+// gives the table that it was built with, thus the host and the kernels always agree.
+struct isaprobe_op {
+    uint32 kind;          // enum isa_kind
+    uint32 min_arch;      // the minimum __HVX_ARCH__ of the SDK header
+    uint32 out_type;      // enum isa_type
+    uint32 in_type[3];    // enum isa_type
+    uint32 in_stream[3];  // enum isa_stream, 0 for an input that the op does not use
+    uint32 in_bytes[3];   // bytes per iteration from each input: 0, 128 or 256
+    uint32 out_bytes;     // bytes per iteration to the output: 128 or 256
+    uint32 n_vectors;     // the iterations of the census run
+    uint32 available;     // isa_available() of the library: 1 if the op is in this build
+};
+
+// The problem of a candidate kernel (dsp/candidates.h). The inputs travel as sequences.
+struct isaprobe_kparams {
+    uint32 op;           // CAND_OP_*
+    uint32 rows;
+    uint32 cols;
+    uint32 iters;        // the timed iterations of run, 1 or more
+    uint32 reserved[4];  // zero
+};
+
+interface isaprobe : remote_handle64 {
+    // Tell the DSP facts and the result of the HVX, HMX and VTCM setup.
+    //   arch          The raw value of qurt_sysenv_get_arch_version, 0 if the DSP image has no
+    //                 such function. The host decodes it.
+    //   skel_arch     The __HVX_ARCH__ of the library build (79 for the v79 library)
+    //   hvx_threads   The number of 128-byte HVX contexts
+    //   hmx_count     1 if the library holds the HMX, 0 if not
+    //   vtcm_bytes    The number of VTCM bytes that the library holds
+    //   setup_status  0, or the first setup step that failed (ISAPROBE_SETUP_* of isaprobe_status.h)
+    //   setup_error   The error code of that step
+    //   n_ops         The number of census ops (ISA_N_OPS), 0 for the stub kernels
+    //   n_streams     The number of corpus stream IDs (ISA_S_COUNT), 0 for the stub kernels
+    AEEResult info(rout uint32 arch, rout uint32 skel_arch, rout uint32 hvx_threads,
+                   rout uint32 hmx_count, rout uint32 vtcm_bytes, rout int32 setup_status,
+                   rout int32 setup_error, rout uint32 n_ops, rout uint32 n_streams);
+
+    // Give one op of the census table and its name. AEE_EBADPARM for an op ID that is not
+    // valid, AEE_EUNSUPPORTED for the stub kernels.
+    AEEResult op_info(in uint32 op_id, rout isaprobe_op desc, rout string name);
+
+    // Give the name of one corpus stream. The file of the stream is corpus_<name>.bin.
+    AEEResult stream_name(in uint32 stream_id, rout string name);
+
+    // Run one op: status = isa_run(op_id, in0, in1, in2, dst, n_vectors).
+    // An empty input sequence gives a NULL pointer to isa_run. The return value is an error of
+    // the transport or of the setup. The status is the value of isa_run, or a probe status
+    // (ISAPROBE_STATUS_* of isaprobe_status.h).
+    AEEResult run(in int32 op_id, in sequence<uint8> in0, in sequence<uint8> in1,
+                  in sequence<uint8> in2, rout sequence<uint8> dst, in int32 n_vectors,
+                  rout int32 status);
+
+    // Give one candidate kernel: its op (CAND_OP_*), its name, and the number of kernels.
+    // AEE_EBADPARM for a kernel ID that is not valid.
+    AEEResult kernel_info(in uint32 kernel_id, rout uint32 n_kernels, rout uint32 op, rout string name);
+
+    // Run one candidate kernel: prepare, then run params.iters times, then release.
+    // For CAND_OP_MATVEC_Q8_0: in0 holds the Q8_0 weights, in1 the f32 activation, and dst the
+    // f32 output of rows values. status is the first nonzero value of a kernel function or a probe
+    // status (ISAPROBE_STATUS_*). pcycles and usecs are the minimum over the iterations of run
+    // (the processor cycles, and the time in microseconds).
+    AEEResult kernel_run(in uint32 kernel_id, in isaprobe_kparams params, in sequence<uint8> in0,
+                         in sequence<uint8> in1, rout sequence<uint8> dst, rout int32 status,
+                         rout uint64 pcycles, rout uint64 usecs);
+};
+
+#endif
