@@ -325,11 +325,17 @@ fi
     [[ -f $UBSAN_SUPP ]] && cp -f "$UBSAN_SUPP" "$stage/ubsan.supp"
     # The inputs: the seeds and the regression inputs of fuzz_graph, then the corpus of the x86 runs
     fd -t f . "$HERE/corpus/graph" "$HERE/regress/graph" -x cp -f {} "$stage/in/" 2> /dev/null || true
+    # The first 150 small inputs of each corpus. A slice of an array, not head: head closes the
+    # pipe early, and with pipefail the SIGPIPE of sort stops the script.
     local c
+    local -a picked
     for c in "$REPO"/build/fuzz/$AREA-*-asan/runs/graph/corpus; do
-        [[ -d $c ]] && fd -t f -S -2k . "$c" | sort | head -n 150 | xargs -r cp -f -t "$stage/in/"
+        [[ -d $c ]] || continue
+        mapfile -t picked < <(fd -t f -S -2k . "$c" | sort)
+        (( ${#picked[@]} > 0 )) && cp -f -t "$stage/in/" "${picked[@]:0:150}"
     done
-    (cd "$stage" && fd -t f . | sort | xargs sha256sum > SHA256SUMS)
+    # The list does not hold SHA256SUMS itself: the shell makes the file before fd runs
+    (cd "$stage" && fd -t f -E SHA256SUMS . | sort | xargs sha256sum > SHA256SUMS)
     echo "run.sh: staged $(fd -t f . "$stage/in" | wc -l) inputs and $(fd -t f . "$stage/lib" | wc -l) libraries in ${stage#"$REPO"/}"
 }
 
