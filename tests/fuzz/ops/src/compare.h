@@ -35,6 +35,8 @@ struct out_cmp {
     float   worst_got   = 0.0f;
     double  worst_strict = 0.0;
     double  worst_loose  = 0.0;
+    int64_t n_nf_f16    = 0;   // non-finite results with a finite reference above 65504 (the f16 range)
+    double  max_ref_fin = 0.0; // the largest |reference| with a finite result
     int64_t nf_i        = -1;  // the first non-finite mismatch
     float   nf_ref      = 0.0f;
     float   nf_got      = 0.0f;

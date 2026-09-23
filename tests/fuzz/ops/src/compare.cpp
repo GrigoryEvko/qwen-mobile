@@ -96,9 +96,13 @@ case_cmp compare_case(const built_case & c, const std::vector<std::vector<uint8_
                         oc.nf_got = g;
                     }
                     oc.n_nonfinite++;
+                    if (std::isfinite(r) && std::fabs(r) > 65504.0f) {
+                        oc.n_nf_f16++;
+                    }
                 }
                 continue;
             }
+            oc.max_ref_fin = std::max(oc.max_ref_fin, (double) std::fabs(r));
             const double err = std::fabs((double) g - (double) r);
             if (err == 0.0) {
                 continue;
@@ -160,8 +164,11 @@ case_cmp compare_case(const built_case & c, const std::vector<std::vector<uint8_
             cc.text += buf;
         }
         if (oc.nf_i >= 0) {
-            std::snprintf(buf, sizeof(buf), " nonfinite[%lld] ref=%g got=%g", (long long) oc.nf_i, (double) oc.nf_ref,
-                          (double) oc.nf_got);
+            std::snprintf(buf, sizeof(buf),
+                          " nonfinite[%lld] ref=%g got=%g; nonfinite with |ref| > 65504: %lld of %lld; largest |ref| "
+                          "with a finite result %.6g",
+                          (long long) oc.nf_i, (double) oc.nf_ref, (double) oc.nf_got, (long long) oc.n_nf_f16,
+                          (long long) oc.n_nonfinite, oc.max_ref_fin);
             cc.text += buf;
         }
         cc.text += "; ";
