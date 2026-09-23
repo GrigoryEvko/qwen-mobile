@@ -65,6 +65,23 @@ op_verdict overflow(uint64_t need, uint64_t have, const char * what) {
     return v;
 }
 
+// Gives the verdict of a VTCM layout of `total` bytes that is larger than the VTCM of the DSP. The
+// DSP computes the layout with a 32-bit size_t. A layout of 4 GB or more thus gets a wrapped size on
+// the DSP, which can fit, and the op then writes beyond VTCM. Such a layout gets the tag
+// "vtcm-size-wrap". A smaller layout gets the refusal of the DSP with `status`.
+op_verdict layout_too_large(uint64_t total, uint64_t vtcm, uint32_t status, const char * what) {
+    if (total > UINT32_MAX) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "%s: layout %" PRIu64 " > VTCM %" PRIu64 ": the DSP computes the layout with a "
+                 "32-bit size_t, thus it gets a wrapped size and can write beyond VTCM", what, total, vtcm);
+        op_verdict v;
+        v.vtcm_overflow = true;
+        v.why           = buf;
+        return tagged(v, "vtcm-size-wrap");
+    }
+    return fail(status, "%s: layout %" PRIu64 " > VTCM %" PRIu64, what, total, vtcm);
+}
+
 bool aligned128(uint64_t a) {
     return (a & 127) == 0;
 }
@@ -100,7 +117,7 @@ op_verdict hmx_2d(const dsp_ctx & ctx, const htp_mm_kernel_params & k, uint64_t 
     htp_mm_hmx_vtcm_layout_build(&L, HTP_MM_KERNEL_HMX_2D, (int) wtype, kk, (size_t) k.m_chunk, (size_t) k.n_chunk, 1,
                                  false, k.pipeline != 0, (uint32_t) k.n_act_threads, (uint32_t) aligned_tile_size);
     if (L.total_bytes > ctx.vtcm_size) {
-        return fail(HTP_STATUS_INTERNAL_ERR, "hmx-2d: layout %zu > VTCM %" PRIu64, L.total_bytes, ctx.vtcm_size);
+        return layout_too_large(L.total_bytes, ctx.vtcm_size, HTP_STATUS_INTERNAL_ERR, "hmx-2d");
     }
     return op_verdict();
 }
@@ -219,8 +236,9 @@ op_verdict hvx_mm(const dsp_ctx & ctx, const htp_mm_kernel_params & k, const op_
                                  src0.nb[1], src1_row_size, src2.present ? src2.nb[1] : 0, (uint32_t) k.n_prefetch, false,
                                  false);
     if (L.total_bytes > ctx.vtcm_size) {
-        return fail(HTP_STATUS_VTCM_TOO_SMALL, "hvx-mm: layout %zu > VTCM %" PRIu64 " (kernel %d)", L.total_bytes,
-                    ctx.vtcm_size, k.kernel_type);
+        char what[32];
+        snprintf(what, sizeof(what), "hvx-mm (kernel %d)", k.kernel_type);
+        return layout_too_large(L.total_bytes, ctx.vtcm_size, HTP_STATUS_VTCM_TOO_SMALL, what);
     }
     return op_verdict();
 }
@@ -333,7 +351,7 @@ op_verdict model_matmul_nx(const dsp_ctx & ctx, const op_record & op) {
         htp_mm_hmx_vtcm_layout_build(&L, HTP_MM_KERNEL_HMX_2D, (int) wt, kk, (size_t) k.m_chunk, (size_t) k.n_chunk, 1,
                                      false, k.pipeline != 0, (uint32_t) k.n_act_threads, (uint32_t) k.aligned_tile_size);
         if (L.total_bytes > ctx.vtcm_size) {
-            return fail(HTP_STATUS_VTCM_TOO_SMALL, "mm-nx-hmx: layout %zu > VTCM %" PRIu64, L.total_bytes, ctx.vtcm_size);
+            return layout_too_large(L.total_bytes, ctx.vtcm_size, HTP_STATUS_VTCM_TOO_SMALL, "mm-nx-hmx");
         }
         return op_verdict();
     }
@@ -356,7 +374,7 @@ op_verdict model_matmul_nx(const dsp_ctx & ctx, const op_record & op) {
     htp_mm_hvx_vtcm_layout_build(&L, k.kernel_type, (int) wt, act.ne[0], rows, (uint32_t) k.n_threads, 0,
                                  op.src[0].nb[1], src1_row_size, 0, (uint32_t) k.n_prefetch, false, true);
     if (L.total_bytes > ctx.vtcm_size) {
-        return fail(HTP_STATUS_VTCM_TOO_SMALL, "mm-nx: layout %zu > VTCM %" PRIu64, L.total_bytes, ctx.vtcm_size);
+        return layout_too_large(L.total_bytes, ctx.vtcm_size, HTP_STATUS_VTCM_TOO_SMALL, "mm-nx");
     }
     return op_verdict();
 }
@@ -410,7 +428,7 @@ op_verdict model_matmul_id(const dsp_ctx & ctx, const op_record & op, bool nx) {
     htp_mm_hvx_vtcm_layout_build(&L, k.kernel_type, (int) src0.type, act.ne[0], rows, (uint32_t) k.n_threads, 0,
                                  src0.nb[1], src1_row_size, 0, (uint32_t) k.n_prefetch, true, false);
     if (L.total_bytes > ctx.vtcm_size) {
-        return fail(HTP_STATUS_VTCM_TOO_SMALL, "mm-id: layout %zu > VTCM %" PRIu64, L.total_bytes, ctx.vtcm_size);
+        return layout_too_large(L.total_bytes, ctx.vtcm_size, HTP_STATUS_VTCM_TOO_SMALL, "mm-id");
     }
     return op_verdict();
 }
@@ -628,7 +646,7 @@ op_verdict model_fa(const dsp_ctx & ctx, const op_record & op) {
         struct hmx_fa_vtcm_layout L;
         hmx_fa_vtcm_layout_build(&L, k.G, q.ne[0], v.ne[0], k.Br, k.Bc, k.n_threads, k.u.hmx.pipeline != 0, k.is_q_fp32 != 0);
         if (L.total_bytes > ctx.vtcm_size) {
-            return fail(HTP_STATUS_VTCM_TOO_SMALL, "fa-hmx: layout %zu > VTCM %" PRIu64, L.total_bytes, ctx.vtcm_size);
+            return layout_too_large(L.total_bytes, ctx.vtcm_size, HTP_STATUS_VTCM_TOO_SMALL, "fa-hmx");
         }
         return op_verdict();
     }

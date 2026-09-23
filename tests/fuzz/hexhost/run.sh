@@ -34,7 +34,12 @@ ASAN_RT=libclang_rt.asan-aarch64-android.so
 # fix in the patch series. In the fuzz mode the harness keeps these conditions off (HEXHOST_IGNORE),
 # thus the fuzzers look for other defects. The test mode does not set them, thus each regression
 # input of such a defect fails.
-KNOWN_IDS=""
+#
+#   dsp-vtcm-size-wrap  The kernel params keep the VTCM size of a matmul layout in an int32 field,
+#                       and the DSP computes the layout with a 32-bit size_t. A layout of 4 GB or
+#                       more (MUL_MAT_ID with many activation rows) thus gets a small size on the
+#                       two sides, the host packs the op, and the op writes beyond VTCM on the NPU.
+KNOWN_IDS="dsp-vtcm-size-wrap"
 
 # The host switches of the phone runs: a name and the GGML_HEXAGON_* variables of each run
 PHONE_RUNS=(
