@@ -19,131 +19,19 @@
 // A std::exception is a correct refusal of an input. The properties:
 //   P1  No crash, no sanitizer report, no exception of a different type.
 //   P2  Message mode: when each input string is valid UTF-8, the prompt is valid UTF-8.
-//
-// The switch FUZZ_CHAT_KNOWN_JINJA=1 keeps two known findings off:
-//   jinja-parser-assert  In a build with live asserts, jinja::chk_type fails an
-//                        assert on a syntax tree node of an unexpected type.
-//   jinja-float-cast     In a UBSan build, a number of a template or of a JSON
-//                        text outside the int64_t range makes a float-cast-overflow
-//                        report in common/jinja/value.h.
-// With the switch, the jinja mode first renders the template in a child
-// process, and skips the input when the child stops with one of the two
-// signatures. The message mode skips an input when a JSON text holds a number
-// of 19 or more digits or an exponent of two or more digits. In a release
-// build without UBSan, the two findings cannot occur, and the switch does nothing.
 
 #include "fuzz_common.h"
 
 #include "chat.h"
 #include "common.h"
 
-#include <cctype>
-#include <cerrno>
-#include <csignal>
 #include <string>
 #include <vector>
-
-#include <sys/prctl.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
-// These two symbols exist only in a build with a sanitizer runtime (weak: a null address otherwise).
-extern "C" __attribute__((weak)) void __ubsan_handle_float_cast_overflow_abort();
-extern "C" __attribute__((weak)) void __sanitizer_set_death_callback(void (*callback)(void));
 
 namespace {
 
 llama_model *             g_model = nullptr;
 common_chat_templates_ptr g_tmpls;
-
-/** True when the build can show one of the two known jinja findings (see the header). */
-bool jinja_findings_possible() {
-#ifndef NDEBUG
-    return true;
-#else
-    return __ubsan_handle_float_cast_overflow_abort != nullptr;
-#endif
-}
-
-/** True when FUZZ_CHAT_KNOWN_JINJA=1 and the build can show a known jinja finding. */
-bool known_jinja() {
-    static const bool on = fuzz::env_long("FUZZ_CHAT_KNOWN_JINJA", 0) != 0 && jinja_findings_possible();
-    return on;
-}
-
-/** True when a JSON text can hold a number outside the int64_t range: 19 or more digits, or a 2-digit exponent. */
-bool json_has_huge_number(const std::string & s) {
-    size_t run = 0;
-    for (size_t i = 0; i < s.size(); ++i) {
-        const char c = s[i];
-        run = (c >= '0' && c <= '9') ? run + 1 : 0;
-        if (run >= 19) {
-            return true;
-        }
-        if ((c == 'e' || c == 'E') && i + 1 < s.size()) {
-            size_t j = i + 1;
-            if (s[j] == '+' || s[j] == '-') {
-                ++j;
-            }
-            if (j + 1 < s.size() && isdigit((unsigned char) s[j]) && isdigit((unsigned char) s[j + 1])) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-/**
- * Run fn in a child process. True when the child stops with a known jinja signature on its stderr.
- * The child uses the default signal actions and no death callback, thus libFuzzer writes no crash
- * file for it. The child stops after 10 s, and it stops when the parent stops.
- */
-template <typename F>
-bool child_shows_known_jinja(F && fn) {
-    int fds[2];
-    if (pipe(fds) != 0) {
-        return false;
-    }
-    const pid_t pid = fork();
-    if (pid < 0) {
-        close(fds[0]);
-        close(fds[1]);
-        return false;
-    }
-    if (pid == 0) {
-        prctl(PR_SET_PDEATHSIG, SIGKILL);
-        for (const int sig : { SIGABRT, SIGALRM, SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTERM, SIGINT, SIGUSR1, SIGUSR2 }) {
-            signal(sig, SIG_DFL);
-        }
-        if (__sanitizer_set_death_callback != nullptr) {
-            __sanitizer_set_death_callback(nullptr);
-        }
-        dup2(fds[1], STDERR_FILENO);
-        close(fds[0]);
-        close(fds[1]);
-        alarm(10);
-        fn();
-        _exit(0);
-    }
-    close(fds[1]);
-    std::string err;
-    char buf[4096];
-    ssize_t n;
-    while ((n = read(fds[0], buf, sizeof(buf))) > 0 || (n < 0 && errno == EINTR)) {
-        if (n > 0 && err.size() < (1u << 16)) {
-            err.append(buf, (size_t) n);
-        }
-    }
-    close(fds[0]);
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
-    }
-    const bool failed = WIFSIGNALED(status) || (WIFEXITED(status) && WEXITSTATUS(status) != 0);
-    const bool parser_assert = err.find("jinja::chk_type") != std::string::npos;
-    const bool float_cast = err.find("jinja/value.h") != std::string::npos &&
-                            err.find("is outside the range of representable values") != std::string::npos;
-    return failed && (parser_assert || float_cast);
-}
 
 /** A string from the input that is often one of the words that the Qwen3.5 template reacts to. */
 std::string word(FuzzedDataProvider & fdp, size_t max_len) {
@@ -257,21 +145,6 @@ void run_messages(FuzzedDataProvider & fdp) {
     in.reasoning_format      = (common_reasoning_format) fdp.ConsumeIntegralInRange<int>(0, 3);
     in.continue_final_message = (common_chat_continuation) fdp.ConsumeIntegralInRange<int>(0, 3);
 
-    if (known_jinja()) {
-        for (const auto & m : in.messages) {
-            for (const auto & tc : m.tool_calls) {
-                if (json_has_huge_number(tc.arguments)) {
-                    return;
-                }
-            }
-        }
-        for (const auto & t : in.tools) {
-            if (json_has_huge_number(t.parameters)) {
-                return;
-            }
-        }
-    }
-
     common_chat_params params;
     try {
         params = common_chat_templates_apply(g_tmpls.get(), in);
@@ -316,17 +189,11 @@ void run_jinja(const std::string & src) {
     in.tools = { { "f", "a tool", "{\"type\": \"object\", \"properties\": {}}" } };
     in.add_generation_prompt = true;
     in.use_jinja = true;
-    auto render = [&]() {
-        try {
-            common_chat_templates_ptr tmpls = common_chat_templates_init(nullptr, src, "<s>", "</s>");
-            (void) common_chat_templates_apply(tmpls.get(), in);
-        } catch (const std::exception &) {
-        }
-    };
-    if (known_jinja() && child_shows_known_jinja(render)) {
-        return;
+    try {
+        common_chat_templates_ptr tmpls = common_chat_templates_init(nullptr, src, "<s>", "</s>");
+        (void) common_chat_templates_apply(tmpls.get(), in);
+    } catch (const std::exception &) {
     }
-    render();
 }
 
 }  // namespace

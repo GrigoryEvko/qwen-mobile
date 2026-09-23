@@ -1,0 +1,89 @@
+Refuse a malformed template and convert numbers outside int64_t without undefined behavior
+Fold-into: upstream/jinja
+
+The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
+
+- A syntax tree node of the wrong type stops a debug build with an assert.
+
+  chk_type checks the type of a syntax tree node with assert(). A template is input (a GGUF file
+  holds it), thus a debug build stops on a keyword argument with a key that is not an identifier,
+  and a release build continues with a node of the wrong type.
+
+  The change: chk_type throws std::runtime_error, which the template API gives to the caller.
+
+  The reproducer: tests/fuzz/core/regress/fuzz_chat--jinja-parser-assert.
+
+- A number outside int64_t makes an undefined conversion.
+
+  value_float_t casts a double to int64_t, and value_int_t casts an int64_t near 2^63 through a
+  double back to int64_t. For a value outside int64_t (a JSON number of tool arguments, or a
+  number of a template) the cast is undefined.
+
+  The change: The two conversions compare in the double range first, and saturate.
+
+  The reproducer: tests/fuzz/core/regress/fuzz_chat--jinja-float-cast.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    common/jinja/runtime.h
+    common/jinja/value.h
+--- a/common/jinja/runtime.h
++++ b/common/jinja/runtime.h
+@@ -7,6 +7,7 @@
+ #include <ctime>
+ #include <memory>
+ #include <sstream>
++#include <stdexcept>
+ #include <string>
+ #include <vector>
+ 
+@@ -137,16 +138,22 @@
+ 
+ // Type Checking Utilities
+ 
++// A template is input (a GGUF file carries it), thus a node of the wrong type is an error of the
++// template, and a debug build must not abort on it where a release build continues.
+ template<typename T>
+ static void chk_type(const statement_ptr & ptr) {
+     if (!ptr) return; // Allow null for optional fields
+-    assert(dynamic_cast<T *>(ptr.get()) != nullptr);
++    if (dynamic_cast<T *>(ptr.get()) == nullptr) {
++        throw std::runtime_error("invalid template: a node of the syntax tree has an unexpected type");
++    }
+ }
+ 
+ template<typename T, typename U>
+ static void chk_type(const statement_ptr & ptr) {
+     if (!ptr) return;
+-    assert(dynamic_cast<T *>(ptr.get()) != nullptr || dynamic_cast<U *>(ptr.get()) != nullptr);
++    if (dynamic_cast<T *>(ptr.get()) == nullptr && dynamic_cast<U *>(ptr.get()) == nullptr) {
++        throw std::runtime_error("invalid template: a node of the syntax tree has an unexpected type");
++    }
+ }
+ 
+ // Base Types
+--- a/common/jinja/value.h
++++ b/common/jinja/value.h
+@@ -215,7 +215,9 @@
+     value_int_t(int64_t v) {
+         val_int = v;
+         val_flt = static_cast<double>(v);
+-        if (static_cast<int64_t>(val_flt) != v) {
++        // an int64_t above 2^63 - 1024 rounds to the double 2^63, and the cast of 2^63 back to
++        // int64_t is undefined: compare in the double range first
++        if (!(val_flt < 9223372036854775808.0) || static_cast<int64_t>(val_flt) != v) {
+             val_flt = v < 0 ? -INFINITY : INFINITY;
+         }
+     }
+@@ -249,7 +251,9 @@
+     value val;
+     value_float_t(double v) {
+         val_flt = v;
+-        val_int = std::isfinite(v) ? static_cast<int64_t>(v) : 0;
++        // the cast of a double outside int64_t is undefined: saturate it, as a JSON number
++        // of the input can have any size (9.2e18 is below 2^63, and -9.2e18 is above -2^63)
++        val_int = !std::isfinite(v) ? 0 : v >= 9.2e18 ? INT64_MAX : v <= -9.2e18 ? INT64_MIN : static_cast<int64_t>(v);
+         val = mk_val<value_int>(val_int);
+     }
+     virtual std::string type() const override { return "Float"; }

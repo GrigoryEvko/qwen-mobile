@@ -133,6 +133,7 @@ fuzz-core/0002-clear-the-rollback-index-of-a-removed-sequence.patch
 fuzz-core/0003-tests-state-the-rollback-depth-rule-in-the-recurrent-state-test.patch
 fuzz-core/0004-check-the-metadata-of-the-model-loader.patch
 fuzz-core/0005-refuse-a-defective-vocabulary.patch
+fuzz-core/0006-refuse-a-malformed-template.patch
 
 # The fixes of the defects that the sanitizer matrix of tests/run-suite.sh finds in the tests of llama.cpp.
 # The header of each patch describes its defect and the change.
