@@ -69,7 +69,9 @@
 #                       It is necessary with FUZZ_LLAMA_DIR.
 #   ADB_SERIAL          The phone of phone-commands (default 192.168.14.130:5555).
 #
-# Each fuzz run uses nice 10, -rss_limit_mb=4096 and -timeout=30. libFuzzer stops
+# Each fuzz run uses nice 10, -rss_limit_mb=4096 and -timeout=30 (a test run
+# -timeout=60). fuzz_npu_decode gets -timeout=120 in a sanitizer build, because
+# one input can run for 30 s there. libFuzzer stops
 # at the first crash, thus the script starts it again on the same corpus until
 # the budget is spent (at most 200 starts). A start that does not stop 120 s
 # after its budget gets SIGKILL: a sanitizer report can hang in the death
@@ -162,6 +164,20 @@ max_len() {
     esac
 }
 
+# The -timeout of libFuzzer for one input on the host. $1 is the mode (fuzz or test), $2 the target,
+# $3 the configuration. One input of fuzz_npu_decode (two contexts that decode the same tokens) runs
+# for up to about 30 s in a sanitizer build (26.3 s and 30.4 s in debug-ubsan), thus it gets 120 s
+# there, as the ops area has.
+unit_timeout() {
+    if [[ $2 == fuzz_npu_decode && $3 != none ]]; then
+        echo 120
+    elif [[ $1 == fuzz ]]; then
+        echo 30
+    else
+        echo 60
+    fi
+}
+
 # The first error line of a run log on stdin: the signature of a finding.
 signature() {
     grep -oE "FUZZ FAILURE: (P[0-9]+: )?[a-zA-Z ,'-]+|[a-z_./-]+:[0-9]+: fatal error|runtime error: [a-z0-9.+ -]*is outside the range|runtime error: [a-z -]+|ERROR: [A-Za-z]+Sanitizer: [a-z-]+|WARNING: ThreadSanitizer: [a-z ]+|WARNING: MemorySanitizer: [a-z-]+|[a-z_./-]+:[0-9]+: GGML_ASSERT\([^)]*\)|GGML_ABORT|what\(\): .*|Assertion .*|libFuzzer: [a-z-]+|cannot write shared[a-z ]+" \
@@ -236,7 +252,7 @@ fuzz_one() {
         rc=0
         env "${known[@]}" GGML_NO_BACKTRACE=1 FUZZ_DATA_DIR="$DATA" FUZZ_ARTIFACT_DIR="$out/artifacts" \
             timeout -s KILL $(( left + 120 )) nice -n 10 "$dir/$fz" "$out/corpus" "$HERE/seeds/$fz" \
-                -max_total_time="$left" -rss_limit_mb=4096 -timeout=30 \
+                -max_total_time="$left" -rss_limit_mb=4096 -timeout="$(unit_timeout fuzz "$fz" "$san")" \
                 -max_len="$(max_len "$fz")" -artifact_prefix="$out/artifacts/" -print_final_stats=1 \
                 >> "$log" 2>&1 || rc=$?
         echo "run.sh: start $starts ended with code $rc after $(( SECONDS - start )) s" >> "$log"
@@ -279,9 +295,10 @@ test_one() {
     # shellcheck source=../../sanitizers/env.sh
     source "$SHARED/env.sh"
     sanitizer_env "$san"
-    local start=$SECONDS findings=0 execs=0 rc f name finding sw expect sig tmp art
+    local start=$SECONDS findings=0 execs=0 rc f name finding sw expect sig tmp art tmo
     local -a failed=() all=() others=()
     local notes=""
+    tmo=$(unit_timeout test "$fz" "$san")
     read -r -a all <<< "$(known_env)"
     tmp=$(mktemp)
     # libFuzzer writes a crash file for each input that fails. These inputs are known, thus the
@@ -289,7 +306,7 @@ test_one() {
     art=$(mktemp -d)
     rc=0
     env "${all[@]}" GGML_NO_BACKTRACE=1 FUZZ_DATA_DIR="$DATA" FUZZ_ARTIFACT_DIR="$art" timeout -s KILL 600 "$dir/$fz" -runs=0 -rss_limit_mb=4096 \
-        -timeout=60 -artifact_prefix="$art/" -max_len="$(max_len "$fz")" "$HERE/seeds/$fz" >> "$log" 2>&1 || rc=$?
+        -timeout="$tmo" -artifact_prefix="$art/" -max_len="$(max_len "$fz")" "$HERE/seeds/$fz" >> "$log" 2>&1 || rc=$?
     execs=$(( execs + $(find "$HERE/seeds/$fz" -type f | wc -l) ))
     if [[ $rc != 0 ]]; then
         findings=$(( findings + 1 ))
@@ -306,7 +323,7 @@ test_one() {
             # no switch: the code has the fix of the defect, and the input must pass with all the switches
             rc=0
             env "${all[@]}" GGML_NO_BACKTRACE=1 FUZZ_DATA_DIR="$DATA" FUZZ_ARTIFACT_DIR="$art" timeout -s KILL 600 "$dir/$fz" \
-                -rss_limit_mb=4096 -timeout=60 -artifact_prefix="$art/" "$f" > "$tmp" 2>&1 || rc=$?
+                -rss_limit_mb=4096 -timeout="$tmo" -artifact_prefix="$art/" "$f" > "$tmp" 2>&1 || rc=$?
             cat "$tmp" >> "$log"
             execs=$(( execs + 1 ))
             sig=$(signature < "$tmp")
@@ -326,7 +343,7 @@ test_one() {
         read -r -a others <<< "$(known_env "$sw")"
         rc=0
         env "${others[@]}" GGML_NO_BACKTRACE=1 FUZZ_DATA_DIR="$DATA" FUZZ_ARTIFACT_DIR="$art" timeout -s KILL 600 "$dir/$fz" -rss_limit_mb=4096 \
-            -timeout=60 -artifact_prefix="$art/" "$f" > "$tmp" 2>&1 || rc=$?
+            -timeout="$tmo" -artifact_prefix="$art/" "$f" > "$tmp" 2>&1 || rc=$?
         cat "$tmp" >> "$log"
         execs=$(( execs + 1 ))
         sig=$(signature < "$tmp")
@@ -345,7 +362,7 @@ test_one() {
         # B: all the switches on. The switch of the finding must keep it off (rule R13).
         rc=0
         env "${all[@]}" GGML_NO_BACKTRACE=1 FUZZ_DATA_DIR="$DATA" FUZZ_ARTIFACT_DIR="$art" timeout -s KILL 600 "$dir/$fz" -rss_limit_mb=4096 \
-            -timeout=60 -artifact_prefix="$art/" "$f" > "$tmp" 2>&1 || rc=$?
+            -timeout="$tmo" -artifact_prefix="$art/" "$f" > "$tmp" 2>&1 || rc=$?
         cat "$tmp" >> "$log"
         execs=$(( execs + 1 ))
         sig=$(signature < "$tmp")
