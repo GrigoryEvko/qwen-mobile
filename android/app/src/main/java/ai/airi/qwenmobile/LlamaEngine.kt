@@ -105,6 +105,40 @@ sealed class Piece {
 }
 
 /**
+ * The pieces of one answer. [start] restores the prompt state, decodes the
+ * prompt and gives the engine handle. [next] gives the bytes of each token,
+ * or null at the end token. The first byte of the bytes is a thinking tag
+ * (1 open, 2 close, 0 none), and the rest is text. The flow stops after
+ * [maxTokens] tokens. It holds [hold] from its start until its end, its
+ * error or its cancel, and it renews the hold at each token. O(tokens).
+ */
+internal fun answerPieces(
+    hold: WakeHold?,
+    maxTokens: Int,
+    start: () -> Long,
+    next: (Long) -> ByteArray?,
+): Flow<Piece> = flow {
+    hold.around {
+        val h = start()
+        var count = 0
+        while (count < maxTokens) {
+            // The native call cannot see a cancel, thus the check is here and not inside emit only.
+            currentCoroutineContext().ensureActive()
+            hold?.renew()
+            val bytes = next(h) ?: break
+            count += 1
+            if (bytes.size > 1) {
+                emit(Piece.Text(String(bytes, 1, bytes.size - 1, Charsets.UTF_8)))
+            }
+            when (bytes[0].toInt()) {
+                1 -> emit(Piece.ThinkOpen)
+                2 -> emit(Piece.ThinkClose)
+            }
+        }
+    }
+}
+
+/**
  * The compute unit of the model. The ggml device name is null for the CPU.
  * The GPU is the default, the NPU is opt-in: its single-token decode is
  * experimental. The hybrid one prefills on the NPU and decodes on the GPU.
@@ -191,6 +225,14 @@ object LlamaEngine {
     /** The cache directory of the app, for the prompt states and the encoded images. */
     private var cacheDir: String? = null
 
+    /**
+     * The hold on the CPU during the native work of the backend start, a
+     * load, a benchmark and an answer. It is null before [start], and then
+     * the engine holds nothing.
+     */
+    @Volatile
+    private var wake: WakeHold? = null
+
     private val stateFlow = MutableStateFlow<LoadedModel?>(null)
 
     /** The loaded model, or null. */
@@ -215,14 +257,18 @@ object LlamaEngine {
      * Initialize the backends on the engine thread. Every native call that
      * follows queues behind it on the same thread. Call one time from the
      * application. [cacheDir] is the cache directory of the app, where the
-     * engine keeps the prompt states and the encoded images.
+     * engine keeps the prompt states and the encoded images. [wake] keeps
+     * the CPU awake during the native work, also with the screen off.
      */
-    fun start(libDir: String, workDir: String, cacheDir: String) {
+    fun start(libDir: String, workDir: String, cacheDir: String, wake: WakeHold? = null) {
         this.cacheDir = cacheDir
+        this.wake = wake
         engineScope.launch {
-            LlamaNative.initialize(libDir)
-            LlamaNative.setWorkingDirectory(workDir)
-            devicesFlow.value = LlamaNative.devices()
+            wake.around {
+                LlamaNative.initialize(libDir)
+                LlamaNative.setWorkingDirectory(workDir)
+                devicesFlow.value = LlamaNative.devices()
+            }
         }
     }
 
@@ -241,28 +287,30 @@ object LlamaEngine {
      */
     suspend fun load(config: EngineConfig): LoadedModel = withContext(dispatcher) {
         awaitReady()
-        releaseLocked()
-        val threads = if (config.backend == Backend.CPU) {
-            config.threads
-        } else {
-            config.threads.coerceAtMost(maxOf(1, Runtime.getRuntime().availableProcessors() / 2))
+        wake.around {
+            releaseLocked()
+            val threads = if (config.backend == Backend.CPU) {
+                config.threads
+            } else {
+                config.threads.coerceAtMost(maxOf(1, Runtime.getRuntime().availableProcessors() / 2))
+            }
+            handle = LlamaNative.load(
+                config.path,
+                config.mmproj,
+                config.backend.deviceName,
+                config.backend.prefillDeviceName,
+                config.visionDeviceName,
+                if (config.backend == Backend.CPU) 0 else 999,
+                threads,
+                config.nCtx,
+                config.imageMaxTokens,
+                config.speculative,
+                cacheDir,
+            )
+            val loaded = LoadedModel(config, LlamaNative.modelInfo(handle), LlamaNative.hasMtp(handle))
+            stateFlow.value = loaded
+            loaded
         }
-        handle = LlamaNative.load(
-            config.path,
-            config.mmproj,
-            config.backend.deviceName,
-            config.backend.prefillDeviceName,
-            config.visionDeviceName,
-            if (config.backend == Backend.CPU) 0 else 999,
-            threads,
-            config.nCtx,
-            config.imageMaxTokens,
-            config.speculative,
-            cacheDir,
-        )
-        val loaded = LoadedModel(config, LlamaNative.modelInfo(handle), LlamaNative.hasMtp(handle))
-        stateFlow.value = loaded
-        loaded
     }
 
     /** Release the loaded model. */
@@ -276,7 +324,8 @@ object LlamaEngine {
      * the token limit, or when the collector cancels. A cancel during the
      * prompt decode ends the flow before the first sample. The messages are
      * copied on the thread of the caller, thus the engine thread reads no
-     * shared text.
+     * shared text. The flow keeps the CPU awake from the restore of the
+     * prompt state until its end, its error or its cancel.
      */
     fun generate(
         messages: List<ChatMessage>,
@@ -287,24 +336,12 @@ object LlamaEngine {
         val roles = messages.map { it.role }.toTypedArray()
         val contents = messages.map { it.content }.toTypedArray()
         val images = messages.map { it.image }.toTypedArray()
-        return flow {
-            val h = requireHandle()
-            LlamaNative.chatStart(h, roles, contents, images, thinking, temperature, topP)
-            var count = 0
-            while (count < MAX_ANSWER_TOKENS) {
-                // The native call cannot see a cancel, thus the check is here and not inside emit only.
-                currentCoroutineContext().ensureActive()
-                val bytes = LlamaNative.generateNext(h) ?: break
-                count += 1
-                if (bytes.size > 1) {
-                    emit(Piece.Text(String(bytes, 1, bytes.size - 1, Charsets.UTF_8)))
-                }
-                when (bytes[0].toInt()) {
-                    1 -> emit(Piece.ThinkOpen)
-                    2 -> emit(Piece.ThinkClose)
-                }
-            }
-        }.flowOn(dispatcher)
+        return answerPieces(
+            wake,
+            MAX_ANSWER_TOKENS,
+            start = { requireHandle().also { LlamaNative.chatStart(it, roles, contents, images, thinking, temperature, topP) } },
+            next = { LlamaNative.generateNext(it) },
+        ).flowOn(dispatcher)
     }
 
     /**
@@ -333,7 +370,7 @@ object LlamaEngine {
 
     /** Run the benchmark on the loaded model. */
     suspend fun bench(pp: Int, tg: Int, reps: Int): String = withContext(dispatcher) {
-        LlamaNative.bench(requireHandle(), pp, tg, reps)
+        wake.around { LlamaNative.bench(requireHandle(), pp, tg, reps) }
     }
 
     private fun requireHandle(): Long {
