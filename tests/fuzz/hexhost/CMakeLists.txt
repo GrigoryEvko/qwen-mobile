@@ -186,9 +186,14 @@ foreach(name kparams graph repack envparse dirty)
 endforeach()
 
 # The repacked bytes of the K-quant forms of the tensors of a model (tools/repack_bytes.cpp): two
-# builds against two llama.cpp trees compare a change of the repack on real weights.
+# builds against two llama.cpp trees compare a change of the repack on real weights. The objects
+# have the coverage of -fsanitize=fuzzer-no-link, and the tool has its own main, thus it links the
+# coverage callbacks of libFuzzer without the main of libFuzzer. The none config has no sanitizer
+# runtime that gives these callbacks.
+execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-runtime-dir OUTPUT_VARIABLE FUZZ_RT_DIR
+                OUTPUT_STRIP_TRAILING_WHITESPACE)
 add_executable(hexhost_repack_bytes tools/repack_bytes.cpp)
-target_link_libraries(hexhost_repack_bytes PRIVATE hexhost_core)
+target_link_libraries(hexhost_repack_bytes PRIVATE hexhost_core "${FUZZ_RT_DIR}/libclang_rt.fuzzer_no_main.a")
 
 # The dirty range tracker of the DSP (htp/htp-tensor.c) runs on x86 with the
 # stubs of stubs/dsp. A copy of the source goes into the build directory, thus
