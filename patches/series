@@ -104,3 +104,7 @@ hexagon-pre79/0001-hexagon-htp-build-the-dsp-library-for-v73-and-v75.patch
 # No HTP device below v73, or when the library of the DSP is missing: a library
 # for a newer DSP than the chip gives incorrect values with no error.
 hexagon-arch/0001-hexagon-no-device-for-an-unsupported-dsp.patch
+
+# The Q8_0 activations of the HVX matmul get the bits of quantize_row_q8_0_ref
+# on every Hexagon version: one scale for each 32 values, integer arithmetic.
+hexagon-q8-ref/0001-hexagon-quantize-the-activations-as-the-cpu-reference.patch
