@@ -1,0 +1,39 @@
+hexagon: keep the fd map of an op batch correct after the buffer sort
+Fold-into: patches/hexagon-host/0001-hexagon-host-timers-and-batch-cache.patch
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+sort_buffers puts the buffers of an op batch in the order of their size,
+and it gives each tensor the new index of its buffer. It does not change
+b_map, the map from the fd of a buffer to its index, which add_buffer
+reads. A flush sorts the batch and then clears it, thus the map has no
+effect there. The verify mode of the batch cache
+(GGML_HEXAGON_BATCHCACHE=2) sorts the replayed batch to compare it with a
+new packing, and the batch then gets the ops of the next split. Those ops
+get the old index of a buffer from the map. The descriptor of such a
+tensor then gives the offset of the tensor in a different buffer, and the
+DSP reads or writes out of that buffer.
+
+This patch writes the sorted index of each fd into the map at the end of
+sort_buffers. A batch has a maximum of 16 buffers. The mode 1 of the batch
+cache, which the app uses, does not sort a replay, thus the ops that the
+app sends do not change.
+
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index bcd146d..f2e92d2 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -2681,6 +2681,13 @@ struct ggml_hexagon_opbatch {
+         for (unsigned int i = 0; i < n_tens; i++) {
+             h_tens[i].bi = remap[h_tens[i].bi];
+         }
++
++        // add_buffer reads the index of a buffer from the fd map. The verify mode of the batch
++        // cache sorts a replay that gets more ops after the sort, thus the map must give the
++        // sorted indexes. O(n_bufs).
++        for (unsigned int i = 0; i < n_bufs; i++) {
++            b_map[(int) h_bufs[i].fd] = (int) i;
++        }
+     }
+ 
+     void update_mdev_group(uint32_t mdev_idx) {
