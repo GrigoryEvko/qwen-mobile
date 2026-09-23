@@ -538,3 +538,90 @@ of both models is twice as fast. The chunked gated delta rule carries that gain,
 patches make the speculative decoding pay. The multi-row matmul of a verify step is neutral end to
 end: the weight stream of a step already hides its compute, thus the kernel gives a margin for a
 longer draft and not a time today.
+
+## Guards and the rotation against the tail of the 4B Q8_0 file (2026-09-23)
+
+A tail result counts only on the Q8_0-activation path. The decode on the phone quantizes the
+activations to Q8_0, as the x86 CPU build does, and the CUDA build does not. The two paths give the
+same mean KL, but the size of each tail event, and the effect of a guard on it, are different.
+
+The decision of 2026-09-23, until Grigory decides differently: the plain 4B Q8_0 file stays. No guard
+and no rotation gives a tail gain on the Q8_0-activation path that we can prove. A later guard must
+select and score its tensors on that path, on a text that is not its selection text.
+
+The variants:
+
+- Plain: `Qwen3.5-4B-Q8_0.gguf` (sha256 6265fa1e), the Q8_0 export of the original checkpoint
+- Guard 1: the plain file with 5 tensors in F16: `blk.3.attn_output`, `blk.0.ssm_out`,
+  `blk.0.attn_qkv`, `blk.1.attn_qkv` and `blk.3.attn_q`
+- Guard 2: the plain file with the decoder layers 0 thru 4 in F16
+- Rotated: the Q8_0 export of the tied transform of the 4B (sha256 cc34f6ae). The head reads the
+  final hidden state through `output_rot`, a dense F16 map of 2560 × 2560
+- Rotated with guard 1: the rotated file with the same 5 tensors in F16 from the rotated F16 file.
+
+A restore sweep selected the 5 tensors of guard 1. The sweep put one tensor at a time back to F16, on
+the CUDA build, on 4 wiki chunks that hold the tail. The effect of the restores does not add. The
+decode cost is the increase of the bytes that one decode step reads (all tensors except the MTP
+block), against 4483.0 MB for the plain file.
+
+The two texts: the first 64 chunks of `wiki.test.raw`, and 16 chunks of the lines of
+`wiki.test.raw` with the largest share of digits (years, dates, counts). The digit text does not
+contain the wiki text of the other runs, thus it is the correct text to score a guard. The base of each KL
+is the naive x86 oracle of the 4B F16 (`build/oracle-x86`), `-c 512`. The columns give the mean,
+the 99.9 % point and the maximum of the KL, and the count of positions above 0.1 and above 0.5 for
+each 1000 positions.
+
+The CUDA build (the laptop recipe on the box, `-ngl 99`, F16 activations):
+
+| Variant | Decode cost | wiki: mean / 99.9 % / max | wiki > 0.1, > 0.5 | digits: mean / 99.9 % / max | digits > 0.1, > 0.5 |
+|---|---|---|---|---|---|
+| Plain | - | 0.00149 / 0.110 / 2.39 | 1.16, 0.31 | 0.00191 / 0.214 / 1.61 | 1.72, 0.49 |
+| Guard 1 | +78.6 MB (+1.75 %) | 0.00084 / 0.0251 / 1.00 | 0.18, 0.12 | 0.00119 / 0.0917 / 0.851 | 0.98, 0.25 |
+| Guard 2 | +522.2 MB (+11.65 %) | 0.00075 / 0.0204 / 1.13 | 0.37, 0.12 | 0.00096 / 0.0542 / 0.708 | 0.74, 0.25 |
+| Rotated | +13.1 MB (+0.29 %) | 0.00110 / 0.0567 / 1.16 | 0.61, 0.18 | 0.00145 / 0.0895 / 0.615 | 0.98, 0.25 |
+| Rotated with guard 1 | +91.7 MB (+2.05 %) | 0.00108 / 0.0617 / 3.10 | 0.37, 0.18 | 0.00176 / 0.147 / 2.66 | 1.23, 0.49 |
+| Rotated F16 | - | 0.00025 / 0.0026 / 0.059 | 0, 0 | 0.00031 / 0.0195 / 0.169 | 0.25, 0 |
+
+The x86 CPU build of the landed tree (`GGML_NATIVE=ON`, `-b 512`, Q8_0 activations):
+
+| Variant | wiki: mean / 99.9 % / max | wiki > 0.1, > 0.5 | digits: mean / 99.9 % / max | digits > 0.1, > 0.5 | PPL wiki, digits |
+|---|---|---|---|---|---|
+| Plain | 0.00129 / 0.0816 / 1.32 | 0.92, 0.31 | 0.00191 / 0.307 / 1.14 | 1.96, 0.49 | 9.3141, 5.6154 |
+| Guard 1 | 0.00088 / 0.0372 / 0.511 | 0.49, 0.06 | 0.00433 / 0.221 / 12.46 | 2.21, 0.25 | 9.3254, 5.6223 |
+| Rotated | 0.00112 / 0.0407 / 1.68 | 0.49, 0.12 | 0.00185 / 0.223 / 1.26 | 1.96, 0.49 | 9.3287, 5.6292 |
+| F16 | 0.000001 / 0.00009 / 0.0012 | 0, 0 | 0.000002 / 0.00019 / 0.0063 | 0, 0 | 9.3154, 5.6264 |
+
+On the CUDA build, the rotation gives the tail rates of guard 1 on the digit text for 0.29 % of the
+decode bytes. On the Q8_0-activation path, the rotated file has the tail rates of the plain file on
+the digit text (1.96 and 0.49), and the same positions lead the tail with almost the same KL. The
+gain of the rotation on the wiki text comes from the text that also holds the selection chunks.
+
+The effect of guard 1 is not the same on the two paths. On the x86 CPU build it gives one position of the digit
+text at a KL of 12.46: the model gives a probability of 1.000 to the digit "0" after "( 2008 , 20",
+and the oracle gives 0.003. Its tensors came from the CUDA build, thus they fix the CUDA tail
+events and move the errors of the other path. On the rotated file, guard 1 makes the digit tail
+worse on the CUDA build too, because the rotation changes the basis of the 5 tensors.
+
+The F16 row of the x86 table shows that the x86 path is almost bit-exact to the oracle with F16
+weights (mean 0.000001). Thus each tail value of that table comes from the Q8_0 weights and the Q8_0
+activations, and not from the build.
+
+A phone stage of the rotated file is ready on the box (`build/fuzz/quant/phone-rot`): a decode
+bench against the plain file at depth 0 and 4096, and the KL on two chunk pairs. It does not run
+unless Grigory asks for the rotated file again. The box check with the fake DSP of hexhost shows
+that the rotated file loads on HTP0 and adds one F16 matvec of 2560 × 2560 on HTP0.
+
+The commands, from the project root of the box:
+
+    uv run python -m quant.run transform --model Qwen3.5-4B --device cpu --tie-head
+    uv run python -m quant.run convert --model Qwen3.5-4B --source t
+    uv run python -m quant.run export --model Qwen3.5-4B --device cpu \
+        --f16 weights/gguf/Qwen3.5-4B-t-F16.gguf --tie-head --bulk Q8_0 --gdn-gate Q8_0 --embedding Q8_0 \
+        --out build/weights-logs/guard/rot-q8.gguf
+    wip/quant/scripts/x86-tail.sh 48
+    uv run python wip/quant/scripts/kld-tokens.py build/weights-logs/tail/4B-F16-oracle-numbers.kld \
+        build/weights-logs/x86tail/rot-numbers.kld weights/Qwen3.5-4B --top 12
+
+The guard files come from `wip/quant/scripts/guard-files.py`, the oracle bases from
+`build/oracle-x86/bin/llama-perplexity --kl-divergence-base`, and the CUDA values from
+`third_party/llama.cpp/build-cuda/bin/llama-perplexity` with the same texts.
