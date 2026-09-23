@@ -34,7 +34,21 @@ with atheris.instrument_imports(include=["gguf"]):
     import gguf
 
 ALLOWED = (ValueError, KeyError, UnicodeDecodeError, OverflowError)
-PATH = Path("/dev/shm") / f"qfz-atheris-reader-{os.getpid()}.gguf"
+SHM = Path("/dev/shm")
+PATH = SHM / f"qfz-atheris-reader-{os.getpid()}.gguf"
+
+
+def remove_stale_inputs() -> None:
+    """Remove the input files of the ended processes of this target. Complexity is O(files).
+
+    libFuzzer ends the process with exit() at -max_total_time or at a
+    finding, thus the finally block of main() does not run, and its file
+    stays in /dev/shm. The next run removes it.
+    """
+    for path in SHM.glob("qfz-atheris-reader-*.gguf"):
+        pid = path.stem.rsplit("-", 1)[-1]
+        if pid.isdigit() and not Path(f"/proc/{pid}").exists():
+            path.unlink(missing_ok=True)
 
 
 def test_one_input(data: bytes) -> None:
@@ -54,6 +68,7 @@ def test_one_input(data: bytes) -> None:
 
 def main() -> None:
     """Start libFuzzer with the command-line options."""
+    remove_stale_inputs()
     try:
         atheris.Setup(sys.argv, test_one_input)
         atheris.Fuzz()
