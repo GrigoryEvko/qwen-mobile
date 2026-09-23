@@ -37,6 +37,11 @@
 //   P3  llama_memory_seq_pos_max(s) == length - 1 for each sequence.
 //   P4  A refused rollback (seq_rm returns false) does not change the memory.
 //   P5  An intact state blob loads (returns non-zero) into any sequence.
+//   P6  A sequence load that fails (returns 0) leaves no part of the
+//       destination sequence, in the KV cache and in the recurrent memory.
+//       The loader of patches/fuzz-core/0026 writes the tensor data after it
+//       reads the blob, and a NaN stops it after some parts are written: the
+//       load then removes the sequence.
 //
 // A sequence becomes "tainted" after an operation that has a result that the
 // shadow cannot predict (a corrupted blob that loads, a middle range remove).
@@ -587,6 +592,13 @@ void run(FuzzedDataProvider & fdp) {
             if (rc == 0) {
                 if (!corrupted) {
                     fuzz::fail("P5: an intact state blob of seq %d (%zu bytes) does not load into seq %d", src, blob.size(), dst);
+                }
+                // P6: the hybrid memory gives the larger of the two minimum positions, thus a part in the
+                // KV cache or in the recurrent memory alone shows here
+                const llama_pos left_min = llama_memory_seq_pos_min(mem, dst);
+                const llama_pos left_max = llama_memory_seq_pos_max(mem, dst);
+                if (left_min != -1 || left_max != -1) {
+                    fuzz::fail("P6: a failed load into seq %d leaves positions %d to %d of it in the memory", dst, left_min, left_max);
                 }
                 drop_seq(mem, sh[dst], dst);
             } else {

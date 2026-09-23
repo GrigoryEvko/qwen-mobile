@@ -1,0 +1,264 @@
+Check the data of a state blob in the copy of the host reader, and remove the sequence of a failed load
+Fold-into: fuzz-core/0025-reject-a-nan-or-an-inf-in-the-data-of-a-state-blob.patch
+
+The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
+
+- The check of patch 0025 adds a second read of the blob and a misaligned load.
+
+  0025 calls ggml_validate_row_data on the bytes of the blob in read_tensor. The bytes of a blob have
+  no alignment, thus the F32 and F16 loads of that function are misaligned (UBSan reports them in
+  the core suite). And its per-element tests in ggml-base run at 3.6 GB/s for F16 on x86, against
+  25 GB/s for memcpy. On the box, one thread, the load of a 2B state of 4096 tokens (F16 KV,
+  67 MiB) takes 21.5 ms against 4.2 ms without the check, and a 4B state (178 MiB) 55.6 ms against
+  11.3 ms.
+
+  The change: the check of the types of the caches of the app (F32, F16, BF16, Q8_0) is one
+  integer pass that the compiler vectorizes: the largest magnitude bits of the values (for Q8_0, of
+  the f16 block scales) against the bits of Inf. It reads each value with memcpy. A different type
+  goes through an aligned copy to ggml_validate_row_data. The host reader saves its reads and
+  writes them later, as upstream does. Its new flush() writes each saved read in parts of 256 KiB:
+  it checks a part and then writes it while the part is in the cache, thus the load reads the blob
+  from memory one time. llama_context::state_set_data and state_seq_set_data call flush() in their
+  try block. A part with a NaN or an Inf stops the flush, and the load fails. The file reader
+  checks the bytes that it reads before it writes them, as in 0025. The device reader has no check.
+  With the change the two loads above take 5.2 ms and 13.0 ms, and a blob with finite values gives
+  the same memory as before.
+
+- A failed sequence load keeps a part of the sequence.
+
+  The KV cache and the recurrent memory remove the cells of the sequence when their own read
+  fails. But the hybrid memory reads the KV cache first: when the read of the recurrent memory
+  fails, the KV cache keeps the cells that it loaded. A failure in the flush() above also comes
+  after the two reads. Thus llama_memory_seq_pos_min shows a part of the sequence after
+  llama_state_seq_set_data returns 0.
+
+  The change: when a sequence load fails after the read of the memory starts, state_seq_set_data
+  removes the sequence (llama_memory_seq_rm with -1, -1). A load that fails at its magic number
+  does not change the memory, as before. When the flush of a full state load fails,
+  state_set_data clears the memory with its data, as the KV cache does when its read fails.
+
+  The reproducers: tests/fuzz/core/regress/fuzz_recurrent--state-fail-kv-part (a damaged recurrent
+  part), and property P6 of fuzz_recurrent with fuzz_recurrent--state-nan-kv-window (a NaN that the
+  flush finds after it wrote the KV rows).
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    src/llama-context.cpp
+    src/llama-io.h
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index fb851b1..341f66b 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2826,17 +2826,64 @@ private:
+     std::vector<write_info> winfos;
+ };
+ 
+-// Reject the bytes of a state blob for a tensor of the memory when they hold a NaN or an Inf (for a
+-// quantized type, in a block scale). The memory keeps the rows of a cell after a remove of its
+-// sequence, and the attention without flash attention reads each cell of its window. A masked cell
+-// gets the weight 0 there, but 0 * NaN and NaN + -inf are NaN. Thus one non-finite value of a damaged
+-// blob gives NaN logits to the other sequences of the stream, and to each later sequence, until a
+-// clear with data. A decode that overflows can also write a NaN: this check does not cover that
+-// path. O(size), at a load only.
+-static void llama_state_check_tensor_data(const ggml_tensor * tensor, const void * data, size_t size) {
+-    if (!ggml_validate_row_data(tensor->type, data, size)) {
+-        throw std::runtime_error(format("the state data of %s holds a NaN or an Inf value, or a size that is not a whole number of blocks", tensor->name));
++// The check of the tensor data of a state blob: a NaN or an Inf (for a quantized type, in a block
++// scale) rejects the load. The memory keeps the rows of a cell after a remove of its sequence, and
++// the attention without flash attention reads each cell of its window. A masked cell gets the weight
++// 0 there, but 0 * NaN and NaN + -inf are NaN. Thus one non-finite value of a damaged blob gives NaN
++// logits to the other sequences of the stream, and to each later sequence, until a clear with data.
++// A decode that overflows can also write a NaN: this check does not cover that path.
++//
++// The types of the caches of the app (F32, F16, BF16, Q8_0) take one integer pass that the compiler
++// vectorizes: the largest magnitude bits of the values (for Q8_0, of the f16 block scales) against
++// the bits of Inf, which the exponent of a NaN also has. The bytes of a blob have no alignment, thus
++// the pass reads each value with memcpy. ggml_validate_row_data gives the same result for these
++// types, but its per-element tests in ggml-base run at 3.6 GB/s for F16 on x86. A different type
++// goes through an aligned copy to ggml_validate_row_data.
++template <typename T, size_t STRIDE>
++static bool llama_state_finite_bits(const uint8_t * data, size_t n, T mask, T inf) {
++    T m = 0;
++    for (size_t i = 0; i < n; ++i) {
++        T v;
++        memcpy(&v, data + i * STRIDE, sizeof(T));
++        m = std::max<T>(m, v & mask);
++    }
++    return m < inf;
++}
++
++// True when the bytes of a state blob for a tensor of the type hold whole blocks with no NaN or Inf. O(size).
++static bool llama_state_data_finite(ggml_type type, const uint8_t * data, size_t size) {
++    const size_t block = ggml_type_size(type);
++    if (block == 0 || size % block != 0) {
++        return false;
+     }
++    const size_t n = size / block;
++    switch (type) {
++        case GGML_TYPE_F32:
++            return llama_state_finite_bits<uint32_t, 4>(data, n, 0x7fffffffu, 0x7f800000u);
++        case GGML_TYPE_F16:
++            return llama_state_finite_bits<uint16_t, 2>(data, n, 0x7fff, 0x7c00);
++        case GGML_TYPE_BF16:
++            return llama_state_finite_bits<uint16_t, 2>(data, n, 0x7fff, 0x7f80);
++        case GGML_TYPE_Q8_0:
++            // a block of 34 bytes is the f16 scale d, then 32 int8 values
++            if (block == 34) {
++                return llama_state_finite_bits<uint16_t, 34>(data, n, 0x7fff, 0x7c00);
++            }
++            break;
++        default:
++            break;
++    }
++    // parts of 64 KiB or more (a whole number of blocks) in an aligned buffer
++    const size_t part = std::max<size_t>(1, 65536 / block) * block;
++    std::vector<double> buf((std::min(size, part) + sizeof(double) - 1) / sizeof(double));
++    for (size_t off = 0; off < size; off += part) {
++        const size_t len = std::min(part, size - off);
++        memcpy(buf.data(), data + off, len);
++        if (!ggml_validate_row_data(type, buf.data(), len)) {
++            return false;
++        }
++    }
++    return true;
+ }
+ 
+ class llama_io_read_host : public llama_io_read_i {
+@@ -2844,10 +2891,8 @@ public:
+     llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
+ 
+     ~llama_io_read_host() {
+-        // flush the reads
+-        for (const auto & rinfo : rinfos) {
+-            ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
+-        }
++        // flush the reads (also after a failed load: flush() stops at a part that is not finite)
++        flush();
+     }
+ 
+     void read(void * dst, size_t size) override {
+@@ -2865,8 +2910,6 @@ public:
+             throw std::runtime_error("unexpectedly reached end of buffer");
+         }
+ 
+-        llama_state_check_tensor_data(tensor, ptr, size);
+-
+         // save for later during destruction
+         rinfos.push_back({tensor, ptr, size, offset});
+ 
+@@ -2875,11 +2918,35 @@ public:
+         buf_size -= size;
+     }
+ 
++    // Write the saved reads in parts of about PART_BYTES (a whole number of blocks). Each part is
++    // checked and then written while it is in the cache, thus the load reads the blob from memory
++    // one time. At a part with a NaN or an Inf the flush stops and gives false: the parts before
++    // it are written, and the caller then removes the sequence.
++    bool flush() override {
++        bool ok = true;
++        for (size_t i = 0; ok && i < rinfos.size(); ++i) {
++            const read_info & r = rinfos[i];
++            const size_t block = std::max<size_t>(1, ggml_type_size(r.tensor->type));
++            const size_t part  = std::max<size_t>(1, PART_BYTES / block) * block;
++            for (size_t off = 0; ok && off < r.size; off += part) {
++                const size_t len = std::min(part, r.size - off);
++                ok = llama_state_data_finite(r.tensor->type, r.ptr + off, len);
++                if (ok) {
++                    ggml_backend_tensor_set(r.tensor, r.ptr + off, r.offset + off, len);
++                }
++            }
++        }
++        rinfos.clear();
++        return ok;
++    }
++
+     size_t n_bytes() override {
+         return size_read;
+     }
+ 
+ private:
++    static constexpr size_t PART_BYTES = 256 * 1024;
++
+     const uint8_t * ptr;
+     size_t buf_size = 0;
+     size_t size_read = 0;
+@@ -2930,7 +2997,9 @@ public:
+     void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+         temp_buffer.resize(size);
+         read(temp_buffer.data(), size);
+-        llama_state_check_tensor_data(tensor, temp_buffer.data(), size);
++        if (!llama_state_data_finite(tensor->type, temp_buffer.data(), size)) {
++            throw std::runtime_error(format("the state data of %s holds a NaN or an Inf value, or a part of a block", tensor->name));
++        }
+         ggml_backend_tensor_set(tensor, temp_buffer.data(), offset, size);
+     }
+ 
+@@ -3269,7 +3338,16 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
+ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
+     llama_io_read_host io(src, size);
+     try {
+-        return state_read_data(io);
++        const size_t n = state_read_data(io);
++        // the host reader writes the tensor data here, and it checks each part before it writes it
++        if (!io.flush()) {
++            // no part of the load stays in the memory
++            if (memory) {
++                memory->clear(true);
++            }
++            throw std::runtime_error("the state data holds a NaN or an Inf value");
++        }
++        return n;
+     } catch (const std::exception & err) {
+         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
+         return 0;
+@@ -3338,6 +3416,8 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
+         io = std::make_unique<llama_io_read_host>(src, size);
+     }
+ 
++    // true after the read of the memory starts: a failure from then on removes the sequence
++    bool reading = false;
+     try {
+         uint32_t magic_read;
+         io->read(&magic_read, sizeof(magic_read));
+@@ -3348,14 +3428,25 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
+         llama_seq_id seq_id_read;
+         io->read(&seq_id_read, sizeof(seq_id_read));
+ 
++        reading = true;
+         const int64_t t0 = hostprof ? ggml_time_us() : 0;
+         const size_t  n  = state_seq_read_data(*io, seq_id, flags);
+         if (hostprof) {
+             LLAMA_LOG_INFO("hostprof: state_seq_set seq %d flags %u bytes %zu us %lld\n", seq_id, (unsigned) flags, n, (long long) (ggml_time_us() - t0));
+         }
++        // the host reader writes the tensor data here, and it checks each part before it writes it
++        if (!io->flush()) {
++            throw std::runtime_error("the state data holds a NaN or an Inf value");
++        }
+         return n;
+     } catch (const std::exception & err) {
+         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
++        // No part of a failed load stays in the memory. A part of the memory removes its own
++        // cells when its read fails, but the parts before it (the KV cache before the recurrent
++        // memory of a hybrid model) and a failure of the check in flush() keep theirs.
++        if (reading && memory) {
++            memory->seq_rm(seq_id, -1, -1);
++        }
+         return 0;
+     }
+ }
+diff --git a/src/llama-io.h b/src/llama-io.h
+index f276af4..4d9d007 100644
+--- a/src/llama-io.h
++++ b/src/llama-io.h
+@@ -28,6 +28,10 @@ public:
+     virtual void read(void * dst, size_t size) = 0;
+     virtual void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) = 0;
+ 
++    // Write the tensor data of read_tensor that the reader saves for later. False when the data holds
++    // a NaN or an Inf, and then the rest is not written. A reader that writes in read_tensor gives true.
++    virtual bool flush() { return true; }
++
+     // bytes read so far
+     virtual size_t n_bytes() = 0;
+ 
