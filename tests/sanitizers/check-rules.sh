@@ -1,0 +1,633 @@
+#!/usr/bin/env bash
+# Check the sanitizer rules (R1 to R13) that a machine can check.
+#
+# Usage:
+#   tests/sanitizers/check-rules.sh [--areas core,ops,hexhost,app,quant] [--no-builds]
+#                                   [--write-requests] [--json FILE]
+#
+#   --areas LIST       The fuzz areas to check. The preset value is each
+#                      directory of tests/fuzz. "none" checks only the
+#                      shared files of tests/sanitizers (and the builds).
+#   --no-builds        Do not check build/fuzz (for a clean CI checkout,
+#                      before the builds).
+#   --write-requests   Write the violations of each area to
+#                      build/fuzz/matrix/requests/<area>-rules.txt.
+#   --json FILE        Also write each violation as one JSON line to FILE.
+#
+# The checks:
+#   R1   Each -fsanitize= list in tests/fuzz/<area> (CMakeLists.txt, *.cmake,
+#        *.sh), in tests/sanitizers/*.cmake, and in each build/fuzz/*/
+#        CMakeCache.txt and compile_commands.json has at most one sanitizer
+#        family (fuzzer and fuzzer-no-link are not sanitizers). In a build
+#        directory with a configuration in its name (<area>-<profile>-<config>),
+#        the family is that configuration, and "none" has no family.
+#   R3   Each tests/fuzz/<area>/run.sh exists, and its --help lists test,
+#        fuzz, the five configurations, --budget-seconds, --jobs and --profile.
+#   R3   Each line of each build/fuzz/*/results.jsonl has the schema, and its
+#        sanitizer and profile agree with the directory name.
+#   R5   A UBSan suppression file exists only as tests/sanitizers/ubsan.supp.
+#        Each entry names a function (no file, no src:, no wildcard), and its
+#        comment has a task number and a date.
+#   R6   An ASan, LSan, TSan or MSan suppression file exists only as
+#        tests/sanitizers/<config>.supp, with the same entry rules.
+#   R5/R6 Each -fno-sanitize= and -fsanitize-recover= flag has a comment with
+#        the word "reason", "evidence" or "finding", or a task number, in the
+#        15 lines before it.
+#   R7   A tsan or msan build directory with GGML_OPENMP in its cache has
+#        GGML_OPENMP=OFF. An msan build directory has FUZZ_MSAN_PREFIX, and
+#        GGML_NATIVE=OFF and the x86 SIMD options OFF if it builds ggml.
+#   R11  The build directories have a profile in the name, and the results
+#        have a "profile" field.
+#   R12  The shipped flags of tests/sanitizers/profile-release.cmake agree
+#        with the preset (android/snapdragon/CMakeUserPresets.json) and with
+#        build/native/llama/compile_commands.json. Each release build uses
+#        those flags (x86: less -march) with -O3 -DNDEBUG, and each debug build
+#        uses -O1, no -flto and no -DNDEBUG. The lab release build of the DSP
+#        code uses each code generation flag of the shipped DSP library.
+#   R13  Each entry of tests/sanitizers/ubsan.supp has a reproducer in
+#        tests/sanitizers/repro/, and the last run of
+#        tests/sanitizers/supp-repro.sh passed in the two profiles.
+#   L8   No suppression comment names a task of tests/sanitizers/closed-tasks.txt.
+#   L9   Each libFuzzer command of the scripts of an area has -artifact_prefix,
+#        each fuzz run has an outer "timeout -s KILL", and the root of the
+#        repository has no stray crash-*, leak-*, timeout-* or oom-* file.
+#   TSan Each libFuzzer target of an area includes tests/sanitizers/fuzz_death.h
+#        and calls fuzz_death_note_input() (the death callback without the
+#        deadlock of TSan and libFuzzer).
+#
+# Output: one line for each violation, "<rule> <area> <place>: <message>".
+# Requirements: bash, jq, rg. No build and no container.
+# Exit status: 0 if there is no violation, 1 if there is one or more.
+
+set -euo pipefail
+
+readonly REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+readonly FUZZ_DIR="$REPO/tests/fuzz"
+readonly SAN_DIR="$REPO/tests/sanitizers"
+readonly BUILD_FUZZ="$REPO/build/fuzz"
+readonly PRESET_FILE="$REPO/android/snapdragon/CMakeUserPresets.json"
+readonly NATIVE_CC="$REPO/build/native/llama/compile_commands.json"
+readonly CONFIG_TOKENS="none asan ubsan tsan msan hwasan"
+
+AREAS=""
+CHECK_BUILDS=1
+WRITE_REQUESTS=0
+JSON_OUT=""
+VIOLATIONS=()
+
+# Write the usage text, from the header comment of this file.
+print_usage() {
+    local line
+    while IFS= read -r line; do
+        [[ "$line" == "#!"* ]] && continue
+        [[ "$line" != "#"* ]] && break
+        line="${line#\#}"
+        echo "${line# }"
+    done < "${BASH_SOURCE[0]}"
+}
+
+# Record one violation.
+# Arguments: the rule, the area, the place (file:line or directory), the message.
+violation() {
+    VIOLATIONS+=("$1"$'\t'"$2"$'\t'"${3#"$REPO/"}"$'\t'"$4")
+}
+
+# Print the sanitizer family of one -fsanitize= item, or nothing for an item
+# that is not a sanitizer (fuzzer, fuzzer-no-link).
+family_of() {
+    case "$1" in
+        fuzzer|fuzzer-no-link) ;;
+        address|kernel-address|pointer-compare|pointer-subtract) echo asan ;;
+        hwaddress|kernel-hwaddress) echo hwasan ;;
+        thread) echo tsan ;;
+        memory|kernel-memory) echo msan ;;
+        leak) echo lsan ;;
+        undefined|alignment|bool|builtin|bounds|array-bounds|local-bounds|enum|float-cast-overflow| \
+        float-divide-by-zero|function|integer|integer-divide-by-zero|nonnull-attribute|null| \
+        nullability*|object-size|pointer-overflow|return|returns-nonnull-attribute|shift|shift-*| \
+        signed-integer-overflow|unsigned-integer-overflow|unsigned-shift-base|unreachable|vla-bound| \
+        vptr|implicit-*) echo ubsan ;;
+        *) echo "other:$1" ;;
+    esac
+}
+
+# Print the sorted, unique families of one comma list of -fsanitize= items.
+families_of_list() {
+    local item
+    tr ',' '\n' <<< "$1" | while IFS= read -r item; do
+        if [[ -n "$item" ]]; then family_of "$item"; fi
+    done | sort -u
+}
+
+# Print the area of a path: tests/fuzz/<area>/..., build/fuzz/<area>-...,
+# or "sanitizers" and "matrix" for the files of this agent.
+area_of() {
+    local rel="${1#"$REPO/"}"
+    case "$rel" in
+        tests/fuzz/*) rel="${rel#tests/fuzz/}"; echo "${rel%%/*}" ;;
+        tests/sanitizers/*|tests/suite/*|tests/run-suite.sh) echo sanitizers ;;
+        build/fuzz/matrix*|build/fuzz/msan-libcxx*) echo matrix ;;
+        build/fuzz/*) rel="${rel#build/fuzz/}"; rel="${rel%%/*}"; echo "${rel%%-*}" ;;
+        *) echo other ;;
+    esac
+}
+
+# Print the configuration token of a build directory name, or nothing.
+config_of_dir() {
+    local part found=""
+    for part in ${1//-/ }; do
+        [[ " $CONFIG_TOKENS " == *" $part "* ]] && found="$part"
+    done
+    echo "$found"
+}
+
+# Print the profile token of a build directory name, or nothing.
+profile_of_dir() {
+    local part found=""
+    for part in ${1//-/ }; do
+        [[ "$part" == debug || "$part" == release ]] && found="$part"
+    done
+    echo "$found"
+}
+
+# R1 in source files: each -fsanitize= list has one family at most.
+check_sources_r1() {
+    local file line num text list fams
+    for file in "$@"; do
+        [[ -f "$file" ]] || continue
+        while IFS=: read -r num text; do
+            while IFS= read -r list; do
+                list="${list#-fsanitize=}"
+                # A variable or a generator expression is checked in the build.
+                [[ "$list" == *'$'* || "$list" == *'<'* ]] && continue
+                fams="$(families_of_list "$list" | tr '\n' ' ')"
+                if [[ "$(wc -w <<< "$fams")" -gt 1 ]]; then
+                    violation R1 "$(area_of "$file")" "$file:$num" "-fsanitize=$list has more than one sanitizer family ($fams)"
+                fi
+            done < <(rg -o -e '-fsanitize=[A-Za-z0-9_,${}<>:.-]+' <<< "$text" || true)
+        done < <(rg -n -e '-fsanitize=' "$file" || true)
+    done
+}
+
+# R5 and R6: each -fno-sanitize= and -fsanitize-recover= flag has a reason
+# in a comment of the 15 lines before it, or on its line.
+check_reasons() {
+    local file num start text
+    for file in "$@"; do
+        [[ -f "$file" ]] || continue
+        while IFS=: read -r num text; do
+            # A comment that names a flag is not a flag.
+            [[ "$text" =~ ^[[:space:]]*(#|//) ]] && continue
+            start=$(( num > 15 ? num - 15 : 1 ))
+            if ! line_range "$file" "$start" "$num" | rg -q -i -e '(#|//).*(reason|evidence|finding|task #?[0-9]+)'; then
+                violation R5 "$(area_of "$file")" "$file:$num" "-fno-sanitize= or -fsanitize-recover= has no comment with a reason, evidence, finding or task number in the 15 lines before it"
+            fi
+        done < <(rg -n -e '-fno-sanitize=' -e '-fsanitize-recover=' "$file" || true)
+    done
+}
+
+# Print the lines FIRST thru LAST of a file.
+line_range() {
+    local file="$1" first="$2" last="$3" n=0 line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        n=$((n + 1))
+        (( n < first )) && continue
+        (( n > last )) && break
+        printf '%s\n' "$line"
+    done < "$file"
+}
+
+# R5 and R6: the suppression files and their entries.
+check_suppressions() {
+    local file base area
+    while IFS= read -r file; do
+        base="$(basename "$file")"
+        area="$(area_of "$file")"
+        case "$file" in
+            "$SAN_DIR"/ubsan.supp|"$SAN_DIR"/asan.supp|"$SAN_DIR"/lsan.supp|"$SAN_DIR"/tsan.supp|"$SAN_DIR"/msan.supp) ;;
+            *) violation R5 "$area" "$file" "a suppression file outside tests/sanitizers/<config>.supp: move each entry to the shared file of its sanitizer" ;;
+        esac
+        check_supp_entries "$file" "$area"
+    done < <(find "$FUZZ_DIR" "$SAN_DIR" -name '*.supp' -type f 2> /dev/null | sort)
+}
+
+# Check each entry of one suppression file. An entry is "<type>:<pattern>".
+# Its comment is the block of comment lines directly before it (other entries
+# in the block are permitted).
+check_supp_entries() {
+    local file="$1" area="$2" n=0 line comment="" type pattern
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        n=$((n + 1))
+        if [[ -z "${line// /}" ]]; then
+            comment=""
+            continue
+        fi
+        if [[ "$line" == \#* ]]; then
+            comment+="$line"$'\n'
+            continue
+        fi
+        type="${line%%:*}"
+        pattern="${line#*:}"
+        if [[ "$type" == "src" || "$pattern" == */* || "$pattern" == *'*'* || "$pattern" =~ \.(c|cc|cpp|h|hpp)$ ]]; then
+            violation R5 "$area" "$file:$n" "the entry '$line' is not at the function level (a file, src: or a wildcard)"
+        elif [[ ! ( ( "$pattern" == ^* && ( "$pattern" == *'$' || "$pattern" == *'(' ) ) || "$pattern" == *'<' ) ]]; then
+            # The runtime matches a pattern as a substring, thus an entry
+            # without anchors also matches each longer name.
+            violation R5 "$area" "$file:$n" "the entry '$line' is not anchored: use ^name\$ (C), ^name( (C++) or name< (C++ template), because the runtime matches a substring"
+        fi
+        if ! rg -q -i -e 'task #?[0-9]+' <<< "$comment"; then
+            violation R5 "$area" "$file:$n" "the entry '$line' has no task number in its comment"
+        fi
+        if ! rg -q -e '20[0-9]{2}-[0-9]{2}-[0-9]{2}' <<< "$comment"; then
+            violation R5 "$area" "$file:$n" "the entry '$line' has no date (YYYY-MM-DD) in its comment"
+        fi
+    done < "$file"
+}
+
+# R3: the interface of each run.sh.
+check_run_sh() {
+    local area script help word
+    for area in $AREAS; do
+        script="$FUZZ_DIR/$area/run.sh"
+        if [[ ! -x "$script" ]]; then
+            violation R3 "$area" "tests/fuzz/$area/run.sh" "run.sh is missing or not executable"
+            continue
+        fi
+        if ! help="$(timeout 30 "$script" --help 2>&1)"; then
+            violation R3 "$area" "tests/fuzz/$area/run.sh" "'run.sh --help' does not exit with status 0"
+        fi
+        for word in test fuzz none asan ubsan tsan msan --budget-seconds --jobs --profile; do
+            rg -q -F -e "$word" <<< "$help" \
+                || violation R3 "$area" "tests/fuzz/$area/run.sh" "--help does not list '$word'"
+        done
+    done
+}
+
+# R3 and R11: the schema of each results.jsonl.
+check_results() {
+    local file dir config profile bad
+    for file in "$BUILD_FUZZ"/*/results.jsonl; do
+        [[ -f "$file" ]] || continue
+        dir="$(basename "$(dirname "$file")")"
+        config="$(config_of_dir "$dir")"
+        profile="$(profile_of_dir "$dir")"
+        bad="$(jq -c --arg c "$config" --arg p "$profile" '
+            select(
+                (.area | type) != "string" or (.target | type) != "string" or
+                ((.sanitizer | type) != "string") or
+                (.mode != "test" and .mode != "fuzz") or
+                (.seconds | type) != "number" or (.executions | type) != "number" or
+                (.findings | type) != "number" or (.crash_files | type) != "array" or
+                (.profile != "debug" and .profile != "release") or
+                ($c != "" and .sanitizer != $c) or ($p != "" and .profile != $p)
+            ) | {target, sanitizer, profile, mode}' "$file" 2>&1 | head -3 || true)"
+        if ! jq -e . "$file" > /dev/null 2>&1; then
+            violation R3 "$(area_of "$file")" "$file" "a line is not valid JSON"
+        elif [[ -n "$bad" ]]; then
+            violation R3 "$(area_of "$file")" "$file" "lines without the schema {area, target, profile (debug|release), sanitizer (= $config), mode, seconds, executions, findings, crash_files}, for example: ${bad//$'\n'/ }"
+        fi
+    done
+}
+
+# R1, R7, R11 and R12 in one build directory.
+check_build_dir() {
+    local dir="$1" name config profile cache cc fams flags area android=0
+    name="$(basename "$dir")"
+    area="$(area_of "$dir")"
+    config="$(config_of_dir "$name")"
+    profile="$(profile_of_dir "$name")"
+    cache="$dir/CMakeCache.txt"
+    cc="$dir/compile_commands.json"
+    [[ -f "$cache" || -f "$cc" ]] || return 0
+    [[ -f "$cache" ]] && rg -q '^CMAKE_SYSTEM_NAME:[A-Z]*=Android' "$cache" && android=1
+
+    # R1: the families of all commands and of the cache flags.
+    flags=""
+    [[ -f "$cc" ]] && flags+="$(jq -r '.[] | (.command // (.arguments | join(" ")))' "$cc" 2> /dev/null || true)"$'\n'
+    [[ -f "$cache" ]] && flags+="$(rg '^CMAKE_(C|CXX|EXE_LINKER|SHARED_LINKER|MODULE_LINKER)_FLAGS[A-Z_]*:STRING=' "$cache" || true)"
+    fams="$({ rg -o -e '-fsanitize=[A-Za-z0-9_,-]+' <<< "$flags" || true; } \
+        | while IFS= read -r l; do families_of_list "${l#-fsanitize=}"; done | sort -u | tr '\n' ' ')"
+    fams="${fams% }"
+    if [[ "$(wc -w <<< "$fams")" -gt 1 ]]; then
+        violation R1 "$area" "$dir" "the build has more than one sanitizer family: $fams"
+    elif [[ -n "$config" ]]; then
+        if [[ "$config" == none && -n "$fams" ]]; then
+            violation R1 "$area" "$dir" "the configuration none has the sanitizer $fams"
+        elif [[ "$config" != none && "$fams" != "$config" ]]; then
+            violation R1 "$area" "$dir" "the configuration $config has the sanitizer family '${fams:-none}'"
+        fi
+    fi
+    # R11: the profile in the name.
+    [[ -z "$profile" && -n "$config" ]] \
+        && violation R11 "$area" "$dir" "the directory name has no profile (build/fuzz/<area>-<debug|release>-<config>)"
+
+    # R7: the ggml options of tsan and msan.
+    if [[ -f "$cache" && ( "$config" == tsan || "$config" == msan ) ]]; then
+        if rg -q '^GGML_OPENMP:BOOL=' "$cache" && ! rg -q '^GGML_OPENMP:BOOL=OFF' "$cache"; then
+            violation R7 "$area" "$dir" "GGML_OPENMP is not OFF"
+        fi
+    fi
+    if [[ -f "$cache" && "$config" == msan ]]; then
+        rg -q '^FUZZ_MSAN_PREFIX:[A-Z]*=.+' "$cache" || violation R7 "$area" "$dir" "FUZZ_MSAN_PREFIX is not set"
+        if rg -q '^GGML_NATIVE:BOOL=' "$cache"; then
+            local opt
+            for opt in NATIVE AVX AVX2 AVX512 AVX_VNNI FMA F16C BMI2 SSE42; do
+                if rg -q "^GGML_$opt:BOOL=" "$cache" && ! rg -q "^GGML_$opt:BOOL=OFF" "$cache"; then
+                    violation R7 "$area" "$dir" "GGML_$opt is not OFF"
+                fi
+            done
+        fi
+    fi
+
+    # R12: the flags of the profile, in the C and C++ compile commands.
+    [[ -n "$profile" && -f "$cc" ]] || return 0
+    check_profile_flags "$dir" "$area" "$profile" "$config" "$android" "$cc"
+}
+
+# R12 for one build directory. It reads the compile commands of the .c and
+# .cpp files, and checks the last -O, NDEBUG, -flto and the profile flags.
+check_profile_flags() {
+    local dir="$1" area="$2" profile="$3" config="$4" android="$5" cc="$6"
+    local shipped=() want=() tok cmds last_o bad_tok="" want_o=" -O1"
+    read -r -a shipped <<< "$(shipped_flags)"
+    for tok in "${shipped[@]}"; do
+        [[ $android -eq 0 && "$tok" == -march=* ]] && continue
+        [[ "$profile" == debug && ( "$tok" == -flto || "$tok" == -O3 || "$tok" == -DNDEBUG ) ]] && continue
+        want+=("$tok")
+    done
+    cmds="$(jq -r '.[] | select(.file | test("\\.(c|cc|cpp)$")) | (.command // (.arguments | join(" ")))' "$cc" 2> /dev/null || true)"
+    [[ -n "$cmds" ]] || return 0
+    for tok in "${want[@]}"; do
+        if rg -v -q -F -e " $tok" <<< "$cmds"; then
+            bad_tok+=" $tok"
+        fi
+    done
+    [[ -n "$bad_tok" ]] && violation R12 "$area" "$dir" "some compile commands do not have the $profile flags:$bad_tok"
+    # The last -O of each command decides the optimization level.
+    [[ "$profile" == release ]] && want_o=" -O3"
+    last_o="$(jq -r '.[] | select(.file | test("\\.(c|cc|cpp)$")) | (.command // (.arguments | join(" ")))
+                     | ([scan(" -O[0-3sz](?= |$)")] | last // "none")' "$cc" | sort | uniq -c | tr -s ' ' | tr '\n' ',')"
+    if [[ "$last_o" != *"$want_o," || "$(tr ',' '\n' <<< "$last_o" | rg -c -v -e '^$')" -ne 1 ]]; then
+        violation R12 "$area" "$dir" "the $profile profile needs$want_o as the last -O of each command. The counts are: ${last_o%,}"
+    fi
+    if [[ "$profile" == debug ]]; then
+        rg -q -e ' -flto' <<< "$cmds" && violation R12 "$area" "$dir" "the debug profile has -flto"
+        rg -q -e ' -DNDEBUG' <<< "$cmds" && violation R12 "$area" "$dir" "the debug profile has -DNDEBUG, thus assert() does not run"
+    fi
+    return 0
+}
+
+# Print the shipped flags of tests/sanitizers/profile-release.cmake, with
+# the release flags (-O3 -DNDEBUG).
+shipped_flags() {
+    local a b
+    a="$(rg -o -r '$1' 'SANMATRIX_SHIPPED_FLAGS "([^"]*)"' "$SAN_DIR/profile-release.cmake")"
+    b="$(rg -o -r '$1' 'SANMATRIX_SHIPPED_RELEASE_FLAGS "([^"]*)"' "$SAN_DIR/profile-release.cmake")"
+    echo "$a $b"
+}
+
+# R12: the shipped flags of profile-release.cmake against the preset and
+# against the compile commands of the shipped build.
+check_parity_sources() {
+    local ours preset preset_rel profile_flags tok native_cmd lab_cc v shipped_cmd missing
+    ours="$(rg -o -r '$1' 'SANMATRIX_SHIPPED_FLAGS "([^"]*)"' "$SAN_DIR/profile-release.cmake")"
+    if [[ -f "$PRESET_FILE" ]]; then
+        preset="$(jq -r '.configurePresets[] | select(.name == "arm64-android-snapdragon") | .cacheVariables.CMAKE_C_FLAGS' "$PRESET_FILE")"
+        preset_rel="$(jq -r '.configurePresets[] | select(.name == "arm64-android-snapdragon") | .cacheVariables.CMAKE_C_FLAGS_RELEASE' "$PRESET_FILE")"
+        [[ "$preset" == "$ours" ]] \
+            || violation R12 sanitizers "tests/sanitizers/profile-release.cmake" "SANMATRIX_SHIPPED_FLAGS '$ours' differs from the preset CMAKE_C_FLAGS '$preset'"
+        [[ "$(jq -r '.configurePresets[] | select(.name == "arm64-android-snapdragon") | .cacheVariables.CMAKE_CXX_FLAGS' "$PRESET_FILE")" == "$preset" ]] \
+            || violation R12 sanitizers "$PRESET_FILE" "the preset CMAKE_CXX_FLAGS differs from CMAKE_C_FLAGS"
+        [[ "$preset_rel" == "$(rg -o -r '$1' 'SANMATRIX_SHIPPED_RELEASE_FLAGS "([^"]*)"' "$SAN_DIR/profile-release.cmake")" ]] \
+            || violation R12 sanitizers "tests/sanitizers/profile-release.cmake" "SANMATRIX_SHIPPED_RELEASE_FLAGS differs from the preset CMAKE_C_FLAGS_RELEASE '$preset_rel'"
+    else
+        violation R12 sanitizers "$PRESET_FILE" "the preset file is missing"
+    fi
+    # The profile flags are the shipped flags less -march.
+    profile_flags="$(rg -o -r '$1' 'SANMATRIX_PROFILE_FLAGS "([^"]*)"' "$SAN_DIR/profile-release.cmake")"
+    [[ "$profile_flags" == "$(tr ' ' '\n' <<< "$ours" | rg -v '^-march=' | tr '\n' ' ' | xargs)" ]] \
+        || violation R12 sanitizers "tests/sanitizers/profile-release.cmake" "SANMATRIX_PROFILE_FLAGS '$profile_flags' is not the shipped flags less -march"
+    # The shipped build itself.
+    if [[ -f "$NATIVE_CC" ]]; then
+        native_cmd="$(jq -r '.[] | select(.file | test("ggml-cpu/ggml-cpu\\.c$")) | .command' "$NATIVE_CC" | head -1)"
+        missing=""
+        for tok in $ours -O3 -DNDEBUG; do
+            [[ " $native_cmd " == *" $tok "* ]] || missing+=" $tok"
+        done
+        [[ -z "$missing" ]] || violation R12 sanitizers "build/native/llama/compile_commands.json" "the shipped ggml-cpu.c command does not have:$missing (the preset and the shipped build differ)"
+    fi
+    # The DSP profile of the lab against the shipped DSP libraries.
+    for v in v73 v75 v79 v81; do
+        local shipped_cc="$REPO/build/native/llama/ggml/src/ggml-hexagon/htp-$v-prefix/src/htp-$v-build/compile_commands.json"
+        lab_cc="$BUILD_FUZZ/matrix-lab-release/build-$v-release/compile_commands.json"
+        [[ -f "$shipped_cc" && -f "$lab_cc" ]] || continue
+        shipped_cmd="$(jq -r '.[] | select(.file | test("htp/matmul-ops\\.c$")) | .command' "$shipped_cc" | head -1)"
+        local lab_cmd
+        lab_cmd="$(jq -r '.[0].command' "$lab_cc")"
+        missing=""
+        # The code generation flags: each option that is not an include, a
+        # define other than NDEBUG, a warning or a path map.
+        for tok in $(tr ' ' '\n' <<< "$shipped_cmd" | rg -e '^-(m|f|O|G|DNDEBUG|enable-)' | rg -v -e '^-f(file|debug)-prefix-map' -e '^-W'); do
+            [[ " $lab_cmd " == *" $tok "* ]] || missing+=" $tok"
+        done
+        [[ -z "$missing" ]] || violation R12 sanitizers "build/fuzz/matrix-lab-release/build-$v-release" "the lab release build of the DSP code does not have the shipped flags:$missing"
+    done
+}
+
+# R13: each ubsan.supp entry has a reproducer, and the last runs passed.
+check_repro() {
+    local entry func profile res
+    while IFS= read -r entry; do
+        func="${entry#*:}"
+        if ! rg -q -F -e "REPRO-ENTRY: $entry" "$SAN_DIR/repro/" 2> /dev/null; then
+            violation R13 sanitizers "tests/sanitizers/ubsan.supp" "the entry '$entry' has no reproducer (a file in tests/sanitizers/repro/ with the line 'REPRO-ENTRY: $entry')"
+        fi
+        for profile in debug release; do
+            res="$BUILD_FUZZ/matrix-supp-repro-$profile/results.jsonl"
+            if [[ ! -f "$res" ]]; then
+                violation R13 sanitizers "$res" "no run of tests/sanitizers/supp-repro.sh --profile $profile"
+                continue
+            fi
+            local link links="shared static" ext_area
+            # An entry of repro/external.txt has the reproducer of its area,
+            # and its record is "<area>/<entry>".
+            if rg -q -F -e "REPRO-ENTRY: $entry AREA: " "$SAN_DIR/repro/external.txt" 2> /dev/null; then
+                ext_area="$(rg -F -e "REPRO-ENTRY: $entry AREA: " "$SAN_DIR/repro/external.txt" | rg -o -r '$1' 'AREA: (\S+)' | head -1)"
+                links="$ext_area"
+            fi
+            for link in $links; do
+                jq -e --arg e "$link/$entry" 'select(.target == $e and .status == "pass")' "$res" > /dev/null 2>&1 \
+                    || violation R13 sanitizers "$res" "the entry '$entry' did not pass its reproducer in the $profile profile ($link)"
+            done
+        done
+    done < <(rg -v -e '^\s*#' -e '^\s*$' "$SAN_DIR/ubsan.supp" || true)
+}
+
+# Write the violations of each area to its request file.
+write_requests() {
+    local dir="$BUILD_FUZZ/matrix/requests" area v file
+    mkdir -p "$dir"
+    for area in $AREAS; do
+        file="$dir/$area-rules.txt"
+        {
+            echo "$(date -u +%Y-%m-%d), from sanitizer-matrix: tests/sanitizers/check-rules.sh found these violations in the area $area."
+            echo "Format: <rule> <place>: <message>. The rules are in the message of the coordinator (R1 to R13)."
+            echo
+            for v in "${VIOLATIONS[@]}"; do
+                IFS=$'\t' read -r r a p m <<< "$v"
+                if [[ "$a" == "$area" ]]; then echo "$r $p: $m"; fi
+            done
+        } > "$file"
+        if [[ "$(wc -l < "$file")" -le 3 ]]; then
+            rm -f "$file"
+        fi
+    done
+}
+
+# L9 and the TSan hang: each libFuzzer command in the scripts of an area has
+# -artifact_prefix, and each fuzz run (-max_total_time=) has an outer
+# "timeout -s KILL". A command can go on more than one line with "\".
+check_libfuzzer_commands() {
+    local file area n start line logical
+    for area in $AREAS; do
+        while IFS= read -r file; do
+            n=0
+            logical=""
+            start=0
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                n=$((n + 1))
+                [[ -z "$logical" ]] && start=$n
+                if [[ "$line" == *'\' ]]; then
+                    logical+="${line%\\} "
+                    continue
+                fi
+                logical+="$line"
+                if [[ ! "$logical" =~ ^[[:space:]]*# ]] \
+                    && [[ "$logical" == *-max_total_time=* || "$logical" == *-runs=* || "$logical" == *-rss_limit_mb=* ]]; then
+                    [[ "$logical" == *-artifact_prefix* ]] \
+                        || violation L9 "$area" "$file:$start" "a libFuzzer command without -artifact_prefix (crash files go to the working directory)"
+                    if [[ "$logical" == *-max_total_time=* && "$logical" != *"timeout -s KILL"* \
+                          && "$logical" != *"timeout --signal=KILL"* && "$logical" != *"timeout -s 9"* ]]; then
+                        violation L9 "$area" "$file:$start" "a fuzz run without an outer 'timeout -s KILL' (a TSan hang then blocks the job)"
+                    fi
+                fi
+                logical=""
+            done < "$file"
+        done < <(find "$FUZZ_DIR/$area" -name '*.sh' -type f 2> /dev/null | sort)
+    done
+    # Stray libFuzzer files in the root of the repository.
+    local stray
+    while IFS= read -r stray; do
+        violation L9 other "$stray" "a stray libFuzzer file in the root of the repository: move it to the regress/ directory of its area"
+    done < <(find "$REPO" -maxdepth 1 -type f \( -name 'crash-*' -o -name 'leak-*' -o -name 'timeout-*' -o -name 'oom-*' -o -name 'slow-unit-*' \) 2> /dev/null | sort)
+    # Any untracked file in the root (git status entries with no slash), for
+    # example the dump_state.bin of a test that ran with the root as its
+    # working directory.
+    if command -v git > /dev/null && git -C "$REPO" rev-parse --git-dir > /dev/null 2>&1; then
+        while IFS= read -r stray; do
+            violation L9 other "$stray" "an untracked file in the root of the repository: a test or a fuzzer wrote it there. Remove it, and give the program a working directory under build/"
+        done < <(git -C "$REPO" status --porcelain --untracked-files=normal 2> /dev/null \
+                 | { rg -o -r '$1' '^\?\? ([^/]+)$' || true; })
+    fi
+}
+
+# The TSan death callback: each libFuzzer target of an area includes
+# tests/sanitizers/fuzz_death.h (directly or through a header of its area)
+# and calls fuzz_death_note_input (directly or through a wrapper of that
+# header). Each area builds tsan, thus the rule is for each target.
+check_death_callback() {
+    local area file text inc
+    for area in $AREAS; do
+        while IFS= read -r file; do
+            text="$(cat "$file")"
+            # The local headers that the file includes, one level deep.
+            while IFS= read -r inc; do
+                [[ -f "$(dirname "$file")/$inc" ]] && text+=$'\n'"$(cat "$(dirname "$file")/$inc")"
+                [[ -f "$FUZZ_DIR/$area/$inc" ]] && text+=$'\n'"$(cat "$FUZZ_DIR/$area/$inc")"
+            done < <(rg -o -r '$1' '^\s*#\s*include\s+"([^"]+)"' "$file" || true)
+            if ! rg -q -e '#\s*include\s+[<"]([^">]*/)?fuzz_death\.h[">]' <<< "$text"; then
+                violation R1 "$area" "$file" "a libFuzzer target without tests/sanitizers/fuzz_death.h (the TSan death callback without a deadlock)"
+            elif ! rg -q -e 'fuzz_death_note_input\(' <<< "$text"; then
+                violation R1 "$area" "$file" "a libFuzzer target that does not call fuzz_death_note_input()"
+            fi
+        done < <(rg -l -e 'LLVMFuzzerTestOneInput' "$FUZZ_DIR/$area" -g '*.c' -g '*.cc' -g '*.cpp' 2> /dev/null | sort)
+    done
+}
+
+# The suppressions of a closed task: a suppression entry must not name a task
+# of tests/sanitizers/closed-tasks.txt (rule L8: the fix removes its entries).
+check_closed_tasks() {
+    local closed="$SAN_DIR/closed-tasks.txt" task file n line
+    [[ -f "$closed" ]] || return 0
+    while IFS= read -r task; do
+        [[ -z "$task" ]] && continue
+        while IFS=: read -r file n line; do
+            violation L8 "$(area_of "$file")" "$file:$n" "the task $task is closed ($closed), but this suppression comment still names it: remove its entries"
+        done < <(find "$FUZZ_DIR" "$SAN_DIR" -name '*.supp' -type f -print0 2> /dev/null \
+                 | xargs -0 -r rg -n -i -e "task ${task}\\b" || true)
+    done < <(rg -o -e '^#[0-9]+' "$closed" || true)
+}
+
+main() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --areas) AREAS="${2//,/ }"; shift 2 ;;
+            --no-builds) CHECK_BUILDS=0; shift ;;
+            --write-requests) WRITE_REQUESTS=1; shift ;;
+            --json) JSON_OUT="$2"; shift 2 ;;
+            -h|--help) print_usage; exit 0 ;;
+            *) echo "check-rules: the option '$1' is not known. Use --help." >&2; exit 2 ;;
+        esac
+    done
+    command -v jq > /dev/null || { echo "check-rules: jq is necessary." >&2; exit 2; }
+    command -v rg > /dev/null || { echo "check-rules: rg (ripgrep) is necessary." >&2; exit 2; }
+    if [[ -z "$AREAS" ]]; then
+        AREAS="$(find "$FUZZ_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2> /dev/null | sort | tr '\n' ' ')"
+    elif [[ "$AREAS" == "none" ]]; then
+        # --areas none: only the shared files (tests/sanitizers) and the
+        # build directories.
+        AREAS=""
+    fi
+
+    local sources=() area dir
+    for area in $AREAS; do
+        while IFS= read -r f; do sources+=("$f"); done < <(find "$FUZZ_DIR/$area" \
+            \( -name CMakeLists.txt -o -name '*.cmake' -o -name '*.sh' \) -type f 2> /dev/null | sort)
+    done
+    while IFS= read -r f; do sources+=("$f"); done < <(find "$SAN_DIR" -maxdepth 1 -name '*.cmake' -type f | sort)
+
+    check_sources_r1 "${sources[@]}"
+    check_reasons "${sources[@]}"
+    check_suppressions
+    check_run_sh
+    check_libfuzzer_commands
+    check_death_callback
+    check_closed_tasks
+    check_parity_sources
+    check_repro
+    if [[ $CHECK_BUILDS -eq 1 && -d "$BUILD_FUZZ" ]]; then
+        for dir in "$BUILD_FUZZ"/*/; do
+            dir="${dir%/}"
+            case "$(basename "$dir")" in
+                matrix|matrix-upstream|msan-libcxx|*-src) continue ;;
+            esac
+            check_build_dir "$dir"
+        done
+        check_results
+    fi
+
+    local v r a p m
+    for v in "${VIOLATIONS[@]}"; do
+        IFS=$'\t' read -r r a p m <<< "$v"
+        echo "$r $a $p: $m"
+        if [[ -n "$JSON_OUT" ]]; then
+            jq -nc --arg rule "$r" --arg area "$a" --arg place "$p" --arg message "$m" \
+                '{rule: $rule, area: $area, place: $place, message: $message}' >> "$JSON_OUT"
+        fi
+    done
+    [[ $WRITE_REQUESTS -eq 1 ]] && write_requests
+    echo "check-rules: ${#VIOLATIONS[@]} violation(s) in the areas [$AREAS] and tests/sanitizers." >&2
+    [[ ${#VIOLATIONS[@]} -eq 0 ]]
+}
+
+main "$@"
