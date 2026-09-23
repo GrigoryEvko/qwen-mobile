@@ -1,0 +1,37 @@
+hexagon: state the L2 limit of the dirty range tracker
+Fold-into: upstream/hexagon-host
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+The dirty range tracker of the DSP writes back and invalidates the lines of
+a range with hex_l2flush, a dccleaninva loop. On the v79 that loop does not
+reach the lines of the L2 cache, and the DMA transfers of the kernels
+bypass L2. Thus inside one op batch, an op can read an old line of L2
+after a DMA write, or the write-back of an old line can go over the bytes
+of a DMA write. The full write-back and invalidate at the start and at the
+end of each batch reaches L2, thus a batch of one op cannot have this
+property.
+
+This patch states that limit in a comment of htp-tensor.c. The code does
+not change. A range call of qurt_mem_cache_clean for each op, or DMA
+transfers through L2, close the property, but they cost decode or prefill
+time.
+
+diff --git a/ggml/src/ggml-hexagon/htp/htp-tensor.c b/ggml/src/ggml-hexagon/htp/htp-tensor.c
+index 760ccd8..7a90a2b 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-tensor.c
++++ b/ggml/src/ggml-hexagon/htp/htp-tensor.c
+@@ -11,6 +11,13 @@
+ #include "htp-ctx.h"
+ #include "work-queue.h"
+ 
++// The tracker writes back and invalidates the lines of a range with hex_l2flush, a dccleaninva loop.
++// On the v79 that loop does not reach the lines of the L2 cache, and the DMA transfers of the kernels
++// bypass L2. Thus inside one op batch, a line of L2 can hold old bytes of a range that a DMA transfer
++// wrote, or dirty bytes that a DMA transfer does not read. The full write-back and invalidate at the
++// start and at the end of each batch (qurt_mem_cache_clean) reaches L2. A range call of
++// qurt_mem_cache_clean for each op also reaches L2, but it costs decode and prefill time.
++
+ struct l2flush_range {
+     uint32_t start;       // line-aligned start address
+     uint32_t end;         // line-aligned end address

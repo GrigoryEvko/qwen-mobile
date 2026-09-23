@@ -190,3 +190,4 @@ fuzz-matrix/0004-sampler-give-each-padding-slot-of-the-penalties-its-own-token-i
 # memory: the loader reads a duplicate of a lazy tensor (the tied output on a device) from the file and not
 # through the lazy mapping, thus the lazy mode does not slow the load.
 memory/0005-llama-copy-a-duplicate-of-a-lazy-tensor-from-the-file.patch
+fuzz-hexhost/0013-hexagon-state-the-l2-limit-of-the-dirty-range-tracker.patch
