@@ -1,0 +1,359 @@
+hexagon: compute the matmul VTCM layout in 64 bits and saturate its int32 size
+Fold-into: upstream/hexagon-host
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+The HVX matmul layout (htp_mm_hvx_vtcm_layout_build) multiplies the size of
+an activation row by the row count, and the size of a weight row by the
+prefetch depth and by the thread count, in size_t. size_t has 32 bits on
+the DSP, thus a layout of 4 GB or more wraps, and the wrapped size can fit
+the VTCM. The host keeps the size in the int32 field vtcm_size of the kernel
+params, and the truncation gives the same small size. For example, a
+MUL_MAT_ID with Q8_0 weights of 11648 columns and 10240 activation rows
+needs 4296574464 bytes, and the two sides got 1607168 bytes. The DSP then
+accepted the op and wrote beyond the VTCM.
+
+This patch computes the sizes of that layout in uint64_t and saturates each
+size of the layout struct to SIZE_MAX. The host stores the total in
+vtcm_size with a saturation to INT32_MAX. Thus the host and the DSP refuse
+such a layout. A layout below 4 GB gives the same sizes as before.
+
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index f2e92d2..9fd703e 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -5008,6 +5008,13 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
+     GGML_UNUSED(src0);
+ }
+ 
++// The VTCM size of a matmul layout in the int32 field of the kernel params. A size above INT32_MAX
++// gives INT32_MAX, which is more than the VTCM budget, thus the checks against the budget refuse the
++// layout. A truncation to int32 could give a small size that fits.
++static inline int32_t ggml_hexagon_vtcm_i32(size_t v) {
++    return v > (size_t) INT32_MAX ? INT32_MAX : (int32_t) v;
++}
++
+ static void ggml_hexagon_precompute_hvx_mm_params(
+     const struct ggml_hexagon_session * sess,
+     const struct ggml_tensor * src0,
+@@ -5062,7 +5069,7 @@ static void ggml_hexagon_precompute_hvx_mm_params(
+                 );
+             }
+             kparams->n_prefetch = best_n_prefetch;
+-            kparams->vtcm_size      = L.total_bytes;
++            kparams->vtcm_size      = ggml_hexagon_vtcm_i32(L.total_bytes);
+             kparams->vtcm_src0_size = L.src0_bytes;
+             kparams->vtcm_src1_size = L.src1_bytes;
+             kparams->vtcm_dst_size  = L.dst_bytes;
+@@ -5106,7 +5113,7 @@ static void ggml_hexagon_precompute_hvx_mm_params(
+                 kparams->n_prefetch = best_n_prefetch;
+ 
+                 if (L.total_bytes <= vtcm_budget) {
+-                    kparams->vtcm_size = L.total_bytes;
++                    kparams->vtcm_size = ggml_hexagon_vtcm_i32(L.total_bytes);
+                     kparams->vtcm_src0_size = L.src0_bytes;
+                     kparams->vtcm_src1_size = L.src1_bytes;
+                     kparams->vtcm_dst_size = L.dst_bytes;
+@@ -5127,7 +5134,7 @@ static void ggml_hexagon_precompute_hvx_mm_params(
+                 );
+ 
+                 kparams->n_prefetch = 16;
+-                kparams->vtcm_size = L.total_bytes;
++                kparams->vtcm_size = ggml_hexagon_vtcm_i32(L.total_bytes);
+                 kparams->vtcm_src0_size = L.src0_bytes;
+                 kparams->vtcm_src1_size = L.src1_bytes;
+                 kparams->vtcm_dst_size = L.dst_bytes;
+@@ -5149,7 +5156,7 @@ static void ggml_hexagon_precompute_hvx_mm_params(
+         if (!is_batched && !is_permuted && L.total_bytes <= vtcm_budget) {
+             kparams->kernel_type = HTP_MM_KERNEL_HVX_F16_F16_VTCM;
+             kparams->src1_row_size = hex_round_up(ne10 * 2, 128);
+-            kparams->vtcm_size = L.total_bytes;
++            kparams->vtcm_size = ggml_hexagon_vtcm_i32(L.total_bytes);
+             kparams->vtcm_src0_size = L.src0_bytes;
+             kparams->vtcm_src1_size = L.src1_bytes;
+             kparams->vtcm_dst_size = L.dst_bytes;
+@@ -5165,7 +5172,7 @@ static void ggml_hexagon_precompute_hvx_mm_params(
+                 &L, kparams->kernel_type, wtype, ne10, src1_nrows, sess->n_threads,
+                 dst->nb[1], src0->nb[1], src1->nb[1], src2_row_size, 16, false, false
+             );
+-            kparams->vtcm_size = L.total_bytes;
++            kparams->vtcm_size = ggml_hexagon_vtcm_i32(L.total_bytes);
+             kparams->vtcm_src0_size = L.src0_bytes;
+             kparams->vtcm_src1_size = L.src1_bytes;
+             kparams->vtcm_dst_size = L.dst_bytes;
+@@ -5185,7 +5192,7 @@ static void ggml_hexagon_precompute_hvx_mm_params(
+         if (!is_batched && !is_permuted && L.total_bytes <= vtcm_budget) {
+             kparams->kernel_type = HTP_MM_KERNEL_HVX_F32_F32_VTCM;
+             kparams->src1_row_size = hex_round_up(ne10 * 4, 128);
+-            kparams->vtcm_size = L.total_bytes;
++            kparams->vtcm_size = ggml_hexagon_vtcm_i32(L.total_bytes);
+             kparams->vtcm_src0_size = L.src0_bytes;
+             kparams->vtcm_src1_size = L.src1_bytes;
+             kparams->vtcm_dst_size = L.dst_bytes;
+@@ -5197,7 +5204,7 @@ static void ggml_hexagon_precompute_hvx_mm_params(
+                 &L, kparams->kernel_type, wtype, ne10, src1_nrows, sess->n_threads,
+                 dst->nb[1], src0->nb[1], src1->nb[1], src2_row_size, 16, false, false
+             );
+-            kparams->vtcm_size = L.total_bytes;
++            kparams->vtcm_size = ggml_hexagon_vtcm_i32(L.total_bytes);
+             kparams->vtcm_src0_size = L.src0_bytes;
+             kparams->vtcm_src1_size = L.src1_bytes;
+             kparams->vtcm_dst_size = L.dst_bytes;
+@@ -5551,7 +5558,7 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
+             kparams->vtcm_src0_size = L.src0_bytes;
+             kparams->vtcm_src1_size = L.src1_bytes;
+             kparams->vtcm_dst_size  = L.dst_bytes;
+-            kparams->vtcm_size      = L.total_bytes;
++            kparams->vtcm_size      = ggml_hexagon_vtcm_i32(L.total_bytes);
+             kparams->n_prefetch     = best_n_prefetch;
+             kparams->n_weights      = n_weights;
+         } else {
+@@ -5565,7 +5572,7 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
+             kparams->vtcm_src0_size = L.src0_bytes;
+             kparams->vtcm_src1_size = L.src1_bytes;
+             kparams->vtcm_dst_size  = L.dst_bytes;
+-            kparams->vtcm_size      = L.total_bytes;
++            kparams->vtcm_size      = ggml_hexagon_vtcm_i32(L.total_bytes);
+             kparams->n_prefetch     = best_n_prefetch;
+             kparams->n_weights      = n_weights;
+         }
+diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.h b/ggml/src/ggml-hexagon/htp/matmul-ops.h
+index 1bf43b1..56b1de3 100644
+--- a/ggml/src/ggml-hexagon/htp/matmul-ops.h
++++ b/ggml/src/ggml-hexagon/htp/matmul-ops.h
+@@ -285,6 +285,18 @@ static inline size_t htp_mm_round_up(size_t n, size_t m) {
+     return ((n + m - 1) / m) * m;
+ }
+ 
++// The round up of a size in 64 bits: a layout size can be 4 GB or more, and size_t has 32 bits on
++// the DSP.
++static inline uint64_t htp_mm_round_up64(uint64_t n, uint64_t m) {
++    return ((n + m - 1) / m) * m;
++}
++
++// A layout size in size_t. A size that does not fit (4 GB or more on the DSP) gives the maximum,
++// which is more than the VTCM, thus the op refuses the layout.
++static inline size_t htp_mm_size_sat(uint64_t n) {
++    return n > (uint64_t) SIZE_MAX ? SIZE_MAX : (size_t) n;
++}
++
+ // Whether the HMX 2D path overlaps the weight DMA and the dequantization with the multiply.
+ //
+ // The threshold was m > 32, which left every row count from 5 to 32 on the serial path. That is
+@@ -508,11 +520,14 @@ static inline void htp_mm_hvx_vtcm_layout_build(
+     bool is_matmul_id,
+     bool is_fused_nx
+ ) {
+-    size_t src0_sz = 0;
+-    size_t src1_sz = 0;
+-    size_t src2_sz = src2_row_size > 0 ? htp_mm_round_up(src2_row_size, 128) : 0;
+-    size_t src3_sz = 0;
+-    size_t dst_sz  = 0;
++    // The sizes have 64 bits: a size_t of 32 bits on the DSP can wrap for a large activation or a
++    // large prefetch, and a wrapped total can fit the VTCM. Each size of a layout that fits the VTCM
++    // is below 4 GB, thus it is the same as before.
++    uint64_t src0_sz = 0;
++    uint64_t src1_sz = 0;
++    uint64_t src2_sz = src2_row_size > 0 ? htp_mm_round_up64(src2_row_size, 128) : 0;
++    uint64_t src3_sz = 0;
++    uint64_t dst_sz  = 0;
+ 
+     const bool is_repack = (wtype == HTP_TYPE_Q4_0 || wtype == HTP_TYPE_Q4_1 ||
+                             wtype == HTP_TYPE_Q8_0 || wtype == HTP_TYPE_IQ4_NL ||
+@@ -520,27 +535,27 @@ static inline void htp_mm_hvx_vtcm_layout_build(
+                             wtype == HTP_TYPE_Q4_K);
+ 
+     if (is_fused_nx) {
+-        const size_t src0_row_size_padded = hex_round_up(src0_row_size, 128);
+-        const size_t quant_scratch_size = hex_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float)) * n_threads;
++        const uint64_t src0_row_size_padded = htp_mm_round_up64(src0_row_size, 128);
++        const uint64_t quant_scratch_size = htp_mm_round_up64((uint64_t) ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float)) * n_threads;
+ 
+-        size_t weight_sz_per_thread = 0;
++        uint64_t weight_sz_per_thread = 0;
+ 
+         if (is_repack) {
+             uint32_t aligned_tile_size = htp_mm_get_weight_aligned_tile_size(wtype);
+             uint32_t n_k_tiles = hex_round_up(ne10, 32) / 32;
+-            uint32_t tile_row_size = n_k_tiles * aligned_tile_size;
++            uint64_t tile_row_size = (uint64_t) n_k_tiles * aligned_tile_size;
+ 
+-            weight_sz_per_thread = hex_round_up(n_prefetch * tile_row_size, 128);
++            weight_sz_per_thread = htp_mm_round_up64(n_prefetch * tile_row_size, 128);
+         } else {
+-            weight_sz_per_thread = hex_round_up(n_prefetch * src0_row_size_padded, 128);
++            weight_sz_per_thread = htp_mm_round_up64(n_prefetch * src0_row_size_padded, 128);
+         }
+ 
+-        size_t flat_act_row_size  = (wtype == HTP_TYPE_Q4_1 || wtype == HTP_TYPE_Q4_K) ? htp_mm_q8_1_flat_row_size(ne10)  : htp_mm_q8_0_flat_row_size(ne10);
+-        size_t tiled_act_row_size = (wtype == HTP_TYPE_Q4_1 || wtype == HTP_TYPE_Q4_K) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
++        uint64_t flat_act_row_size  = (wtype == HTP_TYPE_Q4_1 || wtype == HTP_TYPE_Q4_K) ? htp_mm_q8_1_flat_row_size(ne10)  : htp_mm_q8_0_flat_row_size(ne10);
++        uint64_t tiled_act_row_size = (wtype == HTP_TYPE_Q4_1 || wtype == HTP_TYPE_Q4_K) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
+ 
+-        size_t act_sz = (kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT)
+-            ? hex_round_up(flat_act_row_size  * src1_nrows, 128)
+-            : hex_round_up(tiled_act_row_size * src1_nrows, 128);
++        uint64_t act_sz = (kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT)
++            ? htp_mm_round_up64(flat_act_row_size  * src1_nrows, 128)
++            : htp_mm_round_up64(tiled_act_row_size * src1_nrows, 128);
+ 
+         src0_sz = weight_sz_per_thread * n_threads; // shared single-weight prefetch buffer
+         src1_sz = act_sz;                           // quantized activation buffer
+@@ -548,94 +563,94 @@ static inline void htp_mm_hvx_vtcm_layout_build(
+         src3_sz = 0;
+         dst_sz  = quant_scratch_size;
+     } else if (is_matmul_id) {
+-        const size_t src0_row_size_padded = htp_mm_round_up(src0_row_size, 128);
+-        const size_t src1_row_size_tiled = (wtype == HTP_TYPE_Q4_1 || wtype == HTP_TYPE_Q4_K) ? htp_mm_q8_1_tiled_row_size(ne10)
+-                                                                                               : htp_mm_q8_0_tiled_row_size(ne10);
++        const uint64_t src0_row_size_padded = htp_mm_round_up64(src0_row_size, 128);
++        const uint64_t src1_row_size_tiled = (wtype == HTP_TYPE_Q4_1 || wtype == HTP_TYPE_Q4_K) ? htp_mm_q8_1_tiled_row_size(ne10)
++                                                                                                 : htp_mm_q8_0_tiled_row_size(ne10);
+ 
+-        size_t src0_sz_per_thread = htp_mm_round_up(n_prefetch * src0_row_size_padded, 256);
+-        src1_sz                   = htp_mm_round_up(src1_row_size_tiled * src1_nrows, 256);
++        uint64_t src0_sz_per_thread = htp_mm_round_up64(n_prefetch * src0_row_size_padded, 256);
++        src1_sz                     = htp_mm_round_up64(src1_row_size_tiled * src1_nrows, 256);
+ 
+         if (is_repack) {
+             const uint32_t aligned_tile_size = htp_mm_get_weight_aligned_tile_size(wtype);
+             const uint32_t n_k_tiles         = ne10 / 32;
+-            const uint32_t tile_row_size     = n_k_tiles * aligned_tile_size;
+-            size_t repacked_vtcm_size        = htp_mm_round_up(n_prefetch * tile_row_size, 256);
++            const uint64_t tile_row_size     = (uint64_t) n_k_tiles * aligned_tile_size;
++            uint64_t repacked_vtcm_size      = htp_mm_round_up64(n_prefetch * tile_row_size, 256);
+             src0_sz_per_thread               = repacked_vtcm_size;
+         }
+ 
+         src0_sz = src0_sz_per_thread * n_threads;
+-        dst_sz  = htp_mm_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float)) * n_threads;
++        dst_sz  = htp_mm_round_up64((uint64_t) ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float)) * n_threads;
+     } else {
+-        const size_t src0_row_size_padded = htp_mm_round_up(src0_row_size, 128);
++        const uint64_t src0_row_size_padded = htp_mm_round_up64(src0_row_size, 128);
+         const size_t dst_nrows = (src1_nrows > 1) ? 0 : 1;
+ 
+         switch (kernel_type) {
+             case HTP_MM_KERNEL_HVX_F16_F16_VTCM: {
+-                size_t f16_src1_row_size = htp_mm_round_up(ne10 * 2, 128);
+-                src1_sz = htp_mm_round_up(f16_src1_row_size * src1_nrows, 256);
+-                src0_sz = htp_mm_round_up(n_prefetch * src0_row_size_padded, 256) * n_threads;
+-                dst_sz  = dst_nrows > 0 ? htp_mm_round_up(dst_row_size, 128) * n_threads : 0;
++                uint64_t f16_src1_row_size = htp_mm_round_up64((uint64_t) ne10 * 2, 128);
++                src1_sz = htp_mm_round_up64(f16_src1_row_size * src1_nrows, 256);
++                src0_sz = htp_mm_round_up64(n_prefetch * src0_row_size_padded, 256) * n_threads;
++                dst_sz  = dst_nrows > 0 ? htp_mm_round_up64(dst_row_size, 128) * n_threads : 0;
+                 break;
+             }
+             case HTP_MM_KERNEL_HVX_F16_F32_DDR:
+             case HTP_MM_KERNEL_HVX_F16_F16_DDR:
+             case HTP_MM_KERNEL_HVX_F32_F32_DDR:
+             case HTP_MM_KERNEL_HVX_F32_F16_DDR: {
+-                src0_sz = htp_mm_round_up(n_prefetch * src0_row_size, 256) * n_threads;
+-                src1_sz = htp_mm_round_up(n_prefetch * src1_row_size, 256) * n_threads;
+-                dst_sz  = dst_nrows > 0 ? htp_mm_round_up(dst_row_size, 128) * n_threads : 0;
++                src0_sz = htp_mm_round_up64((uint64_t) n_prefetch * src0_row_size, 256) * n_threads;
++                src1_sz = htp_mm_round_up64((uint64_t) n_prefetch * src1_row_size, 256) * n_threads;
++                dst_sz  = dst_nrows > 0 ? htp_mm_round_up64(dst_row_size, 128) * n_threads : 0;
+                 break;
+             }
+             case HTP_MM_KERNEL_HVX_F32_F32_VTCM: {
+-                size_t f32_src1_row_size = htp_mm_round_up(ne10 * 4, 128);
+-                src1_sz = htp_mm_round_up(f32_src1_row_size * src1_nrows, 256);
+-                src0_sz = htp_mm_round_up(n_prefetch * src0_row_size_padded, 256) * n_threads;
+-                dst_sz  = dst_nrows > 0 ? htp_mm_round_up(dst_row_size, 128) * n_threads : 0;
++                uint64_t f32_src1_row_size = htp_mm_round_up64((uint64_t) ne10 * 4, 128);
++                src1_sz = htp_mm_round_up64(f32_src1_row_size * src1_nrows, 256);
++                src0_sz = htp_mm_round_up64(n_prefetch * src0_row_size_padded, 256) * n_threads;
++                dst_sz  = dst_nrows > 0 ? htp_mm_round_up64(dst_row_size, 128) * n_threads : 0;
+                 break;
+             }
+             case HTP_MM_KERNEL_HVX_QUANT_BLOCK:
+             case HTP_MM_KERNEL_HVX_QUANT_MULTIROW:
+             case HTP_MM_KERNEL_HVX_QUANT_ROW: {
+-                size_t q_src1_row_size = (wtype == HTP_TYPE_Q4_1 || wtype == HTP_TYPE_Q4_K) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
++                uint64_t q_src1_row_size = (wtype == HTP_TYPE_Q4_1 || wtype == HTP_TYPE_Q4_K) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
+ 
+-                src0_sz = htp_mm_round_up(n_prefetch * src0_row_size_padded, 256);
+-                src1_sz = htp_mm_round_up(q_src1_row_size * src1_nrows, 256);
++                src0_sz = htp_mm_round_up64(n_prefetch * src0_row_size_padded, 256);
++                src1_sz = htp_mm_round_up64(q_src1_row_size * src1_nrows, 256);
+ 
+                 src0_sz = src0_sz * n_threads;
+ 
+                 if (is_repack) {
+                     uint32_t aligned_tile_size = htp_mm_get_weight_aligned_tile_size(wtype);
+                     uint32_t n_k_tiles = ne10 / 32;
+-                    uint32_t tile_row_size = n_k_tiles * aligned_tile_size;
+-                    size_t repacked_vtcm_size = htp_mm_round_up(n_prefetch * tile_row_size, 256);
++                    uint64_t tile_row_size = (uint64_t) n_k_tiles * aligned_tile_size;
++                    uint64_t repacked_vtcm_size = htp_mm_round_up64(n_prefetch * tile_row_size, 256);
+                     src0_sz = repacked_vtcm_size * n_threads;
+                 }
+ 
+-                size_t quant_scratch_size_per_thread = htp_mm_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float));
+-                size_t dst_slice_per_thread = (dst_nrows > 0 && src1_nrows == 1) ? htp_mm_round_up((dst_row_size + n_threads - 1) / n_threads, 128) : 0;
+-                size_t dst_size_per_thread = (dst_slice_per_thread > quant_scratch_size_per_thread) ? dst_slice_per_thread : quant_scratch_size_per_thread;
++                uint64_t quant_scratch_size_per_thread = htp_mm_round_up64((uint64_t) ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float));
++                uint64_t dst_slice_per_thread = (dst_nrows > 0 && src1_nrows == 1) ? htp_mm_round_up64((dst_row_size + n_threads - 1) / n_threads, 128) : 0;
++                uint64_t dst_size_per_thread = (dst_slice_per_thread > quant_scratch_size_per_thread) ? dst_slice_per_thread : quant_scratch_size_per_thread;
+                 dst_sz = dst_size_per_thread * n_threads;
+                 break;
+             }
+             case HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT: {
+-                size_t q_src1_row_size = (wtype == HTP_TYPE_Q4_1 || wtype == HTP_TYPE_Q4_K) ? htp_mm_q8_1_flat_row_size(ne10) : htp_mm_q8_0_flat_row_size(ne10);
++                uint64_t q_src1_row_size = (wtype == HTP_TYPE_Q4_1 || wtype == HTP_TYPE_Q4_K) ? htp_mm_q8_1_flat_row_size(ne10) : htp_mm_q8_0_flat_row_size(ne10);
+ 
+-                src0_sz = htp_mm_round_up(n_prefetch * src0_row_size_padded, 256);
+-                src1_sz = htp_mm_round_up(q_src1_row_size * src1_nrows, 256);
++                src0_sz = htp_mm_round_up64(n_prefetch * src0_row_size_padded, 256);
++                src1_sz = htp_mm_round_up64(q_src1_row_size * src1_nrows, 256);
+ 
+                 src0_sz = src0_sz * n_threads;
+ 
+                 if (is_repack) {
+                     uint32_t aligned_tile_size = htp_mm_get_weight_aligned_tile_size(wtype);
+                     uint32_t n_k_tiles = ne10 / 32;
+-                    uint32_t tile_row_size = n_k_tiles * aligned_tile_size;
+-                    size_t repacked_vtcm_size = htp_mm_round_up(n_prefetch * tile_row_size, 256);
++                    uint64_t tile_row_size = (uint64_t) n_k_tiles * aligned_tile_size;
++                    uint64_t repacked_vtcm_size = htp_mm_round_up64(n_prefetch * tile_row_size, 256);
+                     src0_sz = repacked_vtcm_size * n_threads;
+                 }
+ 
+-                size_t quant_scratch_size_per_thread = htp_mm_round_up(ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float));
+-                size_t dst_slice_per_thread = dst_nrows > 0 ? htp_mm_round_up((dst_row_size + n_threads - 1) / n_threads, 128) : 0;
+-                size_t dst_size_per_thread = (dst_slice_per_thread > quant_scratch_size_per_thread) ? dst_slice_per_thread : quant_scratch_size_per_thread;
++                uint64_t quant_scratch_size_per_thread = htp_mm_round_up64((uint64_t) ne10 * sizeof(float), QK_Q8_0_TILED * sizeof(float));
++                uint64_t dst_slice_per_thread = dst_nrows > 0 ? htp_mm_round_up64((dst_row_size + n_threads - 1) / n_threads, 128) : 0;
++                uint64_t dst_size_per_thread = (dst_slice_per_thread > quant_scratch_size_per_thread) ? dst_slice_per_thread : quant_scratch_size_per_thread;
+                 dst_sz = dst_size_per_thread * n_threads;
+                 break;
+             }
+@@ -644,19 +659,19 @@ static inline void htp_mm_hvx_vtcm_layout_build(
+         }
+     }
+ 
+-    size_t off = 0;
++    uint64_t off = 0;
+     VTCM_LAYOUT_ALLOC(off, off_src0, src0_sz);
+     VTCM_LAYOUT_ALLOC(off, off_src1, src1_sz);
+     VTCM_LAYOUT_ALLOC(off, off_src2, src2_sz);
+     VTCM_LAYOUT_ALLOC(off, off_src3, src3_sz);
+     VTCM_LAYOUT_ALLOC(off, off_dst,  dst_sz);
+ 
+-    L->src0_bytes = src0_sz;
+-    L->src1_bytes = src1_sz;
+-    L->src2_bytes = src2_sz;
+-    L->src3_bytes = src3_sz;
+-    L->dst_bytes  = dst_sz;
+-    L->total_bytes = off;
++    L->src0_bytes  = htp_mm_size_sat(src0_sz);
++    L->src1_bytes  = htp_mm_size_sat(src1_sz);
++    L->src2_bytes  = htp_mm_size_sat(src2_sz);
++    L->src3_bytes  = htp_mm_size_sat(src3_sz);
++    L->dst_bytes   = htp_mm_size_sat(dst_sz);
++    L->total_bytes = htp_mm_size_sat(off);
+ }
+ 
+ static inline size_t htp_mm_hmx_get_2d_vtcm_size(

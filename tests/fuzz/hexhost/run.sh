@@ -35,17 +35,13 @@ ASAN_RT=libclang_rt.asan-aarch64-android.so
 # thus the fuzzers look for other defects. The test mode does not set them, thus each regression
 # input of such a defect fails. The list is comma-separated, as HEXHOST_IGNORE reads it.
 #
-#   dsp-vtcm-size-wrap  The kernel params keep the VTCM size of a matmul layout in an int32 field,
-#                       and the DSP computes the layout with a 32-bit size_t. A layout of 4 GB or
-#                       more (MUL_MAT_ID with many activation rows) thus gets a small size on the
-#                       two sides, the host packs the op, and the op writes beyond VTCM on the NPU.
 #   gdn-state-tail-later-split
 #                       The fused GDN state op does not write the state tail of the GATED_DELTA_NET
 #                       output, and the matcher sees only the nodes of one split. Thus a reader of
 #                       that tail in a later split gets bytes that no op wrote. The model graphs have
 #                       no such reader: hexhost_graphs checks the decode, prefill, MTP and image
 #                       paths of the 2B and the 4B (graphs mode of this script).
-KNOWN_IDS="dsp-vtcm-size-wrap,gdn-state-tail-later-split"
+KNOWN_IDS="gdn-state-tail-later-split"
 
 # The known properties of the NPU in the phone runs. The phone driver compares HTP0 with the CPU
 # backend of the phone, thus each property shows as a difference:
