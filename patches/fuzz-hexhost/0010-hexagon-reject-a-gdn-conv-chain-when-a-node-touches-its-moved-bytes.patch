@@ -1,0 +1,99 @@
+hexagon: reject a GDN conv chain when a node touches the bytes that the fused op moves
+Fold-into: patches/hexagon-fusion/0007-hexagon-htp-gdn-fusions-with-rollback-slots.patch
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+The fused GDN_CONV_STEP or GDN_CONV_CHUNK stands at the SILU or at the
+first CPY of the chain, at the one that comes first in the graph. Thus the
+op can write the output of the SILU at an earlier index than the graph
+does, and it reads the projection and the conv weights at a later index
+than the CONCAT and the SSM_CONV. The graph allocator can give the bytes of
+a tensor with no more readers to a different tensor. A node between the
+two positions can then read bytes that the fused op wrote too early, or
+write bytes that the fused op reads too late. For example, the allocator
+can give the output of the SILU the bytes of s_copy, while the GET_ROWS of
+the delta net state reads s_copy between the CPY and the SILU. That
+GET_ROWS then reads the conv output as the slot index.
+
+The matcher rejected only one case of this condition: a projection and an
+output that share bytes. This patch adds a check of each node between the
+two positions of each moved access. Such a node must not read or write the
+bytes of the output, and it must not write the bytes of the projection or
+of the weights. The check compares byte ranges, and it ignores views,
+empty nodes and the members of the chain. It runs when a graph is new to
+the graph cache.
+
+diff --git a/ggml/src/ggml-hexagon/htp-gdn-match.h b/ggml/src/ggml-hexagon/htp-gdn-match.h
+index 635a6f8..4633e1f 100644
+--- a/ggml/src/ggml-hexagon/htp-gdn-match.h
++++ b/ggml/src/ggml-hexagon/htp-gdn-match.h
+@@ -176,6 +176,41 @@ static inline bool ggml_hexagon_gdn_chain_span_is_clean(const ggml_cgraph * gf,
+     return true;
+ }
+ 
++// True when the bytes of the two tensors share a byte. A tensor with no data shares no byte.
++static inline bool ggml_hexagon_gdn_bytes_overlap(const ggml_tensor * a, const ggml_tensor * b) {
++    if (!a->data || !b->data) {
++        return false;
++    }
++    const char * ad = (const char *) a->data;
++    const char * bd = (const char *) b->data;
++    return ad < bd + ggml_nbytes(b) && bd < ad + ggml_nbytes(a);
++}
++
++// The fused op reads an input or writes an output at its emit index. The replaced node did that at the
++// index `at`. This change of position is safe when no node between the two indexes writes a byte of
++// the tensor. For an output, no node there can read a byte of it either. The allocator can give the
++// bytes of a tensor with no more readers to a different tensor, thus the check compares bytes and not
++// tensors. The check ignores views, empty nodes and the members of the chain.
++// O(|emit - at| * (GGML_MAX_SRC + members)).
++static inline bool ggml_hexagon_gdn_move_is_safe(const ggml_cgraph * gf, int emit, int at, const ggml_tensor * t,
++                                                 bool is_output, const std::vector<ggml_tensor *> & members) {
++    for (int i = std::min(emit, at) + 1; i < std::max(emit, at); i++) {
++        ggml_tensor * n = gf->nodes[i];
++        if (ggml_is_empty(n) || ggml_hexagon_gdn_is_view_op(n) || ggml_hexagon_gdn_contains(members, n)) {
++            continue;
++        }
++        if (ggml_hexagon_gdn_bytes_overlap(n, t)) {
++            return false;
++        }
++        for (int s = 0; is_output && s < GGML_MAX_SRC; s++) {
++            if (n->src[s] && ggml_hexagon_gdn_bytes_overlap(n->src[s], t)) {
++                return false;
++            }
++        }
++    }
++    return true;
++}
++
+ // The one CPY whose source is a view of `src_root`. Two of them (rollback snapshots) give nullptr and set `n_found`.
+ static inline ggml_tensor * ggml_hexagon_gdn_find_cpy(const ggml_cgraph * gf, const ggml_tensor * src_root, int & n_found) {
+     ggml_tensor * P = nullptr;
+@@ -420,10 +455,23 @@ static inline const char * ggml_hexagon_gdn_conv_chain_check(const ggml_cgraph *
+     if (!ggml_hexagon_gdn_chain_span_is_clean(gf, ir->second, last_idx, cache, members)) {
+         return "another node touches the conv cache inside the chain span";
+     }
+-    // The op reads the projection of the tokens and writes its own output in
+-    // one pass over the channels. The fused op stands at the first CPY, long
+-    // before the SILU, thus the allocator can give the output the bytes of a
+-    // tensor that died earlier, and the projection is such a tensor.
++    // The fused op stands at the SILU or at the first CPY, at the one that comes first in the graph.
++    // Thus the op can write the output before the SILU, and it reads the projection and the weights
++    // at that index, not at the CONCAT and the SSM_CONV.
++    auto ici = index.find(CI);
++    auto ic  = index.find(C);
++    if (ici == index.end() || ic == index.end()) {
++        return "the CONCAT or the SSM_CONV is not a node of the graph";
++    }
++    if (!ggml_hexagon_gdn_move_is_safe(gf, emit, is, S, true, members)) {
++        return "a node between the CPY and the SILU touches the bytes of the output";
++    }
++    if (!ggml_hexagon_gdn_move_is_safe(gf, emit, ici->second, xt, false, members) ||
++        !ggml_hexagon_gdn_move_is_safe(gf, emit, ic->second, W, false, members)) {
++        return "a node between the CPY and the CONCAT or the SSM_CONV writes the bytes of an input";
++    }
++    // The op reads the projection of the tokens and writes its own output in one pass over the
++    // channels, thus the two must not share bytes.
+     {
+         const char * xd = (const char *) xt->data;
+         const char * sd = (const char *) S->data;

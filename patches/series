@@ -175,3 +175,4 @@ memory/0003-hexagon-convert-q8_0-kv-rows-into-the-hmx-tiles-two-blocks-at-a-time
 fuzz-ops/0014-ggml-cpu-the-rope-cache-reads-no-freq-factor-past-src2.patch
 fuzz-hexhost/0008-hexagon-fuse-mul-mat-and-add-only-for-the-one-reader-of-the-product.patch
 fuzz-hexhost/0009-hexagon-keep-the-fd-map-of-an-op-batch-after-the-buffer-sort.patch
+fuzz-hexhost/0010-hexagon-reject-a-gdn-conv-chain-when-a-node-touches-its-moved-bytes.patch
