@@ -97,7 +97,10 @@ def test_reference_scale_maps_the_signed_maximum_to_the_largest_level() -> None:
         idx = grid.quantize_blocks(blocks, d)
         assert grid.value(idx)[0, 0, 5] == top and grid.value(idx)[1, 0, 7] == top
     zero = torch.zeros(1, 1, BLOCK)
-    assert Q4_0Grid().scale_rtn(zero)[0, 0] == 1.0
+    for grid in (Q4_0Grid(), IQ4NLGrid()):
+        d = grid.scale_rtn(zero)
+        assert d[0, 0] == 0.0
+        assert torch.equal(grid.value(grid.quantize_blocks(zero, d)) * d[..., None], zero)
 
 
 def test_scale_search_keeps_a_block_that_is_on_the_grid() -> None:

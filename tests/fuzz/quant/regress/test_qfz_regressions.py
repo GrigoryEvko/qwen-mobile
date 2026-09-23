@@ -29,10 +29,12 @@ from qfz_common import LLAMA_DIR, fixed
 from qfz_rawgguf import array_value, build_file, header, string_value, tensor_info
 from qfz_strategies import MatrixSpec
 from qfz_toy import SMALL, write_source
+from quant.blockopt import STELinear
 from quant.export import export
-from quant.grid import block_error, dequantize, pack_nibbles, q8_0_quantize, quantize
-from quant.grids import IQ4NLGrid, Q4_0Grid
+from quant.grid import block_error, dequantize, pack_nibbles, pack_q8_0, q8_0_dequantize, q8_0_quantize, quantize
+from quant.grids import CodebookGrid, IQ4NLGrid, Q4_0Grid
 from quant.plan import Plan
+from quant.solver import solve_grid
 
 CPU = torch.device("cpu")
 
@@ -135,6 +137,85 @@ def test_scale_search_holds_the_reference_scale() -> None:
     grid = Q4_0Grid()
     sse = {s: float((dequantize(grid, *quantize(grid, w, search=s)) - w).double().pow(2).sum()) for s in (True, False)}
     assert sse[True] <= sse[False], f"the search gives {sse[True]:.6e}, the reference scale {sse[False]:.6e}"
+
+
+# A symmetric codebook with no zero level, as fit_codebook makes one.
+CB4_LEVELS = torch.tensor([-127, -85, -55, -36, -22, -12, -5, -1, 1, 5, 12, 22, 36, 55, 85, 127], dtype=torch.float32)
+GRIDS_4BIT = {"Q4_0": Q4_0Grid, "IQ4_NL": IQ4NLGrid, "CB4": lambda: CodebookGrid(CB4_LEVELS)}
+
+
+def _zero_and_one_value(top: float) -> tuple[torch.Tensor, float]:
+    """Give two blocks: all zeros, and zeros with the value top · 2^-6 at column 5. Give that value too.
+
+    The reference scale of the second block is 2^-6 exactly, thus its value
+    decodes exactly on the level of largest magnitude.
+    """
+    v = float(top) * 2.0 ** -6
+    w = torch.zeros(2, 32)
+    w[1, 5] = v
+    return w, v
+
+
+@pytest.mark.parametrize("kind", sorted(GRIDS_4BIT))
+def test_zero_block_decodes_to_zero_on_each_4bit_grid(kind: str) -> None:
+    """An all-zero block decodes to zero, and a block with one value decodes to its exact values.
+
+    The paths: the plain rounding, the scale search, and the solver with an
+    identity Hessian (no error feedback, thus the same result as the plain
+    rounding and the search). A grid with no zero level (IQ4_NL, CB4) decodes
+    an all-zero block with a non-zero scale to the smallest level times the
+    scale for each element, thus the scale of that block must be 0.
+    """
+    grid = GRIDS_4BIT[kind]()
+    w, v = _zero_and_one_value(float(grid.top))
+    near_zero = float(grid.levels[grid.round(torch.zeros(1))][0])
+    results = {}
+    for search in (False, True):
+        idx, d = quantize(grid, w, search=search)
+        idx_s, d_s, _, _ = solve_grid(w, torch.eye(32), grid, damp=0.0, search=search)
+        assert torch.equal(idx_s, idx) and torch.equal(d_s, d), f"the solver differs from the rounding, {search=}"
+        results[search] = dequantize(grid, idx, d)
+        assert float(d[0, 0]) == 0.0, f"the all-zero block has the scale {float(d[0, 0])}, {search=}"
+        assert torch.equal(results[search][0], torch.zeros(32)), f"the all-zero block decodes to non-zero, {search=}"
+    d_plain = 2.0 ** -6
+    want = torch.full((32,), near_zero * d_plain)
+    want[5] = v
+    assert torch.equal(results[False][1], want), f"the plain rounding gives {results[False][1].tolist()}"
+    err = {s: float((results[s][1] - w[1]).double().pow(2).sum()) for s in (False, True)}
+    assert err[True] <= err[False], f"the search gives the error {err[True]:.4e}, the plain rounding {err[False]:.4e}"
+    if kind in ("Q4_0", "IQ4_NL"):
+        idx, d = quantize(grid, w, search=True)
+        decoded = gguf.quants.dequantize(pack_nibbles(idx, d), getattr(gguf.GGMLQuantizationType, kind))
+        assert np.array_equal(decoded, results[True].numpy()), "gguf-py decodes the packed blocks to other values"
+    # The block optimizer starts from the solved scale 0 of the all-zero block, and its final F16 scale is 0.
+    ste = STELinear(w, quantize(grid, w, search=False)[1], grid, learn_levels=False)
+    assert torch.equal(ste.finalize().dequantized()[0], torch.zeros(32)), "the block optimizer decodes to non-zero"
+
+
+@pytest.mark.parametrize("search", [False, True])
+def test_zero_block_packs_to_the_bytes_of_the_ggml_q4_0_reference(search: bool) -> None:
+    """An all-zero Q4_0 block, with +0 and -0 elements, packs to the bytes of quantize_row_q4_0_ref of ggml.
+
+    That function starts its maximum at +0 and keeps it for an all-zero
+    block, thus its scale is +0 / -8 = -0 (the F16 bits 8000), and each
+    index is 8 (the nibble bytes 0x88).
+    """
+    w = torch.zeros(1, 32)
+    w[0, ::3] = -0.0
+    packed = pack_nibbles(*quantize(Q4_0Grid(), w, search=search))
+    assert packed[0, :2].tobytes() == b"\x00\x80", f"the scale bits are {packed[0, :2].tobytes().hex()}"
+    assert (packed[0, 2:] == 0x88).all()
+
+
+def test_zero_block_decodes_to_zero_in_q8_0() -> None:
+    """q8_0_quantize decodes an all-zero block to zero and a block with the value 127 · 2^-6 to its exact values."""
+    w, v = _zero_and_one_value(127.0)
+    q, d = q8_0_quantize(w)
+    want = torch.zeros(2, 32)
+    want[1, 5] = v
+    assert torch.equal(q8_0_dequantize(q, d), want)
+    decoded = gguf.quants.dequantize(pack_q8_0(q, d), gguf.GGMLQuantizationType.Q8_0)
+    assert np.array_equal(decoded, want.numpy())
 
 
 # --- The export -----------------------------------------------------------------------------------------

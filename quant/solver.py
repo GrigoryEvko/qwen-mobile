@@ -23,7 +23,7 @@ from __future__ import annotations
 import torch
 
 from .grid import BLOCK, ROW_CHUNK, scale_search
-from .grids import Grid
+from .grids import Grid, divisor
 
 
 def _damped(h: torch.Tensor, damp: float, relative_to: str) -> torch.Tensor:
@@ -118,7 +118,7 @@ def _solve_rows(w: torch.Tensor, hinv: torch.Tensor, diag_h: torch.Tensor, grid:
             assert d_cur is not None
             wc = w1[:, i]
             dd = hinv1[i, i]
-            idx = grid.round(wc / d_cur)
+            idx = grid.round(wc / divisor(d_cur))
             deq = grid.value(idx) * d_cur
             idx1[:, i] = idx
             resid = wc - deq

@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import torch
 
+from .grids import divisor
+
 BLOCK = 32
 
 
@@ -161,7 +163,7 @@ def quantize_trellis(w: torch.Tensor, d: torch.Tensor, trellis: Trellis, col_wei
     Returns (codes, heads, trellis). The values are d[block] · lut[state].
     """
     rows, cols = w.shape
-    x = (w.to(torch.float32).reshape(rows, cols // BLOCK, BLOCK) / d.to(torch.float32)[..., None]).reshape(rows, cols)
+    x = (w.to(torch.float32).reshape(rows, cols // BLOCK, BLOCK) / divisor(d.to(torch.float32))[..., None]).reshape(rows, cols)
     wt = None
     if col_weights is not None:
         wt = (col_weights.to(torch.float32)[None, :] * d.to(torch.float32).repeat_interleave(BLOCK, dim=1).pow(2))

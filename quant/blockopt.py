@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from .grid import BLOCK, ROW_CHUNK, dequantize, quantize
-from .grids import CodebookGrid, Grid
+from .grids import CodebookGrid, Grid, divisor
 
 # The small tensors that stay fixed: their GGUF form is not a plain copy of the checkpoint value.
 FROZEN = ("conv1d", "A_log", "dt_bias")
@@ -146,7 +146,7 @@ class STELinear(nn.Module):
         idx = torch.empty(self.rows, self.cols, dtype=torch.int8, device=d.device)
         for r in range(0, self.rows, ROW_CHUNK):
             blocks = self.weight[r:r + ROW_CHUNK].view(-1, self.cols // BLOCK, BLOCK)
-            idx[r:r + ROW_CHUNK] = grid.round(blocks / d[r:r + ROW_CHUNK, :, None]).view(-1, self.cols).to(torch.int8)
+            idx[r:r + ROW_CHUNK] = grid.round(blocks / divisor(d[r:r + ROW_CHUNK])[..., None]).view(-1, self.cols).to(torch.int8)
         low_rank = None
         if self.lora_a is not None:
             low_rank = (self.lora_a.detach().clone(), self.lora_b.detach().clone())

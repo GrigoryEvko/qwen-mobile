@@ -24,6 +24,16 @@ BLOCK = 32
 IQ4_NL_TABLE = (-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113)
 
 
+def divisor(d: torch.Tensor) -> torch.Tensor:
+    """The divisor that gives the level indices of blocks with the scales ``d``: 1 in place of a zero scale.
+
+    A zero scale decodes its block to zero with each index, also on a grid
+    with no zero level. The division by 1 gives a defined index in place of
+    0/0 = NaN, whose cast to int32 has no defined result.
+    """
+    return torch.where(d == 0, torch.ones_like(d), d)
+
+
 class Grid:
     """Sixteen levels in units of the block scale, sorted."""
 
@@ -48,11 +58,17 @@ class Grid:
         stores a signed F16 scale, and the ggml quantizers select the sign
         in the same way, thus an asymmetric grid (Q4_0: −8 … 7, IQ4_NL:
         −127 … 113) keeps its full range on the side of the maximum.
+
+        An all-zero block gets the scale 0, as in the ggml reference
+        quantizers. Thus it decodes to zero also on a grid with no zero level
+        (IQ4_NL, a symmetric codebook), where a non-zero scale decodes each
+        element to the smallest level times the scale. The maximum of such a
+        block is +0 also when the block holds -0, as in quantize_row_q4_0_ref,
+        thus the Q4_0 scale is +0 / -8 = -0 with the bytes of that function.
         """
         idx = blocks.abs().argmax(dim=-1, keepdim=True)
         m = torch.gather(blocks, -1, idx).squeeze(-1)
-        d = m / self.top
-        return torch.where(d == 0, torch.ones_like(d), d)
+        return torch.where(m == 0, torch.zeros_like(m), m) / self.top
 
     def round(self, x: torch.Tensor) -> torch.Tensor:
         """The index (int32) of the nearest level of x, which is in units of the scale."""
@@ -67,12 +83,11 @@ class Grid:
     def quantize_blocks(self, blocks: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
         """Indices [rows, nblocks, 32] for the scales d [rows, nblocks].
 
-        The F16 rounding of a very small scale gives zero, and a zero scale
-        decodes its block to zero. The division uses 1 in place of such a
-        scale, thus 0/0 gives no NaN, and the cast to int32 has a defined
-        result. Complexity is O(elements).
+        An all-zero block, and the F16 rounding of a very small scale, give a
+        zero scale, which decodes its block to zero (refer to ``divisor``).
+        Complexity is O(elements).
         """
-        return self.round(blocks / torch.where(d == 0, torch.ones_like(d), d)[..., None])
+        return self.round(blocks / divisor(d)[..., None])
 
 
 class Q4_0Grid(Grid):
@@ -113,7 +128,7 @@ def fit_codebook(w: torch.Tensor, col_weights: torch.Tensor | None = None, iters
     """
     base = IQ4NLGrid().to(w.device)
     blocks = w.to(torch.float32).reshape(w.shape[0], -1, BLOCK)
-    x = (blocks / base.scale_rtn(blocks)[..., None]).reshape(-1)
+    x = (blocks / divisor(base.scale_rtn(blocks))[..., None]).reshape(-1)
     wt = None
     if col_weights is not None:
         wt = col_weights.to(torch.float32).repeat(w.shape[0]).reshape(-1)
