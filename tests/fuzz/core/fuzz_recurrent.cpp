@@ -265,9 +265,7 @@ void run(FuzzedDataProvider & fdp) {
     p.unified   = fdp.ConsumeBool();
     p.flash     = fdp.ConsumeIntegralInRange<int>(-1, 1);
     p.threads   = (int) fuzz::env_long("FUZZ_THREADS", 0) > 0 ? (int) fuzz::env_long("FUZZ_THREADS", 0) : fdp.ConsumeIntegralInRange<int>(1, 2);
-    // FUZZ_RECURRENT_KNOWN_EMBD_HOST=1 keeps LLAMA_EMBD_LOOKUP_HOST off (finding embd-host-mrope)
-    static const bool known_embd_host = fuzz::env_long("FUZZ_RECURRENT_KNOWN_EMBD_HOST", 0) != 0;
-    p.embd_host = fdp.ConsumeBool() && !known_embd_host;
+    p.embd_host = fdp.ConsumeBool();
     trace("ctx: n_seq_max %u n_rs_seq %u n_ubatch %u unified %d flash %d threads %d embd_host %d",
           p.n_seq_max, p.n_rs_seq, p.n_ubatch, p.unified, p.flash, p.threads, p.embd_host);
 

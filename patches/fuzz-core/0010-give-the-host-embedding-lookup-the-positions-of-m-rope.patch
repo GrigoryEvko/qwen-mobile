@@ -1,0 +1,67 @@
+Give the host embedding lookup the positions of an M-RoPE model
+Fold-into: hexagon-host/0002-llama-host-timers-and-embd-lookup.patch
+
+The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
+
+- The host embedding lookup gives an M-RoPE model one position for each row.
+
+  With LLAMA_EMBD_LOOKUP_HOST=1, llama_context::decode turns a token batch into an embedding
+  batch. An M-RoPE model (Qwen3.5: n_pos_per_embd is 4) reads n_pos_per_embd positions for each
+  row of an embedding batch, but the token batch has one position for each token. Thus
+  llama_batch_allocr::ubatch_add reads past the end of the position array (an ASan report), and
+  the model gets wrong positions and wrong logits.
+
+  The change: embd_lookup gives the embedding batch n_pos_per_embd copies of the positions of the
+  token batch, one copy for each section. A batch without a position array keeps its tokens.
+
+  The reproducer: tests/fuzz/core/regress/fuzz_recurrent--embd-host-mrope.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    src/llama-context.cpp
+    src/llama-context.h
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1484,6 +1484,21 @@ bool llama_context::embd_lookup(const llama_batch & batch) {
+         return false;
+     }
+ 
++    // An M-RoPE model (Qwen3.5: 4 positions for each row) reads n_pos_per_embd positions for
++    // each row of an embedding batch (the layout of an image), but a token batch has one
++    // position for each token. Give the embedding batch the positions of the token layout: one
++    // copy for each section. Without a position array the batch keeps its tokens.
++    const uint32_t n_pos = hparams.n_pos_per_embd();
++    if (n_pos > 1) {
++        if (!batch.pos) {
++            return false;
++        }
++        embd_lookup_pos.resize((size_t) batch.n_tokens * n_pos);
++        for (uint32_t j = 0; j < n_pos; j++) {
++            std::copy(batch.pos, batch.pos + batch.n_tokens, embd_lookup_pos.begin() + (size_t) j * batch.n_tokens);
++        }
++    }
++
+     embd_lookup_buf.resize((size_t) batch.n_tokens * n_embd_inp);
+ 
+     for (int32_t i = 0; i < batch.n_tokens; i++) {
+@@ -1769,6 +1784,9 @@ int llama_context::decode(const llama_batch & batch_inp_user) {
+     if (embd_lookup_host && embd_lookup(batch_inp_user)) {
+         batch_inp.token = nullptr;
+         batch_inp.embd  = embd_lookup_buf.data();
++        if (model.hparams.n_pos_per_embd() > 1) {
++            batch_inp.pos = embd_lookup_pos.data();
++        }
+     }
+ 
+     const auto & vocab   = model.vocab;
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -420,6 +420,7 @@ private:
+     // no GET_ROWS node for them and no split on the CPU
+     bool embd_lookup_host = false;
+     std::vector<float> embd_lookup_buf;
++    std::vector<llama_pos> embd_lookup_pos;  // n_pos_per_embd copies of the positions, for an M-RoPE model
+ 
+     bool embd_lookup(const llama_batch & batch);
+ };
