@@ -45,6 +45,13 @@
 #        those flags (x86: less -march) with -O3 -DNDEBUG, and each debug build
 #        uses -O1, no -flto and no -DNDEBUG. The lab release build of the DSP
 #        code uses each code generation flag of the shipped DSP library.
+#        The linker (lld, mold or the default) and BUILD_SHARED_LIBS are not
+#        part of the shipped flags, thus R12 does not check them.
+#   LTO-PART No file of an area or of tests/sanitizers and no build cache has
+#        --lto-partitions or -flto-partitions: the parallel code generation
+#        of full LTO in lld and clang 22.1.8 can drop the dynamic initializer
+#        of a C++17 inline variable (a minimal program shows it), and the
+#        shipped build has one partition.
 #   R13  Each entry of tests/sanitizers/ubsan.supp has a reproducer in
 #        tests/sanitizers/repro/. With the build directories (not
 #        --no-builds): the last run of tests/sanitizers/supp-repro.sh passed
@@ -640,6 +647,25 @@ check_android_asan_runtime() {
                 -not -path "$BUILD_FUZZ/asan-android-runtime/*" 2> /dev/null | sort)
 }
 
+# LTO-PART: no LTO partition option in the files of the areas, in
+# tests/sanitizers and in the CMake caches of build/fuzz.
+check_lto_partitions() {
+    local dirs=("$SAN_DIR") area file num text
+    for area in $AREAS; do
+        dirs+=("$FUZZ_DIR/$area")
+    done
+    while IFS=: read -r file num text; do
+        [[ "$file" == */check-rules.sh ]] && continue
+        [[ "$text" =~ ^[[:space:]]*(#|//) ]] && continue
+        violation LTO-PART "$(area_of "$file")" "$file:$num" "an LTO partition option: full LTO with more than one partition can drop the dynamic initializer of an inline variable; use one partition, as the shipped build"
+    done < <(rg -n --no-heading -e '-lto-partitions' "${dirs[@]}" -g '!corpus/**' -g '!regress/**' -g '!seeds/**' 2> /dev/null || true)
+    [[ $CHECK_BUILDS -eq 1 && -d "$BUILD_FUZZ" ]] || return 0
+    while IFS=: read -r file num text; do
+        violation LTO-PART "$(area_of "$file")" "$file:$num" "a build with an LTO partition option: configure it again with one partition"
+    done < <(find "$BUILD_FUZZ" -maxdepth 3 -name CMakeCache.txt -print0 2> /dev/null \
+                | xargs -0 -r rg -n --no-heading -e '^CMAKE_[A-Z_]*LINKER_FLAGS[A-Z_]*:STRING=.*-lto-partitions' || true)
+}
+
 # NOID: the pattern of a task number or a finding ID. A comment, a message or
 # a name describes the defect in words (the function, the input, the
 # evidence), never with an ID. "[Tt]ask" also finds the start of a sentence.
@@ -720,6 +746,7 @@ main() {
     check_libfuzzer_commands
     check_death_callback
     check_noid
+    check_lto_partitions
     check_android_asan_runtime
     check_parity_sources
     check_repro
