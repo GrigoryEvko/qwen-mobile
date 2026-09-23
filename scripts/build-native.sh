@@ -11,6 +11,9 @@
 #                    set of libraries that the app ships plus one DSP library
 #                    for each version in HTP_DSPS. "all" builds every target,
 #                    with the tools and the tests of llama.cpp.
+#   JOBS             The number of parallel compile jobs. The default is the CPU
+#                    count. On a large shared host, set a lower value, because
+#                    each compile job needs up to 1 GB of RAM.
 #
 # The steps:
 #   1. scripts/apply-patches.sh puts the series on the submodule.
@@ -50,6 +53,7 @@ for dsp in $HTP_DSPS; do
 done
 readonly DEFAULT_TARGETS="$LLAMA_LIBS$htp_targets"
 NATIVE_TARGETS=${NATIVE_TARGETS:-$DEFAULT_TARGETS}
+JOBS=${JOBS:-$(nproc)}
 
 cd "$REPO_ROOT"
 
@@ -84,6 +88,7 @@ container_run \
     -e LLAMA_BUILD_NUMBER="$LLAMA_BUILD_NUMBER" \
     -e LLAMA_BUILD_COMMIT_SHORT="${LLAMA_COMMIT:0:7}" \
     -e NATIVE_TARGETS="$NATIVE_TARGETS" \
+    -e JOBS="$JOBS" \
     -e REPRO_FLAGS="$REPRO_FLAGS" \
     "$SNAPDRAGON_IMAGE" bash -euo pipefail -c '
 presets=third_party/llama.cpp/CMakeUserPresets.json
@@ -105,7 +110,7 @@ cmake -S third_party/llama.cpp --preset arm64-android-snapdragon-release -B buil
     -DCMAKE_C_FLAGS="$c_flags" \
     -DCMAKE_CXX_FLAGS="$cxx_flags"
 # shellcheck disable=SC2086
-cmake --build build/native/llama -j"$(nproc)" --target $NATIVE_TARGETS
+cmake --build build/native/llama -j"$JOBS" --target $NATIVE_TARGETS
 
 cmake -S android/snapdragon -B build/native/jni -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
@@ -116,7 +121,7 @@ cmake -S android/snapdragon -B build/native/jni -G Ninja \
     -DLLAMA_BUILD_DIR=/workspace/build/native/llama \
     -DCMAKE_C_FLAGS="$REPRO_FLAGS" \
     -DCMAKE_CXX_FLAGS="$REPRO_FLAGS"
-cmake --build build/native/jni -j"$(nproc)"
+cmake --build build/native/jni -j"$JOBS"
 '
 
 # 5. The libraries and their hashes.
