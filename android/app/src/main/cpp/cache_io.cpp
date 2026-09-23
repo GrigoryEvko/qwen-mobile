@@ -91,7 +91,10 @@ std::string sha256_hex(const void * data, size_t len) {
     // The last block: the remaining bytes, the 0x80 marker, zeros, and the bit length.
     uint8_t tail[128] = {};
     const size_t rest = len - i;
-    memcpy(tail, p + i, rest);
+    // An empty input can come with a null pointer, and memcpy from null is undefined also for 0 bytes.
+    if (rest > 0) {
+        memcpy(tail, p + i, rest);
+    }
     tail[rest] = 0x80;
     const size_t total = rest + 1 + 8 <= 64 ? 64 : 128;
     const uint64_t bits = (uint64_t) len * 8;
