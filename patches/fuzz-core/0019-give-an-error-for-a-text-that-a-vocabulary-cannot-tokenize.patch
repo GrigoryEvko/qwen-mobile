@@ -1,0 +1,171 @@
+Give an error for a text that a defective vocabulary cannot tokenize
+Fold-into: upstream/vocab
+
+The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
+
+- The tokenizer stops the process when a special token of add_special is missing.
+
+  A vocabulary can ask for BOS, EOS or SEP (tokenizer.ggml.add_bos_token, or the type WPM) and
+  not have the token, for example when the loader disables a default id outside the vocabulary.
+  The tokenizer then stops on GGML_ASSERT(special_bos_id != LLAMA_TOKEN_NULL).
+
+  The change: The tokenizer throws std::runtime_error, which llama_tokenize reports as INT32_MIN
+  (patches/fuzz-core/0005).
+
+  The reproducer: tests/fuzz/core/regress/fuzz_model_load--vocab-missing-special.
+
+- The tokenizer gives the id -1 for a text that a vocabulary without an unknown token cannot
+  represent.
+
+  The tokenizers give token_unk() for a part of the text with no token (RWKV for a byte with no
+  token, WPM for a word). A vocabulary with no unknown token gives LLAMA_TOKEN_NULL, and
+  llama_tokenize returns the id -1 to the caller.
+
+  The change: The tokenizer throws when its output holds LLAMA_TOKEN_NULL. The loader, which
+  tokenizes the newline to find the linefeed token, takes special_pad_id on that error, as it
+  does for a vocabulary with no newline token.
+
+  The reproducer: tests/fuzz/core/regress/fuzz_model_load--vocab-no-unknown-token.
+
+- The RWKV tokenizer never ends for a text that starts a token but holds no full token.
+
+  When the text at a position is the start of longer tokens, and no token ends in it, the trie
+  walk finds no value, and the next position is 0. The loop then starts again at the start of the
+  text and appends a token each time, until the memory is gone (an allocation of 1 GiB for the
+  reproducer, a vocabulary of 300 tokens that start with "[").
+
+  The change: This case is the same as no match: the unknown token, and the next byte.
+
+  The reproducer: tests/fuzz/core/regress/fuzz_model_load--rwkv-token-prefix-loop.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    src/llama-vocab.cpp
+--- a/src/llama-vocab.cpp
++++ b/src/llama-vocab.cpp
+@@ -1334,6 +1334,7 @@ struct llm_tokenizer_rwkv_session {
+             }
+ 
+             // traverse the trie to find the longest matching token
++            const uint32_t start = position;
+             uint32_t token_id = 0;
+             uint32_t token_length = 0;
+             while (node != NULL) {
+@@ -1347,6 +1348,14 @@ struct llm_tokenizer_rwkv_session {
+                 node = node->traverse(text[++position]);
+             }
+ 
++            // The text at start is only the start of longer tokens, and no token ends in it: the
++            // same as no match. Without this case the next position is 0, and the loop never ends.
++            if (token_length == 0) {
++                output.push_back(vocab.token_unk());
++                position = start + 1;
++                continue;
++            }
++
+             // add the longest matching token
+             output.push_back(token_id);
+             position = token_length;
+@@ -2552,12 +2561,14 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
+         }
+     } else if (type == LLAMA_VOCAB_TYPE_WPM) {
+         linefeed_id = special_pad_id;
+-    } else if (type == LLAMA_VOCAB_TYPE_RWKV) {
+-        const std::vector<int> ids = tokenize("\n", false);
+-        GGML_ASSERT(!ids.empty() && "model vocab missing newline token");
+-        linefeed_id = ids[0];
+     } else {
+-        const std::vector<int> ids = tokenize("\n", false);
++        // tokenize throws for a vocabulary with no token for the newline and no unknown token
++        std::vector<int> ids;
++        try {
++            ids = tokenize("\n", false);
++        } catch (const std::exception & e) {
++            LLAMA_LOG_WARN("%s: the vocabulary cannot tokenize the newline: %s\n", __func__, e.what());
++        }
+ 
+         //GGML_ASSERT(!ids.empty() && "model vocab missing newline token");
+         if (ids.empty()) {
+@@ -3390,6 +3401,14 @@ static std::string llama_decode_text(const std::string & text) {
+     return decoded_text;
+ }
+ 
++// A vocabulary that asks for a special token that it does not have cannot tokenize with
++// add_special. The tokenizer throws, and llama_tokenize reports the error.
++static void llama_vocab_need_special(llama_token id, const char * name) {
++    if (id == LLAMA_TOKEN_NULL) {
++        throw std::runtime_error(std::string("the vocabulary has no ") + name + " token, which add_special needs");
++    }
++}
++
+ std::vector<llama_token> llama_vocab::impl::tokenize(
+         const std::string & raw_text,
+         bool add_special,
+@@ -3415,7 +3434,7 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
+                 bool is_prev_special = true;  // prefix with space if first token
+ 
+                 if (add_special && add_bos) {
+-                    GGML_ASSERT(special_bos_id != LLAMA_TOKEN_NULL);
++                    llama_vocab_need_special(special_bos_id, "BOS");
+                     output.push_back(special_bos_id);
+                     is_prev_special = true;
+                 }
+@@ -3452,7 +3471,7 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
+                 }
+ 
+                 if (add_special && add_eos) {
+-                    GGML_ASSERT(special_eos_id != LLAMA_TOKEN_NULL);
++                    llama_vocab_need_special(special_eos_id, "EOS");
+                     output.push_back(special_eos_id);
+                 }
+             } break;
+@@ -3499,7 +3518,7 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
+         case LLAMA_VOCAB_TYPE_WPM:
+             {
+                 if (add_special) {
+-                    GGML_ASSERT(special_bos_id != LLAMA_TOKEN_NULL);
++                    llama_vocab_need_special(special_bos_id, "BOS");
+                     output.push_back(special_bos_id);
+                 }
+ 
+@@ -3519,14 +3538,14 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
+                 }
+ 
+                 if (add_special) {
+-                    GGML_ASSERT(special_sep_id != LLAMA_TOKEN_NULL);
++                    llama_vocab_need_special(special_sep_id, "SEP");
+                     output.push_back(special_sep_id);
+                 }
+             } break;
+         case LLAMA_VOCAB_TYPE_UGM:
+             {
+                 if (add_special && add_bos) {
+-                    GGML_ASSERT(special_bos_id != LLAMA_TOKEN_NULL);
++                    llama_vocab_need_special(special_bos_id, "BOS");
+                     output.push_back(special_bos_id);
+                 }
+                 llm_tokenizer_ugm_session session(vocab, *static_cast<const llm_tokenizer_ugm *>(tokenizer.get()));
+@@ -3551,7 +3570,7 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
+                 }
+ 
+                 if (add_special && add_eos) {
+-                    GGML_ASSERT(special_eos_id != LLAMA_TOKEN_NULL);
++                    llama_vocab_need_special(special_eos_id, "EOS");
+                     output.push_back(special_eos_id);
+                 }
+             } break;
+@@ -3593,6 +3612,13 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
+             GGML_ABORT("fatal error");
+     }
+ 
++    // A tokenizer gives token_unk() for a part of the text that the vocabulary cannot represent.
++    // A vocabulary with no unknown token then gives LLAMA_TOKEN_NULL, which is not a token id.
++    // O(n) in the count of tokens.
++    if (std::find(output.begin(), output.end(), LLAMA_TOKEN_NULL) != output.end()) {
++        throw std::runtime_error("the vocabulary has no token for a part of the text and no unknown token");
++    }
++
+     return output;
+ }
+ 
