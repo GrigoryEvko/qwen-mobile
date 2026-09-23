@@ -166,10 +166,19 @@ configure() {
 # the executable does not exist. Thus the target names come from the
 # resolved paths in tests/CTestTestfile.cmake. CMake 4.3 writes the test
 # name as [=[name]=], CMake 4.4 as "name", thus the pattern takes the two.
+# First, ninja runs CMake again if a CMakeLists.txt changed (the target
+# build.ninja). Without that step, the file lists the tests of the last
+# configure, and a new test of a new patch has no executable ("Not Run").
 build_tests() {
     local targets
+    cmake --build "$BUILD" --target build.ninja > "$BUILD/regenerate.log" 2>&1 \
+        || { tail -30 "$BUILD/regenerate.log" >&2; suite_die "$PROFILE-$CONFIG: CMake failed to regenerate $BUILD. Refer to $BUILD/regenerate.log."; }
+    # The pattern takes any path that ends in <name of $BUILD>/bin/: CMake
+    # writes the path of the first configure, and that path can differ from
+    # $BUILD by a symbolic link. A test that runs a tool outside the build
+    # (for example cmake -P) does not match.
     mapfile -t targets < <(rg -o --no-filename -r '$2' \
-        "add_test\\((\\[=\\[[^]]+\\]=\\]|\"[^\"]+\") \"${BUILD}/bin/([^\"/]+)\"" \
+        "add_test\\((\\[=\\[[^]]+\\]=\\]|\"[^\"]+\") \"[^\"]*/${BUILD##*/}/bin/([^\"/]+)\"" \
         "$BUILD/tests/CTestTestfile.cmake" | sort -u)
     [[ ${#targets[@]} -gt 0 ]] || suite_die "$PROFILE-$CONFIG: ctest lists no test. Refer to $BUILD/configure.log."
     suite_log "$PROFILE-$CONFIG: build ${#targets[@]} test executables with $JOBS jobs."
@@ -230,7 +239,10 @@ junit_to_records() {
                 reason="$(jq -r '.failure // "failed"' <<< "$line")"
                 [[ "$reason" == *Timeout* ]] && status="timeout"
                 ;;
-            disabled|notrun) status="excluded"; reason="ctest did not run the test" ;;
+            disabled) status="excluded"; reason="the test has the ctest property DISABLED" ;;
+            # A missing executable or a failed fixture: the test must run,
+            # thus this is a failure and not an exclusion.
+            notrun) status="fail"; reason="ctest did not run the test (a missing executable or a failed fixture): $(jq -r '.failure // "no message"' <<< "$line")" ;;
             *) status="fail"; reason="ctest status $(jq -r '.status' <<< "$line")" ;;
         esac
         if [[ "$status" == "pass" && "$findings" -gt 0 ]]; then
