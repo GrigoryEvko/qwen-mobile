@@ -115,3 +115,4 @@ fuzz-ops/0001-ggml-graph-size-with-integers.patch
 # fuzz-quant: the fixes of the quant fuzzer. The header of each patch gives its task.
 fuzz-quant/0001-gguf-py-check-the-byte-ranges-and-the-shapes-of-the-reader.patch
 fuzz-ops/0002-ggml-thunks-for-the-type-trait-functions.patch
+fuzz-quant/0002-perplexity-write-the-queued-log-lines-before-the-exit.patch

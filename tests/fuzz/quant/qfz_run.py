@@ -307,7 +307,7 @@ class Runner:
         import numpy as np
         import torch
 
-        from qfz_checks import parse_kld, run_kld, run_perplexity, sanitizer_env
+        from qfz_checks import NoKLStatistics, kl_statistics, parse_kld, run_perplexity, sanitizer_env
         from qfz_common import scratch
         from qfz_toy import PROFILES, SMALL, make_text, output_rot_for, write_source
         from quant.export import export
@@ -323,15 +323,23 @@ class Runner:
             return r
         env = sanitizer_env(self.san)
         threads = 4
-        lost_runs: list[str] = []
+        no_block: list[str] = []
 
         def check(model: Path, text: Path, base: Path, label: str) -> None:
-            """Run one model in this build against the base of the oracle, and count a finding."""
-            status, log, lost = run_kld(self._llama_bin(), model, text, base, threads=threads, extra_env=env,
-                                        timeout=900)
-            lost_runs.extend(lost)
-            r.executions += 1 + len(lost)
+            """Run one model in this build against the base of the oracle, and count a finding.
+
+            A run with the exit status 0 and no final KL statistics block is a
+            finding too (the check of task #172).
+            """
+            status, log = run_perplexity(self._llama_bin(), model, text, base, write_base=False, threads=threads,
+                                         extra_env=env, timeout=900)
+            r.executions += 1
             kld = parse_kld(log)
+            if status == 0:
+                try:
+                    kld = kl_statistics(log)
+                except NoKLStatistics:
+                    no_block.append(label)
             with _WRITE_LOCK, (self.out / f"llama-toy-{self.mode}.kl.jsonl").open("a") as f:
                 f.write(json.dumps({"model": label, "status": status, **kld}) + "\n")
             if status != 0 or not np.isfinite(kld.get("mean", float("nan"))):
@@ -345,6 +353,9 @@ class Runner:
             text = PHONE / "text.txt"
             for model in phone:
                 check(model, text, model.with_suffix(".kld"), model.stem)
+            # The reproducer of QT1 (rule R13): 20 more runs of one comparison. Each run needs its statistics.
+            for i in range(20):
+                check(phone[0], text, phone[0].with_suffix(".kld"), f"{phone[0].stem}-repeat{i}")
         else:
             rng = random.Random(0 if self.mode == "test" else None)
             n = 0
@@ -374,20 +385,13 @@ class Runner:
                         break
                     check(model, text, base, f"{profile}-{kind}-{seed}")
                     if self.mode == "test" and n == 0:
-                        # The reproducer of QT1 (rule R13): 20 runs of one comparison, with no second run.
-                        for _ in range(20):
-                            status, log = run_perplexity(self._llama_bin(), model, text, base, write_base=False,
-                                                         threads=threads, extra_env=env, timeout=900)
-                            r.executions += 1
-                            if status == 0 and "Mean    KLD:" not in log:
-                                lost_runs.append(log)
+                        # The reproducer of QT1 (rule R13): 20 more runs of one comparison.
+                        for i in range(20):
+                            check(model, text, base, f"{profile}-{kind}-{seed}-repeat{i}")
                 n += 1
-        if lost_runs:
-            # QT1 is a finding of llama.cpp (tools/perplexity), reported here with its evidence (rule R8).
-            r.findings += 1
-            r.note = (f"QT1: {len(lost_runs)} runs of llama-perplexity lost the last chunk and the KL statistics "
-                      f"at the exit with the status 0; the target ran them again")
-            r.crash_files.append(self._keep_log(f"{t.name}-QT1", lost_runs[0]))
+        if no_block:
+            r.note = (f"{len(no_block)} runs with the exit status 0 had no final KL statistics block "
+                      f"(the defect of QT1, task #172): {', '.join(no_block[:4])}")
         r.seconds = time.monotonic() - start
         return r
 

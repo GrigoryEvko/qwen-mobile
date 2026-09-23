@@ -76,7 +76,6 @@ KNOWN_FINDINGS = {
     "QF9": "the scale search compares float32 scales but stores their F16 rounding, which can lose to the plain scale",
     "QF10": "the export filter --only applies to Q4_0 and Q8_0, thus an IQ4_NL tensor out of the match stays IQ4_NL",
     "QF11": "each export() call puts llama_dir/gguf-py at the front of sys.path again, thus sys.path only grows",
-    "QT1": "llama-perplexity does not flush its log at the exit, thus a run with the status 0 can lose its statistics",
 }
 
 # The largest finite F16 value, and the smallest positive subnormal F16 value.

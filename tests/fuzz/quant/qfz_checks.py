@@ -205,35 +205,34 @@ def run_perplexity(binary_dir: Path, model: Path, text: Path, base: Path, write_
     return res.returncode, res.stdout + res.stderr
 
 
-def run_kld(binary_dir: Path, model: Path, text: Path, base: Path, threads: int = 4, timeout: float = 600.0,
-            extra_env: dict[str, str] | None = None, retries: int = 2) -> tuple[int, str, list[str]]:
-    """Compare a model against a KL base, and run it again when the statistics are missing (finding QT1).
+class NoKLStatistics(ValueError):
+    """A llama-perplexity output with no final KL statistics block."""
 
-    llama-perplexity does not flush its log before the exit (finding QT1),
-    thus a run with the exit status 0 can lose the last chunk and the KL
-    statistics. This function runs again, at most ``retries`` times, and it
-    gives the logs of the lost runs, which the caller reports (rule R8).
+
+def kl_statistics(log: str) -> dict[str, float]:
+    """Give the final KL statistics of a llama-perplexity output, and refuse an output that has no such block.
+
+    llama-perplexity writes the statistics block at the end of the run. A
+    run that stops before it, or that loses its log at the exit (finding
+    QT1, task #172, patches/fuzz-quant/0002), has no result, even with the
+    exit status 0. The chunk lines alone are not a result.
 
     Args:
-        binary_dir: The bin directory of the build
-        model: The GGUF file
-        text: The text file
-        base: The KL base of the oracle
-        threads: The CPU threads
-        timeout: The limit of one run in seconds
-        extra_env: More environment variables, for example the sanitizer options
-        retries: The largest number of runs again
+        log: The output of the run
 
     Returns:
-        The exit status and the output of the last run, and the outputs of the runs that lost the statistics
+        The numbers of parse_kld: mean, max, p99 and top1, and rms_dp when the output has it
+
+    Raises:
+        NoKLStatistics: If the output has no mean, maximum, 99th percentile or top-1 line
     """
-    lost: list[str] = []
-    while True:
-        status, log = run_perplexity(binary_dir, model, text, base, write_base=False, threads=threads,
-                                     timeout=timeout, extra_env=extra_env)
-        if status != 0 or "Mean    KLD:" in log or len(lost) >= retries:
-            return status, log, lost
-        lost.append(log)
+    kld = parse_kld(log)
+    missing = [key for key in ("mean", "max", "p99", "top1") if key not in kld]
+    if missing:
+        tail = "\n".join(log.splitlines()[-6:])
+        raise NoKLStatistics(f"the output of llama-perplexity has no final KL statistics block (no "
+                             f"{', '.join(missing)}). The last lines are:\n{tail}")
+    return kld
 
 
 def parse_kld(text: str) -> dict[str, float]:

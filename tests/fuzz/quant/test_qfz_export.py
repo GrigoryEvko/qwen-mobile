@@ -36,7 +36,7 @@ from hypothesis import example, given
 from hypothesis import strategies as st
 
 import gguf
-from qfz_checks import check_available, ggml_loader_check, parse_kld, read_tensors, run_kld, run_perplexity
+from qfz_checks import check_available, ggml_loader_check, kl_statistics, read_tensors, run_perplexity
 from qfz_common import LLAMA_DIR, known_open, san_dir, scratch
 from qfz_hyp import counted, fuzz_settings
 from qfz_toy import PROFILES, SMALL, Geometry, make_text, output_rot_for, write_source
@@ -319,12 +319,8 @@ def _run_toy(tmp_path: Path, profile: str, seed: int, kind: str, tie: bool) -> N
     text.write_text(make_text(900, seed))
     status, log = run_perplexity(TOY_BIN, out, text, tmp_path / "base.kld", write_base=True, threads=2)
     assert status == 0, f"llama-perplexity failed with {status}:\n{log[-3000:]}"
-    # run_kld runs again when llama-perplexity loses its statistics at the exit (QT1). The target llama-toy
-    # of run.sh reports QT1, thus this property looks only at the file. The loss rate increases with the
-    # load of the host (3 losses in a row occurred on 2026-09-23), thus this test permits 6 runs.
-    status, log, _ = run_kld(TOY_BIN, out, text, tmp_path / "base.kld", threads=2, retries=5)
+    status, log = run_perplexity(TOY_BIN, out, text, tmp_path / "base.kld", write_base=False, threads=2)
     assert status == 0, f"llama-perplexity with the KL base failed with {status}:\n{log[-3000:]}"
-    kld = parse_kld(log)
-    assert np.isfinite(kld.get("mean", float("nan"))), \
-        f"the KL of a run against itself is not finite: {kld}\n{log[-4000:]}"
+    kld = kl_statistics(log)
+    assert np.isfinite(kld["mean"]), f"the KL of a run against itself is not finite: {kld}\n{log[-4000:]}"
     assert kld["mean"] <= 1e-3, f"one build gives a different result on a second run: {kld}"

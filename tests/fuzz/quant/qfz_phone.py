@@ -41,7 +41,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
-from qfz_checks import ggml_loader_check, parse_kld, read_tensors, run_kld, run_perplexity  # noqa: E402
+from qfz_checks import (  # noqa: E402
+    NoKLStatistics,
+    ggml_loader_check,
+    kl_statistics,
+    read_tensors,
+    run_perplexity,
+)
 from qfz_common import (  # noqa: E402
     FUZZ_OUT,
     HOST_BIN,
@@ -113,7 +119,8 @@ def build_files(seed: int = 20260923) -> dict:
 
     Raises:
         FileNotFoundError: If the oracle build is missing
-        RuntimeError: If the oracle cannot run a file
+        RuntimeError: If the oracle cannot run a file, or if a host run has no final KL statistics block (the
+            manifest records each such run before the error)
     """
     if not (ORACLE_BIN / "llama-perplexity").exists():
         raise FileNotFoundError(f"{ORACLE_BIN}/llama-perplexity is missing: the oracle build is necessary")
@@ -123,6 +130,7 @@ def build_files(seed: int = 20260923) -> dict:
     text = OUT / "text.txt"
     text.write_text(make_text(1400, seed))
     manifest: dict = {"geometry": dataclasses.asdict(PHONE), "text": "text.txt", "files": {}}
+    no_block: list[str] = []
     for i, spec in enumerate(SET):
         geo = dataclasses.replace(PHONE, mtp=spec.mtp)
         plan = spec.plan(geo.n_layer)
@@ -154,15 +162,24 @@ def build_files(seed: int = 20260923) -> dict:
             if not (bin_dir / "llama-perplexity").exists():
                 entry["host"][label] = {"status": "missing build"}
                 continue
-            status, log, lost = run_kld(bin_dir, model, text, base, threads=8, extra_env=env)
+            status, log = run_perplexity(bin_dir, model, text, base, write_base=False, threads=8, extra_env=env)
             (host_logs / f"{spec.name}.{label}.log").write_text(log)
-            entry["host"][label] = {"status": status, **parse_kld(log), "qt1_lost_runs": len(lost),
+            try:
+                kld = kl_statistics(log)
+            except NoKLStatistics:
+                kld = {"error": "no final KL statistics block"}
+                no_block.append(f"{spec.name}.{label}")
+            entry["host"][label] = {"status": status, **kld,
                                     "sanitizer_reports": len(re.findall(r"(ERROR: AddressSanitizer|runtime error|"
                                                                         r"WARNING: ThreadSanitizer|"
                                                                         r"WARNING: MemorySanitizer)", log))}
         manifest["files"][f"{spec.name}.gguf"] = entry
         LOG.info("%s: %s", spec.name, json.dumps(entry["host"]))
     (OUT / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
+    if no_block:
+        raise RuntimeError(f"{len(no_block)} host runs have no final KL statistics block: {', '.join(no_block)}. "
+                           f"Their logs are in {host_logs}. A build without patches/fuzz-quant/0002 (task #172) "
+                           "can lose the block at the exit: rebuild it.")
     return manifest
 
 
@@ -192,34 +209,34 @@ def phone_commands() -> str:
     lines += [
         "",
         "# 2. The runs: before each run the charger state, the caps and the thermal status; the loop stops at a",
-        "#    status other than 0 or on a charger. After each run the status and the llama processes.",
-        "#    llama-perplexity can lose its KL statistics at the exit (finding QT1): a run without them is kept as",
-        "#    logs/<name>.<unit>.lost.log, and the loop runs it one more time.",
+        "#    status other than 0 or on a charger. After each run the status and the llama processes. A run whose",
+        "#    log has no final KL statistics block fails: llama-perplexity without patches/fuzz-quant/0002 (task #172)",
+        "#    can lose the block at the exit with the status 0. The run is not done again.",
+        "failed=0",
         f"for name in {' '.join(names)}; do",
         "  for dev in htp0 cpu; do",
-        "    for attempt in 1 2; do",
-        f"      {adb} shell 'dumpsys battery | grep -E \"(AC|USB|Wireless) powered|status:|temperature\"' "
+        f"    {adb} shell 'dumpsys battery | grep -E \"(AC|USB|Wireless) powered|status:|temperature\"' "
         "| tee /tmp/qfz-battery.txt",
-        "      if rg -q 'powered: true' /tmp/qfz-battery.txt; then echo 'STOP: the phone charges'; break 3; fi",
-        f"      {adb} shell 'cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq "
+        "    if rg -q 'powered: true' /tmp/qfz-battery.txt; then echo 'STOP: the phone charges'; break 2; fi",
+        f"    {adb} shell 'cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq "
         "/sys/devices/system/cpu/cpu7/cpufreq/scaling_max_freq'",
-        f"      status=$({adb} shell 'dumpsys thermalservice | grep \"Thermal Status\"')",
-        "      echo \"before $name $dev $attempt: $status\"",
-        "      case \"$status\" in *'Thermal Status: 0'*) ;; *) echo 'STOP: thermal status is not 0'; break 3;; esac",
-        "      if [ $dev = htp0 ]; then flags='-dev HTP0 -ngl 99'; else flags='-dev none -ngl 0'; fi",
-        f"      timeout -s KILL 100 adb -s {SERIAL} shell \"cd {REMOTE} && {env} timeout -s KILL 90 "
+        f"    status=$({adb} shell 'dumpsys thermalservice | grep \"Thermal Status\"')",
+        "    echo \"before $name $dev: $status\"",
+        "    case \"$status\" in *'Thermal Status: 0'*) ;; *) echo 'STOP: thermal status is not 0'; break 2;; esac",
+        "    if [ $dev = htp0 ]; then flags='-dev HTP0 -ngl 99'; else flags='-dev none -ngl 0'; fi",
+        f"    timeout -s KILL 100 adb -s {SERIAL} shell \"cd {REMOTE} && {env} timeout -s KILL 90 "
         f"{REMOTE_BIN}/llama-perplexity -m $name.gguf {PPL_ARGS} --kl-divergence-base $name.kld --kl-divergence "
         "$flags > logs/$name.$dev.log 2>&1; echo exit=\\$? >> logs/$name.$dev.log\"",
-        f"      echo \"after $name $dev $attempt: $({adb} shell 'dumpsys thermalservice | grep \"Thermal Status\"')\"",
-        f"      {adb} shell 'pgrep -a llama'",
-        "      sleep 15",
-        f"      found=$({adb} shell \"grep -c 'Mean    KLD' {REMOTE}/logs/$name.$dev.log\")",
-        "      [ \"$found\" != \"0\" ] && break",
-        f"      {adb} shell \"mv {REMOTE}/logs/$name.$dev.log {REMOTE}/logs/$name.$dev.lost.log\"",
-        "    done",
+        f"    echo \"after $name $dev: $({adb} shell 'dumpsys thermalservice | grep \"Thermal Status\"')\"",
+        f"    {adb} shell 'pgrep -a llama'",
+        f"    found=$({adb} shell \"grep -c -e 'Mean    KLD' -e 'Same top p' {REMOTE}/logs/$name.$dev.log\")",
+        "    if [ \"$found\" != \"2\" ]; then echo \"FAIL: logs/$name.$dev.log has no final KL statistics block\"; "
+        "failed=$((failed + 1)); fi",
+        "    sleep 15",
         "  done",
         "done",
         "rm -f /tmp/qfz-battery.txt",
+        "echo \"runs without the final KL statistics block: $failed\"",
         "",
         "# 3. Pull the logs.",
         "mkdir -p build/fuzz/quant/phone/pulled",
@@ -231,32 +248,44 @@ def phone_commands() -> str:
     return "\n".join(lines) + "\n"
 
 
-def compare(pulled: Path) -> str:
+def compare(pulled: Path) -> tuple[str, int]:
     """Give the table of the phone KL results next to the host results of manifest.json.
+
+    A log with no final KL statistics block is a failed run, as is a
+    missing log or an exit status other than 0.
 
     Args:
         pulled: The directory of the pulled logs <name>.<device>.log
 
     Returns:
-        The table as text
+        The table as text, and the number of failed runs
     """
     manifest = json.loads((OUT / "manifest.json").read_text())
     rows = ["| file | unit | exit | mean KL | max KL | same top | host native mean KL |",
             "|---|---|---|---|---|---|---|"]
+    failed = 0
     for fname, entry in manifest["files"].items():
         name = fname.removesuffix(".gguf")
         native = entry["host"].get("native", {}).get("mean", float("nan"))
         for dev in DEVICES:
             log = pulled / f"{name}.{dev}.log"
             if not log.exists():
+                failed += 1
                 rows.append(f"| {name} | {dev} | no log | | | | {native} |")
                 continue
             text = log.read_text(errors="replace")
-            kld = parse_kld(text)
             code = re.search(r"exit=(\d+)", text)
-            rows.append(f"| {name} | {dev} | {code.group(1) if code else '?'} | {kld.get('mean', 'n/a')} | "
-                        f"{kld.get('max', 'n/a')} | {kld.get('top1', 'n/a')} | {native} |")
-    return "\n".join(rows) + "\n"
+            try:
+                kld = kl_statistics(text)
+            except NoKLStatistics:
+                failed += 1
+                rows.append(f"| {name} | {dev} | {code.group(1) if code else '?'} | no final KL statistics block | "
+                            f"| | {native} |")
+                continue
+            failed += not code or code.group(1) != "0"
+            rows.append(f"| {name} | {dev} | {code.group(1) if code else '?'} | {kld['mean']} | {kld['max']} | "
+                        f"{kld['top1']} | {native} |")
+    return "\n".join(rows) + "\n", failed
 
 
 def write_seeds() -> list[Path]:
@@ -356,7 +385,12 @@ def main() -> int:
         for path in write_seeds():
             LOG.info("wrote %s (%d bytes)", path, path.stat().st_size)
     else:
-        sys.stdout.write(compare(a.pulled))
+        table, failed = compare(a.pulled)
+        sys.stdout.write(table)
+        if failed:
+            LOG.error("%d phone runs failed: no log, an exit status other than 0, or no final KL statistics block",
+                      failed)
+            return 1
     return 0
 
 
