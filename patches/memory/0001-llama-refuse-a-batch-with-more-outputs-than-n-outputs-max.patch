@@ -1,0 +1,166 @@
+llama: refuse a batch with more outputs than n_outputs_max
+Fold-into: upstream/llama-context
+
+The defect
+
+llama_decode reserves the output buffer with output_reserve(n_outputs_all), and
+output_reserve asserts n_outputs_max <= cparams.n_outputs_max. Thus a batch that asks for
+more logits rows than the n_outputs_max of the context stops the process with SIGABRT, and
+the caller gets no error code. A small n_outputs_max is how a caller keeps the compute buffer
+small: the reserve graph holds n_outputs_max rows of logits, which is 970 MiB for 1024 rows
+of a vocabulary of 248320 tokens.
+
+The change
+
+llama_context::decode compares the output count of the batch with n_outputs_max before the
+memory changes. It logs an error and returns -1. tests/test-output-limit.cpp decodes one
+batch of n_outputs_max + 1 rows with logits on the generated qwen35-dense model, and expects
+-1 and an empty memory. Then it decodes a batch of n_outputs_max rows, and expects 0 and
+logits for each row. Without the change, the test stops with SIGABRT.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    src/llama-context.cpp
+    tests/CMakeLists.txt
+    tests/test-output-limit.cpp
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 9f5eecc..76f1fe0 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1824,6 +1824,14 @@ int llama_context::decode(const llama_batch & batch_inp_user) {
+     const uint32_t n_tokens_all  = balloc->get_n_tokens();
+     const uint32_t n_outputs_all = balloc->get_n_outputs();
+ 
++    // The compute buffer and the output buffer hold n_outputs_max rows. A batch that asks for
++    // more rows is an error of the caller: the batch is refused before the memory changes.
++    if (n_outputs_all > cparams.n_outputs_max) {
++        LLAMA_LOG_ERROR("%s: the batch asks for %u outputs, but the context holds n_outputs_max = %u\n",
++                __func__, n_outputs_all, cparams.n_outputs_max);
++        return -1;
++    }
++
+     if (output_all) {
+         // require that all tokens are output
+         if (n_outputs_all != n_tokens_all) {
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index a398344..794c83f 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -149,6 +149,7 @@ if (LLAMA_LLGUIDANCE)
+ endif ()
+ 
+ llama_build(test-recurrent-state-rollback.cpp)
++llama_build(test-output-limit.cpp)
+ llama_build(test-save-load-state.cpp)
+ 
+ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+@@ -216,6 +217,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+         FIXTURES_REQUIRED generate-models
+     )
+ 
++    llama_test(
++        test-output-limit
++        LABEL main
++        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
++    )
++    set_tests_properties(test-output-limit PROPERTIES
++        FIXTURES_REQUIRED generate-models
++    )
++
+     llama_test(
+         test-recurrent-state-rollback
+         NAME test-recurrent-state-rollback-nemotron-h
+diff --git a/tests/test-output-limit.cpp b/tests/test-output-limit.cpp
+new file mode 100644
+index 0000000..74a39fc
+--- /dev/null
++++ b/tests/test-output-limit.cpp
+@@ -0,0 +1,87 @@
++// The output limit of a context: llama_decode refuses a batch that asks for more logits rows
++// than n_outputs_max with an error code, keeps the memory as it was, and then accepts a batch
++// inside the limit.
++
++#include "arg.h"
++#include "common.h"
++#include "ggml-backend.h"
++#include "llama.h"
++
++#include <clocale>
++#include <cstdio>
++
++// A batch of n tokens of sequence 0 from position pos0. Each token asks for logits.
++static int decode_all_rows(llama_context * ctx, llama_pos pos0, int n) {
++    llama_batch batch = llama_batch_init(n, 0, 1);
++    for (int i = 0; i < n; ++i) {
++        common_batch_add(batch, (llama_token) (i + 1), pos0 + i, { 0 }, true);
++    }
++    const int rc = llama_decode(ctx, batch);
++    llama_batch_free(batch);
++    return rc;
++}
++
++int main(int argc, char ** argv) {
++    std::setlocale(LC_NUMERIC, "C");
++
++    common_params params;
++    common_init();
++    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
++        return 1;
++    }
++    ggml_backend_load_all();
++
++    llama_model_params mparams = common_model_params_to_llama(params);
++    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
++    if (model == nullptr) {
++        fprintf(stderr, "%s : failed to load the model\n", __func__);
++        return 1;
++    }
++
++    const uint32_t n_outputs_max = 5;
++
++    llama_context_params cparams = llama_context_default_params();
++    cparams.n_ctx         = 64;
++    cparams.n_batch       = 16;
++    cparams.n_ubatch      = 16;
++    cparams.n_seq_max     = 1;
++    cparams.n_outputs_max = n_outputs_max;
++    llama_context * ctx = llama_init_from_model(model, cparams);
++    if (ctx == nullptr) {
++        fprintf(stderr, "%s : failed to create the context\n", __func__);
++        llama_model_free(model);
++        return 1;
++    }
++
++    int failures = 0;
++
++    const int rc_over = decode_all_rows(ctx, 0, (int) n_outputs_max + 1);
++    if (rc_over != -1) {
++        fprintf(stderr, "%s : a batch of %u rows gave %d, expected -1\n", __func__, n_outputs_max + 1, rc_over);
++        failures++;
++    }
++
++    const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
++    if (pos_max != -1) {
++        fprintf(stderr, "%s : the refused batch left position %d in the memory\n", __func__, (int) pos_max);
++        failures++;
++    }
++
++    const int rc_in = decode_all_rows(ctx, 0, (int) n_outputs_max);
++    if (rc_in != 0) {
++        fprintf(stderr, "%s : a batch of %u rows gave %d, expected 0\n", __func__, n_outputs_max, rc_in);
++        failures++;
++    }
++    for (int i = 0; rc_in == 0 && i < (int) n_outputs_max; ++i) {
++        if (llama_get_logits_ith(ctx, i) == nullptr) {
++            fprintf(stderr, "%s : no logits for row %d\n", __func__, i);
++            failures++;
++        }
++    }
++
++    llama_free(ctx);
++    llama_model_free(model);
++
++    fprintf(stderr, "%s : %s\n", __func__, failures == 0 ? "OK" : "FAILED");
++    return failures == 0 ? 0 : 1;
++}

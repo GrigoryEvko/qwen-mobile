@@ -145,3 +145,7 @@ fuzz-hexhost/0006-hexagon-parse-the-init-environment-safely.patch
 fuzz-hexhost/0007-hexagon-saturate-the-k-quant-repack-scales.patch
 fuzz-matrix/0002-server-give-the-chat-parameters-the-defaults-of-common-params.patch
 fuzz-matrix/0003-tests-give-the-tensors-of-test-barrier-defined-data.patch
+
+# memory: the output limit of a context. llama_decode refuses a batch that asks for more
+# logits rows than n_outputs_max with an error code, not with an abort.
+memory/0001-llama-refuse-a-batch-with-more-outputs-than-n-outputs-max.patch
