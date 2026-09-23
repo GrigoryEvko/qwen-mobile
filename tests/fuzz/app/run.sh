@@ -248,6 +248,17 @@ env_of() {
     fi
 }
 
+# The RSS limit of libFuzzer in MB for one process of the sanitizer $1. MSan poisons each
+# allocation, which writes its shadow and origin pages: the metadata block of the scheduler of
+# each llama context (828 MB of malloc, mostly never touched) becomes about 2.5 GB of RSS for
+# each load. The other configurations keep 4096 MB.
+rss_of() {
+    case $1 in
+        msan) echo 12288 ;;
+        *) echo 4096 ;;
+    esac
+}
+
 # The maximum input length of a target.
 max_len_of() {
     case $1 in
@@ -300,7 +311,7 @@ fuzz_one() {
         # shellcheck disable=SC2046
         env FAKEJNI_RELAX="${FAKEJNI_RELAX-}" \
             FUZZ_ARTIFACT_DIR="$art" $(env_of "$target" "$san") \
-            nice -n 10 timeout -s KILL $((budget + 300)) "$bin" -max_total_time="$budget" -rss_limit_mb=4096 \
+            nice -n 10 timeout -s KILL $((budget + 300)) "$bin" -max_total_time="$budget" -rss_limit_mb="$(rss_of "$san")" \
             -max_len="$(max_len_of "$target")" -timeout=180 -print_final_stats=1 -close_fd_mask=1 \
             -artifact_prefix="$art/" "$corpus" > "$log" 2>&1 &
         pids+=($!)
@@ -356,7 +367,7 @@ test_one() {
         # shellcheck disable=SC2046
         if ! env FAKEJNI_RELAX='' FUZZ_ARTIFACT_DIR="$dir/artifacts/test-$target" \
             $(env_of "$target" "$san") nice -n 10 timeout -s KILL 900 \
-            "$bin" -runs=1 -rss_limit_mb=4096 -artifact_prefix="$dir/artifacts/test-$target/" "$f" > "$log" 2>&1; then
+            "$bin" -runs=1 -rss_limit_mb="$(rss_of "$san")" -artifact_prefix="$dir/artifacts/test-$target/" "$f" > "$log" 2>&1; then
             crashes+=("$f")
         fi
     done
