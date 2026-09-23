@@ -1,0 +1,31 @@
+tests: give the keys with no array type a valid gguf_type in test-gguf
+Fold-into: upstream/ggml
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+get_kv_types of test-gguf gives each key that is not an array the element
+type gguf_type(-1). enum gguf_type has no fixed underlying type, and its
+values are 0 to 13, thus -1 is not in the range of the enum. UBSan reports
+an invalid-enum-load in std::make_pair in get_kv_types, in debug and
+release, for each seed.
+
+The change: the placeholder is GGUF_TYPE_COUNT, a valid value of the enum
+that is not a type. The test reads the element type only for an array key,
+and it compares it with GGUF_TYPE_STRING for the other keys, thus the
+handcrafted files and the random sequence do not change. Test code only.
+
+diff --git a/tests/test-gguf.cpp b/tests/test-gguf.cpp
+index fc63618..4b4e8b8 100644
+--- a/tests/test-gguf.cpp
++++ b/tests/test-gguf.cpp
+@@ -155,7 +155,9 @@ static std::vector<std::pair<enum gguf_type, enum gguf_type>> get_kv_types(std::
+             continue;
+         }
+ 
+-        kv_types.push_back(std::make_pair(type, gguf_type(-1)));
++        // No element type. The value must be in the range of the enum: -1 is not, and a load of
++        // it is undefined behavior.
++        kv_types.push_back(std::make_pair(type, GGUF_TYPE_COUNT));
+     }
+     std::shuffle(kv_types.begin(), kv_types.end(), rng);
+ 
