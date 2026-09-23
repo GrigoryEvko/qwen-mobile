@@ -411,6 +411,15 @@ void run(FuzzedDataProvider & fdp) {
             if (known_shared && src != dst && (sh[src].pending || sh[dst].pending)) {
                 continue;
             }
+            // A copy into a sequence that holds tokens has two meanings in the hybrid memory: the
+            // recurrent memory replaces the destination, and the unified KV cache adds the cells of
+            // the source to the old cells of the destination. llama.h does not say that the
+            // destination must be empty, and llama-server clears it first. The harness takes that
+            // contract: FUZZ_RECURRENT_CLEAR_BEFORE_COPY=1 clears the destination before each copy.
+            static const bool clear_first = fuzz::env_long("FUZZ_RECURRENT_CLEAR_BEFORE_COPY", 0) != 0;
+            if (clear_first && src != dst) {
+                drop_seq(mem, sh[dst], dst);
+            }
             llama_memory_seq_cp(mem, src, dst, -1, -1);
             trace("copy seq %d -> %d", src, dst);
             if (src != dst) {
