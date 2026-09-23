@@ -45,6 +45,7 @@ ADSP_DIR=${ADSP_DIR:-/data/local/tmp/qwen/q8ref/lib}
 PACK_N=${PACK_N:-20}
 PACK_CORPUS=${PACK_CORPUS:-40}
 PHONE_SECONDS=${PHONE_SECONDS:-85}
+DIAG_BUILD=${DIAG_BUILD:-release-none}
 
 # Print the usage text.
 usage() {
@@ -504,6 +505,9 @@ cmake -S tests/fuzz/ops -B $bdir -G Ninja \
     -DFUZZ_OPS_GGML_SRC=/workspace/build/fuzz/ops-src/ggml \
     -DHEXAGON_SDK_ROOT=\$HEXAGON_SDK_ROOT -DHEXAGON_TOOLS_ROOT=\$HEXAGON_TOOLS_ROOT -DPREBUILT_LIB_DIR=android_aarch64
 cmake --build $bdir -j$BUILD_JOBS --target ops_replay
+if [ '$b' = debug-none ] && [ '${FUZZ_OPS_BUILD_DSP:-0}' = 1 ]; then
+    cmake --build $bdir -j$BUILD_JOBS --target htp-v79
+fi
 if [ -n '$rt' ]; then
     rt=\$(find \$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt -name '$rt' | head -n 1)
     cp -f \"\$rt\" $bdir/
@@ -530,6 +534,13 @@ fi
     cp -f "$SYMBOLIZER" "$stage/llvm-symbolizer"
     rm -f "$stage/ubsan.supp"
     [[ -f "$SHARED_SAN/ubsan.supp" ]] && cp -f "$SHARED_SAN/ubsan.supp" "$stage/"
+    # FUZZ_OPS_BUILD_DSP=1: the v79 DSP library of the snapshot (it pairs with the host code of the
+    # snapshot in the builds other than release-none, which has the shipped host libraries)
+    if [[ ${FUZZ_OPS_BUILD_DSP:-0} == 1 && -z $DSP_LIB ]]; then
+        DSP_LIB=$(find "$REPO_ROOT/build/fuzz/ops-debug-none/android" -name libggml-htp-v79.so | head -n 1)
+        [[ -f $DSP_LIB ]] || die "no libggml-htp-v79.so in build/fuzz/ops-debug-none/android"
+    fi
+    rm -f "$stage/libggml-htp-v79.so"
     if [[ -n $DSP_LIB ]]; then
         [[ -f $DSP_LIB ]] || die "DSP_LIB=$DSP_LIB is not a file"
         cp -f "$DSP_LIB" "$stage/libggml-htp-v79.so"
@@ -564,8 +575,13 @@ phone_commands() {
         echo "#    empty it later, thus pull the diagnosis results before them)."
         echo "adb -s $PHONE shell 'mkdir -p $d/out'"
         echo "adb -s $PHONE push $stage/phone_run.sh $stage/diag.pack $d/"
-        echo "adb -s $PHONE push $stage/release-none $d/"
-        echo "adb -s $PHONE shell 'chmod 755 $d/release-none/ops_replay; sha256sum $d/diag.pack $d/release-none/ops_replay | cut -c1-16'"
+        echo "adb -s $PHONE push $stage/$DIAG_BUILD $d/"
+        if [[ -f "$stage/libggml-htp-v79.so" ]]; then
+            adsp="$d/dsp"
+            echo "adb -s $PHONE shell 'mkdir -p $d/dsp'"
+            echo "adb -s $PHONE push $stage/libggml-htp-v79.so $d/dsp/"
+        fi
+        echo "adb -s $PHONE shell 'chmod 755 $d/$DIAG_BUILD/ops_replay; sha256sum $d/diag.pack $d/$DIAG_BUILD/ops_replay $adsp/libggml-htp-v79.so | cut -c1-16'"
     else
     echo "# 1. Push the files into an empty work directory."
     echo "adb -s $PHONE shell 'rm -rf $d && mkdir -p $d/out $d/dsp'"
@@ -610,9 +626,9 @@ phone_commands() {
             for n in $(seq 1 "$parts"); do
                 echo "# $variant, part $n"
                 echo "adb -s $PHONE shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
-                echo "adb -s $PHONE shell 'timeout -s KILL 100 env FUZZ_OPS_PACK=diag.pack FUZZ_OPS_EXTRA=\"$extra\" FUZZ_OPS_ENV=\"$xenv\" sh $d/phone_run.sh release-none $tag HTP0 -$variant $fusion $adsp $PHONE_SECONDS all 1'"
+                echo "adb -s $PHONE shell 'timeout -s KILL 100 env FUZZ_OPS_PACK=diag.pack FUZZ_OPS_EXTRA=\"$extra\" FUZZ_OPS_ENV=\"$xenv\" sh $d/phone_run.sh $DIAG_BUILD $tag HTP0 -$variant $fusion $adsp $PHONE_SECONDS all 1'"
                 echo "adb -s $PHONE shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
-                echo "adb -s $PHONE shell 'pgrep -a ops_replay; tail -n 2 $d/out/log-release-none-$tag.txt'"
+                echo "adb -s $PHONE shell 'pgrep -a ops_replay; tail -n 2 $d/out/log-$DIAG_BUILD-$tag.txt'"
             done
         done
         echo
