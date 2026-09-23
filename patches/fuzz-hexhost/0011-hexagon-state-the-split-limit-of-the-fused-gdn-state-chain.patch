@@ -1,0 +1,31 @@
+hexagon: state the split limit of the fused GDN state chain
+Fold-into: patches/hexagon-fusion/0003-hexagon-htp-gdn-state-step-hvx-conv-and-match-fix.patch
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+The fused GDN_STATE_STEP writes the attention part of the GATED_DELTA_NET
+output and the slot of the cache, not the state tail of the output. The
+matcher sees only the nodes of the split that graph_compute gets, thus its
+privacy check cannot see a reader of that tail in a later split. Such a
+reader gets bytes that no op wrote.
+
+This patch states that limit in the comment of htp-gdn-match.h: the only
+permitted reader of the state tail is the CPY into the cache in the same
+split. The code does not change.
+
+diff --git a/ggml/src/ggml-hexagon/htp-gdn-match.h b/ggml/src/ggml-hexagon/htp-gdn-match.h
+index 4633e1f..76827fc 100644
+--- a/ggml/src/ggml-hexagon/htp-gdn-match.h
++++ b/ggml/src/ggml-hexagon/htp-gdn-match.h
+@@ -13,6 +13,11 @@
+ // other reader of the replaced tensors, and no other node that touches the cache inside the chain span.
+ // The state_zero SCALE of build_rs comes before the chain, thus it stays a separate op and runs first.
+ //
++// The matcher sees only the nodes of the split that graph_compute gets. The fused state op does not
++// write the state tail of the GATED_DELTA_NET output, thus the only permitted reader of that tail is
++// the CPY into the cache in the same split. A reader in a later split gets bytes that no op wrote. The
++// model graphs have no such reader: tests/fuzz/hexhost/run.sh graphs checks the paths of the app.
++//
+ // This header depends on ggml only. A host program can run the same checks on a graph. Each check
+ // returns nullptr when the chain matches, or a short text for the first failed condition.
+ 
