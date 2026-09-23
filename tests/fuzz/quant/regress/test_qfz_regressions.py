@@ -59,30 +59,27 @@ def _plain_source(path: Path, align: int | None = None) -> Path:
     return path
 
 
-# --- QF1: non-finite F16 scales ---------------------------------------------------------------
+# --- QF1 (task #167): non-finite F16 scales ---------------------------------------------------------
 
-@xfail_open("QF1", "q8_0_quantize writes an inf scale for a block maximum over 65504 * 127")
 def test_qf1_q8_0_refuses_a_block_beyond_the_scale_range() -> None:
-    """quant/grid.py:180: amax 8.4e6 gives d = inf in F16, and the block decodes to NaN. It must raise."""
+    """q8_0_quantize refuses the block maximum 8.4e6, whose scale is inf in F16 (the block decoded to NaN)."""
     w = torch.zeros(1, 32)
     w[0, 0] = 8.4e6
     with pytest.raises(ValueError):
         q8_0_quantize(w)
 
 
-@xfail_open("QF1", "q8_0_quantize writes a NaN or inf scale for a NaN or inf input")
 @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
 def test_qf1_q8_0_refuses_a_non_finite_input(bad: float) -> None:
-    """quant/grid.py:179-180: a NaN or inf weight gives a non-finite scale with no error. It must raise."""
+    """q8_0_quantize refuses a NaN or an infinite weight, which gave a scale that is not finite."""
     w = torch.zeros(1, 32)
     w[0, 3] = bad
     with pytest.raises(ValueError):
         q8_0_quantize(w)
 
 
-@xfail_open("QF1", "quantize writes an inf Q4_0 scale for a block maximum over 65504 * 8")
 def test_qf1_q4_0_refuses_a_block_beyond_the_scale_range() -> None:
-    """quant/grid.py:78: amax 6e5 gives d = -inf in F16. It must raise."""
+    """quantize refuses the Q4_0 block maximum 6e5, whose scale was -inf in F16."""
     w = torch.zeros(1, 32)
     w[0, 0] = 6e5
     with pytest.raises(ValueError):

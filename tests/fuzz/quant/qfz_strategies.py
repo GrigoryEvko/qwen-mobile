@@ -25,7 +25,7 @@ from dataclasses import dataclass
 import numpy as np
 from hypothesis import strategies as st
 
-from qfz_common import F16_MAX, known_open
+from qfz_common import F16_MAX
 
 PROFILES = ("gauss", "zero", "const", "spike", "sparse", "spread", "ties", "opposite")
 BLOCK = 32
@@ -120,7 +120,7 @@ def matrices(draw: st.DrawFn, max_rows: int = 6, max_blocks: int = 6, f16: bool 
 
 @st.composite
 def raw_float_matrices(draw: st.DrawFn, max_rows: int = 4, max_blocks: int = 4) -> np.ndarray:
-    """Draw a float32 matrix element by element, with NaN and Inf only when QF1 and QF2 are not open.
+    """Draw a float32 matrix element by element, NaN, the infinities and the extremes included.
 
     This strategy gives the shrinker full control of each value, thus it
     finds the smallest value that breaks a bound. It is slow, thus the
@@ -128,9 +128,6 @@ def raw_float_matrices(draw: st.DrawFn, max_rows: int = 4, max_blocks: int = 4) 
     """
     rows = draw(st.integers(1, max_rows))
     nblocks = draw(st.integers(1, max_blocks))
-    finite_only = known_open("QF1") or known_open("QF2")
-    limit = 4.0e5 if known_open("QF1") else None
-    element = st.floats(width=32, allow_nan=not finite_only, allow_infinity=not finite_only,
-                        min_value=None if limit is None else -limit, max_value=limit)
+    element = st.floats(width=32, allow_nan=True, allow_infinity=True)
     values = draw(st.lists(element, min_size=rows * nblocks * BLOCK, max_size=rows * nblocks * BLOCK))
     return np.asarray(values, dtype=np.float32).reshape(rows, nblocks * BLOCK)

@@ -66,7 +66,6 @@ LLAMA_BIN = san_dir() / "llama" / "bin"
 
 # The open findings of the campaign. The regression tests give the file, the line and the example.
 KNOWN_FINDINGS = {
-    "QF1": "a non-finite input or a block maximum out of the F16 scale range gives a non-finite F16 scale",
     "QF2": "Q4_0Grid.round casts NaN to int32, and a zero or NaN scale gives an IndexError",
     "QF3": "pack_nibbles and the export accept a pack with indices out of 0..15 or with a wrong shape",
     "QF4": "the export copies general.alignment, but the writer keeps the alignment 32",
@@ -81,6 +80,38 @@ KNOWN_FINDINGS = {
 # The largest finite F16 value, and the smallest positive subnormal F16 value.
 F16_MAX = 65504.0
 F16_TINY = 2.0 ** -24
+# The magnitude of the level of largest magnitude of each block format, and the largest factor of the scale search.
+FORMAT_TOP = {"Q8_0": 127.0, "Q4_0": 8.0, "IQ4_NL": 127.0}
+SEARCH_FACTOR = {"Q8_0": 1.0, "Q4_0": 1.05, "IQ4_NL": 1.05}
+
+
+def scale_domain(w: np.ndarray, kind: str) -> str:
+    """Give the domain of a matrix for a block format: "in", "out" or "edge". Complexity is O(elements).
+
+    A block scale is the block maximum over the level of largest magnitude.
+    F16 rounds 65520 and more to infinity. Thus:
+
+    - "out": a value that is not finite, or a block maximum whose reference
+      scale is 65520 or more. The quantizer must raise ValueError.
+    - "in": each block maximum keeps its searched scale below 65519. The
+      quantizer must not raise.
+    - "edge": between the two, where the search or the float32 division
+      decides. The quantizer can raise ValueError or give finite scales.
+
+    Args:
+        w: The float32 matrix [rows, cols], with cols a multiple of 32
+        kind: "Q8_0", "Q4_0" or "IQ4_NL"
+
+    Returns:
+        The domain
+    """
+    if not np.isfinite(w).all():
+        return "out"
+    amax = float(np.abs(block_view(w.astype(np.float64))).max()) if w.size else 0.0
+    top = FORMAT_TOP[kind]
+    if amax >= top * 65520.0 * (1.0 + 1e-6):
+        return "out"
+    return "edge" if amax >= top * 65519.0 / SEARCH_FACTOR[kind] else "in"
 
 
 def fixed(finding: str) -> bool:

@@ -12,8 +12,10 @@ The properties:
 - A block on the grid keeps its scale and its values.
 - The results do not depend on the row chunk size.
 - block_error agrees with quantize and dequantize.
+- A value that is not finite, or a block beyond the F16 scale range, gives
+  ValueError (qfz_common.scale_domain).
 
-The inputs of the open findings QF1 and QF2 are excluded. Refer to qfz_common.
+The inputs of the open finding QF2 are excluded. Refer to qfz_common.
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ from hypothesis import strategies as st
 
 import gguf
 import quant.grid as grid_module
-from qfz_common import F16_MAX, block_view, fixed, known_open, q8_0_error_bound
+from qfz_common import F16_MAX, block_view, known_open, q8_0_error_bound, scale_domain
 from qfz_hyp import counted, fuzz_settings
 from qfz_strategies import MatrixSpec, matrices, raw_float_matrices
 from quant.grid import (block_error, dequantize, pack_nibbles, pack_q8_0, q8_0_dequantize, q8_0_quantize,
@@ -37,8 +39,6 @@ from quant.grids import IQ4NLGrid, Q4_0Grid
 
 Q8 = gguf.GGMLQuantizationType.Q8_0
 GRIDS = {"Q4_0": Q4_0Grid, "IQ4_NL": IQ4NLGrid}
-# The largest block maximum whose scale stays finite in F16, for each grid, with the search factor 1.05.
-SCALE_LIMIT = {"Q8_0": 127.0 * 65519.0, "Q4_0": 8.0 * 65519.0 / 1.05, "IQ4_NL": 127.0 * 65519.0 / 1.05}
 
 # The explicit examples: the seeds of the mode "test", and the minimal examples of the findings.
 SPEC_MIXED = MatrixSpec(2, 2, (("gauss", "spike"), ("zero", "ties")), ((0, -30), (5, -10)), 1, False)
@@ -56,29 +56,23 @@ def _amax(w: np.ndarray) -> np.ndarray:
     return np.abs(block_view(w.astype(np.float64))).max(axis=-1)
 
 
-def _out_of_range(w: np.ndarray, kind: str) -> bool:
-    """Tell if an input is out of the domain of a block format: a non-finite value or a scale beyond F16."""
-    return not np.isfinite(w).all() or float(np.nan_to_num(_amax(w), posinf=np.inf).max()) >= SCALE_LIMIT[kind]
+def _refused(w: np.ndarray, kind: str) -> bool:
+    """Check the answer of the quantizer to an input out of the F16 scale range. Give True when it refused the input.
 
-
-def _skip_known_scale_range(w: np.ndarray, kind: str) -> bool:
-    """Handle an input out of the domain of the format (QF1). Give True when the caller must stop.
-
-    While QF1 is open, the input is skipped. With QFZ_FIXED holding QF1,
-    the quantizer must refuse the input with ValueError, the clear error of
-    the property. With QFZ_KNOWN holding QF1, the input goes on, and the
-    checks of the caller show the defect.
+    An input "out" of scale_domain must give ValueError. An input on the
+    "edge" can give ValueError, or finite scales that the caller checks.
     """
-    if not _out_of_range(w, kind):
+    domain = scale_domain(w, kind)
+    if domain == "in":
         return False
-    if fixed("QF1"):
-        with pytest.raises(ValueError):
-            if kind == "Q8_0":
-                q8_0_quantize(torch.from_numpy(w))
-            else:
-                quantize(GRIDS[kind](), torch.from_numpy(w))
+    try:
+        if kind == "Q8_0":
+            q8_0_quantize(torch.from_numpy(w))
+        else:
+            quantize(GRIDS[kind](), torch.from_numpy(w))
+    except ValueError:
         return True
-    assume(not known_open("QF1"))
+    assert domain == "edge", "the quantizer accepts a value that is not finite or a block beyond the F16 scale range"
     return False
 
 
@@ -111,7 +105,7 @@ def _check_q8_0(w: np.ndarray) -> None:
 def test_q8_0_packs_within_the_format_bound(spec) -> None:
     """Q8_0 of a float32 matrix: finite scales, the bytes of gguf-py, the bound, the ggml reference."""
     w = spec.build()
-    if not _skip_known_scale_range(w, "Q8_0"):
+    if not _refused(w, "Q8_0"):
         _check_q8_0(w)
 
 
@@ -122,7 +116,7 @@ def test_q8_0_packs_within_the_format_bound(spec) -> None:
 @counted
 def test_q8_0_element_by_element(w: np.ndarray) -> None:
     """Q8_0 with each value drawn on its own, thus the shrinker gives the smallest failing value."""
-    if not _skip_known_scale_range(w, "Q8_0"):
+    if not _refused(w, "Q8_0"):
         _check_q8_0(w)
 
 
@@ -135,7 +129,7 @@ def test_q8_0_element_by_element(w: np.ndarray) -> None:
 def test_grid4_packs_and_decodes_in_gguf_py(spec, kind: str, search: bool, f16: bool) -> None:
     """Q4_0 and IQ4_NL: indices 0 .. 15, finite scales, and gguf-py decodes the bytes to our values."""
     w = dataclasses.replace(spec, f16=f16).build()
-    if _skip_known_scale_range(w, kind):
+    if _refused(w, kind):
         return
     grid = GRIDS[kind]()
     idx, d = quantize(grid, torch.from_numpy(w), search=search)

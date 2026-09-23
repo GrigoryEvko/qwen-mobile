@@ -59,12 +59,36 @@ def scale_search(grid: Grid, blocks: torch.Tensor, weights: torch.Tensor | None 
 ROW_CHUNK = 16384
 
 
+def _check_scales(d: torch.Tensor, blocks: torch.Tensor, row0: int, largest: float) -> None:
+    """Raise ValueError when an F16 block scale is not finite. Complexity is O(blocks).
+
+    The block maximum of torch keeps NaN and infinity, thus a value that is
+    not finite gives a scale that is not finite. This check finds that value
+    too, with no pass over the elements. ``largest`` is the largest block
+    maximum that the format permits, for the error text.
+    """
+    bad = ~torch.isfinite(d)
+    if not bad.any():
+        return
+    r, b = (int(x) for x in bad.nonzero()[0])
+    block = blocks[r, b]
+    odd = (~torch.isfinite(block)).nonzero()
+    if odd.numel():
+        j = int(odd[0])
+        raise ValueError(f"the weight at row {row0 + r}, column {b * BLOCK + j} is {float(block[j])}: "
+                         "a block format needs finite values")
+    raise ValueError(f"the block of 32 at row {row0 + r}, column {b * BLOCK} has the maximum "
+                     f"{float(block.abs().max()):.6g}: its scale is beyond the F16 range, which permits a block "
+                     f"maximum of about {largest:.6g}")
+
+
 def quantize(grid: Grid, w: torch.Tensor, weights: torch.Tensor | None = None, search: bool = True):
     """Quantize [rows, cols] to (indices int8 [rows, cols], d float16 [rows, nblocks]).
 
     The work runs in row chunks on the device of the grid, and the results
     live there. ``w`` can be on another device, thus the head (248320 x 2048)
-    needs no multi-gigabyte temporaries on the device.
+    needs no multi-gigabyte temporaries on the device. Raises ValueError for
+    a value that is not finite and for a block whose scale is beyond F16.
     """
     rows, cols = w.shape
     dev = grid.levels.device
@@ -74,8 +98,13 @@ def quantize(grid: Grid, w: torch.Tensor, weights: torch.Tensor | None = None, s
         weights = weights.to(dev)
     for r in range(0, rows, ROW_CHUNK):
         blocks = blocks_of(w[r:r + ROW_CHUNK].to(dev, torch.float32))
-        d = scale_search(grid, blocks, weights) if search else grid.scale_rtn(blocks)
+        largest = 65504.0 * float(grid.top.abs())
+        d0 = grid.scale_rtn(blocks)
+        # The reference scale must fit F16. The search could clamp such a block with a smaller finite scale.
+        _check_scales(d0.to(torch.float16).to(torch.float32), blocks, r, largest)
+        d = scale_search(grid, blocks, weights) if search else d0
         d = d.to(torch.float16).to(torch.float32)
+        _check_scales(d, blocks, r, largest)
         idx_out[r:r + ROW_CHUNK] = grid.quantize_blocks(blocks, d).reshape(blocks.shape[0], cols).to(torch.int8)
         d_out[r:r + ROW_CHUNK] = d.to(torch.float16)
     return idx_out, d_out
@@ -170,7 +199,11 @@ def pack_nibbles(idx: torch.Tensor, d: torch.Tensor) -> np.ndarray:
 
 
 def q8_0_quantize(w: torch.Tensor):
-    """Round-to-nearest Q8_0: (q int8 [rows, cols], d float16 [rows, nblocks]), in row chunks."""
+    """Round-to-nearest Q8_0: (q int8 [rows, cols], d float16 [rows, nblocks]), in row chunks.
+
+    Raises ValueError for a value that is not finite and for a block whose
+    maximum is beyond 127 times the largest F16 value.
+    """
     rows, cols = w.shape
     q_out = torch.empty(rows, cols, dtype=torch.int8, device=w.device)
     d_out = torch.empty(rows, cols // BLOCK, dtype=torch.float16, device=w.device)
@@ -178,6 +211,7 @@ def q8_0_quantize(w: torch.Tensor):
         blocks = blocks_of(w[r:r + ROW_CHUNK].to(torch.float32))
         amax = blocks.abs().amax(dim=-1)
         d = torch.where(amax == 0, torch.ones_like(amax), amax / 127.0).to(torch.float16).to(torch.float32)
+        _check_scales(d, blocks, r, 65504.0 * 127.0)
         q_out[r:r + ROW_CHUNK] = torch.clamp(torch.round(blocks / d[..., None]), -127, 127).reshape(-1, cols).to(torch.int8)
         d_out[r:r + ROW_CHUNK] = d.to(torch.float16)
     return q_out, d_out

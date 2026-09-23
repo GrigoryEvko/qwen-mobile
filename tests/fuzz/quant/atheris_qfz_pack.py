@@ -8,8 +8,8 @@ possible. The oracle is the same as in test_qfz_grid.py:
 - The indices and the scales are in range, and the scales are finite.
 - gguf-py decodes the packed bytes to the values of the pipeline, bit for bit.
 - A Q8_0 block keeps the format bound.
-
-An input of an open finding (QF1, QF2) is skipped, unless QFZ_KNOWN holds it.
+- A value that is not finite, or a block beyond the F16 scale range, gives
+  ValueError, and no input in the range does (qfz_common.scale_domain).
 
     uv run python tests/fuzz/quant/atheris_qfz_pack.py -max_total_time=600 -timeout=20 \\
         -rss_limit_mb=4096 -artifact_prefix=build/fuzz/quant/atheris/ build/fuzz/quant/atheris/pack-corpus \\
@@ -40,10 +40,9 @@ with atheris.instrument_imports(include=["quant.grid", "quant.grids", "gguf.quan
     from quant.grid import dequantize, pack_nibbles, pack_q8_0, q8_0_dequantize, q8_0_quantize, quantize
     from quant.grids import IQ4NLGrid, Q4_0Grid
 
-from qfz_common import block_view, known_open, q8_0_error_bound  # noqa: E402
+from qfz_common import block_view, q8_0_error_bound, scale_domain  # noqa: E402
 
 KINDS = ("Q8_0", "Q4_0", "IQ4_NL")
-LIMIT = {"Q8_0": 127.0 * 65519.0, "Q4_0": 8.0 * 65519.0 / 1.05, "IQ4_NL": 127.0 * 65519.0 / 1.05}
 torch.set_num_threads(1)
 
 
@@ -57,14 +56,17 @@ def test_one_input(data: bytes) -> None:
     if len(raw) < rows * nblocks * 32 * 4:
         return
     w = np.frombuffer(raw, dtype=np.float32).reshape(rows, nblocks * 32).copy()
-    if (known_open("QF1") or known_open("QF2")) and not np.isfinite(w).all():
-        return
-    amax = np.abs(block_view(w.astype(np.float64))).max(-1)
-    if known_open("QF1") and float(amax.max()) >= LIMIT[kind]:
-        return
+    domain = scale_domain(w, kind)
     wt = torch.from_numpy(w)
+    grid = Q4_0Grid() if kind == "Q4_0" else IQ4NLGrid()
+    try:
+        q, d = q8_0_quantize(wt) if kind == "Q8_0" else quantize(grid, wt, search=search)
+    except ValueError:
+        assert domain != "in", f"the {kind} quantizer refuses a finite input in the F16 scale range"
+        return
+    assert domain != "out", f"the {kind} quantizer accepts a value that is not finite or a block beyond F16"
     if kind == "Q8_0":
-        q, d = q8_0_quantize(wt)
+        amax = np.abs(block_view(w.astype(np.float64))).max(-1)
         d32 = d.to(torch.float32).numpy()
         assert np.isfinite(d32).all(), "a Q8_0 scale is not finite"
         assert int(q.abs().max()) <= 127
@@ -74,8 +76,7 @@ def test_one_input(data: bytes) -> None:
         err = np.abs(block_view(w.astype(np.float64)) - block_view(ours.astype(np.float64))).max(-1)
         assert (err <= q8_0_error_bound(amax, d32)).all(), "the Q8_0 error is over the bound"
         return
-    grid = Q4_0Grid() if kind == "Q4_0" else IQ4NLGrid()
-    idx, d = quantize(grid, wt, search=search)
+    idx = q
     assert int(idx.min()) >= 0 and int(idx.max()) <= 15, "an index is out of 0 .. 15"
     assert torch.isfinite(d).all(), "a 4-bit scale is not finite"
     decoded = gguf.quants.dequantize(pack_nibbles(idx, d), getattr(gguf.GGMLQuantizationType, kind))
