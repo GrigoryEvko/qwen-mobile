@@ -16,6 +16,12 @@
 #                                        (msan.cmake sets it OFF, rule R7)
 #   the NDK linker lld                  -fuse-ld=lld, necessary for -flto
 #   the arm64 frame pointer             -fno-omit-frame-pointer (common.cmake)
+#
+# The libraries are shared (BUILD_SHARED_LIBS=ON), as the app ships them.
+# Thus the full LTO of ggml and llama runs one time for each library, not
+# again for each test or fuzz executable, and no inlining crosses the
+# boundary of a library, as in the shipped build. The LTO code generation is
+# not partitioned, as in the shipped build.
 # The NDK toolchain file also adds -fstack-protector-strong,
 # -D_FORTIFY_SOURCE=2, -ffunction-sections, -fdata-sections and
 # -funwind-tables. They are not in the preset, and this profile does not add
@@ -42,3 +48,4 @@ set(CMAKE_BUILD_TYPE Release CACHE STRING "")
 set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "")
 set(GGML_NATIVE ON CACHE BOOL "")
+set(BUILD_SHARED_LIBS ON CACHE BOOL "")
