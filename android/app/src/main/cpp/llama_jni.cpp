@@ -190,7 +190,27 @@ struct TurnStats {
     int64_t gen_steps      = 0;
 };
 
+/**
+ * The state of an engine that requestStop and hasMtp use. Those calls run
+ * on another thread (requestStop on the display thread of the app), and they
+ * reach this block and not the engine. Thus they never own the engine, and
+ * the destructor of the engine, which takes hundreds of milliseconds on the
+ * phone, never runs in them.
+ */
+struct EngineFlags {
+    /** Set by requestStop from another thread. generateNext reads it before the sample. */
+    std::atomic<bool> stop_requested{false};
+    /**
+     * True when the model holds the MTP tensors and the backend can use them.
+     * The load sets it before the table publishes the engine, and it does not
+     * change after that.
+     */
+    bool mtp_ready = false;
+};
+
 struct Engine {
+    /** The flags of this engine. The engine table holds them next to the engine. */
+    const std::shared_ptr<EngineFlags> flags = std::make_shared<EngineFlags>();
     llama_model *     model = nullptr;
     llama_context *   ctx   = nullptr;
     llama_sampler *   smpl  = nullptr;
@@ -224,7 +244,7 @@ struct Engine {
     llama_context *      ctx_dft = nullptr;
     common_speculative * spec    = nullptr;
     /** True when the model holds the MTP tensors and the backend can use them. The app asks with hasMtp. */
-    bool mtp_ready = false;
+    bool & mtp_ready = flags->mtp_ready;
     /** False while the benchmark runs: the draft context must not follow those decodes. */
     bool spec_feed = false;
     /** The draft of the step that runs, and the tokens that the target context holds (text only). */
@@ -254,7 +274,7 @@ struct Engine {
     /** Bytes of an incomplete UTF-8 sequence from the last token. */
     std::string utf8_pending;
     /** Set by requestStop from another thread. generateNext reads it before the sample. */
-    std::atomic<bool> stop_requested{false};
+    std::atomic<bool> & stop_requested = flags->stop_requested;
     /** True while the thinking of the answer is open: the generation prompt or a generated tag opened it. */
     bool think_open = false;
     /**
@@ -1586,10 +1606,13 @@ std::pair<double, double> mean_std(const std::vector<double> & v) {
  * and not an address, thus a handle of a released engine matches nothing and
  * a late call cannot reach freed memory.
  *
- * requestStop runs on the thread of the caller without the mutex of the
- * engine, and a model switch can release the engine at the same moment. The
- * table therefore hands out a shared pointer: the engine stays alive while a
- * call holds it, and the destructor runs when the last holder lets go.
+ * The table hands out a shared pointer: the engine stays alive while a call
+ * holds it, and the destructor runs when the last holder lets go. The app
+ * makes each call that holds the engine on its engine thread, thus the
+ * destructor runs there. requestStop runs on the thread of the caller, and a
+ * model switch can release the engine at the same moment. Thus requestStop
+ * and hasMtp get only the flags of the engine (EngineFlags), which the table
+ * holds next to it, and never the last owner of the engine.
  * Complexity: O(1) for each operation.
  */
 class EngineTable {
@@ -1598,7 +1621,8 @@ public:
     jlong add(std::shared_ptr<Engine> engine) {
         std::lock_guard<std::mutex> lock(mutex_);
         const jlong handle = next_++;
-        engines_.emplace(handle, std::move(engine));
+        std::shared_ptr<EngineFlags> flags = engine->flags;
+        engines_.emplace(handle, Entry{std::move(engine), std::move(flags)});
         return handle;
     }
 
@@ -1606,7 +1630,14 @@ public:
     std::shared_ptr<Engine> get(jlong handle) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = engines_.find(handle);
-        return it == engines_.end() ? nullptr : it->second;
+        return it == engines_.end() ? nullptr : it->second.engine;
+    }
+
+    /** The flags of the engine of the handle, without the engine, or null when the handle is not live. */
+    std::shared_ptr<EngineFlags> flags(jlong handle) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = engines_.find(handle);
+        return it == engines_.end() ? nullptr : it->second.flags;
     }
 
     /** Drops the engine of the handle. A second call with it does nothing. */
@@ -1621,14 +1652,20 @@ public:
             if (it == engines_.end()) {
                 return;
             }
-            engine = std::move(it->second);
+            engine = std::move(it->second.engine);
             engines_.erase(it);
         }
     }
 
 private:
+    /** An engine and its flags. */
+    struct Entry {
+        std::shared_ptr<Engine>      engine;
+        std::shared_ptr<EngineFlags> flags;
+    };
+
     std::mutex mutex_;
-    std::unordered_map<jlong, std::shared_ptr<Engine>> engines_;
+    std::unordered_map<jlong, Entry> engines_;
     jlong next_ = 1;  // The app reads 0 as "no model", thus a handle starts at 1.
 };
 
@@ -2111,8 +2148,9 @@ Java_ai_airi_qwenmobile_LlamaNative_modelInfo(JNIEnv * env, jclass, jlong handle
  */
 JNIEXPORT jboolean JNICALL
 Java_ai_airi_qwenmobile_LlamaNative_hasMtp(JNIEnv *, jclass, jlong handle) {
-    const std::shared_ptr<Engine> e = engine_of(handle);
-    return e != nullptr && e->mtp_ready ? JNI_TRUE : JNI_FALSE;
+    // The flags and not the engine: refer to EngineTable.
+    const std::shared_ptr<EngineFlags> f = engine_table().flags(handle);
+    return f != nullptr && f->mtp_ready ? JNI_TRUE : JNI_FALSE;
 }
 
 static jint chat_start_impl(JNIEnv * env, jclass native_class, jlong handle,
@@ -2360,12 +2398,12 @@ Java_ai_airi_qwenmobile_LlamaNative_generateNext(JNIEnv * env, jclass, jlong han
 JNIEXPORT void JNICALL
 Java_ai_airi_qwenmobile_LlamaNative_requestStop(JNIEnv *, jclass, jlong handle) {
     // Runs on the thread of the caller, without the mutex of the engine and
-    // possibly while the engine thread releases the model. The shared pointer
-    // keeps the engine alive for the store below, and a handle that is no
-    // longer live gives null instead of a freed address.
-    const std::shared_ptr<Engine> e = engine_of(handle);
-    if (e != nullptr) {
-        e->stop_requested = true;
+    // possibly while the engine thread releases the model. The call owns the
+    // flags of the engine and not the engine: refer to EngineTable. A handle
+    // that is no longer live gives null instead of a freed address.
+    const std::shared_ptr<EngineFlags> f = engine_table().flags(handle);
+    if (f != nullptr) {
+        f->stop_requested = true;
     }
 }
 

@@ -63,7 +63,7 @@ int check_priority(const Options & opt);
 /**
  * Run one deterministic scenario of a defect class. The names:
  * image-shape, image-twice, jni-pending, spec-disable, spec-parity, spec-image, snapshot-damage,
- * image-damage, sampler-nan, priority. Returns 0
+ * image-damage, sampler-nan, stop-free, priority. Returns 0
  * when the defect does not occur, 1 when the priority check reports it,
  * and 2 for an unknown name. The other defects stop the process with the
  * message of the check or the report of the sanitizer.

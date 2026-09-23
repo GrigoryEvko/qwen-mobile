@@ -8,7 +8,11 @@
  * - common_speculative_process: a fault plan makes the draft context refuse
  *   a batch, as a failed decode on the NPU does.
  * - setpriority and closedir: the check of the thread priorities.
- * - ggml_threadpool_free: the thread that destroys an engine.
+ * - ggml_threadpool_free: the thread that destroys an engine. The app calls
+ *   free on the engine thread, and only requestStop on another thread. Thus
+ *   a destruction on another thread in a call that is not free (the frees
+ *   of the second thread of --cross-free) would stop the thread of the
+ *   caller, in the app the display thread, for the time of the destructor.
  *
  * The checks after each operation, for each live engine:
  *
@@ -110,9 +114,16 @@ std::condition_variable g_bystander_cv;
 bool g_bystander_release = false;
 std::thread g_bystander;
 
-/** The engine thread of the harness, and the count of engines that another thread destroyed. */
+/**
+ * The engine thread of the harness, and the counts of the engines that
+ * another thread destroyed: in a free of that thread, and in another call.
+ */
 std::thread::id g_engine_thread;
 std::atomic<uint64_t> g_off_thread_frees{0};
+std::atomic<uint64_t> g_off_thread_other{0};
+
+/** The name of the JNI call that runs on this thread, or null. */
+thread_local const char * t_jni_call = nullptr;
 
 }  // namespace
 
@@ -163,7 +174,14 @@ bool harness_spec_process(common_speculative * spec, const llama_batch & batch) 
 
 void harness_threadpool_free(ggml_threadpool * tp) {
     if (std::this_thread::get_id() != g_engine_thread) {
-        g_off_thread_frees += 1;
+        if (t_jni_call != nullptr && strcmp(t_jni_call, "free") == 0) {
+            g_off_thread_frees += 1;
+        } else {
+            g_off_thread_other += 1;
+            fakejni::fail("an engine was destroyed off the engine thread in %s: in the app that call runs on the "
+                          "display thread, which then stops for the time of the destructor",
+                          t_jni_call != nullptr ? t_jni_call : "no JNI call");
+        }
     }
     ggml_threadpool_free(tp);
 }
@@ -271,6 +289,12 @@ template <typename F>
 fakejni::CallOutcome jni_call(const char * name, F && body) {
     JNIEnv * env = fakejni::env();
     fakejni::begin_call(env, name);
+    const char * outer = t_jni_call;
+    t_jni_call = name;
+    struct Restore {
+        const char * name;
+        ~Restore() { t_jni_call = name; }
+    } restore{outer};
     try {
         body(env);
     } catch (const std::exception & ex) {
@@ -1290,8 +1314,10 @@ void init_once(const Options & opt) {
             for (const auto & kv : g_exceptions) {
                 fprintf(f, "%8llu %s\n", (unsigned long long) kv.second, kv.first.c_str());
             }
-            fprintf(f, "engines destroyed off the engine thread: %llu, draft follow faults: %llu\n",
-                    (unsigned long long) g_off_thread_frees.load(), (unsigned long long) g_spec_faults.load());
+            fprintf(f,
+                    "engines destroyed off the engine thread: %llu in a free, %llu in another call, draft follow faults: %llu\n",
+                    (unsigned long long) g_off_thread_frees.load(), (unsigned long long) g_off_thread_other.load(),
+                    (unsigned long long) g_spec_faults.load());
             fclose(f);
         });
     });
@@ -1306,13 +1332,13 @@ void print_summary() {
     fprintf(stderr,
             "summary: %llu programs, %llu ops, %llu loads (%llu failed), %llu turns, %llu tokens, %llu stops, "
             "%llu images, %llu oracle checks, %llu Java exceptions, %llu JNI faults, %llu draft faults, "
-            "drafted %llu accepted %llu, %llu engines destroyed off the engine thread\n",
+            "drafted %llu accepted %llu, engines destroyed off the engine thread: %llu in a free, %llu in another call\n",
             (unsigned long long) c.programs, (unsigned long long) c.ops, (unsigned long long) (c.loads_ok + c.loads_failed),
             (unsigned long long) c.loads_failed, (unsigned long long) c.turns, (unsigned long long) c.tokens,
             (unsigned long long) c.stops, (unsigned long long) c.images, (unsigned long long) c.oracle_checks,
             (unsigned long long) c.java_exceptions, (unsigned long long) c.faults,
             (unsigned long long) g_spec_faults.load(), (unsigned long long) c.drafted, (unsigned long long) c.accepted,
-            (unsigned long long) g_off_thread_frees.load());
+            (unsigned long long) g_off_thread_frees.load(), (unsigned long long) g_off_thread_other.load());
     std::lock_guard<std::mutex> lock(g_exc_mutex);
     for (const auto & kv : g_exceptions) {
         fprintf(stderr, "  %8llu %s\n", (unsigned long long) kv.second, kv.first.c_str());
@@ -1602,12 +1628,63 @@ int run_scenario(const Options & opt, const std::string & name) {
         const int n = drain_answer(le, 8);
         fprintf(stderr, "scenario sampler-nan: chatStart gave %d, %d pieces, no assert\n", rc, n);
         api_free(h);
+    } else if (name == "stop-free") {
+        // The display thread of the app calls requestStop while the engine thread frees the
+        // model. The destructor of an engine takes hundreds of milliseconds on the phone, thus
+        // it must run in free, and never in requestStop or hasMtp on the other thread. Thus
+        // those two calls must not own the engine at any time: a call that owns it can hold
+        // the last owner when a free runs, and a free in that window is too rare to wait for.
+        s.mmproj.clear();
+        constexpr int kRounds = 50;
+        constexpr int kSamples = 20000;
+        const uint64_t before = g_off_thread_other.load();
+        uint64_t requests = 0;
+        uint64_t owned = 0;
+        for (int round = 0; round < kRounds; ++round) {
+            const jlong h = api_load(s);
+            if (h == 0) {
+                fail("scenario stop-free: the tiny model did not load");
+            }
+            std::atomic<bool> done{false};
+            std::atomic<uint64_t> calls{0};
+            std::thread ui([&] {
+                while (!done.load()) {
+                    api_request_stop(h);
+                    api_has_mtp(h);
+                    calls += 1;
+                }
+            });
+            while (calls.load() == 0) {
+                std::this_thread::yield();
+            }
+            {
+                // The owners of the engine: the table and this sample. A third one is a call of the other thread.
+                const std::shared_ptr<Engine> e = engine_of(h);
+                for (int i = 0; i < kSamples; ++i) {
+                    owned += e.use_count() > 2 ? 1 : 0;
+                }
+            }
+            api_free(h);
+            done = true;
+            ui.join();
+            requests += calls.load();
+        }
+        const uint64_t off = g_off_thread_other.load() - before;
+        if (owned != 0 || off != 0) {
+            fail("scenario stop-free: requestStop or hasMtp owned the engine in %llu of %d samples, and %llu of %d "
+                 "engines were destroyed on the other thread, not in free",
+                 (unsigned long long) owned, kRounds * kSamples, (unsigned long long) off, kRounds);
+        }
+        fprintf(stderr,
+                "scenario stop-free: %llu stop requests, no owner of the engine in them, %d frees, each engine "
+                "destroyed in free\n",
+                (unsigned long long) requests, kRounds);
     } else if (name == "priority") {
         result = check_priority(opt);
     } else {
         fprintf(stderr,
                 "unknown scenario %s: image-shape, image-twice, jni-pending, spec-disable, spec-parity, spec-image, "
-                "snapshot-damage, image-damage, sampler-nan, priority\n",
+                "snapshot-damage, image-damage, sampler-nan, stop-free, priority\n",
                 name.c_str());
         result = 2;
     }

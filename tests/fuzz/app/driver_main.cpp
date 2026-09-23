@@ -17,7 +17,7 @@
  * --check-priority  Run the check of the thread priorities and stop with its result.
  * --scenario  Run one scenario of a defect class (image-shape, image-twice,
  *             jni-pending, spec-disable, spec-parity, spec-image, snapshot-damage,
- *             image-damage, sampler-nan, priority)
+ *             image-damage, sampler-nan, stop-free, priority)
  *             and stop.
  * --speed     Measure the time of one generateNext of the tiny model, REPS
  *             answers without and REPS with speculation, and stop.
