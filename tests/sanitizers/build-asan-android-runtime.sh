@@ -31,6 +31,10 @@
 #   --jobs N        The number of parallel compile jobs. The preset value is 8.
 #   --ndk DIR       The Android NDK that compiles the runtime. The preset
 #                   value is the newest NDK in ~/Android/Sdk/ndk.
+#                   tests/sanitizers/fetch-android-ndk.sh puts the pinned
+#                   NDK r30 there. The paths of the NDK and of the prefix go
+#                   into the runtime, thus the runtime is bit-identical only
+#                   with the same two paths.
 #   --verify-only   Do only the checks of an existing runtime.
 #
 # Outputs, in DIR:
