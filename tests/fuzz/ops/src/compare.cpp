@@ -11,6 +11,7 @@ namespace fo {
 namespace {
 
 constexpr float FLT_MIN_NORMAL = 1.17549435e-38f;
+constexpr float FLT_MAX_F32    = 3.40282347e+38f;
 
 // Return the spacing of f32 values at |x|.
 double ulp_of(double x) {
@@ -89,7 +90,13 @@ case_cmp compare_case(const built_case & c, const std::vector<std::vector<uint8_
             const float g = gf[(size_t) i];
             if (!std::isfinite(r) || !std::isfinite(g)) {
                 const bool same = (std::isnan(r) && std::isnan(g)) || r == g;
-                if (!same) {
+                // The f32 range limit of the kind (refer to bound_arrays::overflow_factor)
+                const bool f32_limit = std::isfinite(r) && std::isinf(g) && std::signbit(r) == std::signbit(g) &&
+                                       ba.overflow_factor > 0.0 &&
+                                       ba.overflow_factor * std::fabs((double) r) >= (double) FLT_MAX_F32;
+                if (f32_limit) {
+                    oc.n_f32_limit++;
+                } else if (!same) {
                     if (oc.nf_i < 0) {
                         oc.nf_i   = i;
                         oc.nf_ref = r;
@@ -171,6 +178,11 @@ case_cmp compare_case(const built_case & c, const std::vector<std::vector<uint8_
                           "with a finite result %.6g",
                           (long long) oc.nf_i, (double) oc.nf_ref, (double) oc.nf_got, (long long) oc.n_nf_f16,
                           (long long) oc.n_nonfinite, oc.max_ref_fin);
+            cc.text += buf;
+        }
+        if (oc.n_f32_limit > 0) {
+            std::snprintf(buf, sizeof(buf), " inf at the f32 range limit (overflow factor %g, not a finding): %lld",
+                          ba.overflow_factor, (long long) oc.n_f32_limit);
             cc.text += buf;
         }
         cc.text += "; ";

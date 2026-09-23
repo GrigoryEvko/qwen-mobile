@@ -74,6 +74,10 @@ struct built_case {
 struct bound_arrays {
     std::vector<double> strict;
     std::vector<double> loose;
+    // The f32 overflow factor F of the kind. A backend result of +Inf or -Inf, with the sign of a
+    // finite oracle value r and F |r| >= FLT_MAX, is the limit of the f32 range and not a finding:
+    // the backend forms a value up to F |r| in f32 on the way to r. 0 turns the rule off.
+    double overflow_factor = 0.0;
 };
 
 // One kind of case.

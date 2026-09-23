@@ -735,6 +735,16 @@ void gdn_growth_bounds(const built_case & c, const ggml_tensor * y, int64_t T, i
     }
 }
 
+// The f32 overflow factor of a GDN output (refer to bound_arrays::overflow_factor), 2 sqrt(S_v).
+// Reason: the attention output is scale q^T S with scale = 1/sqrt(S_v), and the backend sums
+// q^T S in f32 before the scale, thus that sum is sqrt(S_v) |y|. The state step forms k^T S, a
+// sum of S_v terms with |k| = 1, of the same size. The factor 2 is the margin of the partial sums
+// of such a sum in another order. Only a case outside the domain of the model (gdn_growth) gets a
+// state near FLT_MAX.
+double gdn_overflow_factor(double S_v) {
+    return 2.0 * std::sqrt(S_v);
+}
+
 // Return true if each finite gate is <= 0 and each finite beta is in [0, 1]: the domain of the model.
 bool gdn_in_domain(const built_case & c, const ggml_tensor * y) {
     for (double x : logical_values(c, y->src[3])) {
@@ -764,6 +774,7 @@ void bound_gdn(const built_case & c, size_t o, const std::vector<float> & ref, b
     if (!gdn_in_domain(c, y)) {
         gdn_growth_bounds(c, y, (int64_t) T, (int64_t) n_seqs, ref, ba);
     }
+    ba.overflow_factor = gdn_overflow_factor(S_v);
 }
 
 const char * TXT_GDN =
@@ -776,7 +787,10 @@ const char * TXT_GDN =
     "beta outside [0, 1], only from a byte after the other fields of a wild case) can expand the state by "
     "gamma = exp(max g) max(1, |1 - beta|) for each token, and the error grows with it: each output "
     "of a head also gets max_t (e_t + 8u (S_v+4) c_t), with c the growth bound of the column norm of "
-    "the state and e_t+1 = gamma_t e_t + 8u (S_v+4) c_t+1 (refer to gdn_growth).";
+    "the state and e_t+1 = gamma_t e_t + 8u (S_v+4) c_t+1 (refer to gdn_growth). Such a state can get "
+    "near FLT_MAX: an Inf of the sign of a finite reference y with 2 sqrt(S_v) |y| >= FLT_MAX is the "
+    "f32 range limit and not a finding, because the backend sums q^T S (sqrt(S_v) |y|) and k^T S in "
+    "f32, and the factor 2 is the margin of the partial sums (refer to gdn_overflow_factor).";
 
 bool build_gdn_state_chain(builder & b) {
     reader &  rd = b.rd;
@@ -851,6 +865,7 @@ void bound_gdn_chain(const built_case & c, size_t o, const std::vector<float> & 
             ba.loose[i]  = std::max(ba.loose[i], w.loose);
         }
     }
+    ba.overflow_factor = gdn_overflow_factor(c.prm[0]);
 }
 
 const char * TXT_GDN_CHAIN =
