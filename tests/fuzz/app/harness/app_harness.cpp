@@ -1468,6 +1468,40 @@ int run_scenario(const Options & opt, const std::string & name) {
             fprintf(stderr, "scenario spec-parity: fault at %d (%llu faults), %zu bytes, the same text\n", fault_at,
                     (unsigned long long) (g_spec_faults.load() - faults), got.size());
         }
+    } else if (name == "spec-image") {
+        // A speculative engine with the projector: a text turn with drafts, then a turn with an
+        // image. The verify batch of a speculative step asks for the most logits rows of all the
+        // decodes of the engine, and the image chunks ask for none: each one must stay inside the
+        // output limit of the contexts.
+        s.speculative = true;
+        p.images.push_back(make_bmp(32, 32, 11));
+        const jlong h = api_load(s);
+        if (h == 0) {
+            fail("scenario spec-image: the tiny model did not load");
+        }
+        LiveEngine le;
+        le.handle = h;
+        std::vector<Msg> chat = {user(u"Hello, how are you? Tell me about the cat.", -1)};
+        if (api_chat_start(p, h, chat, false, 0.0f, 0.8f, false, false) < 0) {
+            fail("scenario spec-image: the text turn did not start");
+        }
+        start_tracking(le);
+        const int n_text = drain_answer(le, 48);
+        const std::shared_ptr<Engine> e = engine_of(h);
+        const int64_t drafted = e != nullptr ? e->turn.drafted : 0;
+        if (drafted == 0) {
+            fail("scenario spec-image: the text turn made no draft, thus it did not test the verify batch");
+        }
+        chat.push_back(Msg{"assistant", u"ok", -1});
+        chat.push_back(user(u"What is in the picture?", 0));
+        if (api_chat_start(p, h, chat, false, 0.0f, 0.8f, false, false) < 0) {
+            fail("scenario spec-image: the image turn did not start");
+        }
+        start_tracking(le);
+        const int n_image = drain_answer(le, 48);
+        fprintf(stderr, "scenario spec-image: text turn %d pieces with %lld drafted, image turn %d pieces, no abort\n",
+                n_text, (long long) drafted, n_image);
+        api_free(h);
     } else if (name == "sampler-nan") {
         // A NaN temperature (a damaged settings file can hold one) reaches the sampler chain.
         s.mmproj.clear();
@@ -1484,8 +1518,8 @@ int run_scenario(const Options & opt, const std::string & name) {
         result = check_priority(opt);
     } else {
         fprintf(stderr,
-                "unknown scenario %s: image-shape, image-twice, jni-pending, spec-disable, spec-parity, sampler-nan, "
-                "priority\n",
+                "unknown scenario %s: image-shape, image-twice, jni-pending, spec-disable, spec-parity, spec-image, "
+                "sampler-nan, priority\n",
                 name.c_str());
         result = 2;
     }
