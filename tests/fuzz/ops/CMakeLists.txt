@@ -137,8 +137,6 @@ else()
     # The sanitizer of the Android builds. The UBSan checks that recover are the checks with a
     # tracked finding (rule R5). A recovered report stops the run through halt_on_error=1 when no
     # function-level entry of the shared file tests/sanitizers/ubsan.supp matches it:
-    #   function         task #127 (F-UB-2), the typed functions of the type traits.
-    #                     Fix: build/fuzz/ops/fixes/ub-function-pointer-casts.patch
     #   integer-divide-by-zero  task #156 (F-UB-4), init_fastdiv_values(ne12 / ne02) in the
     #                     MUL_MAT_ID support check of ggml-hexagon.cpp. fuzz-hexhost owns the fix.
     #   vptr              F-UB-3 (fuzz-ops, 2026-09-23), a false positive of the build, not of ggml.
@@ -163,11 +161,11 @@ else()
     if (FUZZ_SANITIZER STREQUAL "asan")
         set(android_san "-fsanitize=address")
     elseif (FUZZ_SANITIZER STREQUAL "ubsan")
-        # The recovered checks are the findings of task #127 (function) and task #156
-        # (integer-divide-by-zero in init_fastdiv_values of the Hexagon host, F-UB-4 of this area).
-        # Refer to the table above and to tests/sanitizers/ubsan.cmake. The fix of task #125
-        # (pointer-overflow) is patches/fuzz-ops/0001, thus that check does not recover.
-        set(android_san "-fsanitize=undefined -fno-sanitize-recover=undefined -fsanitize-recover=function,integer-divide-by-zero")
+        # The recovered check is the finding of task #156 (integer-divide-by-zero in
+        # init_fastdiv_values of the Hexagon host, F-UB-4 of this area). Refer to the table above
+        # and to tests/sanitizers/ubsan.cmake. The fixes of task #125 (pointer-overflow) and task #127
+        # (function) are patches/fuzz-ops/0001 and 0002, thus those checks do not recover.
+        set(android_san "-fsanitize=undefined -fno-sanitize-recover=undefined -fsanitize-recover=integer-divide-by-zero")
         set(android_link "-static-libsan")
     elseif (FUZZ_SANITIZER STREQUAL "hwasan")
         set(android_san "-fsanitize=hwaddress")
