@@ -1,0 +1,71 @@
+Apply the pending memory update before a state write or a state read
+Fold-into: upstream/llama-context
+
+The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
+
+- A state save after a sequence copy between two KV streams saves old data.
+
+  With kv_unified = false, llama_kv_cache::seq_cp between two streams copies the cell metadata at
+  once, but it enqueues the copy of the K and V data, and the next memory update (at the next
+  decode) does the copy. A llama_state_seq_get_data of the destination before that decode saves
+  the metadata of the source with the old K and V data of the destination. A state load into the
+  source of a pending copy is then overwritten by the copy at the next decode. A pending position
+  shift (seq_add) has the same effect on a save. The next decode of the sequence then gives wrong
+  logits (max diff 0.118 on the tiny model), with no error.
+
+  The change: The four state functions of llama_context (write and read, full and for one
+  sequence) run memory_update(false) first. With no pending update, the memory gives
+  LLAMA_MEMORY_STATUS_NO_UPDATE and nothing runs. The app uses kv_unified = true and no seq_add,
+  thus it has no pending update at a save.
+
+  The reproducer: tests/fuzz/core/regress/fuzz_recurrent--state-pending-stream-copy.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3481,6 +3481,12 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
+ size_t llama_context::state_write_data(llama_io_write_i & io) {
+     LLAMA_LOG_DEBUG("%s: writing state\n", __func__);
+ 
++    // The memory applies a sequence copy between two streams (kv_unified = false) and a position
++    // shift at its next update, which runs at the next decode. A state write before that update
++    // saves the old data of the destination, and a state read before it is then overwritten by
++    // the copy. Thus the pending update runs first. With no pending update it does nothing.
++    memory_update(false);
++
+     // write model info
+     {
+         LLAMA_LOG_DEBUG("%s: - writing model info\n", __func__);
+@@ -3501,6 +3507,9 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
+ size_t llama_context::state_read_data(llama_io_read_i & io) {
+     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
+ 
++    // the pending update runs first (refer to state_write_data)
++    memory_update(false);
++
+     // read model info
+     {
+         LLAMA_LOG_DEBUG("%s: - reading model info\n", __func__);
+@@ -3525,6 +3534,9 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
+ }
+ 
+ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
++    // the pending update runs first (refer to state_write_data)
++    memory_update(false);
++
+     if (memory) {
+         memory->state_write(io, seq_id, flags);
+     }
+@@ -3533,6 +3545,9 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
+ }
+ 
+ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
++    // the pending update runs first (refer to state_write_data)
++    memory_update(false);
++
+     if (memory) {
+         memory->state_read(io, seq_id, flags);
+     }
