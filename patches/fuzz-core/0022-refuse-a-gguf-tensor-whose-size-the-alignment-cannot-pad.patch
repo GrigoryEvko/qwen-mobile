@@ -1,0 +1,43 @@
+Refuse a GGUF tensor whose size the alignment cannot pad
+Fold-into: upstream/gguf
+
+The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
+
+- The padded size of a tensor wraps around to 0.
+
+  The reader adds GGML_PAD(ggml_nbytes(t), alignment) for each tensor to the size of the data
+  section. For a size within alignment - 1 of SIZE_MAX, GGML_PAD wraps around: an F32 tensor with
+  the shape (4, 2^60 - 1) has 2^64 - 16 bytes, and its padded size is 0. The reader then accepts a
+  tensor with no bytes behind it in the data section. A reader of the tensor data reads far past
+  its buffer, and the writer copies 2^64 - 16 bytes (ASan: memcpy with the size -16), or writes a
+  corrupted file in a release build.
+
+  The change: The reader refuses a tensor whose size is larger than SIZE_MAX - (alignment - 1).
+
+  The reproducer: tests/fuzz/core/regress/fuzz_gguf--gguf-size-pad-wrap.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    ggml/src/gguf.cpp
+--- a/ggml/src/gguf.cpp
++++ b/ggml/src/gguf.cpp
+@@ -834,7 +834,17 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
+                 gguf_free(ctx);
+                 return nullptr;
+             }
+-            size_t padded_size = GGML_PAD(ggml_nbytes(&ti.t), ctx->alignment);
++            // GGML_PAD wraps around for a size within alignment - 1 of SIZE_MAX: the padded size is
++            // then less than the size of the tensor (0 for a size of 2^64 - 16), and the data section
++            // does not hold the bytes that the tensor gives to its readers
++            const size_t nbytes = ggml_nbytes(&ti.t);
++            if (nbytes > SIZE_MAX - (ctx->alignment - 1)) {
++                GGML_LOG_ERROR("%s: tensor '%s' has a size of %zu bytes, which the alignment %zu cannot pad\n",
++                    __func__, ti.t.name, nbytes, ctx->alignment);
++                gguf_free(ctx);
++                return nullptr;
++            }
++            size_t padded_size = GGML_PAD(nbytes, ctx->alignment);
+             if (SIZE_MAX - ctx->size < padded_size) {
+                 GGML_LOG_ERROR("%s: tensor '%s' size overflow, cannot accumulate size %zu + %zu\n",
+                     __func__, ti.t.name, ctx->size, padded_size);

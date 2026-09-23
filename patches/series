@@ -149,6 +149,7 @@ fuzz-core/0018-apply-the-pending-memory-update-before-a-state-write-or-read.patc
 fuzz-core/0019-give-an-error-for-a-text-that-a-vocabulary-cannot-tokenize.patch
 fuzz-core/0020-check-the-strings-and-the-cell-sequences-of-a-state-blob.patch
 fuzz-core/0021-write-zeros-to-a-used-recurrent-row-before-a-new-sequence.patch
+fuzz-core/0022-refuse-a-gguf-tensor-whose-size-the-alignment-cannot-pad.patch
 
 # The fixes of the defects that the sanitizer matrix of tests/run-suite.sh finds in the tests of llama.cpp.
 # The header of each patch describes its defect and the change.
