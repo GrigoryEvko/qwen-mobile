@@ -165,8 +165,9 @@ validate_link() {
         mode_of["$entry"]="${mode_of[$entry]:-}${mode_of[$entry]:+ }$mode"
     done < <(rg -e 'REPRO-ENTRY: ' "$REPRO_SRC")
 
-    # Step 3: each mode with the full file.
-    mapfile -t modes < <(printf '%s\n' ${mode_of[@]} | sort -u)
+    # Step 3: each mode with the full file, also the modes of the fixed
+    # findings (REPRO-FIXED), which must stay free of reports.
+    mapfile -t modes < <({ printf '%s\n' ${mode_of[@]}; rg -o -r '$1' 'REPRO-FIXED: \S+ MODE: (\S+)' "$REPRO_SRC" || true; } | sort -u)
     for mode in "${modes[@]}"; do
         read -r rc n < <(run_mode "$prog" "$mode" "$SUPP" "$logs/$mode.full.log")
         if [[ "$rc" -eq 0 && "$n" -eq 0 ]]; then

@@ -9,14 +9,9 @@
 #   cmake -S <project> -B <build> -C tests/sanitizers/profile-<debug|release>.cmake \
 #       -C tests/sanitizers/ubsan.cmake
 include("${CMAKE_CURRENT_LIST_DIR}/common.cmake")
-# Reason for -fsanitize-recover=pointer-overflow: the tracked finding of
-# task #125 (2026-09-23). ggml_graph_nbytes starts
-# from a null pointer and incr_ptr_aligned (ggml.c) adds offsets to it. Each
-# graph allocation reaches it. With halt_on_error=1 and the function-level
-# entries "pointer-overflow:ggml_graph_nbytes" and
-# "pointer-overflow:incr_ptr_aligned" in ubsan.supp, only that report
-# continues. Each other pointer-overflow report stops the run.
-# Remove "pointer-overflow" when the patch series has the fix.
+# pointer-overflow does not recover: its finding (task #125, ggml_graph_nbytes)
+# has its fix in patches/fuzz-ops/0001 (commit bac1229), thus each
+# pointer-overflow report stops the run.
 #
 # Reason for -fsanitize-recover=function: the tracked finding of task #127
 # (2026-09-23). The CPU backend calls the typed functions of its type traits
@@ -37,6 +32,6 @@ include("${CMAKE_CURRENT_LIST_DIR}/common.cmake")
 # past it. Each other division report stops the run. Remove
 # "integer-divide-by-zero" when task #156 lands.
 sanitizer_matrix_apply(ubsan
-    "-fsanitize=undefined -fno-sanitize-recover=undefined -fsanitize-recover=pointer-overflow,function,integer-divide-by-zero"
+    "-fsanitize=undefined -fno-sanitize-recover=undefined -fsanitize-recover=function,integer-divide-by-zero"
     "-fsanitize=undefined"
     "")

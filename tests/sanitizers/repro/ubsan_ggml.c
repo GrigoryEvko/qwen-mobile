@@ -16,8 +16,7 @@
  * The map of the entries to the modes. supp-repro.sh and check-rules.sh
  * read these lines. An entry can have more than one mode. It passes if one
  * of its modes stops with a report of its check when the entry is removed.
- *   REPRO-ENTRY: pointer-overflow:^ggml_graph_nbytes$ MODE: graph_nbytes
- *   REPRO-ENTRY: pointer-overflow:^ggml_graph_nbytes$ MODE: mul_mat_f32
+ *   REPRO-FIXED: pointer-overflow MODE: graph_nbytes
  *   REPRO-ENTRY: function:^ggml_compute_forward_mul_mat_one_chunk$ MODE: mul_mat_f32
  *   REPRO-ENTRY: function:^ggml_compute_forward_mul_mat_one_chunk$ MODE: mul_mat_f16
  *   REPRO-ENTRY: function:^ggml_compute_forward_mul_mat$ MODE: mul_mat_f16
@@ -38,10 +37,11 @@
  * of ggml_from_float_t, thus they give no report (measured 2026-09-23). They
  * stay as the evidence that ggml_compute_forward_dup_to_q and the repack
  * functions need no entry.
- * The mode graph_nbytes reaches ggml_graph_nbytes through
- * ggml_graph_overhead. The other modes reach it through ggml_new_graph
- * (ggml_new_graph_custom). LTO can inline it into one caller and not into
- * the other, thus each path has a mode.
+ * A REPRO-FIXED line names a mode of a finding whose fix has landed: the
+ * mode must give no report with the full file (a regression check).
+ * graph_nbytes: task #125 (ggml_graph_nbytes, fixed by patches/fuzz-ops/0001).
+ * It reaches ggml_graph_nbytes through ggml_graph_overhead, and each other
+ * mode reaches it through ggml_new_graph.
  */
 
 #include "ggml.h"

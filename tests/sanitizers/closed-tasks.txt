@@ -2,4 +2,5 @@
 # this list: the commit that closes a task removes the entries of that task.
 # tests/sanitizers/check-rules.sh reads the lines that start with "#<number>".
 # Format: #<task number> <date YYYY-MM-DD> <the commit or the reason>
-# The coordinator adds a line when a task closes. The list is empty today.
+# The coordinator adds a line when a task closes.
+#125 2026-09-23 bac1229 (patches/fuzz-ops/0001: the size of a ggml graph with integers)
