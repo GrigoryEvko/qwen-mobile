@@ -1,0 +1,118 @@
+hexagon: parse the environment of the backend init without a crash or a hang
+Fold-into: upstream/hexagon-host
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+ggml_hexagon_init reads its switches from the environment. Six values gave a
+crash, an exception out of the init, undefined behavior or a hang:
+
+- An empty GGML_HEXAGON_PROFILE list: vec_to_str called pop_back on an empty
+  string.
+- A GGML_HEXAGON_OPFILTER value that is not a valid regex: the constructor of
+  std::regex threw out of the init.
+- A GGML_HEXAGON_PROFILE item that is not a number or is too large: std::stoul
+  threw out of the init.
+- A large GGML_HEXAGON_OPBATCH: the default trace size opbatch * 256
+  overflowed int.
+- A physical range "A-B" of GGML_HEXAGON_DEVICES with a large B: the loop over
+  the range does a linear search in each step, thus a large range takes a very
+  long time, and B = INT_MAX never stops.
+- A device group of more than 16 physical devices, from ranges and single
+  indices together: the group has arrays of 16 entries
+  (ggml_hexagon_mdev_group::fence_slots).
+
+This patch gives an empty string for an empty list. For a regex that is not
+valid it logs a warning and uses no op filter. For a profile list that does
+not parse it logs a warning and turns profiling off. It computes the trace
+size in 64 bits and clamps it to the int range. It ignores, with a warning, a
+range that starts below 0, ends before its start, or holds more than 16
+devices, and it cuts a device group to 16 physical devices with a warning.
+The app sets only GGML_HEXAGON_OPFUSION and GGML_HEXAGON_OPFUSION_STATE, thus
+its behavior does not change.
+
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index d93e7a5..70f1d61 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -7956,7 +7956,10 @@ template<typename T, int BASE=10> std::string vec_to_str(std::vector<T> v) {
+     std::stringstream ss;
+     ss << std::setbase(BASE) << std::showbase;
+     for (auto i : v) { ss << i << ','; }
+-    auto str = ss.str(); str.pop_back(); // drop last comma
++    auto str = ss.str();
++    if (!str.empty()) {
++        str.pop_back(); // drop last comma (an empty list gives an empty string)
++    }
+     return str;
+ }
+ 
+@@ -8146,11 +8149,23 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+ 
+     auto RE_ICASE = std::regex_constants::icase;
+ 
+-    opt_opfilter  = str_opfilter ? new std::regex(str_opfilter, RE_ICASE) : NULL;
++    // A regex that is not valid throws std::regex_error: then no op filter, and a warning
++    opt_opfilter  = NULL;
++    if (str_opfilter) {
++        try {
++            opt_opfilter = new std::regex(str_opfilter, RE_ICASE);
++        } catch (const std::regex_error & e) {
++            GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_OPFILTER='%s' is not a valid regex (%s), no op filter\n", str_opfilter,
++                          e.what());
++        }
++    }
+     opt_verbose   = str_verbose  ? atoi(str_verbose)                      : 0;
+     opt_opbatch   = str_opbatch  ? strtoul(str_opbatch, NULL, 0)          : opt_opbatch;
+     opt_opqueue   = str_opqueue  ? strtoul(str_opqueue, NULL, 0)          : opt_opqueue;
+-    opt_optrace   = str_optrace  ? strtoul(str_optrace, NULL, 0)          : (opt_opbatch * 256);
++    // The default trace size is 256 for each op of a batch. The product is in 64 bits and clamped
++    // to the int range, thus a large GGML_HEXAGON_OPBATCH does not overflow the int
++    opt_optrace   = str_optrace  ? strtoul(str_optrace, NULL, 0)
++                                 : (int) std::min<int64_t>(std::max<int64_t>((int64_t) opt_opbatch * 256, 0), INT32_MAX);
+     opt_oppoll    = str_oppoll   ? strtoul(str_oppoll,  NULL, 0)          : opt_oppoll;
+     opt_opfusion  = str_opfusion ? atoi(str_opfusion)                     : opt_opfusion;
+     opt_multirow  = str_multirow ? atoi(str_multirow)                     : opt_multirow;
+@@ -8275,6 +8290,13 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+                             try {
+                                 int p_start = std::stoi(p_part.substr(0, dash_pos));
+                                 int p_end   = std::stoi(p_part.substr(dash_pos + 1));
++                                // A range holds at most GGML_HEXAGON_MAX_SESSIONS devices. A wider
++                                // range (p_end = INT_MAX never stops the loop) is refused.
++                                if (p_start < 0 || p_end < p_start || p_end - p_start >= GGML_HEXAGON_MAX_SESSIONS) {
++                                    GGML_LOG_WARN("ggml-hex: physical range '%s' is not a range of 1 to %d devices from 0, ignored\n",
++                                                  p_part.c_str(), GGML_HEXAGON_MAX_SESSIONS);
++                                    continue;
++                                }
+                                 for (int p = p_start; p <= p_end; p++) {
+                                     if (std::find(phys_list.begin(), phys_list.end(), p) == phys_list.end()) {
+                                         phys_list.push_back(p);
+@@ -8298,6 +8320,13 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+                     if (phys_list.empty()) {
+                         phys_list.push_back(0);
+                     }
++                    // A device group holds at most GGML_HEXAGON_MAX_SESSIONS physical devices: the
++                    // group has arrays of that size (ggml_hexagon_mdev_group::fence_slots)
++                    if (phys_list.size() > GGML_HEXAGON_MAX_SESSIONS) {
++                        GGML_LOG_WARN("ggml-hex: device '%s' has %zu physical devices, the maximum is %d: the list is cut\n",
++                                      item.c_str(), phys_list.size(), GGML_HEXAGON_MAX_SESSIONS);
++                        phys_list.resize(GGML_HEXAGON_MAX_SESSIONS);
++                    }
+ 
+                     if (opt_ndev < GGML_HEXAGON_MAX_SESSIONS) {
+                         auto & cfg = opt_device_configs[opt_ndev];
+@@ -8378,7 +8407,14 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+ 
+     if (str_profile) {
+         opt_pmu_evt = [&]() -> std::vector<uint32_t> {
+-            auto v  = str_to_vec<uint32_t>(str_profile);
++            std::vector<uint32_t> v;
++            try {
++                v = str_to_vec<uint32_t>(str_profile);
++            } catch (const std::exception & e) {
++                // std::stoul throws for an item that is not a number or is too large
++                GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_PROFILE='%s' is not a list of numbers (%s), profiling is off\n",
++                              str_profile, e.what());
++            }
+             switch (v.size()) {
+                 case 1:  opt_profile = v[0]; return opt_pmu_evt; // mode with default pmu events
+                 case 8:  opt_profile = 2;    return v;           // mode with custom  pmu events

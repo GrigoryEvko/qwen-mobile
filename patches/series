@@ -139,3 +139,4 @@ fuzz-matrix/0001-tests-free-the-compute-context-of-test-opt.patch
 # fuzz-ops: the value asserts of ggml-cpu behind an opt-in macro, and the fully masked soft_max row.
 fuzz-ops/0005-ggml-cpu-run-the-value-asserts-only-with-an-opt-in-macro.patch
 fuzz-ops/0006-ggml-cpu-soft-max-of-a-fully-masked-row-gives-0.patch
+fuzz-hexhost/0006-hexagon-parse-the-init-environment-safely.patch

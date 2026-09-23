@@ -34,7 +34,7 @@ ASAN_RT=libclang_rt.asan-aarch64-android.so
 # fix in the patch series. In the fuzz mode the harness keeps these conditions off (HEXHOST_IGNORE),
 # thus the fuzzers look for other defects. The test mode does not set them, thus each regression
 # input of such a defect fails.
-KNOWN_IDS="env-profile-empty,env-exception,env-devices-range,repack-nonfinite-scale,env-int-overflow"
+KNOWN_IDS="repack-nonfinite-scale"
 
 # The host switches of the phone runs: a name and the GGML_HEXAGON_* variables of each run
 PHONE_RUNS=(
