@@ -94,8 +94,9 @@ Other modes:
   minimize FILE GROUP KIND VERDICT [PROFILE CONFIG]
                            Minimize a numeric finding with libFuzzer, and write the result to
                            tests/fuzz/ops/regress/KIND/. VERDICT is above-strict, above-loose or nonfinite.
-  snapshot                 Take a new private copy of third_party/llama.cpp/ggml. The phone run needs
-                           a host library that pairs with the DSP library, thus take it with care.
+  snapshot                 Refresh the private copy of ggml (build/fuzz/ops-src/ggml): the llama.cpp
+                           commit of HEAD plus patches/series, made by tests/sanitizers/llama-copy.sh.
+                           Each run that builds from the copy refreshes it first.
   symbolizer               Build llvm-symbolizer for arm64 Android with
                            tests/sanitizers/build-android-symbolizer.sh (phone-build does it when it is
                            missing). Without it, a sanitizer report on the phone has no function
@@ -159,23 +160,29 @@ Environment (defaults in parentheses):
 EOF
 }
 
-# Copy the ggml tree of the submodule into the private snapshot, and record the date and hashes.
-# rsync compares the contents (-c) and does not keep the times of the submodule (no -t): a file with
-# new contents gets the time of the copy, and a file with the same contents keeps its time. Thus
-# ninja builds again each object of a changed file. A copy that keeps the times (cp -a) can give a
-# header a time before its objects, and ninja then keeps the objects of the old header.
+# Refresh the private copy of ggml with the shared helper tests/sanitizers/llama-copy.sh: the
+# llama.cpp commit of HEAD plus patches/series, without the file times of the source (refer to that
+# script). Then record the date and hashes. A lock keeps two runs of this script from one copy at
+# the same time.
 take_snapshot() {
     mkdir -p "$SNAP"
-    rsync -rlc --delete "$LLAMA_SUBMODULE/ggml/" "$SNAP/ggml/"
-    date > "$SNAP/SNAPSHOT-DATE"
-    sha256sum "$SRC/src/ggml-hexagon/ggml-hexagon.cpp" "$SRC/src/ggml-hexagon/htp/htp-ops.h" \
-        "$SRC/src/ggml-hexagon/htp-opnode.h" > "$SNAP/SNAPSHOT-HASHES"
-    echo "fuzz-ops: new snapshot in $SNAP"
+    (
+        flock 8
+        "$REPO_ROOT/tests/sanitizers/llama-copy.sh" --ggml "$SNAP" > /dev/null \
+            || die "tests/sanitizers/llama-copy.sh --ggml $SNAP failed"
+        date > "$SNAP/SNAPSHOT-DATE"
+        sha256sum "$SRC/src/ggml-hexagon/ggml-hexagon.cpp" "$SRC/src/ggml-hexagon/htp/htp-ops.h" \
+            "$SRC/src/ggml-hexagon/htp-opnode.h" > "$SNAP/SNAPSHOT-HASHES"
+    ) 8> "$SNAP.lock"
+    echo "fuzz-ops: the snapshot in $SNAP is the tree of HEAD"
 }
 
-# Make sure that the snapshot exists.
+# Refresh the snapshot one time for each run of this script, before the first build from it.
+SNAPSHOT_DONE=0
 need_snapshot() {
-    [[ -d "$SRC/src" ]] || take_snapshot
+    [[ $SNAPSHOT_DONE == 1 ]] && return 0
+    take_snapshot
+    SNAPSHOT_DONE=1
 }
 
 # Stop when the argument is not a host configuration.
