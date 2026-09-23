@@ -50,8 +50,9 @@ class MemoryBudgetTest {
         val draft = plain.copy(speculative = true)
         assertEquals(0L, MemoryBudget.speculativeBytes(plain))
         assertEquals(1_000L, MemoryBudget.loadBytes(plain))
-        // 8192 positions of 4 KB, and the three recurrent state snapshots.
-        val expected = 8_192L * MemoryBudget.DRAFT_KV_BYTES_PER_POSITION + MemoryBudget.DRAFT_STATE_BYTES
+        // 8192 positions of 4 KB, the compute buffer of the draft context, and the four recurrent state snapshots.
+        val expected = 8_192L * MemoryBudget.DRAFT_KV_BYTES_PER_POSITION + MemoryBudget.DRAFT_COMPUTE_BYTES +
+            MemoryBudget.DRAFT_STATE_BYTES
         assertEquals(expected, MemoryBudget.speculativeBytes(draft))
         assertEquals(1_000L + expected, MemoryBudget.loadBytes(draft))
         // A longer context needs a longer draft cache.
@@ -68,7 +69,17 @@ class MemoryBudgetTest {
         val hybrid = EngineConfig(model.absolutePath, Backend.HYBRID, 4, 8192, speculative = true)
         assertFalse(hybrid.speculativeReady)
         assertEquals(0L, MemoryBudget.speculativeBytes(hybrid))
-        assertEquals(2_000L, MemoryBudget.loadBytes(hybrid))
+        assertEquals(2_000L + MemoryBudget.HYBRID_CONTEXT_BYTES, MemoryBudget.loadBytes(hybrid))
+    }
+
+    @Test
+    fun onlyTheHybridBackendCountsASecondContext() {
+        val model = folder.newFile("second.gguf").also { it.writeBytes(ByteArray(1_000)) }
+        val gpu = EngineConfig(model.absolutePath, Backend.GPU, 4, 8192)
+        val hybrid = EngineConfig(model.absolutePath, Backend.HYBRID, 4, 8192)
+        assertEquals(0L, MemoryBudget.hybridContextBytes(gpu))
+        assertEquals(MemoryBudget.HYBRID_CONTEXT_BYTES, MemoryBudget.hybridContextBytes(hybrid))
+        assertEquals(1_000L, MemoryBudget.loadBytes(gpu))
     }
 
     @Test

@@ -12,8 +12,21 @@ import java.util.Locale
  * off the main thread: they read files.
  */
 object MemoryBudget {
-    /** The memory the runtime needs next to the weights: context, graph, buffers. */
-    const val RUNTIME_BYTES = 1_200L shl 20
+    /**
+     * The memory the runtime needs next to the weights: context, graph, buffers.
+     *
+     * The ceiling is the 4B model at the longest context of the settings
+     * (16384 tokens) with an F16 KV cache on the NPU. Measured on the phone at
+     * 8192 tokens: 4768 MiB of rpcmem buffers and 802 MiB of resident memory
+     * after a prompt of 4096 tokens, against 4516 MiB of weights in the file,
+     * thus 1055 MiB. The resident part holds a CPU copy of the token
+     * embedding (644 MiB), because a model loads without a file mapping when
+     * one of its devices cannot load from a mapping. 8192 more positions add
+     * 256 MiB of KV cache and about 16 MiB of compute buffer: 1327 MiB. The
+     * RAM tiers of the state store (256 MiB) and of the image cache (64 MiB)
+     * fill during a conversation: 1647 MiB. The 2B model needs about 1260 MiB.
+     */
+    const val RUNTIME_BYTES = 1_650L shl 20
 
     /**
      * The bytes of the KV cache of the MTP draft context for each position of
@@ -38,6 +51,20 @@ object MemoryBudget {
     const val DRAFT_STATE_BYTES = 201L shl 20
 
     /**
+     * The bytes of the compute buffer of the MTP draft context: 100 to 130 MiB
+     * for the 2B and the 4B model. This value is the ceiling of the two.
+     */
+    const val DRAFT_COMPUTE_BYTES = 130L shl 20
+
+    /**
+     * The bytes of the second context of the hybrid backend, next to its second
+     * copy of the weights: the KV cache, the recurrent state and the compute
+     * buffer of the prefill context. The ceiling is the 4B model at the longest
+     * context of the settings (16384 tokens), about 750 MiB.
+     */
+    const val HYBRID_CONTEXT_BYTES = 750L shl 20
+
+    /**
      * The bytes of the weights that the backend holds in memory. The hybrid
      * backend holds one copy for the NPU and one for the GPU.
      */
@@ -50,14 +77,23 @@ object MemoryBudget {
 
     /**
      * The bytes that speculative decoding adds: the KV cache of the MTP draft
-     * context over the whole context length, and the recurrent state
-     * snapshots of the target context. Zero without it.
+     * context over the whole context length, the compute buffer of that
+     * context, and the recurrent state snapshots of the target context. Zero
+     * without it.
      */
     fun speculativeBytes(config: EngineConfig): Long =
-        if (config.speculativeReady) config.nCtx * DRAFT_KV_BYTES_PER_POSITION + DRAFT_STATE_BYTES else 0L
+        if (config.speculativeReady) {
+            config.nCtx * DRAFT_KV_BYTES_PER_POSITION + DRAFT_COMPUTE_BYTES + DRAFT_STATE_BYTES
+        } else {
+            0L
+        }
+
+    /** The bytes of the second context of the hybrid backend, zero for the other backends. */
+    fun hybridContextBytes(config: EngineConfig): Long =
+        if (config.backend.prefillDeviceName != null) HYBRID_CONTEXT_BYTES else 0L
 
     /** The bytes that the load needs next to [RUNTIME_BYTES]. */
-    fun loadBytes(config: EngineConfig): Long = weightBytes(config) + speculativeBytes(config)
+    fun loadBytes(config: EngineConfig): Long = weightBytes(config) + speculativeBytes(config) + hybridContextBytes(config)
 
     /**
      * The bytes the kernel can give without swapping: MemAvailable of
