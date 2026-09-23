@@ -4,3 +4,13 @@
 # Format: #<task number> <date YYYY-MM-DD> <the commit or the reason>
 # The coordinator adds a line when a task closes.
 #125 2026-09-23 bac1229 (patches/fuzz-ops/0001: the size of a ggml graph with integers)
+#126 2026-09-23 closed by the coordinator
+#127 2026-09-23 c897468 (patches/fuzz-ops/0002: thunks for the type trait functions)
+#155 2026-09-23 closed by the coordinator
+#156 2026-09-23 a134bb0 (the fastdiv of MUL_MAT_ID, fuzz-hexhost)
+#159 2026-09-23 closed by the coordinator
+#169 2026-09-23 closed by the coordinator
+#171 2026-09-23 closed by the coordinator
+#172 2026-09-23 closed by the coordinator
+#174 2026-09-23 closed by the coordinator
+#176 2026-09-23 d2d87a9 (the Android ASan runtime from compiler-rt 22.1.8)
