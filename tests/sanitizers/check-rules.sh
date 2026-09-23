@@ -6,6 +6,8 @@
 #                                   [--write-requests] [--json FILE]
 #   tests/sanitizers/check-rules.sh --copies-only [--areas LIST]
 #                                   [--accept-stamp COMMIT:PATCHES]...
+#   tests/sanitizers/check-rules.sh --commit-msg FILE
+#   tests/sanitizers/check-rules.sh --noid-self-test
 #
 #   --areas LIST       The fuzz areas to check. The preset value is each
 #                      directory of tests/fuzz. "none" checks only the
@@ -17,6 +19,12 @@
 #   --accept-stamp C:P Also accept the stamp of the llama.cpp commit C and
 #                      the patches tree P (the value of HEAD when an area
 #                      step started). The stamp of HEAD is always accepted.
+#   --commit-msg FILE  Check only the commit message in FILE (NOID-MSG) and
+#                      the staged diff (NOID-STAGED). This is the check of
+#                      the commit-msg hook tests/sanitizers/git-hooks/commit-msg,
+#                      and each landing runs it with its message file.
+#   --noid-self-test   Test the pattern of NOID on its positive and negative
+#                      cases, on the pushed history and on the tree.
 #   --write-requests   Write the violations of each area to
 #                      build/fuzz/matrix/requests/<area>-rules.txt.
 #   --json FILE        Also write each violation as one JSON line to FILE.
@@ -79,7 +87,11 @@
 #   NOID A tracked file in tests/, patches/, android/app/src/, quant/,
 #        scripts/ or tools/ has no task number and no finding ID (a comment
 #        names the defect in words). NOID_ALLOW below lists the lines of
-#        real code that match the pattern.
+#        real code that match the pattern. NOID_PATTERN gives the forms.
+#   NOID-STAGED Each line that the staged diff adds, in each directory, has
+#        no task number and no finding ID.
+#   NOID-MSG (only with --commit-msg) The commit message has no task number
+#        and no finding ID.
 #   L9   Each libFuzzer command of the scripts of an area has -artifact_prefix,
 #        each fuzz run has an outer "timeout -s KILL", and the root of the
 #        repository has no stray crash-*, leak-*, timeout-* or oom-* file.
@@ -104,6 +116,8 @@ readonly CONFIG_TOKENS="none asan ubsan tsan msan hwasan"
 AREAS=""
 CHECK_BUILDS=1
 COPIES_ONLY=0
+COMMIT_MSG=""
+NOID_SELF_TEST=0
 ACCEPT_STAMPS=""
 WRITE_REQUESTS=0
 JSON_OUT=""
@@ -739,10 +753,27 @@ check_llama_copies() {
     done
 }
 
-# NOID: the pattern of a task number or a finding ID. A comment, a message or
-# a name describes the defect in words (the function, the input, the
-# evidence), never with an ID. "[Tt]ask" also finds the start of a sentence.
-readonly NOID_PATTERN='([Tt]ask[s]? #?[0-9]{2,3}|#[0-9]{2,3}\b|\bF-[A-Z0-9]+(-[A-Z0-9]+)*-[0-9]+\b|\bQF[0-9]+\b|[Ff]inding [A-Z]+[0-9-]*[0-9])'
+# NOID: the forms of a task number and of a finding ID. A comment, a commit
+# message or a name describes the defect in words (the function, the input,
+# the evidence), never with an ID. The forms:
+#   - "#" and 2 or 3 digits, not after a letter, a digit, "_", "/", ".",
+#     "&", "#" or "-" (thus not a URL fragment and not an HTML entity)
+#   - "task" or "tasks" and a number, with or without "#"
+#   - QF, QG, QR or QT and a number (the IDs of the quant findings)
+#   - F-<WORD>-<number>, for example F-UB-4 (the IDs of the fuzz findings)
+#   - "finding" or "findings" and an uppercase ID or a hyphenated name
+#   - "item" or "items" and an uppercase letter with a number, for example
+#     item D9
+# #include, #define, #pragma, a hex colour with a letter or with more than 3
+# digits, and an upstream pull request number with 4 or more digits do not
+# match. The rules R1 to R13 and L1 to L9, F16, L2 and HTP0 do not match.
+readonly NOID_PATTERN='((^|[^A-Za-z0-9_/.&#-])#[0-9]{2,3}\b|\b[Tt]asks? #?[0-9]{2,4}\b|\bQ[FGRT][0-9]{1,2}\b|\bF-[A-Z0-9]+(-[A-Z0-9]+)*-[0-9]+\b|\b[Ff]indings? [A-Z]+[0-9-]*[0-9]\b|\b[Ff]indings? [a-z][a-z0-9]*(-[a-z0-9]+)+\b|\bitems? [A-Z][0-9]{1,2}\b)'
+# The pushed history when the forms above were written, and the count of its
+# commit message lines that have an ID. --noid-self-test uses them as the
+# positive case. A change of NOID_PATTERN that changes the count is
+# deliberate, thus it changes this count too.
+readonly NOID_HISTORY_REF="4c4f59ae2d4333371647a79ab00b8df1c75af0d3"
+readonly NOID_HISTORY_LINES=112
 # The lines of real code that match NOID_PATTERN. Format: <path>:<fixed text
 # of the line>. Each entry has the reason as a comment.
 readonly NOID_ALLOW=(
@@ -783,12 +814,100 @@ check_noid() {
                 | xargs -0 -r rg -n --no-heading -e "$NOID_PATTERN" -- 2> /dev/null || true)
 }
 
+# NOID-STAGED: each line that the staged diff (the index against HEAD) adds
+# has no task number and no finding ID, in each directory. In a hook of
+# "git commit", the index is the content of the commit, also for
+# "git commit -- <paths>". The added lines go to one rg call as
+# "<text> US <path> US <line>" (US is the byte 0x1f), thus the text keeps its
+# start of line for the pattern.
+# Complexity: one pass over the staged diff.
+check_noid_staged() {
+    command -v git > /dev/null && git -C "$REPO" rev-parse --verify -q HEAD > /dev/null 2>&1 || return 0
+    local us=$'\x1f' line file="" num=0 added="" text path header=0
+    while IFS= read -r line; do
+        # A "+++" line is a file header only between "diff --git" and the
+        # first hunk, not an added line that starts with "++".
+        case "$header:$line" in
+            *:'diff --git '*) header=1; file="" ;;
+            '1:+++ b/'*) file="${line#+++ b/}" ;;
+            '1:+++ '*) file="" ;;
+            *:'@@ '*) header=0; num="${line#*+}"; num="${num%%[, ]*}" ;;
+            '0:+'*)
+                # This file holds the pattern and its examples.
+                [[ -n "$file" && "$file" != tests/sanitizers/check-rules.sh ]] \
+                    && added+="${line#+}$us$file$us$num"$'\n'
+                num=$((num + 1)) ;;
+        esac
+    done < <(git -C "$REPO" diff --cached --no-color --no-ext-diff --no-renames -U0 2> /dev/null || true)
+    [[ -n "$added" ]] || return 0
+    while IFS="$us" read -r text path num; do
+        noid_allowed "$path" "$text" && continue
+        violation NOID-STAGED "$(area_of "$REPO/$path")" "$path:$num" "the staged diff adds a task number or a finding ID: describe the defect in words ('${text:0:90}')"
+    done < <(rg --no-heading -e "$NOID_PATTERN" <<< "$added" || true)
+}
+
+# NOID-MSG: the commit message in the file $1 has no task number and no
+# finding ID. The comment lines of git ("# Please enter ...") do not match.
+check_noid_msg() {
+    local msg="$1" num text
+    [[ -f "$msg" ]] || { echo "check-rules: the commit message file '$msg' does not exist." >&2; exit 2; }
+    while IFS=: read -r num text; do
+        violation NOID-MSG commit "commit message:$num" "a task number or a finding ID: describe the defect in words ('${text:0:90}')"
+    done < <(rg -n --no-heading -e "$NOID_PATTERN" -- "$msg" || true)
+}
+
+# The self-test of NOID_PATTERN (--noid-self-test). The positive cases: each
+# form, and the pushed history of NOID_HISTORY_REF (if the clone has it).
+# The negative cases: the lines that look like an ID but are not, and the
+# tracked files of the tree (rule NOID). Output: one line for each case that
+# fails. Return status: 0 if all cases pass.
+noid_self_test() {
+    local failed=0 s n
+    local -a positive=(
+        "the fix of task #168" "(#173)" "#125, #126 and #127" "Tasks 167 and 168"
+        "finding QF6" "QR3 in gguf-py" "QG1" "QT1 in llama-perplexity" "F-UB-4 of this area"
+        "F-REPACK-1" "Finding sampler-nan" "findings conversation-all-or-nothing"
+        "Task 94, item D9" "fixes finding mm-id-div-zero (task"
+    )
+    local -a negative=(
+        "#include <stdio.h>" "#define N 12" "#pragma once" "#if 0" "color: #fff;" "color: #a1b2c3;"
+        "color: #123456;" "https://github.com/ggml-org/llama.cpp/blob/master/README.md#L120"
+        "https://example.org/page#section-12" "https://example.org/a/#12" "&#123;"
+        "ci: switch fast jobs back to github (#28959)" "the L2 line" "R13 and L9" "Q8_0 and Q4_K"
+        "F16 and FP16" "HTP0" "{D0, D2}" "QK1_0" "a finding of UBSan" "the findings of the run"
+        "r7 = #64" "task-parallel" "F-16"
+    )
+    for s in "${positive[@]}"; do
+        rg -q -e "$NOID_PATTERN" <<< "$s" || { echo "NOID self-test: no match on the positive case '$s'"; failed=1; }
+    done
+    for s in "${negative[@]}"; do
+        # r7 = #64 is the assembly immediate of NOID_ALLOW: the pattern
+        # matches it, and the allowlist keeps it.
+        [[ "$s" == "r7 = #64" ]] && { rg -q -e "$NOID_PATTERN" <<< "$s" || { echo "NOID self-test: the allowlist case '$s' does not match"; failed=1; }; continue; }
+        rg -q -e "$NOID_PATTERN" <<< "$s" && { echo "NOID self-test: a match on the negative case '$s'"; failed=1; }
+    done
+    if git -C "$REPO" cat-file -e "$NOID_HISTORY_REF^{commit}" 2> /dev/null; then
+        n="$(git -C "$REPO" log "$NOID_HISTORY_REF" --format=%B | rg -c -e "$NOID_PATTERN" || true)"
+        [[ "${n:-0}" -eq $NOID_HISTORY_LINES ]] \
+            || { echo "NOID self-test: the history of ${NOID_HISTORY_REF:0:12} has ${n:-0} lines with an ID, not $NOID_HISTORY_LINES"; failed=1; }
+    else
+        echo "NOID self-test: the clone has no commit ${NOID_HISTORY_REF:0:12}, thus the history case does not run"
+    fi
+    VIOLATIONS=()
+    check_noid
+    [[ ${#VIOLATIONS[@]} -eq 0 ]] || { echo "NOID self-test: the tree has ${#VIOLATIONS[@]} NOID violation(s)"; printf '  %s\n' "${VIOLATIONS[@]}"; failed=1; }
+    [[ $failed -eq 0 ]] && echo "NOID self-test: ${#positive[@]} positive and ${#negative[@]} negative cases pass, the history has $NOID_HISTORY_LINES ID lines, the tree has none."
+    return $failed
+}
+
 main() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --areas) AREAS="${2//,/ }"; shift 2 ;;
             --no-builds) CHECK_BUILDS=0; shift ;;
             --copies-only) COPIES_ONLY=1; shift ;;
+            --commit-msg) COMMIT_MSG="${2:-}"; [[ -n "$COMMIT_MSG" ]] || { echo "check-rules: --commit-msg needs a file." >&2; exit 2; }; shift 2 ;;
+            --noid-self-test) NOID_SELF_TEST=1; shift ;;
             --accept-stamp)
                 [[ "${2:-}" =~ ^[0-9a-f]{40}:[0-9a-f]{40}$ ]] \
                     || { echo "check-rules: --accept-stamp needs COMMIT:PATCHES (two 40-digit ids)." >&2; exit 2; }
@@ -801,22 +920,36 @@ main() {
     done
     command -v jq > /dev/null || { echo "check-rules: jq is necessary." >&2; exit 2; }
     command -v rg > /dev/null || { echo "check-rules: rg (ripgrep) is necessary." >&2; exit 2; }
-    if [[ -z "$AREAS" ]]; then
-        AREAS="$(find "$FUZZ_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2> /dev/null | sort | tr '\n' ' ')"
-    elif [[ "$AREAS" == "none" ]]; then
-        # --areas none: only the shared files (tests/sanitizers) and the
-        # build directories.
-        AREAS=""
+    if [[ $NOID_SELF_TEST -eq 1 ]]; then
+        noid_self_test
+        exit $?
     fi
-
-    local sources=() area dir
-    for area in $AREAS; do
-        while IFS= read -r f; do sources+=("$f"); done < <(find "$FUZZ_DIR/$area" \
-            \( -name CMakeLists.txt -o -name '*.cmake' -o -name '*.sh' \) -type f 2> /dev/null | sort)
-    done
-    while IFS= read -r f; do sources+=("$f"); done < <(find "$SAN_DIR" -maxdepth 1 -name '*.cmake' -type f | sort)
-
-    if [[ $COPIES_ONLY -eq 1 ]]; then
+    local full=1 sources=() area dir
+    if [[ -n "$COMMIT_MSG" ]]; then
+        # The commit-msg hook: only the message and the staged diff, thus it
+        # takes less than one second.
+        full=0
+        AREAS=""
+        check_noid_msg "$COMMIT_MSG"
+        check_noid_staged
+    else
+        if [[ -z "$AREAS" ]]; then
+            AREAS="$(find "$FUZZ_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2> /dev/null | sort | tr '\n' ' ')"
+        elif [[ "$AREAS" == "none" ]]; then
+            # --areas none: only the shared files (tests/sanitizers) and the
+            # build directories.
+            AREAS=""
+        fi
+        for area in $AREAS; do
+            while IFS= read -r f; do sources+=("$f"); done < <(find "$FUZZ_DIR/$area" \
+                \( -name CMakeLists.txt -o -name '*.cmake' -o -name '*.sh' \) -type f 2> /dev/null | sort)
+        done
+        while IFS= read -r f; do sources+=("$f"); done < <(find "$SAN_DIR" -maxdepth 1 -name '*.cmake' -type f | sort)
+    fi
+    if [[ -n "$COMMIT_MSG" ]]; then
+        :
+    elif [[ $COPIES_ONLY -eq 1 ]]; then
+        full=0
         check_llama_copies
     else
         check_sources_r1 "${sources[@]}"
@@ -827,12 +960,13 @@ main() {
         check_libfuzzer_commands
         check_death_callback
         check_noid
+        check_noid_staged
         check_lto_partitions
         check_android_asan_runtime
         check_parity_sources
         check_repro
     fi
-    if [[ $COPIES_ONLY -eq 0 && $CHECK_BUILDS -eq 1 && -d "$BUILD_FUZZ" ]]; then
+    if [[ $full -eq 1 && $CHECK_BUILDS -eq 1 && -d "$BUILD_FUZZ" ]]; then
         for dir in "$BUILD_FUZZ"/*/; do
             dir="${dir%/}"
             case "$(basename "$dir")" in
@@ -853,7 +987,11 @@ main() {
         fi
     done
     [[ $WRITE_REQUESTS -eq 1 ]] && write_requests
-    echo "check-rules: ${#VIOLATIONS[@]} violation(s) in the areas [$AREAS] and tests/sanitizers." >&2
+    if [[ -n "$COMMIT_MSG" ]]; then
+        echo "check-rules: ${#VIOLATIONS[@]} violation(s) in the commit message and the staged diff." >&2
+    else
+        echo "check-rules: ${#VIOLATIONS[@]} violation(s) in the areas [$AREAS] and tests/sanitizers." >&2
+    fi
     [[ ${#VIOLATIONS[@]} -eq 0 ]]
 }
 

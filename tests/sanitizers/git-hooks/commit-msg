@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# The commit-msg hook of git for this repository. It refuses a commit when
+# its message or the lines that it adds have a task number or a finding ID
+# (tests/sanitizers/check-rules.sh --commit-msg, the rules NOID-MSG and
+# NOID-STAGED). Git gives the hook the index of the commit, also for
+# "git commit -- <paths>".
+#
+# Install it for the clone with:
+#   git config core.hooksPath tests/sanitizers/git-hooks
+set -euo pipefail
+exec "$(git rev-parse --show-toplevel)/tests/sanitizers/check-rules.sh" --commit-msg "$1"
