@@ -56,7 +56,7 @@ from qfz_common import (  # noqa: E402
     PROFILES,
     REGRESS_DIR,
     SEED_DIR,
-    san_dir,
+    llama_bin,
     scratch,
 )
 from qfz_toy import PHONE, SMALL, make_text, output_rot_for, write_source  # noqa: E402
@@ -156,7 +156,7 @@ def build_files(seed: int = 20260923) -> dict:
             raise RuntimeError(f"the oracle failed on {model} with {status}. Log: {host_logs}/{spec.name}.oracle.log")
         # The native host build, then the build without a sanitizer of each profile (rule R11). The target
         # llama-toy of run.sh runs the same files in each sanitizer build, one sanitizer per run (rule R1).
-        runs = [("native", HOST_BIN, {})] + [(f"{prof}-none", san_dir("none", prof) / "llama" / "bin", {})
+        runs = [("native", HOST_BIN, {})] + [(f"{prof}-none", llama_bin("none", prof), {})
                                              for prof in PROFILES]
         for label, bin_dir, env in runs:
             if not (bin_dir / "llama-perplexity").exists():

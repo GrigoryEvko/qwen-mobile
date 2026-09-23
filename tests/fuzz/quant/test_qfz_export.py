@@ -37,7 +37,7 @@ from hypothesis import strategies as st
 
 import gguf
 from qfz_checks import check_available, ggml_loader_check, kl_statistics, read_tensors, run_perplexity
-from qfz_common import LLAMA_DIR, san_dir, scratch
+from qfz_common import LLAMA_DIR, llama_bin, scratch
 from qfz_hyp import counted, fuzz_settings
 from qfz_toy import PROFILES, SMALL, Geometry, make_text, output_rot_for, write_source
 from quant.export import FILE_TYPES, GGUF_4BIT, LinearAttentionLayout, export, mtp_map
@@ -52,7 +52,7 @@ FILTERS = (None, r"ffn_", r"attn_(qkv|gate)", r"^token_embd", r"output")
 SKIPPED_KEYS = {"general.architecture", "general.file_type", "GGUF.version", "GGUF.tensor_count", "GGUF.kv_count"}
 # The build without a sanitizer of the profile of this run (run.sh build none). run.sh builds it from the
 # submodule with the patch series, thus it has the fixes of patches/.
-TOY_BIN = san_dir("none") / "llama" / "bin"
+TOY_BIN = llama_bin("none")
 
 
 @st.composite

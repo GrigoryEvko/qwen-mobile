@@ -28,8 +28,11 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 SEED_DIR = HERE / "seeds"
 REGRESS_DIR = HERE / "regress"
-LLAMA_DIR = ROOT / "third_party" / "llama.cpp"
 FUZZ_OUT = ROOT / "build" / "fuzz" / "quant"
+# The llama.cpp tree of the fuzzers. run.sh sets QFZ_LLAMA_DIR to the stamped copy of the patched tree of
+# HEAD (build/fuzz/quant/llama-src, tests/sanitizers/llama-copy.sh), and it puts the gguf-py of that tree
+# first in PYTHONPATH. Thus "import gguf" and export() read the same tree.
+LLAMA_DIR = Path(os.environ.get("QFZ_LLAMA_DIR", str(FUZZ_OUT / "llama-src")))
 ORACLE_BIN = ROOT / "build" / "oracle-x86" / "bin"
 # The native reference of the phone set (run.sh build native): preset flags, no fast math, no sanitizer.
 HOST_BIN = FUZZ_OUT / "native-host" / "llama" / "bin"
@@ -62,8 +65,23 @@ def san_dir(sanitizer: str | None = None, profile: str | None = None) -> Path:
     return ROOT / "build" / "fuzz" / f"quant-{prof}-{san}"
 
 
+def llama_bin(sanitizer: str | None = None, profile: str | None = None) -> Path:
+    """Give the bin directory of the llama.cpp build of a sanitizer and a profile (run.sh build).
+
+    The CMake build directory is <san_dir>/build, the name that the rule LLAMA-COPY of check-rules.sh reads.
+
+    Args:
+        sanitizer: One of SANITIZERS, or None for the sanitizer of this run
+        profile: One of PROFILES, or None for the profile of this run
+
+    Returns:
+        The directory of llama-perplexity
+    """
+    return san_dir(sanitizer, profile) / "build" / "bin"
+
+
 CHECK_BIN = san_dir() / "bin" / "qfz-gguf-check"
-LLAMA_BIN = san_dir() / "llama" / "bin"
+LLAMA_BIN = llama_bin()
 
 # The known defects of the code under test. The regression tests give the file and the minimal example of each.
 KNOWN_DEFECTS: dict[str, str] = {}

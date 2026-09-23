@@ -7,6 +7,13 @@ HERE="$ROOT/tests/fuzz/quant"
 SANITIZERS=(none asan ubsan tsan msan)
 PROFILES=(debug release)
 FUZZ_MSAN_PREFIX="${FUZZ_MSAN_PREFIX:-$ROOT/build/fuzz/msan-libcxx/install}"
+# The llama.cpp tree: QFZ_LLAMA_DIR, or a private copy of the patched tree of HEAD that
+# tests/sanitizers/llama-copy.sh makes or refreshes one time for each run of this script (refresh_llama).
+# The copy comes from the git objects of HEAD, thus an uncommitted edit in the submodule, or a landing
+# during a run, does not go into the build, and the rule LLAMA-COPY of check-rules.sh checks its stamp.
+LLAMA_DIR="${QFZ_LLAMA_DIR:-$ROOT/build/fuzz/quant/llama-src}"
+LLAMA_COPY=1
+[[ -n "${QFZ_LLAMA_DIR:-}" ]] && LLAMA_COPY=0
 export CUDA_VISIBLE_DEVICES=""
 # Two threads for torch and numpy in each target, thus --jobs N does not ask for N x 28 threads.
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}" MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
@@ -35,9 +42,9 @@ Modes:
   fuzz    Generate new inputs for each target for the budget (the preset
           value is 600 s for each target).
   build   Build the native code of one sanitizer and one profile: llama-perplexity
-          of third_party/llama.cpp and the GGUF loader check qfz-gguf-check, in
-          build/fuzz/quant-<profile>-<sanitizer>. test and fuzz build it when it
-          is missing. "build native" builds the native reference of the phone set:
+          and the GGUF loader check qfz-gguf-check, in
+          build/fuzz/quant-<profile>-<sanitizer>. test and fuzz build it first
+          (an incremental build). "build native" builds the native reference of the phone set:
           llama-perplexity with the llama.cpp preset flags (Release, GGML_NATIVE=ON),
           no fast math and no sanitizer, in build/fuzz/quant/native-host.
   phone-files     Write the phone set into build/fuzz/quant/phone: the fuzzed GGUF
@@ -87,8 +94,12 @@ Options:
 Results: one JSON line per target in build/fuzz/quant-<profile>-<sanitizer>/results.jsonl,
 and a copy in build/fuzz/quant-<sanitizer>/results.jsonl:
   {area, target, sanitizer, profile, mode, seconds, executions, findings, crash_files}
-Environment: QFZ_KNOWN (fuzz the inputs of the known defects too), QFZ_FIXED (expect the
-correct behavior of a known defect), FUZZ_SANITIZER, FUZZ_PROFILE, FUZZ_MSAN_PREFIX. The
+The llama.cpp tree: build/fuzz/quant/llama-src, a copy of the patched tree of HEAD that
+tests/sanitizers/llama-copy.sh makes or refreshes at the start of each run. The native builds
+compile it, and the Python targets import its gguf-py (PYTHONPATH, QFZ_LLAMA_DIR).
+Environment: QFZ_LLAMA_DIR (a llama.cpp tree of your own in place of the copy), QFZ_KNOWN (fuzz
+the inputs of the known defects too), QFZ_FIXED (expect the correct behavior of a known defect),
+FUZZ_SANITIZER, FUZZ_PROFILE, FUZZ_MSAN_PREFIX. The
 names of the known defects are the keys of KNOWN_DEFECTS in qfz_common.py. The GPU stays
 hidden.
 EOF
@@ -122,7 +133,30 @@ sanitizer_flags() {
 
 FP_FLAGS="-fvectorize -ffp-model=fast -fno-finite-math-only -D_GNU_SOURCE"
 
-# Build llama-perplexity and qfz-gguf-check with one sanitizer and one profile.
+# Make or refresh the copy of llama.cpp (when QFZ_LLAMA_DIR is not set). Then give the Python targets its
+# gguf-py: qfz_common.LLAMA_DIR reads QFZ_LLAMA_DIR, and PYTHONPATH puts the gguf-py of the tree before the
+# editable install of the submodule. The lock keeps two runs of this script from writing the copy together.
+refresh_llama() {
+    if [[ $LLAMA_COPY == 1 ]]; then
+        mkdir -p "$(dirname "$LLAMA_DIR")"
+        flock "$LLAMA_DIR.lock" "$ROOT/tests/sanitizers/llama-copy.sh" "$LLAMA_DIR" > /dev/null \
+            || die "tests/sanitizers/llama-copy.sh could not make the copy $LLAMA_DIR"
+    fi
+    [[ -f "$LLAMA_DIR/gguf-py/gguf/__init__.py" ]] || die "$LLAMA_DIR is not a llama.cpp tree: it has no gguf-py"
+    export QFZ_LLAMA_DIR="$LLAMA_DIR" PYTHONPATH="$LLAMA_DIR/gguf-py${PYTHONPATH:+:$PYTHONPATH}"
+}
+
+# Remove the CMake build directory $1 when another llama.cpp tree configured it: CMake refuses a second
+# source tree for one build directory.
+drop_other_tree() {
+    local cache="$1/CMakeCache.txt"
+    if [[ -f "$cache" ]] && ! rg -q -x -F "CMAKE_HOME_DIRECTORY:INTERNAL=$LLAMA_DIR" "$cache"; then
+        rm -rf "$1"
+    fi
+}
+
+# Build llama-perplexity and qfz-gguf-check with one sanitizer and one profile. The build is incremental,
+# thus a refreshed copy of llama.cpp gives new objects only for its changed files.
 build() {
     local san="$1" profile="$2"
     local out="$ROOT/build/fuzz/quant-$profile-$san"
@@ -140,32 +174,30 @@ build() {
     else
         build_type=Debug; opt_var=DEBUG; opt_flags="-O1 -g -fno-omit-frame-pointer"
     fi
+    # The CMake build directory is $out/build, the name that the rule LLAMA-COPY of check-rules.sh reads.
+    local cm="$out/build"
     mkdir -p "$out/bin" "$out/logs"
-    echo "run.sh: build $profile $san into $out (logs in $out/logs)"
-    cmake -S "$ROOT/third_party/llama.cpp" -B "$out/llama" -G Ninja \
+    drop_other_tree "$cm"
+    echo "run.sh: build $profile $san from $LLAMA_DIR into $out (logs in $out/logs)"
+    cmake -S "$LLAMA_DIR" -B "$cm" -G Ninja \
         -DCMAKE_BUILD_TYPE="$build_type" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ "${tools[@]}" \
         -DCMAKE_C_FLAGS="$FP_FLAGS $lto $flags" -DCMAKE_CXX_FLAGS="$FP_FLAGS $lto $flags $cxx_extra" \
         -DCMAKE_C_FLAGS_"$opt_var"="$opt_flags" -DCMAKE_CXX_FLAGS_"$opt_var"="$opt_flags" \
         -DCMAKE_EXE_LINKER_FLAGS="$lto_link $flags $link_extra" \
         -DGGML_NATIVE=ON -DGGML_OPENMP=OFF -DGGML_LLAMAFILE=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF \
-        -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TESTS=OFF -DBUILD_SHARED_LIBS=OFF > "$out/logs/cmake.log" 2>&1
-    nice -n 10 cmake --build "$out/llama" --target llama-perplexity ggml-base -j "${BUILD_JOBS:-10}" \
-        > "$out/logs/build.log" 2>&1
+        -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TESTS=OFF -DBUILD_SHARED_LIBS=OFF > "$out/logs/cmake.log" 2>&1 \
+        || { echo "run.sh: the configure of $cm failed. Read $out/logs/cmake.log." >&2; return 1; }
+    nice -n 10 cmake --build "$cm" --target llama-perplexity ggml-base -j "${BUILD_JOBS:-10}" \
+        > "$out/logs/build.log" 2>&1 \
+        || { echo "run.sh: the build of $cm failed. Read $out/logs/build.log." >&2; return 1; }
     # shellcheck disable=SC2086
-    clang -std=c11 $opt_flags $FP_FLAGS $lto $flags -I "$ROOT/third_party/llama.cpp/ggml/include" \
-        -c "$HERE/qfz_gguf_check.c" -o "$out/bin/qfz_gguf_check.o"
+    clang -std=c11 $opt_flags $FP_FLAGS $lto $flags -I "$LLAMA_DIR/ggml/include" \
+        -c "$HERE/qfz_gguf_check.c" -o "$out/bin/qfz_gguf_check.o" || return 1
     # shellcheck disable=SC2086
-    clang++ $lto_link $flags $link_extra "$out/bin/qfz_gguf_check.o" "$out/llama/ggml/src/libggml-base.a" -lm -lpthread \
-        -o "$out/bin/qfz-gguf-check"
+    clang++ $lto_link $flags $link_extra "$out/bin/qfz_gguf_check.o" "$cm/ggml/src/libggml-base.a" -lm -lpthread \
+        -o "$out/bin/qfz-gguf-check" || return 1
     rm -f "$out/bin/qfz_gguf_check.o"
-    echo "run.sh: built $out/llama/bin/llama-perplexity and $out/bin/qfz-gguf-check"
-}
-
-ensure_built() {
-    local san="$1" profile="$2" out="$ROOT/build/fuzz/quant-$2-$1"
-    if [[ ! -x "$out/bin/qfz-gguf-check" || ! -x "$out/llama/bin/llama-perplexity" ]]; then
-        build "$san" "$profile"
-    fi
+    echo "run.sh: built $cm/bin/llama-perplexity and $out/bin/qfz-gguf-check"
 }
 
 # Build the native reference of the phone set: llama-perplexity with the llama.cpp preset flags
@@ -173,12 +205,15 @@ ensure_built() {
 build_native() {
     local out="$ROOT/build/fuzz/quant/native-host"
     mkdir -p "$out/logs"
-    echo "run.sh: build the native host reference into $out (logs in $out/logs)"
-    cmake -S "$ROOT/third_party/llama.cpp" -B "$out/llama" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    drop_other_tree "$out/llama"
+    echo "run.sh: build the native host reference from $LLAMA_DIR into $out (logs in $out/logs)"
+    cmake -S "$LLAMA_DIR" -B "$out/llama" -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DGGML_NATIVE=ON -DLLAMA_CURL=OFF \
         -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TESTS=OFF -DBUILD_SHARED_LIBS=OFF \
-        > "$out/logs/cmake.log" 2>&1
-    nice -n 10 cmake --build "$out/llama" --target llama-perplexity -j "${BUILD_JOBS:-10}" > "$out/logs/build.log" 2>&1
+        > "$out/logs/cmake.log" 2>&1 \
+        || { echo "run.sh: the configure of $out/llama failed. Read $out/logs/cmake.log." >&2; return 1; }
+    nice -n 10 cmake --build "$out/llama" --target llama-perplexity -j "${BUILD_JOBS:-10}" > "$out/logs/build.log" 2>&1 \
+        || { echo "run.sh: the build of $out/llama failed. Read $out/logs/build.log." >&2; return 1; }
     echo "run.sh: built $out/llama/bin/llama-perplexity"
 }
 
@@ -210,6 +245,10 @@ fi
 for p in "${profiles[@]}"; do member "$p" "${PROFILES[@]}" || die "the profile $p is not one of: ${PROFILES[*]}"; done
 
 case "$mode" in
+    build|test|fuzz|phone-files|phone-commands) refresh_llama ;;
+esac
+
+case "$mode" in
     -h|--help|help)
         usage
         ;;
@@ -225,7 +264,7 @@ case "$mode" in
         member "$san" "${SANITIZERS[@]}" || die "$mode needs one sanitizer of: ${SANITIZERS[*]}"
         status=0
         for p in "${profiles[@]}"; do
-            if ! ensure_built "$san" "$p"; then
+            if ! build "$san" "$p"; then
                 echo "run.sh: the build of $p $san is not possible, the native targets report it as skipped" >&2
             fi
             code=0
@@ -237,8 +276,8 @@ case "$mode" in
         exit "$status"
         ;;
     phone-files)
-        for p in "${PROFILES[@]}"; do ensure_built none "$p"; done
-        [[ -x "$ROOT/build/fuzz/quant/native-host/llama/bin/llama-perplexity" ]] || build_native
+        for p in "${PROFILES[@]}"; do build none "$p" || die "the build of $p none failed"; done
+        build_native || die "the build of the native host reference failed"
         exec uv run python "$HERE/qfz_phone.py" files
         ;;
     phone-commands)

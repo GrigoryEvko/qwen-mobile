@@ -65,6 +65,7 @@ from qfz_common import (  # noqa: E402
     ROOT,
     SANITIZERS,
     SEED_DIR,
+    llama_bin,
     san_dir,
 )
 
@@ -276,7 +277,7 @@ class Runner:
         return self.out / "bin" / "qfz-gguf-check"
 
     def _llama_bin(self) -> Path:
-        return self.out / "llama" / "bin"
+        return llama_bin(self.san, self.profile)
 
     def run_loader(self, t: Target) -> Result:
         """The ggml loader check of this sanitizer: seed files (test), or the files of the fuzzers (fuzz)."""
