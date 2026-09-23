@@ -580,6 +580,8 @@ int cmd_same(int argc, char ** argv) {
         ib[key(r)] = &r;
     }
     size_t same = 0, diff = 0, unpaired = 0, shown = 0;
+    const char * max_env   = std::getenv("FUZZ_OPS_SAME_MAX");  // the most differences to print
+    const size_t max_shown = max_env ? (size_t) std::strtoull(max_env, nullptr, 10) : 10;
     for (const auto & r : a) {
         const auto it = ib.find(key(r));
         if (it == ib.end()) {
@@ -593,7 +595,7 @@ int cmd_same(int argc, char ** argv) {
             continue;
         }
         diff++;
-        if (shown++ < 10) {
+        if (shown++ < max_shown) {
             std::printf("different: case %u %s: status %u/%u, %zu/%zu outputs\n", r.idx, key(r).second.c_str(),
                         r.rr.status, o.rr.status, r.rr.outs.size(), o.rr.outs.size());
         }
