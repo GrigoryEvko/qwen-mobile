@@ -105,7 +105,8 @@ void builder::inject(leaf & l) {
         if (l.t->type == GGML_TYPE_F32) {
             std::memcpy(l.bytes.data() + pos * 4, &bits, 4);
             const float f = bits_f32(bits);
-            if (!std::isfinite(f) || (f != 0.0f && std::fabs(f) < 1.17549435e-38f)) {
+            // random bits give each exponent: a value at or past 2^64 is huge (its square overflows)
+            if (!std::isfinite(f) || (f != 0.0f && std::fabs(f) < 1.17549435e-38f) || std::fabs(f) >= 0x1p64f) {
                 c.special = true;
             }
         } else if (l.t->type == GGML_TYPE_F16) {

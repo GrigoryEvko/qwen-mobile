@@ -75,6 +75,42 @@ double amax(const std::vector<double> & v) {
     return m;
 }
 
+// The f16 value of |x| >= 65520 is inf.
+constexpr double F16_INF_AT = 65520.0;
+
+// Return the smallest |x| of an f32 input that the op converts to the type `to` with an infinite
+// result: F16_INF_AT for f16 (the value itself), 127 F16_INF_AT for Q8_0 (the f16 scale amax/127 of
+// its 32-block), and infinity for the other types (no conversion to a narrow type).
+double conv_limit(ggml_type to) {
+    if (to == GGML_TYPE_F16) {
+        return F16_INF_AT;
+    }
+    if (to == GGML_TYPE_Q8_0) {
+        return 127.0 * F16_INF_AT;
+    }
+    return std::numeric_limits<double>::infinity();
+}
+
+// Mark the case special if an f32 input has a value that its conversion to the type `to` makes
+// infinite. The op then gives inf or NaN, and which one depends on the order of the operations of
+// each backend (for example 0 * inf in one order and a sum of inf in the other), thus the oracle is
+// not a reference for this output. Complexity: O(n) in the elements of x.
+void mark_conv_range(builder & b, const ggml_tensor * x, ggml_type to) {
+    const double lim = conv_limit(to);
+    if (std::isfinite(lim) && amax(logical_values(b.c, x)) >= lim) {
+        b.c.special = true;
+    }
+}
+
+// Return the type that the CPU converts the f32 activations to for a weight type (vec_dot_type):
+// F16 for an F16 weight, Q8_0 for a Q8_0 or Q4_0 weight, and F32 (no conversion) for an F32 weight.
+ggml_type act_type(ggml_type wt) {
+    if (wt == GGML_TYPE_F16) {
+        return GGML_TYPE_F16;
+    }
+    return ggml_is_quantized(wt) ? GGML_TYPE_Q8_0 : GGML_TYPE_F32;
+}
+
 // Pick a quantized or float weight type.
 ggml_type pick_wtype(reader & rd) {
     static const ggml_type types[] = { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 };
@@ -255,6 +291,7 @@ bool build_mul_mat(builder & b) {
     }
     ggml_tensor * w = mm_weight(b, wt, k, m, ne02, ne03, true);
     ggml_tensor * x = mm_act(b, k, n, ne02 * r2, ne03 * r3, q);
+    mark_conv_range(b, x, act_type(wt));
     ggml_tensor * y = ggml_mul_mat(b.ctx, w, x);
     ggml_build_forward_expand(b.c.gf, y);
     b.out(y, "y");
@@ -327,6 +364,7 @@ bool build_mm_model(builder & b) {
     const vspec   v     = b.vs(-0.125f, 0.125f);
     ggml_tensor * w     = b.typed(wt, k, m, 1, 1, v, leaf_role::WEIGHT);
     ggml_tensor * x     = b.f32(k, n, 1, 1, b.vs(-4.0f, 4.0f, true));
+    mark_conv_range(b, x, act_type(wt));
     ggml_tensor * y     = ggml_mul_mat(b.ctx, w, x);
     ggml_build_forward_expand(b.c.gf, y);
     b.out(y, "y");
@@ -344,6 +382,7 @@ bool build_mul_mat_add(builder & b) {
     mm_shape(b, wt, k, m, n, model);
     ggml_tensor * w     = mm_weight(b, wt, k, m, 1, 1, false);
     ggml_tensor * x     = mm_act(b, k, n, 1, 1, ggml_is_quantized(wt));
+    mark_conv_range(b, x, act_type(wt));
     ggml_tensor * y     = ggml_mul_mat(b.ctx, w, x);
     const bool    bias  = rd.chance(128);
     ggml_tensor * add   = bias ? b.f32(m, 1, 1, 1, b.vs(-1.0f, 1.0f), leaf_role::WEIGHT)
@@ -387,6 +426,7 @@ bool build_mul_mat_multi(builder & b) {
     mm_shape(b, wt, k, m, n, model);
     const int     nw = (int) rd.range(2, 3);
     ggml_tensor * x  = mm_act(b, k, n, 1, 1, ggml_is_quantized(wt));
+    mark_conv_range(b, x, act_type(wt));
     for (int i = 0; i < nw; i++) {
         const int64_t mi = std::max<int64_t>(1, m >> rd.range(0, 2));
         ggml_tensor * w  = mm_weight(b, wt, k, mi, 1, 1, false);
@@ -415,6 +455,7 @@ bool build_mul_mat_id(builder & b) {
     }
     ggml_tensor * as  = b.typed(wt, k, m, n_expert, 1, b.vs(-0.125f, 0.125f), leaf_role::WEIGHT);
     ggml_tensor * x   = b.f32(k, b1, nt, 1, b.vs(-4.0f, 4.0f, q));
+    mark_conv_range(b, x, act_type(wt));
     ggml_tensor * ids = b.idx_distinct(GGML_TYPE_I32, n_used, nt, n_expert);
     ggml_tensor * y   = ggml_mul_mat_id(b.ctx, as, x, ids);
     ggml_build_forward_expand(b.c.gf, y);
@@ -851,6 +892,18 @@ bool build_rope(builder & b) {
     }
     ggml_tensor * pos = b.i32(mrope ? 4 * T : T, 1, 1, 1, b.wild && b.rd.chance(32) ? -pm : 0, pm);
     ggml_tensor * ff  = !model && rd.chance(40) ? b.f32(n_dims / 2, 1, 1, 1, b.vs(0.9f, 1.1f)) : nullptr;
+    if (ff != nullptr) {
+        // A wide distribution can give a factor near 0, and the angle pos / ff can then go past
+        // 2^64. At such an angle one ulp is more than 2 pi, thus sin and cos (or inf and NaN when
+        // the angle overflows) depend on the order of the operations, and the case is special.
+        double ffmin = std::numeric_limits<double>::infinity();
+        for (double f : logical_values(b.c, ff)) {
+            ffmin = std::min(ffmin, std::fabs(f));
+        }
+        if (!((double) pm * std::max(1.0, (double) fscale) < 0x1p64 * ffmin)) {
+            b.c.special = true;
+        }
+    }
     ggml_tensor * y;
     if (mrope) {
         y = ggml_rope_multi(b.ctx, a, pos, ff, n_dims, sections, mode, n_ctx_orig, base, fscale, ext, 1.0f, 32.0f, 1.0f);
@@ -896,7 +949,8 @@ void bound_rope(const built_case & c, size_t o, const std::vector<float> & ref, 
             for (int64_t i = 0; i < n_dims / 2; i++) {
                 const int64_t i0 = neox_like ? i : 2 * i;
                 const int64_t i1 = neox_like ? i + n_dims / 2 : 2 * i + 1;
-                const double  ff = FF.empty() ? 1.0 : std::max(0.5, FF[(size_t) i]);
+                // a factor of 0 gives an infinite angle, thus an infinite bound
+                const double  ff = FF.empty() ? 1.0 : std::fabs(FF[(size_t) i]);
                 const double  th = pmax * std::pow(base, -2.0 * (double) i / (double) n_dims) * std::max(1.0, fscale) / ff;
                 const double  xm = 1.5 * (std::fabs(X[(size_t) (base_i + i0)]) + std::fabs(X[(size_t) (base_i + i1)]));
                 const double  s  = xm * ((double) (n_dims / 2 + 4) * 4.0 * EPS32 * (th + 1.0));
@@ -914,7 +968,7 @@ void bound_rope(const built_case & c, size_t o, const std::vector<float> & ref, 
 const char * TXT_ROPE =
     "rotated pair: strict = 1.5 (|x0|+|x1|) (n_dims/2 + 4) 4u (|theta| + 1) + 2u|y|, loose = strict + "
     "1.5 (|x0|+|x1|) 4 u16; the other dims are copies (0). |theta| <= max|pos| base^(-2i/n_dims) "
-    "max(1, freq_scale) / ff. Reason: the CPU makes theta by n_dims/2 repeated f32 products, thus "
+    "max(1, freq_scale) / |ff|. Reason: the CPU makes theta by n_dims/2 repeated f32 products, thus "
     "the angle carries a relative error of about (i+2)u, and a large position turns it into an "
     "absolute angle error. The factor 1.5 covers the YaRN magnitude scale. The loose bound adds one f16 "
     "rounding of sin and cos.";
@@ -957,6 +1011,14 @@ bool build_flash_attn(builder & b) {
         q = ggml_permute(b.ctx, b.f32(D, nh, n_q, 1, b.vs(-2.0f, 2.0f)), 0, 2, 1, 3);
     } else {
         q = b.f32(D, n_q, nh, 1, b.vs(-2.0f, 2.0f));
+    }
+    // The CPU converts Q to the type of K for the dot products. With an F16 V, its one-row path
+    // adds the weighted V rows in an f16 accumulator, and the sum of n_kv rows with weights of 1 or
+    // less stays below n_kv max|V|. Half of the f16 range keeps the rounding of the f16 sum away
+    // from the limit.
+    mark_conv_range(b, q, kt);
+    if (vt == GGML_TYPE_F16 && (double) n_kv * amax(logical_values(b.c, v)) >= 0.5 * F16_INF_AT) {
+        b.c.special = true;
     }
     const uint8_t mb     = rd.u8();
     ggml_tensor * mask   = mb < 25 && !model ? nullptr : b.mask_f16(n_kv, n_q, 1, 1, model || mb < 160);

@@ -53,7 +53,9 @@ struct built_case {
     std::vector<output>  outs;
     int                  n_threads  = 1;
     bool                 cpu_repack = false; // weights go into the extra buffer type of the CPU backend
-    bool                 special    = false; // the inputs hold Inf, NaN, subnormal or huge values
+    // The inputs hold Inf, NaN, subnormal or huge values, or a value that a conversion of the op
+    // (to f16 or Q8_0) makes infinite, or a rope factor that makes an angle past 2^64.
+    bool                 special    = false;
     std::string          desc;               // the shapes and types, readable
     std::string          path;               // the path class of the backends, for the error table
     std::vector<double>  prm;                // numbers that the bound rules of the kind read
