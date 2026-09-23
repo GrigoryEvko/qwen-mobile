@@ -26,36 +26,6 @@
 #include <cstring>
 #include <vector>
 
-namespace {
-
-// Sets the exponent of an FP16 value to max_exp when it is larger (this includes Inf and NaN).
-void clamp_half(uint8_t * p, uint32_t max_exp) {
-    uint16_t h;
-    memcpy(&h, p, 2);
-    if (((h >> 10) & 0x1f) > max_exp) {
-        h = (uint16_t) ((h & 0x83ff) | (max_exp << 10));
-    }
-    memcpy(p, &h, 2);
-}
-
-// The forward repack of Q4_K (d * sc, sc <= 63) and of Q6_K (d * scale, |scale| <= 128) writes Inf
-// into the FP16 scales of the tile when d is too large, and the read back converts NaN to an
-// integer (ggml-hexagon.cpp:1675, 1850). This function makes d and dmin of each block small, thus
-// the products stay finite and the harness goes past that defect (the check repack-nonfinite-scale).
-void clamp_scales(ggml_type t, std::vector<uint8_t> & in) {
-    const size_t bs = ggml_type_size(t);
-    for (size_t b = 0; b + bs <= in.size(); b += bs) {
-        if (t == GGML_TYPE_Q4_K) {
-            clamp_half(&in[b + 0], 24);  // d < 1024
-            clamp_half(&in[b + 2], 24);  // dmin < 1024
-        } else {
-            clamp_half(&in[b + bs - 2], 23);  // d < 512
-        }
-    }
-}
-
-} // namespace
-
 extern "C" int LLVMFuzzerInitialize(int * argc, char *** argv) {
     (void) argc;
     (void) argv;
@@ -101,9 +71,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
             std::vector<uint8_t> in(n);
             for (size_t i = 0; i < n; i++) {
                 in[i] = fdp.ConsumeIntegral<uint8_t>();
-            }
-            if (kq && fakedsp::is_ignored("repack-nonfinite-scale")) {
-                clamp_scales(t, in);
             }
             const size_t row   = ggml_row_size(t, ne0);
             const size_t rows  = (size_t) ne1 * ne2 * ne3;
