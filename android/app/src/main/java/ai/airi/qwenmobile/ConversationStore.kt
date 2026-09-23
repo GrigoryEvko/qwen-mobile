@@ -95,32 +95,98 @@ class ConversationStore(private val dir: File) {
         }
     }
 
-    /** Read the messages, or an empty list when there is no file or it is not readable. */
+    /**
+     * Read the messages, or an empty list when there is no file. A message
+     * that is not readable is skipped, and the others load (task #94, D9).
+     *
+     * A file that did not load in full stays on the disk as
+     * conversation.json.bad (refer to [keepDamaged]). A file that gives no
+     * message goes there, thus the next save does not write an empty
+     * conversation over it. A file that gives some messages stays, and a
+     * copy of it goes there. O(size of the file).
+     */
     @Synchronized
     fun load(): List<Entry> {
         if (!file.isFile) {
             return emptyList()
         }
-        return try {
-            val array = JSONObject(file.readText()).getJSONArray("messages")
-            List(array.length()) { i ->
-                val obj = array.getJSONObject(i)
-                val image = obj.optString("image", "").takeIf { it.isNotEmpty() }
-                    ?.let { File(imageDir, it) }?.takeIf { it.isFile }?.readBytes()
-                Entry(
-                    role = obj.getString("role"),
-                    content = obj.getString("content"),
-                    thinking = obj.optString("thinking", ""),
-                    thinkingMs = obj.optLong("thinkingMs", 0L),
-                    image = image,
-                    meta = obj.optString("meta", "").takeIf { it.isNotEmpty() },
-                )
-            }
-        } catch (e: Exception) {
+        val bytes = try {
+            file.readBytes()
+        } catch (e: IOException) {
             Log.w(TAG, "The conversation file is not readable, the conversation starts empty", e)
-            emptyList()
+            return emptyList()
+        }
+        val array = try {
+            JSONObject(String(bytes, Charsets.UTF_8)).getJSONArray("messages")
+        } catch (e: Exception) {
+            Log.w(TAG, "The conversation file does not parse, the conversation starts empty", e)
+            keepDamaged(bytes, move = true)
+            return emptyList()
+        } catch (e: StackOverflowError) {
+            // The org.json parser of Android is recursive and has no limit of the depth.
+            Log.w(TAG, "The conversation file is nested too deeply, the conversation starts empty", e)
+            keepDamaged(bytes, move = true)
+            return emptyList()
+        }
+        val out = ArrayList<Entry>(array.length())
+        for (i in 0 until array.length()) {
+            try {
+                out += entryOf(array.getJSONObject(i))
+            } catch (e: Exception) {
+                Log.w(TAG, "Message $i of the conversation file is not readable, it is skipped", e)
+            }
+        }
+        if (out.size < array.length()) {
+            keepDamaged(bytes, move = out.isEmpty())
+        }
+        return out
+    }
+
+    /** The entry of one message object of the file. */
+    private fun entryOf(obj: JSONObject): Entry {
+        val image = obj.optString("image", "").takeIf { it.isNotEmpty() }
+            ?.let { File(imageDir, it) }?.takeIf { it.isFile }?.readBytes()
+        return Entry(
+            role = obj.getString("role"),
+            content = obj.getString("content"),
+            thinking = obj.optString("thinking", ""),
+            thinkingMs = obj.optLong("thinkingMs", 0L),
+            image = image,
+            meta = obj.optString("meta", "").takeIf { it.isNotEmpty() },
+        )
+    }
+
+    /**
+     * Keep the bytes of a conversation file that did not load in full. The
+     * name is conversation.json.bad, or conversation.json.bad-<hash> when
+     * that name holds other bytes, thus no kept file is overwritten and the
+     * same bytes are kept one time. With [move], the file goes to that name,
+     * else it stays and a copy goes there. The images of the file stay only
+     * until the next save.
+     */
+    private fun keepDamaged(bytes: ByteArray, move: Boolean) {
+        try {
+            val first = File(dir, file.name + ".bad")
+            val target = if (!first.exists() || sameBytes(first, bytes)) {
+                first
+            } else {
+                File(dir, file.name + ".bad-" + hashName(bytes).take(12))
+            }
+            // A target that exists holds the same bytes already.
+            if (!target.exists() && !(move && file.renameTo(target))) {
+                target.writeBytes(bytes)
+            }
+            if (move) {
+                file.delete()
+            }
+        } catch (e: IOException) {
+            Log.w(TAG, "The damaged conversation file was not kept, it stays as ${file.name}", e)
         }
     }
+
+    /** True when the file holds exactly the bytes. */
+    private fun sameBytes(f: File, bytes: ByteArray): Boolean =
+        f.length() == bytes.size.toLong() && f.readBytes().contentEquals(bytes)
 
     /** Remove the file and the images. */
     @Synchronized

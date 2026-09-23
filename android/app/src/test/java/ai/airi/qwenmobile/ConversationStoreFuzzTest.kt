@@ -170,12 +170,12 @@ class ConversationStoreFuzzTest {
     }
 
     /**
-     * A deeply nested file loads as an empty conversation. On the JVM this
-     * test passes, because the org.json of the tests stops at a nesting depth
-     * of 512 with a JSONException. The org.json of Android has no such limit
-     * and its parser is recursive, thus there the same file gives a
-     * StackOverflowError, which load() does not catch (finding
-     * conversation-deep-nesting, from the source, not from a run on a phone).
+     * A deeply nested file loads as an empty conversation. The org.json of
+     * the tests stops at a nesting depth of 512 with a JSONException. The
+     * org.json of Android has no such limit and its parser is recursive, thus
+     * there the same file gives a StackOverflowError, which load() catches
+     * (finding conversation-deep-nesting, task #94 D9, from the source, not
+     * from a run on a phone).
      */
     @Test
     fun aDeeplyNestedFileLoadsAsAnEmptyConversation() {
@@ -208,17 +208,48 @@ class ConversationStoreFuzzTest {
     }
 
     /**
-     * Finding conversation-all-or-nothing: one message without a role or a
-     * content makes the whole conversation load as empty, and the next save
-     * writes the empty conversation over the file.
+     * One message without a role or a content does not lose the other
+     * messages, and the file stays whole as conversation.json.bad (finding
+     * conversation-all-or-nothing, task #94 D9).
      */
     @Test
     fun oneBadMessageDoesNotLoseTheOthers() {
-        FuzzSwitch.requireFindings("conversation-all-or-nothing")
         val good = JSONObject().put("role", "user").put("content", "kept")
         val bad = JSONObject().put("content", "no role")
-        file.writeText(JSONObject().put("messages", JSONArray().put(good).put(bad).put(good)).toString())
+        val text = JSONObject().put("messages", JSONArray().put(good).put(bad).put(good)).toString()
+        file.writeText(text)
         val loaded = ConversationStore(folder.root).load()
         assertEquals(2, loaded.size)
+        assertEquals("the file stays", text, file.readText())
+        assertEquals("a copy is kept", text, File(folder.root, "conversation.json.bad").readText())
+    }
+
+    /**
+     * A file that does not parse goes to conversation.json.bad, thus the next
+     * save does not write over it. A second damaged file does not overwrite
+     * the first one, and the same bytes are kept one time (task #94 D9).
+     */
+    @Test
+    fun aFileThatDoesNotParseIsKeptAndNotOverwritten() {
+        val store = ConversationStore(folder.root)
+        val bad = File(folder.root, "conversation.json.bad")
+        file.writeText("{\"messages\": [")
+        assertTrue(store.load().isEmpty())
+        assertTrue("the damaged file moved", !file.exists())
+        assertEquals("{\"messages\": [", bad.readText())
+        store.save(listOf(ConversationStore.Entry("user", "new", "", 0, null, null)))
+        assertEquals("the save did not touch the damaged file", "{\"messages\": [", bad.readText())
+
+        file.writeText("not json")
+        assertTrue(store.load().isEmpty())
+        assertEquals("the first damaged file stays", "{\"messages\": [", bad.readText())
+        val others = folder.root.listFiles().orEmpty().filter { it.name.startsWith("conversation.json.bad-") }
+        assertEquals(1, others.size)
+        assertEquals("not json", others[0].readText())
+
+        file.writeText("not json")
+        assertTrue(store.load().isEmpty())
+        assertEquals("the same bytes are kept one time", 2,
+            folder.root.listFiles().orEmpty().count { it.name.startsWith("conversation.json.bad") })
     }
 }
