@@ -31,8 +31,9 @@ def scale_search(grid: Grid, blocks: torch.Tensor, weights: torch.Tensor | None 
     """Pick the scale per block that minimizes the (weighted) squared error on the grid.
 
     Candidates are the reference scale times factors in [lo, hi]. The 41
-    points have the step 0.0125, thus the reference scale (factor 1) is a
-    candidate and a block that is already on the grid keeps its scale. This
+    points have the step 0.0125. linspace in float32 gives 0.99999994 near
+    1, thus the factor nearest to 1 is set to exactly 1: the reference scale
+    is a candidate, and a block that is already on the grid keeps its scale. This
     is the diagonal-Hessian scale search of NeUQI for a grid without zero
     point. ``weights`` [cols] weights the error per input column. Each
     candidate is rounded to F16 before its error is measured, thus the
@@ -42,6 +43,7 @@ def scale_search(grid: Grid, blocks: torch.Tensor, weights: torch.Tensor | None 
     """
     d0 = grid.scale_rtn(blocks)
     factors = torch.linspace(lo, hi, n_candidates, device=blocks.device, dtype=blocks.dtype)
+    factors[(factors - 1).abs().argmin()] = 1.0
     best_d = d0.clone()
     best_err = torch.full_like(d0, float("inf"))
     wgt = None

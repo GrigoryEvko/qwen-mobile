@@ -122,14 +122,13 @@ def test_scale_search_is_not_worse_after_the_f16_rounding() -> None:
     assert sse[True] <= sse[False], f"the search gives {sse[True]:.4e}, the plain scale {sse[False]:.4e}"
 
 
-@xfail_open("search-factor-one-inexact", "the candidate at the factor 0.99999994 rounds to another F16 scale")
 def test_scale_search_holds_the_reference_scale() -> None:
     """The scale search is not worse than the reference scale on a block whose reference scale is subnormal in F16.
 
-    The search factors come from linspace(0.55, 1.05, 41) in float32, and
-    the factor nearest to 1 is 0.99999994. On this block, d0 · 0.99999994
-    rounds to another F16 scale than d0, thus no candidate of the search is
-    the stored reference scale, and each candidate gives a larger error.
+    linspace(0.55, 1.05, 41) in float32 gives the factor 0.99999994 near 1.
+    On this block, d0 · 0.99999994 rounds to another F16 scale than d0, thus
+    a search without the exact factor 1 has no candidate at the stored
+    reference scale, and each of its candidates gives a larger error.
     """
     spec = MatrixSpec(1, 5, (("spread", "spread", "gauss", "gauss", "sparse"),), ((0, 0, 0, 0, -12),),
                       3_358_071_818, True)

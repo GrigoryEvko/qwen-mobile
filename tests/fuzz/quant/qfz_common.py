@@ -66,11 +66,7 @@ CHECK_BIN = san_dir() / "bin" / "qfz-gguf-check"
 LLAMA_BIN = san_dir() / "llama" / "bin"
 
 # The known defects of the code under test. The regression tests give the file and the minimal example of each.
-KNOWN_DEFECTS: dict[str, str] = {
-    "search-factor-one-inexact":
-        "the search factor nearest to 1 is 0.99999994 in float32, thus the F16 rounding of that candidate can differ "
-        "from the stored reference scale, and the search can lose to the reference scale",
-}
+KNOWN_DEFECTS: dict[str, str] = {}
 
 # The largest finite F16 value, and the smallest positive subnormal F16 value.
 F16_MAX = 65504.0

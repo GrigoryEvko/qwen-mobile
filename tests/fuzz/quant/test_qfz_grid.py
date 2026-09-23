@@ -28,7 +28,7 @@ from hypothesis import strategies as st
 
 import gguf
 import quant.grid as grid_module
-from qfz_common import F16_MAX, block_view, known_open, q8_0_error_bound, scale_domain
+from qfz_common import F16_MAX, block_view, q8_0_error_bound, scale_domain
 from qfz_hyp import counted, fuzz_settings
 from qfz_strategies import MatrixSpec, matrices, raw_float_matrices
 from quant.grid import (block_error, dequantize, pack_nibbles, pack_q8_0, q8_0_dequantize, q8_0_quantize,
@@ -171,12 +171,6 @@ def test_scale_search_is_not_worse_than_the_reference_scale(spec, kind: str) -> 
     err_p = ((block_view(plain) - block_view(w.astype(np.float64))) ** 2).sum(-1)
     noise = 64.0 * np.spacing(_amax(w).astype(np.float32)).astype(np.float64) ** 2
     worse = err_s - err_p * (1.0 + 1e-5) - noise
-    if known_open("search-factor-one-inexact"):
-        # Exclude the blocks whose candidate nearest to the factor 1 rounds to another F16 scale than the reference.
-        d0 = grid.scale_rtn(torch.from_numpy(block_view(w)))
-        near_one = torch.linspace(0.55, 1.05, 41)[36]
-        other = ((d0 * near_one).to(torch.float16) != d0.to(torch.float16)).numpy()
-        worse = np.where(other, -1.0, worse)
     assert (worse <= 0).all(), (f"the search error is larger than the reference error in {int((worse > 0).sum())} "
                                 f"blocks, worst {float(worse.max()):.3e} over the tolerance")
 
