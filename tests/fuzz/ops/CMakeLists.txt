@@ -220,6 +220,11 @@ if (FUZZ_OPS_VARIANT STREQUAL "fuzz")
     target_compile_options(fuzz_ops PRIVATE ${FUZZ_OPS_HARNESS_FP})
     target_link_options(fuzz_ops PRIVATE -fsanitize=fuzzer)
     fuzz_ops_replay()
+    # The check of the f32-to-f16 conversions of ggml. It keeps the float flags of the profile (no
+    # FUZZ_OPS_HARNESS_FP), because it checks the ggml code with these flags (src/f16_check.cpp).
+    add_executable(ops_f16_check src/f16_check.cpp)
+    target_include_directories(ops_f16_check PRIVATE ${FUZZ_OPS_GGML_SRC}/include ${FUZZ_OPS_GGML_SRC}/src)
+    target_link_libraries(ops_f16_check PRIVATE ggml ggml-base ggml-cpu)
 elseif (FUZZ_OPS_VARIANT STREQUAL "oracle")
     add_executable(ops_oracle src/oracle_main.cpp)
     target_link_libraries(ops_oracle PRIVATE fuzz_ops_core)

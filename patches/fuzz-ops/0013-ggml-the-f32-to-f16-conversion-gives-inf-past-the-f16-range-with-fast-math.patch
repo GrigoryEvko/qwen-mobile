@@ -1,0 +1,51 @@
+ggml: the f32-to-f16 conversion gives inf past the f16 range with fast math
+Fold-into: upstream/ggml-core
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+ggml_compute_fp32_to_fp16 (ggml-impl.h) calculates base = (|f| * 2^112) *
+2^-110. The first product is inf for |f| >= 65520, and thus the result is inf.
+With reassociation (for example -ffp-model=fast, the flags of the app build),
+clang changes the two products into one product by 4. Then the function gives
+a finite value or a NaN for these values: 0x7c46 (a NaN) for 70000, 0x0ba1
+for 1e6 and 0x53dc for 2.7e11. A test of each of the 2^32 f32 values against
+the F16C conversion gives 1828646904 differences, and each one is a value that
+must give inf.
+
+On x86, the CPU backend uses this function for each scalar f16 value
+(GGML_CPU_FP32_TO_FP16), for example in CPY to f16. The op fuzzer found the
+defect in the x86 release build: CPY of f32[192] to f16 gave the finite value
+0.0034 where the correct value is inf. On arm64, the CPU backend uses the
+hardware conversion, but ggml-base (ggml_fp32_to_fp16_row), the reference
+quantizers of ggml-quants.c and the Hexagon host code use this function. The
+app graphs do not reach this condition: no value that they convert to f16 is
+near 65504 (the largest is 205), and the Hexagon host code sets a value more
+than 65504 to 65504 first.
+
+This patch adds an integer compare of the bits of |f| with the bits of 65520
+before the float calculation. For |f| >= 65520 that is not a NaN, the function
+gives inf with the sign of f. The compare does not depend on the float flags,
+and the result of each other value does not change. With the release flags,
+the path costs one integer add, one compare and one branch on x86 and on
+aarch64: the compiler makes one unsigned compare from the two limits. The test
+of the 2^32 values gives 0 differences with the precise flags and with
+-ffp-model=fast.
+
+diff --git a/ggml/src/ggml-impl.h b/ggml/src/ggml-impl.h
+index ae26e0c..87b7095 100644
+--- a/ggml/src/ggml-impl.h
++++ b/ggml/src/ggml-impl.h
+@@ -429,6 +429,13 @@ static inline ggml_fp16_t ggml_compute_fp32_to_fp16(float f) {
+     const uint32_t w = fp32_to_bits(f);
+     const uint32_t shl1_w = w + w;
+     const uint32_t sign = w & UINT32_C(0x80000000);
++    // The f16 value of |f| >= 65520 (0x477FF000) is inf. The two products of base give inf for such
++    // a value, but a compiler with reassociation (for example -ffp-model=fast) can change them into
++    // one product by 4. Then base gives a finite value or a NaN. This integer compare does not
++    // depend on the float flags, and it does not include a NaN (shl1_w > 0xFF000000).
++    if (shl1_w >= UINT32_C(0x8EFFE000) && shl1_w <= UINT32_C(0xFF000000)) {
++        return (sign >> 16) | UINT16_C(0x7C00);
++    }
+     uint32_t bias = shl1_w & UINT32_C(0xFF000000);
+     if (bias < UINT32_C(0x71000000)) {
+         bias = UINT32_C(0x71000000);

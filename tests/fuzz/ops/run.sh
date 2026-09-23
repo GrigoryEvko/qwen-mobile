@@ -68,7 +68,9 @@ ops) to build/fuzz/ops-PROFILE-CONFIG/results.jsonl:
                 gives a nonzero exit code: a sanitizer report, a crash or an assert, a write
                 outside a tensor or into an input, a decode mismatch between the harness and the
                 oracle, or a result above the loose bound for an input without special values.
-  fuzz CONFIG   Run libFuzzer on each group for --budget-seconds (default 600), --jobs groups at
+                The suite also runs ops_f16_check (target f16_check): the f32-to-f16 conversions
+                of ggml with the flags of the profile, against a table and the F16C hardware.
+  fuzz CONFIG  Run libFuzzer on each group for --budget-seconds (default 600), --jobs groups at
                 a time (default 4). The default is every group. The inputs include the special
                 values (Inf, NaN, subnormal, huge) and fully masked rows in the two profiles: the
                 value asserts of the ggml CPU ops run only with GGML_CPU_VALUE_ASSERTS.
@@ -234,7 +236,7 @@ build_config() {
             -C "$SHARED_SAN/profile-$profile.cmake" -C "$SHARED_SAN/$config.cmake" > "$dir/cmake.log" 2>&1 \
             || die "the configure of $dir failed, refer to $dir/cmake.log"
     fi
-    nice -n 10 cmake --build "$dir" -j"$BUILD_JOBS" --target fuzz_ops ops_replay > "$dir/build.log" 2>&1 \
+    nice -n 10 cmake --build "$dir" -j"$BUILD_JOBS" --target fuzz_ops ops_replay ops_f16_check > "$dir/build.log" 2>&1 \
         || die "the build of $dir failed, refer to $dir/build.log"
 }
 
@@ -335,7 +337,19 @@ run_test() {
     local profile=$1 config=$2
     build_oracle
     build_config "$profile" "$config"
-    local total_bad=0 g
+    local total_bad=0 g dir t0 t1 fbad=0
+    dir=$(host_dir "$profile" "$config")
+    mkdir -p "$dir/test"
+    # The f32-to-f16 conversions of ggml with the flags of the profile (src/f16_check.cpp).
+    t0=$(date +%s)
+    if ! with_san "$config" timeout -s KILL 300 "$dir/ops_f16_check" > "$dir/test/f16_check.log" 2>&1; then
+        fbad=1
+        echo "fuzz-ops: test $profile-$config f16_check: FINDING (log $dir/test/f16_check.log)" >&2
+    fi
+    t1=$(date +%s)
+    json_line "$profile" "$config" f16_check test $((t1 - t0)) 1 "$fbad"
+    echo "fuzz-ops: test $profile-$config f16_check: 1 check, $fbad findings"
+    total_bad=$((total_bad + fbad))
     for g in $ALL_GROUPS; do
         local t0 t1 res n bad failed
         failed="$(host_dir "$profile" "$config")/test/$g.failed"
