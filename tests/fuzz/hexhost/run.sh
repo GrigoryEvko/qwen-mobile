@@ -33,7 +33,7 @@ ASAN_RT=libclang_rt.asan-aarch64-android.so
 # The ids of the known findings (fake_dsp.cpp: violation). In the fuzz mode the harness keeps these
 # conditions off (HEXHOST_IGNORE), thus the fuzzers look for new defects. The test mode does not
 # set them, thus each regression input of an open finding fails.
-KNOWN_IDS="dsp-mm-add-shape,dsp-mm-add-src2,gdn-slot-stale,env-profile-empty,env-exception,env-devices-range,repack-nonfinite-scale"
+KNOWN_IDS="dsp-mm-add-shape,dsp-mm-add-src2,env-profile-empty,env-exception,env-devices-range,repack-nonfinite-scale"
 KNOWN_IDS+=",mm-id-div-zero,dsp-vtcm-binary,dsp-vtcm-glu,dsp-vtcm-softmax,dsp-vtcm-concat,dsp-vtcm-rows,dsp-vtcm-gdn"
 KNOWN_IDS+=",dsp-unary-block0,dsp-hmx-align,dsp-cpy-layout,env-int-overflow"
 

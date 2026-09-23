@@ -1,0 +1,226 @@
+hexagon: read the slot index of a fused recurrent op before the graph goes to the DSP
+Fold-into: patches/hexagon-fusion/0004-hexagon-htp-gdn-slot-index-from-host-and-error-report.patch
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+Finding gdn-slot-stale of fuzz-hexhost, task #126. The fused recurrent ops
+GDN_CONV_STEP, GDN_CONV_CHUNK and GDN_STATE_STEP get the row of the state
+table from the s_copy input. The host read s_copy in enqueue_op, when it put
+the op into a batch. At that time the value can be incorrect in two
+conditions:
+
+- ggml-alloc gives the bytes of s_copy to a different tensor after the last
+  reader of s_copy in the node order. An op of an earlier batch of the same
+  graph writes that tensor on the DSP before the host puts the fused op into
+  its batch.
+- s_copy is the output of an op of the graph (for example a GET_ROWS of an
+  index table), not an input. The DSP did not run that op yet.
+
+With an incorrect value, the fused op reads and writes an incorrect row of
+the state table. When the value is not a row, the host runs the unfused ops.
+
+This patch reads the index of each fused recurrent op in graph_compute before
+the first op of the graph goes to the DSP (latch_gdn_slots), and enqueue_op
+uses that value. The matcher does not fuse a chain whose s_copy is not an
+input of the graph. A replay of the batch cache reads s_copy at its start,
+before an op of the graph goes to the DSP.
+
+Evidence (2026-09-23):
+- The regression inputs tests/fuzz/hexhost/regress/graph/gdn-slot-stale-
+  computed.bin and gdn-slot-stale-reuse.bin give the finding before this
+  patch in the none, asan and ubsan builds, debug and release. With the
+  five patches of fuzz-hexhost they give no finding in the asan build, debug
+  and release.
+- The graph fuzzer with the condition on ran for 10 minutes with this patch
+  (14852 executions): no finding.
+- With the five patches of fuzz-hexhost, the corpora of the campaign (549
+  graph, 2468 kparams, 1745 dirty, 609 repack and 695 envparse inputs) give no
+  finding in the asan build, debug and release. The open findings of tasks
+  #157 and #158 stay off in that run.
+- The phone (OnePlus 13, HTP0 v79): one graph input of the fuzz corpus gives
+  "the s_copy index is not a row of the state table (index 1057826292,
+  1 slots)" with the libraries before this patch, and then "GGML ABORT
+  dspqueue_read failed: 0x0000002e". With the libraries of the five patches
+  the same input gives no abort.
+- The fused ops of the Qwen3.5 graphs are the same before and after (x86,
+  the real-graph tool of fuzz-hexhost with the fake DSP): 2B decode 18
+  GDN_CONV_STEP and 18 GDN_STATE_STEP, 2B prefill 18 GDN_CONV_CHUNK, 4B
+  decode 24 and 24, 4B prefill 24.
+- The phone check of the five patches of fuzz-hexhost together (OnePlus 13,
+  the 2B Q8_0 on HTP0, thermal status 0, cpu7 cap 4.32 GHz, battery 27.6 to
+  27.7 °C, MemAvailable 8.9 to 9.5 GB):
+  - test-backend-ops on HTP0 in five op groups (GATED_DELTA_NET and
+    SSM_CONV, MUL_MAT_ID, CONCAT CPY GET_ROWS SET_ROWS, the binary ops with
+    GLU and SOFT_MAX, NORM RMS_NORM SCALE): each group passes before and
+    after.
+  - llama-bench tg32 -r 3 after one warmup at 23.76 t/s: before 23.56 ±
+    0.10, after 23.59 ± 0.27, before 23.63 ± 0.13, after 23.57 ± 0.11 t/s.
+  - llama-speculative-simple with the MTP draft of depth 4, temperature 0,
+    64 tokens: before 23.589 and 23.685 t/s, after 24.076 and 24.029 t/s.
+    Each run accepts 44 drafts (52.381 %), and the four runs give the same
+    text.
+  - The graph driver of fuzz-hexhost (HTP0 against the CPU of the phone, 40
+    random graph inputs): 17 inputs differ before, and 15 after, all in the
+    17. Task #179 holds these differences.
+
+Measurement: the host instructions for each decode token of the 4B Q8_0
+graph (x86, the real-graph tool with the fake DSP, perf stat): 3,691,856
+before and 3,711,938 after (+0.54 %) with GGML_HEXAGON_BATCHCACHE=0, and
+3,689,973 before and 3,715,434 after (+0.69 %) with the batch cache. The
+tg32 of the phone check does not change.
+
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 6d0797f..7586c16 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -618,6 +618,12 @@ struct ggml_hexagon_session {
+     ggml_hexagon_opbatch * verify_batch = nullptr;  // a fresh packing to compare with a replay (GGML_HEXAGON_BATCHCACHE=2)
+     ggml_hexagon_hostprof  hp;                      // the host-side times of the current token (LLAMA_HOSTPROF)
+ 
++    // The slot index of each fused recurrent op of the graph in graph_compute, read from s_copy
++    // before the first op of the graph goes to the DSP (latch_gdn_slots). Empty outside that
++    // packing: then enqueue_op reads s_copy itself.
++    std::unordered_map<const ggml_tensor *, int32_t> gdn_slots;
++    void latch_gdn_slots(const std::vector<htp_opnode> & nodes);
++
+     ggml_hexagon_graph_cache_entry * graph_cache_find(uint64_t uid);
+     ggml_hexagon_graph_cache_entry & graph_cache_insert(uint64_t uid, std::vector<htp_opnode> && nodes);
+ 
+@@ -3780,6 +3786,23 @@ void ggml_hexagon_session::hostprof_print() {
+     hp.reset();
+ }
+ 
++// Reads the slot index of each fused recurrent op of a node list from its s_copy input. Call it
++// before the first op of the list goes to the DSP: the scheduler wrote s_copy, and no op of this
++// graph wrote its bytes yet. O(number of nodes).
++void ggml_hexagon_session::latch_gdn_slots(const std::vector<htp_opnode> & nodes) {
++    gdn_slots.clear();
++    for (const auto & node : nodes) {
++        if (node.opcode != HTP_OP_GDN_CONV_STEP && node.opcode != HTP_OP_GDN_CONV_CHUNK &&
++            node.opcode != HTP_OP_GDN_STATE_STEP) {
++            continue;
++        }
++        const ggml_tensor * idx = node.inputs[node.opcode != HTP_OP_GDN_STATE_STEP ? 1 : 6];
++        if (idx->data) {
++            gdn_slots[idx] = *(const int32_t *) idx->data;
++        }
++    }
++}
++
+ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
+     auto clone_tensor_buffer = [this](const ggml_tensor * t) {
+         if (t && t->buffer && ggml_backend_buffer_is_hexagon(t->buffer)) {
+@@ -3800,9 +3823,11 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
+         clone_tensor_buffer(t);
+     }
+ 
+-    // The fused recurrent state ops take the slot index from the s_copy input. The host reads it here,
+-    // once per token, and gives it to the DSP in the kernel params. When the index is not a row of the
+-    // state table, the unfused ops of the chain run in place of the fused op.
++    // The fused recurrent state ops take the slot index from the s_copy input, and the host gives it to
++    // the DSP in the kernel params. graph_compute reads the index before the first op of the graph goes
++    // to the DSP (latch_gdn_slots): at this later point ggml-alloc can have given the bytes of s_copy to
++    // a tensor that an op of an earlier batch wrote. When the index is not a row of the state table,
++    // the unfused ops of the chain run in place of the fused op.
+     if (node.opcode == HTP_OP_GDN_CONV_STEP || node.opcode == HTP_OP_GDN_CONV_CHUNK ||
+         node.opcode == HTP_OP_GDN_STATE_STEP) {
+         const bool          conv   = node.opcode != HTP_OP_GDN_STATE_STEP;
+@@ -3810,7 +3835,9 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
+         const ggml_tensor * idx    = node.inputs[conv ? 1 : 6];
+ 
+         int32_t      slot   = -1;
+-        const char * reason = ggml_hexagon_gdn_slot_index_check(idx, states, &slot);
++        const auto   latch  = gdn_slots.find(idx);
++        const char * reason = latch != gdn_slots.end() ? ggml_hexagon_gdn_slot_value_check(latch->second, states, &slot)
++                                                       : ggml_hexagon_gdn_slot_index_check(idx, states, &slot);
+         if (reason) {
+             GGML_LOG_WARN("ggml-hex: %s %s %s: %s (index %d, %d slots), the unfused ops run\n", this->c_name(),
+                           node.name.c_str(), node.dst()->name, reason, (int) slot, (int) states->ne[1]);
+@@ -6487,6 +6514,10 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+     const std::vector<htp_opnode> * nodes_ptr = nullptr;
+     std::vector<htp_opnode> computed_nodes;
+ 
++    // The slot indices of an earlier graph are not valid here. The replay and its verify read s_copy
++    // at their start, before an op of this graph goes to the DSP.
++    sess->gdn_slots.clear();
++
+     // Check for cache hit
+     ggml_hexagon_graph_cache_entry * entry = graph->uid != 0 ? sess->graph_cache_find(graph->uid) : nullptr;
+     const bool cache_hit = entry != nullptr;
+@@ -6617,9 +6648,11 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+     const bool     batch_empty = sess->op_batch->n_ops == 0;
+     const uint64_t seq_before  = sess->batch_req_seq;
+ 
++    sess->latch_gdn_slots(*nodes_ptr);
+     for (const auto & node : *nodes_ptr) {
+         sess->enqueue_op(node);
+     }
++    sess->gdn_slots.clear();
+ 
+     const bool one_batch = batch_empty && sess->batch_req_seq == seq_before && sess->op_batch->n_ops > 0;
+ 
+diff --git a/ggml/src/ggml-hexagon/htp-gdn-match.h b/ggml/src/ggml-hexagon/htp-gdn-match.h
+index 1c16862..635a6f8 100644
+--- a/ggml/src/ggml-hexagon/htp-gdn-match.h
++++ b/ggml/src/ggml-hexagon/htp-gdn-match.h
+@@ -191,21 +191,31 @@ static inline ggml_tensor * ggml_hexagon_gdn_find_cpy(const ggml_cgraph * gf, co
+     return n_found == 1 ? P : nullptr;
+ }
+ 
+-// The slot index of the state read: the one value of the s_copy input. The host reads it at enqueue
+-// time, once per token, and gives it to the DSP in the kernel params. When the value is not a valid
+-// row of the state table, the fused op must not run, and the unfused chain runs in its place.
++// The check of a slot index value against the state table. When the value is not a valid row of the
++// state table, the fused op must not run, and the unfused chain runs in its place.
++static inline const char * ggml_hexagon_gdn_slot_value_check(int32_t v, const ggml_tensor * states, int32_t * slot) {
++    *slot = v;
++    if (v < 0 || v >= states->ne[1]) {
++        return "the s_copy index is not a row of the state table";
++    }
++    return nullptr;
++}
++
++// The slot index of the state read: the one value of the s_copy input. The host reads it once per
++// token, before an op of the graph goes to the DSP, and gives it to the DSP in the kernel params.
+ static inline const char * ggml_hexagon_gdn_slot_index_check(const ggml_tensor * idx, const ggml_tensor * states,
+                                                              int32_t * slot) {
+     *slot = -1;
+     if (!idx->data) {
+         return "s_copy has no data at enqueue time";
+     }
+-    const int32_t v = *(const int32_t *) idx->data;
+-    *slot = v;
+-    if (v < 0 || v >= states->ne[1]) {
+-        return "the s_copy index is not a row of the state table";
+-    }
+-    return nullptr;
++    return ggml_hexagon_gdn_slot_value_check(*(const int32_t *) idx->data, states, slot);
++}
++
++// The host reads s_copy before the DSP runs an op of the graph, thus s_copy must be an input of the
++// graph (a value that the scheduler writes), not the output of an op.
++static inline bool ggml_hexagon_gdn_slot_index_is_input(ggml_tensor * idx) {
++    return ggml_hexagon_gdn_root(idx)->op == GGML_OP_NONE;
+ }
+ 
+ // True for the node that ends the conv chain: SILU of an SSM_CONV
+@@ -298,6 +308,9 @@ static inline const char * ggml_hexagon_gdn_conv_chain_check(const ggml_cgraph *
+     if (!idx || idx->type != GGML_TYPE_I32 || ggml_nelements(idx) != 1) {
+         return "s_copy is not one I32 index";
+     }
++    if (!ggml_hexagon_gdn_slot_index_is_input(idx)) {
++        return "s_copy is the output of an op of the graph, not an input";
++    }
+     ggml_tensor * cache = ggml_hexagon_gdn_root(states);
+ 
+     // the new column: the second CONCAT input is the transposed projection [1, n_ch]
+@@ -508,6 +521,9 @@ static inline const char * ggml_hexagon_gdn_state_chain_check(const ggml_cgraph
+     if (!idx || idx->type != GGML_TYPE_I32 || ggml_nelements(idx) != 1) {
+         return "s_copy is not one I32 index";
+     }
++    if (!ggml_hexagon_gdn_slot_index_is_input(idx)) {
++        return "s_copy is the output of an op of the graph, not an input";
++    }
+     ggml_tensor * cache = ggml_hexagon_gdn_root(states);
+ 
+     // the state write: the one CPY of the state tail of the output into a slot of the cache
