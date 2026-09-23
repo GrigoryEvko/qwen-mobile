@@ -630,12 +630,14 @@ phone_commands() {
     local real="FUZZ_APP_REAL_MODEL=/data/local/tmp/qwen/models/Qwen3.5-2B-Q8_0.gguf FUZZ_APP_REAL_ONLY=1 FUZZ_APP_MAX_OPS=8 FUZZ_APP_MAX_GEN=16 FUZZ_APP_ORACLE=0"
     local thermal="$a shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
     # One run: the thermal status before and after it, and the processes that stay.
+    # The phone shell must get the pattern in quotes, else it reads the | as a pipe. The
+    # brackets prevent a match of the pattern with the command line of that shell.
     one() {
         echo "# $1"
         echo "$thermal"
         echo "$a shell \"$2; echo rc=\\\$?\""
         echo "$thermal"
-        echo "$a shell pgrep -a -f 'fuzz_|app_fuzz_driver'"
+        echo "$a shell \"pgrep -a -f '[f]uzz_|[a]pp_fuzz_driver'\""
     }
     echo "# The phone build of $PROFILE-$san: $s (run \"tests/fuzz/app/run.sh phone-build $san --profile $PROFILE\" first)."
     echo "$a shell mkdir -p $d/work $d/logs"
