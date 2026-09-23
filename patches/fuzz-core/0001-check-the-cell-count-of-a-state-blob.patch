@@ -1,0 +1,54 @@
+Check the cell count of a state blob before it sizes an allocation
+Fold-into: upstream/memory
+
+The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
+
+- The cell count of a state blob sizes an allocation with no check.
+
+  The cell count of a sequence state blob sizes llama_batch_allocr::ubatch_reserve with no check
+  (0xffffffff asks for 17 GB). A damaged snapshot file thus stops the process on out-of-memory.
+  The recurrent memory has the same read, and a count other than 1 later fails
+  GGML_ASSERT(head + cell_count <= size).
+
+  The change: The KV cache refuses a cell count larger than the cache, and the recurrent memory refuses a count
+  other than 1 for one sequence. llama_state_seq_set_data then returns 0.
+
+  The reproducer: tests/fuzz/core/regress/fuzz_recurrent--state-cell-count.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    src/llama-kv-cache.cpp
+    src/llama-memory-recurrent.cpp
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -2340,6 +2340,13 @@
+         // single sequence
+         seq_rm(dest_seq_id, -1, -1);
+ 
++        // cell_count comes from the blob: check it before it sizes an allocation (a count of
++        // 0xffffffff asks for 17 GB here)
++        if (cell_count > cells.size()) {
++            LLAMA_LOG_ERROR("%s: the state has %u cells, the cache has %u\n", __func__, cell_count, cells.size());
++            return false;
++        }
++
+         llama_batch_allocr balloc(hparams.n_pos_per_embd());
+ 
+         llama_ubatch ubatch = balloc.ubatch_reserve(cell_count, 1);
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -1051,6 +1051,13 @@
+             return true;
+         }
+ 
++        // one sequence has one cell. cell_count comes from the blob: a larger count sizes an
++        // allocation below, and then fails GGML_ASSERT(head + cell_count <= size)
++        if (cell_count != 1) {
++            LLAMA_LOG_ERROR("%s: the state of one sequence has %u cells, the recurrent memory needs 1\n", __func__, cell_count);
++            return false;
++        }
++
+         llama_batch_allocr balloc(hparams.n_pos_per_embd());
+ 
+         llama_ubatch ubatch = balloc.ubatch_reserve(cell_count, 1);

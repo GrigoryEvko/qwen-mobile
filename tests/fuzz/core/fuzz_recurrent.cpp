@@ -215,41 +215,23 @@ llama_context * make_ctx(const CtxParams & p) {
     return ctx;
 }
 
-/** The 32-bit word at the aligned offset off of a blob (the fields of a state blob are 4-byte aligned). */
-uint32_t word_at(const std::vector<uint8_t> & blob, size_t off) {
-    uint32_t w = 0;
-    memcpy(&w, blob.data() + off, std::min<size_t>(4, blob.size() - off));
-    return w;
-}
-
 /**
- * Corrupt a state blob in place: flip bytes, write a 32-bit value, or change the size.
- *
- * A large value in the cell count field of a blob makes state_read_meta reserve memory for that
- * count: 0xffffffff asks for 17 GB (finding state-cell-count). FUZZ_RECURRENT_KNOWN_STATE_COUNT=1
- * keeps the finding off: the 32-bit writes use only the small values, and a byte flip does not
- * change a 32-bit word from less than 2^16 to 2^16 or more (a count field holds a small value).
+ * Corrupt a state blob in place: flip bytes, write a 32-bit value, or change the size. The 32-bit
+ * values include counts of 0x7fffffff and more, which a loader must refuse before it sizes an
+ * allocation with them.
  */
 void corrupt(FuzzedDataProvider & fdp, std::vector<uint8_t> & blob) {
-    static const bool known_count = fuzz::env_long("FUZZ_RECURRENT_KNOWN_STATE_COUNT", 0) != 0;
     switch (fdp.ConsumeIntegralInRange<int>(0, 3)) {
         case 0: {
             const int n = fdp.ConsumeIntegralInRange<int>(1, 4);
             for (int i = 0; i < n && !blob.empty(); ++i) {
-                const size_t  at  = fdp.ConsumeIntegralInRange<size_t>(0, blob.size() - 1);
-                const uint8_t x   = fdp.ConsumeIntegralInRange<uint8_t>(1, 255);
-                const size_t  off = at & ~(size_t) 3;
-                const uint32_t before = word_at(blob, off);
-                blob[at] ^= x;
-                if (known_count && before < (1u << 16) && word_at(blob, off) >= (1u << 16)) {
-                    blob[at] ^= x;
-                }
+                blob[fdp.ConsumeIntegralInRange<size_t>(0, blob.size() - 1)] ^= fdp.ConsumeIntegralInRange<uint8_t>(1, 255);
             }
             break;
         }
         case 1: {
             static const uint32_t kValues[] = { 0, 1, 2, 3, 4, 5, 255, 0x7fffffff, 0x80000000, 0xffffffff };
-            const uint32_t v = kValues[fdp.ConsumeIntegralInRange<int>(0, known_count ? 6 : 9)];
+            const uint32_t v = kValues[fdp.ConsumeIntegralInRange<int>(0, 9)];
             if (blob.size() >= 4) {
                 // the fields of the state blob are 4-byte aligned
                 const size_t off = 4 * fdp.ConsumeIntegralInRange<size_t>(0, blob.size() / 4 - 1);

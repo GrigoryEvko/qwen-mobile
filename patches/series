@@ -125,3 +125,7 @@ fuzz-hexhost/0003-hexagon-model-the-dsp-limits-in-supports-op.patch
 fuzz-hexhost/0004-hexagon-no-fastdiv-of-zero-in-the-matmul-params.patch
 fuzz-hexhost/0005-hexagon-tiled-matmul-rows-from-dst.patch
 fuzz-ops/0004-ggml-cpu-quantize-a-strided-src1-of-the-repack-matmul.patch
+
+# The fixes of the defects that the fuzz harness of tests/fuzz/core finds in the core of llama.cpp.
+# The header of each patch describes its defects and the change.
+fuzz-core/0001-check-the-cell-count-of-a-state-blob.patch

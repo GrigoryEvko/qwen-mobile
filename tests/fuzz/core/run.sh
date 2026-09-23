@@ -102,7 +102,6 @@ declare -A SWITCH=(
     [kv-keep-streams]=FUZZ_RECURRENT_KNOWN_KV_KEEP
     [recurrent-shared-rollback]=FUZZ_RECURRENT_KNOWN_SHARED_ROLLBACK
     [recurrent-keep-rollback]=FUZZ_RECURRENT_KNOWN_KEEP_ROLLBACK
-    [state-cell-count]=FUZZ_RECURRENT_KNOWN_STATE_COUNT
     [gguf-alignment]=FUZZ_GGUF_KNOWN_ALIGNMENT
     [gguf-early-alloc]=FUZZ_GGUF_KNOWN_EARLY_ALLOC
     [gguf-zero-dim]=FUZZ_GGUF_KNOWN_ZERO_DIM
@@ -144,7 +143,6 @@ declare -A EXPECT=(
     [kv-keep-streams]='P2: after'
     [recurrent-shared-rollback]='cannot write shared recurrent state|P2: after'
     [recurrent-keep-rollback]='P2: after'
-    [state-cell-count]='out-of-memory|allocation-size-too-big|requested allocation size'
     [ubatch-tail]='GGML_ASSERT\(n_ubatch > n_keep_tail\)'
     [tsan-topset-counters]='ThreadSanitizer: data race'
 )
