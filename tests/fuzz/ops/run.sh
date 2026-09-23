@@ -985,3 +985,5 @@ main() {
 }
 
 main "$@"
+# Stop here: an edit of this file while a long run reads it must not run the new text.
+exit $?
