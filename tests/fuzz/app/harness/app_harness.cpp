@@ -545,15 +545,16 @@ std::string pick_role(FuzzedDataProvider & fdp) {
 
 /**
  * A temperature or a top-p: the usual value, the edges, and values out of
- * range. NaN reaches the assert of llama_sampler_dist_apply (finding
- * sampler-nan), thus skip_known gives the usual value in its place.
+ * range. NaN and the infinities go to the check of rebuild_sampler (finding
+ * sampler-nan, task #164): NaN logits stop llama_sampler_dist_apply.
  */
-float pick_float(FuzzedDataProvider & fdp, float usual, bool skip_known) {
-    switch (fdp.ConsumeIntegralInRange<int>(0, 9)) {
+float pick_float(FuzzedDataProvider & fdp, float usual) {
+    switch (fdp.ConsumeIntegralInRange<int>(0, 10)) {
         case 0: return 0.0f;
         case 1: return -1.0f;
-        case 2: return skip_known ? usual : std::numeric_limits<float>::quiet_NaN();
+        case 2: return std::numeric_limits<float>::quiet_NaN();
         case 3: return std::numeric_limits<float>::infinity();
+        case 10: return -std::numeric_limits<float>::infinity();
         case 4: return 1e30f;
         case 5: return fdp.ConsumeFloatingPointInRange<float>(0.0f, 2.0f);
         default: return usual;
@@ -1109,8 +1110,8 @@ void op_chat(Program & p) {
         }
     }
     const bool thinking = fdp.ConsumeBool();
-    const float temp    = pick_float(fdp, 0.7f, p.opt->skip_known);
-    const float top_p   = pick_float(fdp, 0.8f, p.opt->skip_known);
+    const float temp    = pick_float(fdp, 0.7f);
+    const float top_p   = pick_float(fdp, 0.8f);
     const int   shape   = fdp.ConsumeIntegralInRange<int>(0, 31);
     for (const Msg & m : msgs) {
         g_counters.images += m.image >= 0 ? 1 : 0;
@@ -1261,7 +1262,6 @@ Options options_from_env() {
     o.max_ops     = num("FUZZ_APP_MAX_OPS", 48);
     o.max_gen     = num("FUZZ_APP_MAX_GEN", 96);
     o.trace       = num("FUZZ_APP_TRACE", 0) != 0;
-    o.skip_known  = num("FUZZ_APP_SKIP_KNOWN", 0) != 0;
     return o;
 }
 

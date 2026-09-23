@@ -427,6 +427,16 @@ void append_piece(Engine & e, llama_token token) {
  * with thinking, 0.7 and 0.8 without. A temperature of 0 is greedy.
  */
 void rebuild_sampler(Engine & e, bool thinking, float temp, float top_p) {
+    // A value that is not a finite number (NaN from a damaged settings file)
+    // takes the recommended value of the mode. With NaN logits the dist
+    // sampler finds no token: an assert in a build with assertions, and the
+    // last candidate in a release build (task #164).
+    if (!std::isfinite(temp)) {
+        temp = thinking ? 1.0f : 0.7f;
+    }
+    if (!std::isfinite(top_p)) {
+        top_p = thinking ? 0.95f : 0.8f;
+    }
     if (e.smpl != nullptr) {
         llama_sampler_free(e.smpl);
     }

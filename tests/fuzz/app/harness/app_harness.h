@@ -38,16 +38,11 @@ struct Options {
     int max_gen = 96;
     /** Print each operation to stderr. */
     bool trace = false;
-    /**
-     * Do not reach the findings that a scenario reproduces already, thus a
-     * long run explores past them: no NaN temperature or top-p (task #164).
-     */
-    bool skip_known = false;
 };
 
 /** The options from the environment: FUZZ_APP_MODEL_DIR, FUZZ_APP_REAL_MODEL, FUZZ_APP_REAL_MMPROJ,
  *  FUZZ_APP_DEVICE, FUZZ_APP_WORK, FUZZ_APP_ORACLE, FUZZ_APP_THREADS, FUZZ_APP_CROSS_FREE,
- *  FUZZ_APP_MAX_OPS, FUZZ_APP_MAX_GEN, FUZZ_APP_TRACE, FUZZ_APP_SKIP_KNOWN. */
+ *  FUZZ_APP_MAX_OPS, FUZZ_APP_MAX_GEN, FUZZ_APP_TRACE. */
 Options options_from_env();
 
 /** Initialize the backends one time, as LlamaNative.initialize does, and register the Java methods. */
