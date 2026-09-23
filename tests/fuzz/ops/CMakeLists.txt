@@ -81,7 +81,13 @@ endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set(BUILD_SHARED_LIBS   OFF CACHE BOOL "" FORCE)
+# The host fuzz builds take BUILD_SHARED_LIBS from the profile (tests/sanitizers/profile-*.cmake,
+# shared libraries as the app ships them). The global flags of the fuzz variant below give the
+# coverage flag -fsanitize=fuzzer-no-link to each ggml library too. The oracle and the phone replay
+# driver have no profile, and they link ggml static: one executable each.
+if (NOT FUZZ_OPS_VARIANT STREQUAL "fuzz")
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+endif()
 set(GGML_BACKEND_DL     OFF CACHE BOOL "" FORCE)
 set(GGML_OPENMP         OFF CACHE BOOL "" FORCE)
 set(GGML_LLAMAFILE      OFF CACHE BOOL "" FORCE)
