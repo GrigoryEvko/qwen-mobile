@@ -105,11 +105,15 @@ else()
     message(FATAL_ERROR "hexhost: FUZZ_SANITIZER must be none, asan, ubsan, tsan or msan, it is ${FUZZ_SANITIZER}")
 endif()
 
-# The fp flags of the app (preset arm64-android-snapdragon) in the two profiles
+# The fp flags of the app (preset arm64-android-snapdragon) in the two profiles. The two profiles
+# build shared libraries (hexhost_ggml, hexhost_core), as the app ships the libraries and as
+# tests/sanitizers/profile-<profile>.cmake does. Thus the LTO of the release profile runs one time
+# for each library, not again for each fuzz target.
 set(APP_FP_FLAGS -fvectorize -ffp-model=fast -fno-finite-math-only -D_GNU_SOURCE)
+set(BUILD_SHARED_LIBS ON)
 if (FUZZ_PROFILE STREQUAL "debug")
     set(PROFILE_FLAGS -O1 -g -fno-omit-frame-pointer ${APP_FP_FLAGS})
-    set(PROFILE_LINK_FLAGS "")
+    set(PROFILE_LINK_FLAGS -fuse-ld=lld)
 elseif (FUZZ_PROFILE STREQUAL "release")
     # -fno-omit-frame-pointer: the x86 substitution of the arm64 frame pointer (profile-release.cmake)
     set(PROFILE_FLAGS -O3 -DNDEBUG -flto ${APP_FP_FLAGS} -g -fno-omit-frame-pointer)
@@ -144,7 +148,7 @@ set(GGML_BUILD_COMMIT "hexhost")
 configure_file("${G}/src/ggml-version.h.in" "${CMAKE_CURRENT_BINARY_DIR}/ggml-version.h" @ONLY)
 
 # The ggml base library
-add_library(hexhost_ggml STATIC
+add_library(hexhost_ggml
     ${G}/src/ggml.c
     ${G}/src/ggml.cpp
     ${G}/src/ggml-alloc.c
@@ -161,7 +165,7 @@ find_package(Threads REQUIRED)
 target_link_libraries(hexhost_ggml PUBLIC Threads::Threads m)
 
 # The host part of the Hexagon backend, the fake DSP and the model of the DSP checks
-add_library(hexhost_core STATIC
+add_library(hexhost_core
     common/hexhost_tu.cpp
     common/fake_dsp.cpp
     common/dsp_model.cpp
@@ -189,11 +193,13 @@ endforeach()
 # builds against two llama.cpp trees compare a change of the repack on real weights. The objects
 # have the coverage of -fsanitize=fuzzer-no-link, and the tool has its own main, thus it links the
 # coverage callbacks of libFuzzer without the main of libFuzzer. The none config has no sanitizer
-# runtime that gives these callbacks.
+# runtime that gives these callbacks. The shared libraries find the callbacks in the tool, thus the
+# tool exports its symbols.
 execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-runtime-dir OUTPUT_VARIABLE FUZZ_RT_DIR
                 OUTPUT_STRIP_TRAILING_WHITESPACE)
 add_executable(hexhost_repack_bytes tools/repack_bytes.cpp)
 target_link_libraries(hexhost_repack_bytes PRIVATE hexhost_core "${FUZZ_RT_DIR}/libclang_rt.fuzzer_no_main.a")
+set_target_properties(hexhost_repack_bytes PROPERTIES ENABLE_EXPORTS ON)
 
 # The dirty range tracker of the DSP (htp/htp-tensor.c) runs on x86 with the
 # stubs of stubs/dsp. A copy of the source goes into the build directory, thus

@@ -419,8 +419,9 @@ phone_commands() {
 graphs_check() {
     local dir="$REPO/build/fuzz/$AREA-graphs" m model mmproj rc bad=0
     mkdir -p "$dir/out"
+    # Shared libraries, as the app ships them
     CC=clang CXX=clang++ cmake -S "$HERE/graphs" -B "$dir" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-        -DHEXHOST_LLAMA_DIR="$LLAMA_DIR" > "$dir/configure.log" 2>&1 \
+        -DBUILD_SHARED_LIBS=ON -DHEXHOST_LLAMA_DIR="$LLAMA_DIR" > "$dir/configure.log" 2>&1 \
         || die "the configure of $dir failed. Read $dir/configure.log."
     nice -n 10 cmake --build "$dir" -j"$BUILD_JOBS" --target hexhost_graphs > "$dir/build.log" 2>&1 \
         || die "the build of $dir failed. Read $dir/build.log."

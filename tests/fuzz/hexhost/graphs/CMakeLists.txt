@@ -19,7 +19,6 @@ set(HEXHOST_LLAMA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../third_party/llama
     "The llama.cpp tree with the patch series applied")
 
 # llama.cpp with the CPU backend only; the Hexagon host code comes from the harness below
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
 set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
 set(GGML_HEXAGON OFF CACHE BOOL "" FORCE)
