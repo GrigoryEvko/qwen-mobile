@@ -1,0 +1,42 @@
+llama: the loader copies a duplicate of a lazy tensor from the file and not through the mapping
+Fold-into: upstream/loader
+
+The defect
+
+With LLAMA_LAZY_MODE_ON and no mmap load, load_all_data reads a tensor through the file mapping
+when lazy.has() is true, and lazy.has() compares only the name. A tied output of qwen35 on a
+device is a duplicate of token_embd.weight with the same name and a buffer of its own, thus the
+loader copied it through the mapping. The lazy range has POSIX_MADV_RANDOM, thus that copy faulted
+in one page at a time: the load of Qwen3.5 2B Q8_0 on HTP0 took 25.5 to 25.7 s against 5.0 to
+5.4 s without the lazy mode, and the first decode 186 against 45 ms. On the host CPU with a cold
+page cache the load took 14.3 s against 6.6 s.
+
+The change
+
+A tensor reads through the mapping only when it is lazy and has no data yet, that is the lazy
+tensor itself. A duplicate with a buffer of its own reads from the file as in a load without the
+lazy mode. With --drop-cache on the host the 2B loads in 1.1 to 3.0 s with the lazy mode and in
+2.2 to 6.3 s without it (the box has a high load), and the logits hashes are the same.
+test-lazy-embd covers the logits of the three loads.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    src/llama-model-loader.cpp
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 685d991..fed52a7 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1647,7 +1647,11 @@ bool llama_model_loader::load_all_data(
+ 
+         size_t n_size = ggml_nbytes(cur);
+ 
+-        const bool from_mapping = use_mmap || lazy.has(cur);
++        // Without mmap, only the lazy tensor itself stays in the file mapping. A tensor with the same
++        // name and a buffer of its own (a duplicate on a device, for example the tied output of the
++        // token embedding) reads from the file: the lazy range has POSIX_MADV_RANDOM, thus a copy
++        // through the mapping would fault in one page at a time.
++        const bool from_mapping = use_mmap || (lazy.has(cur) && cur->data == nullptr);
+ 
+         if (from_mapping) {
+             const auto & mapping = mappings.at(weight->idx);

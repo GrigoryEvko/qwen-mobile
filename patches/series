@@ -186,3 +186,7 @@ fuzz-hexhost/0012-hexagon-write-the-final-gdn-state-through-the-cache-when-it-sh
 # stays in a file mapping and takes no anonymous memory.
 memory/0004-llama-qwen35-reads-the-token-embedding-lazily.patch
 fuzz-matrix/0004-sampler-give-each-padding-slot-of-the-penalties-its-own-token-id.patch
+
+# memory: the loader reads a duplicate of a lazy tensor (the tied output on a device) from the file and not
+# through the lazy mapping, thus the lazy mode does not slow the load.
+memory/0005-llama-copy-a-duplicate-of-a-lazy-tensor-from-the-file.patch
