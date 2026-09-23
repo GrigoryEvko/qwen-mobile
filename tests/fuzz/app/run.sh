@@ -640,7 +640,8 @@ phone_commands() {
         echo "$a shell \"pgrep -a -f '[f]uzz_|[a]pp_fuzz_driver'\""
     }
     echo "# The phone build of $PROFILE-$san: $s (run \"tests/fuzz/app/run.sh phone-build $san --profile $PROFILE\" first)."
-    echo "$a shell mkdir -p $d/work $d/logs"
+    # The logs and the work files of an earlier batch go first, thus a crash file of that batch is not in the pull.
+    echo "$a shell \"rm -rf $d/logs $d/work && mkdir -p $d/work $d/logs\""
     echo "$a push $push $d/"
     if [[ $san == asan ]]; then
         echo "$a shell sha256sum $d/asan-rt/libclang_rt.asan-aarch64-android.so  # must be $(cut -d' ' -f1 "$ASAN_RT22.sha256")"
