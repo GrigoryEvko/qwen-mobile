@@ -85,15 +85,18 @@ class SettingsFuzzTest {
         return sb.toString()
     }
 
-    private fun randomFloat(rnd: Random): Float = when (rnd.nextInt(6)) {
+    private fun randomFloat(rnd: Random): Float = when (rnd.nextInt(9)) {
         0 -> 0f
         1 -> -rnd.nextFloat() * 1e30f
         2 -> rnd.nextFloat() * 1e30f
         3 -> Float.MAX_VALUE
+        4 -> Float.NaN
+        5 -> Float.POSITIVE_INFINITY
+        6 -> Float.NEGATIVE_INFINITY
         else -> rnd.nextFloat() * 3f - 1f
     }
 
-    /** A value of the type, finite for a float. */
+    /** A value of the type. A float can be NaN or infinite. */
     private fun randomValue(rnd: Random, type: Type): Any = when (type) {
         Type.STRING -> randomString(rnd, if (rnd.nextInt(8) == 0) 5000 else 40)
         Type.INT -> if (rnd.nextBoolean()) rnd.nextInt() else listOf(2048, 4096, 8192, 16384, 1, 8, 0, -1)[rnd.nextInt(8)]
@@ -182,15 +185,15 @@ class SettingsFuzzTest {
     }
 
     /**
-     * Finding settings-nan: coerceIn keeps NaN, thus a NaN temperature or
-     * top-p in the file passes sanitize and reaches the sampler of the engine.
+     * A NaN temperature or top-p in the file takes the default (finding
+     * settings-nan, task #164). coerceIn keeps NaN, and NaN stops the sampler
+     * of the engine.
      */
     @Test
     fun aNanTemperatureAndTopPAreSanitized() {
-        FuzzSwitch.requireFindings("settings-nan")
         val s = SettingsStore.sanitize(AppSettings(modelPath = null, backend = Backend.CPU, temperature = Float.NaN, topP = Float.NaN))
-        assertFalse("temperature ${s.temperature}", s.temperature.isNaN())
-        assertFalse("topP ${s.topP}", s.topP.isNaN())
+        assertEquals(SettingsStore.DEFAULT_TEMPERATURE, s.temperature)
+        assertEquals(SettingsStore.DEFAULT_TOP_P, s.topP)
     }
 
     /**

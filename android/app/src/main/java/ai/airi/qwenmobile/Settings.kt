@@ -37,8 +37,8 @@ data class AppSettings(
     val visionOnGpu: Boolean = false,
     val imageDetail: ImageDetail = ImageDetail.DEFAULT,
     val thinking: Boolean = false,
-    val temperature: Float = 0.7f,
-    val topP: Float = 0.8f,
+    val temperature: Float = SettingsStore.DEFAULT_TEMPERATURE,
+    val topP: Float = SettingsStore.DEFAULT_TOP_P,
     /**
      * Draft the answer with the MTP block of the model. A change loads the
      * model again, because the MTP block loads with the weights and the
@@ -96,8 +96,8 @@ class SettingsStore private constructor(context: Context) {
                 ImageDetail.entries.firstOrNull { it.name == name }
             } ?: ImageDetail.DEFAULT,
             thinking = prefs.getBoolean(KEY_THINKING, false),
-            temperature = prefs.getFloat(KEY_TEMPERATURE, 0.7f),
-            topP = prefs.getFloat(KEY_TOP_P, 0.8f),
+            temperature = prefs.getFloat(KEY_TEMPERATURE, DEFAULT_TEMPERATURE),
+            topP = prefs.getFloat(KEY_TOP_P, DEFAULT_TOP_P),
             speculative = prefs.getBoolean(KEY_SPECULATIVE, false),
             systemPrompt = prefs.getString(KEY_SYSTEM_PROMPT, null) ?: "",
         ),
@@ -141,6 +141,10 @@ class SettingsStore private constructor(context: Context) {
         const val MAX_TEMPERATURE = 1.5f
         const val MIN_TOP_P = 0.5f
 
+        /** The sampling of a fresh install: the values that Qwen3.5 recommends without thinking. */
+        const val DEFAULT_TEMPERATURE = 0.7f
+        const val DEFAULT_TOP_P = 0.8f
+
         /** The character ceiling of the system prompt, about 500 tokens. */
         const val MAX_SYSTEM_PROMPT = 2000
 
@@ -164,8 +168,9 @@ class SettingsStore private constructor(context: Context) {
             backend = if (!LlamaEngine.ready || LlamaEngine.has(s.backend)) s.backend else defaultBackend(),
             threads = s.threads.coerceIn(MIN_THREADS, MAX_THREADS),
             nCtx = if (s.nCtx in CONTEXT_LENGTHS) s.nCtx else 8192,
-            temperature = s.temperature.coerceIn(0f, MAX_TEMPERATURE),
-            topP = s.topP.coerceIn(MIN_TOP_P, 1f),
+            // coerceIn keeps NaN, and NaN stops the sampler of the engine, thus NaN takes the default (task #164).
+            temperature = if (s.temperature.isNaN()) DEFAULT_TEMPERATURE else s.temperature.coerceIn(0f, MAX_TEMPERATURE),
+            topP = if (s.topP.isNaN()) DEFAULT_TOP_P else s.topP.coerceIn(MIN_TOP_P, 1f),
             // The prompt costs context on every turn and is prefilled again
             // whenever it changes, thus it is bounded.
             systemPrompt = s.systemPrompt.trim().take(MAX_SYSTEM_PROMPT),
