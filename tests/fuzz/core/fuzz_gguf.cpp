@@ -21,8 +21,10 @@
 // does not fit in the input, reader 4 must refuse the input before it
 // allocates the declared data size. A malloc hook of the sanitizer runtime
 // measures the largest single allocation, thus this check runs in the asan,
-// tsan and msan builds only. FUZZ_GGUF_KNOWN_EARLY_ALLOC=1 turns it off, thus
-// the fuzz suite can continue after the first report.
+// tsan and msan builds only.
+//
+// Property "no huge alignment": the reader refuses an alignment above 1 MiB.
+// The writer pads the metadata to the alignment one byte at a time.
 //
 // The harness skips reader 4 when the declared data section is larger than
 // FUZZ_GGUF_MAX_DATA bytes (the default is 256 MiB), to keep the RSS below the
@@ -37,7 +39,6 @@
 #include <atomic>
 #include <cinttypes>
 #include <cstdio>
-#include <set>
 #include <string>
 #include <vector>
 
@@ -83,33 +84,12 @@ size_t read_cb(void * userdata, void * output, uint64_t offset, size_t len) {
     return n;
 }
 
-/**
- * True when FUZZ_GGUF_KNOWN_KEY_NUL=1 and two keys are equal as C strings, or a key is empty as
- * a C string. The reader accepts a key with a NUL byte, but the key API takes C strings, thus
- * gguf_find_key cannot find such a key and gguf_set_kv aborts on it (finding gguf-key-nul).
- * O(n log n) in the count of keys.
- */
-bool key_nul(const gguf_context * ctx) {
-    static const bool known = fuzz::env_long("FUZZ_GGUF_KNOWN_KEY_NUL", 0) != 0;
-    if (!known) {
-        return false;
-    }
-    std::set<std::string> seen;
-    for (int64_t i = 0; i < gguf_get_n_kv(ctx); ++i) {
-        const char * key = gguf_get_key(ctx, i);
-        if (key[0] == '\0' || !seen.insert(key).second) {
-            return true;
-        }
-    }
-    return false;
-}
-
 /** Read every key and every tensor info of ctx with the correct getter. Stop on an inconsistency. */
 void walk(const gguf_context * ctx) {
     const int64_t n_kv = gguf_get_n_kv(ctx);
     for (int64_t i = 0; i < n_kv; ++i) {
         const char * key = gguf_get_key(ctx, i);
-        if (gguf_find_key(ctx, key) != i && !key_nul(ctx)) {
+        if (gguf_find_key(ctx, key) != i) {
             fuzz::fail("gguf_find_key(\"%s\") does not return its index %" PRId64, key, i);
         }
         const gguf_type type = gguf_get_kv_type(ctx, i);
@@ -291,21 +271,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
     if (size == 0) {
         return 0;
     }
-    static const uint64_t max_data   = (uint64_t) fuzz::env_long("FUZZ_GGUF_MAX_DATA", 256l << 20);
-    static const bool     known_early = fuzz::env_long("FUZZ_GGUF_KNOWN_EARLY_ALLOC", 0) != 0;
-    static const bool     known_align = fuzz::env_long("FUZZ_GGUF_KNOWN_ALIGNMENT", 0) != 0;
-    // FUZZ_GGUF_KNOWN_ENUM_LOAD=1 skips a file that makes the reader load an enum value outside the
-    // range of its type (finding gguf-enum-load, a UBSan report in the ubsan builds only).
-    // FUZZ_GGUF_KNOWN_NELEMENTS=1 skips a file with a tensor whose count of elements overflows
-    // int64_t (finding gguf-nelements-overflow).
-    static const bool     known_enum  = fuzz::env_long("FUZZ_GGUF_KNOWN_ENUM_LOAD", 0) != 0;
-    static const bool     known_nel   = fuzz::env_long("FUZZ_GGUF_KNOWN_NELEMENTS", 0) != 0;
-    if (known_enum || known_nel) {
-        const fuzz::GgufScan scan = fuzz::gguf_scan(data, size);
-        if ((known_enum && scan.bad_enum) || (known_nel && scan.nelements_overflow)) {
-            return 0;
-        }
-    }
+    static const uint64_t max_data = (uint64_t) fuzz::env_long("FUZZ_GGUF_MAX_DATA", 256l << 20);
 
     // 1. buffer, metadata only
     gguf_context * ctx = gguf_init_from_buffer(data, size, { /*no_alloc =*/ true, /*ctx =*/ nullptr });
@@ -348,33 +314,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
 
     walk(ctx);
 
-    // The writer writes ggml_n_dims(t) dimensions, and ggml_n_dims counts a dimension of 0 as 1,
-    // thus a tensor with a zero dimension changes its shape (finding gguf-zero-dim).
-    // FUZZ_GGUF_KNOWN_ZERO_DIM=1 skips the round trips of such a file.
-    // A tensor of 0 bytes can also come from gguf-nelements-overflow (a product of the dimensions
-    // that wraps to 0): its data pointer is null, and the writer stops on GGML_ASSERT(info.t.data).
-    // FUZZ_GGUF_KNOWN_NELEMENTS=1 keeps such a file out above.
-    static const bool known_zero = fuzz::env_long("FUZZ_GGUF_KNOWN_ZERO_DIM", 0) != 0;
-    bool zero_dim = false;
-    for (int64_t i = 0; i < gguf_get_n_tensors(ctx); ++i) {
-        const int64_t * ne = gguf_get_tensor_ne(ctx, i);
-        zero_dim = zero_dim || ne[0] == 0 || ne[1] == 0 || ne[2] == 0 || ne[3] == 0;
-    }
-    // The writer pads the metadata to the alignment one byte at a time, and the reader accepts
-    // any power of 2 up to 2^31: 1 GiB of padding takes 40 s and 1 GiB of memory (finding
-    // gguf-huge-alignment). The property: the reader refuses an alignment above 1 MiB (the limit of
-    // the fix). FUZZ_GGUF_KNOWN_HUGE_ALIGN=1 turns the property off and skips the round trips of
-    // such a file.
-    static const bool known_align_huge = fuzz::env_long("FUZZ_GGUF_KNOWN_HUGE_ALIGN", 0) != 0;
-    if (!known_align_huge && gguf_get_alignment(ctx) > (1u << 20)) {
+    // The writer pads the metadata to the alignment one byte at a time, thus an alignment of 1 GiB
+    // costs 1 GiB of memory and 40 s. The reader must refuse an alignment above 1 MiB.
+    if (gguf_get_alignment(ctx) > (1u << 20)) {
         fuzz::fail("the reader accepts the alignment %zu, and the writer then pads up to that many bytes one at a time",
                    gguf_get_alignment(ctx));
     }
-    const bool huge_align = known_align_huge && gguf_get_alignment(ctx) > (1u << 20);
-    const bool do_roundtrip = !(known_zero && zero_dim) && !key_nul(ctx) && !huge_align;
-    if (do_roundtrip) {
-        roundtrip_meta(ctx);
-    }
+    roundtrip_meta(ctx);
 
     // 4. buffer with the tensor data
     uint64_t data_size = 0;
@@ -394,17 +340,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
         if (!fits && c4 != nullptr) {
             fuzz::fail("the data section does not fit (end %" PRIu64 " > %zu), but the reader with data accepts the input", data_end, size);
         }
-        if (g_have_hooks && !fits && !known_early && data_size > size + (1u << 20) && max_alloc >= data_size) {
+        if (g_have_hooks && !fits && data_size > size + (1u << 20) && max_alloc >= data_size) {
             fuzz::fail("the reader allocates %zu bytes for a data section of %" PRIu64 " bytes before it finds that the input holds only %zu bytes",
                        max_alloc, data_size, size);
         }
         if (c4 != nullptr) {
             compare_ctx(ctx, c4);
-            // gguf_set_kv copies general.alignment as a key, but the writer keeps the default
-            // alignment (finding gguf-alignment). FUZZ_GGUF_KNOWN_ALIGNMENT=1 skips such a file.
-            if (do_roundtrip && (!known_align || gguf_get_alignment(c4) == GGUF_DEFAULT_ALIGNMENT)) {
-                roundtrip_data(c4, ctx_data);
-            }
+            roundtrip_data(c4, ctx_data);
             gguf_free(c4);
             ggml_free(ctx_data);
         }

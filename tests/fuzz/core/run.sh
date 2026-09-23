@@ -97,19 +97,11 @@ PHONE_TARGETS="fuzz_npu_decode fuzz_recurrent"
 
 # The switch of each known finding (rule R8 and R13).
 declare -A SWITCH=(
-    [gguf-enum-load]=FUZZ_GGUF_KNOWN_ENUM_LOAD
-    [gguf-reader-uninit-type]=FUZZ_GGUF_KNOWN_ENUM_LOAD
     [embd-host-mrope]=FUZZ_RECURRENT_KNOWN_EMBD_HOST
     [ubatch-tail]=FUZZ_RECURRENT_KNOWN_UBATCH_TAIL
     [kv-keep-streams]=FUZZ_RECURRENT_KNOWN_KV_KEEP
     [recurrent-shared-rollback]=FUZZ_RECURRENT_KNOWN_SHARED_ROLLBACK
     [copy-into-used-sequence]=FUZZ_RECURRENT_CLEAR_BEFORE_COPY
-    [gguf-alignment]=FUZZ_GGUF_KNOWN_ALIGNMENT
-    [gguf-early-alloc]=FUZZ_GGUF_KNOWN_EARLY_ALLOC
-    [gguf-zero-dim]=FUZZ_GGUF_KNOWN_ZERO_DIM
-    [gguf-nelements-overflow]=FUZZ_GGUF_KNOWN_NELEMENTS
-    [gguf-key-nul]=FUZZ_GGUF_KNOWN_KEY_NUL
-    [gguf-huge-alignment]=FUZZ_GGUF_KNOWN_HUGE_ALIGN
     [dist-inf]=FUZZ_SAMPLER_KNOWN_DIST_INF
     [sampler-bucket-cast]=FUZZ_SAMPLER_KNOWN_BUCKET_CAST
     [tsan-topset-counters]=FUZZ_TOPSET_KNOWN_COUNTERS
@@ -118,14 +110,6 @@ declare -A SWITCH=(
 # The report of each known finding, as an extended regular expression on the run log. A
 # regression input "reproduces" its finding when its log matches this expression.
 declare -A EXPECT=(
-    [gguf-alignment]='the reader refuses the full file that the writer wrote'
-    [gguf-early-alloc]='the reader allocates [0-9]+ bytes for a data section'
-    [gguf-enum-load]="not a valid value for type '(enum )?(gguf_type|ggml_type)'"
-    [gguf-reader-uninit-type]="MemorySanitizer: use-of-uninitialized-value|gguf\.cpp:7[0-9][0-9]:[0-9]+: runtime error: load of value .*'enum ggml_type'"
-    [gguf-huge-alignment]='the reader accepts the alignment [0-9]+'
-    [gguf-key-nul]='GGML_ASSERT\(!key\.empty\(\)|does not return its index'
-    [gguf-nelements-overflow]='GGML_ASSERT\(info\.t\.data\)|gguf\.cpp:[0-9]+:[0-9]+: runtime error: signed integer overflow|ggml\.c:[0-9]+:[0-9]+: runtime error: signed integer overflow'
-    [gguf-zero-dim]='the reader refuses the metadata that the writer wrote'
     [dist-inf]="P4: candidate [0-9]+ has the logit \+Inf|Assertion .found. failed"
     [sampler-bucket-cast]='P3: the top set|llama-sampler\.cpp:[0-9]+:[0-9]+: runtime error: .*outside the range'
     [embd-host-mrope]='llama_batch_allocr::ubatch_add|P2: after decode'

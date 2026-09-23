@@ -16,12 +16,8 @@
 //   - tokenize gives token ids in [0, n_vocab) for a fixed set of texts, and
 //     detokenize accepts those ids
 //   - the chat template of the model is a C string
-//
-// The switch of a known finding: FUZZ_GGUF_KNOWN_ENUM_LOAD (gguf-enum-load).
 
 #include "fuzz_common.h"
-
-#include "gguf.h"
 
 #include <sys/mman.h>
 #include <unistd.h>
@@ -137,17 +133,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
     const uint8_t mode = data[size - 1];
     size -= 1;
 
-    // The loader reads the file with the GGUF reader of ggml. FUZZ_GGUF_KNOWN_ENUM_LOAD=1 and
-    // FUZZ_GGUF_KNOWN_NELEMENTS=1 skip a file that shows the finding gguf-enum-load or
-    // gguf-nelements-overflow of that reader.
-    static const bool known_enum = fuzz::env_long("FUZZ_GGUF_KNOWN_ENUM_LOAD", 0) != 0;
-    static const bool known_nel  = fuzz::env_long("FUZZ_GGUF_KNOWN_NELEMENTS", 0) != 0;
-    if (known_enum || known_nel) {
-        const fuzz::GgufScan scan = fuzz::gguf_scan(data, size);
-        if ((known_enum && scan.bad_enum) || (known_nel && scan.nelements_overflow)) {
-            return 0;
-        }
-    }
     llama_model_params mp = llama_model_default_params();
     mp.vocab_only = true;
     mp.load_mode  = LLAMA_LOAD_MODE_MMAP;
