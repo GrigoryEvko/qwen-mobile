@@ -1,0 +1,54 @@
+Replace the destination of a sequence copy in one KV cache stream
+Fold-into: upstream/memory
+
+The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
+
+- A copy into a sequence that holds cells keeps its old cells in the KV cache.
+
+  llama_kv_cache::seq_cp between two sequences of one stream (kv_unified = true) adds the
+  destination to each cell of the source in [p0, p1), and it does not remove the old cells of the
+  destination in that range. The destination then holds two cells at one position, and its
+  attention reads the old tokens next to the copied ones. A second copy into the same
+  destination stops a debug build on the assert of llama_kv_cells::seq_add, because a cell holds
+  the destination from the first copy. In a hybrid model the recurrent memory replaces the
+  destination (it gives the destination the cell of the source), thus the two memories of one
+  sequence disagree. On the 2B model the next decode of the destination differs from a decode of
+  its history by 2.25 in a logit.
+
+  The semantics: a copy replaces the destination in [p0, p1). The other copy paths of the memory
+  modules do this: the copy between two streams (kv_unified = false) resets the stream of the
+  destination, and the recurrent memory drops the old cell of the destination. A refusal is not
+  possible, because seq_cp returns no status. Each caller in upstream (llama-server, the
+  speculative, lookahead and parallel examples) empties the destination before the copy or
+  copies into an unused sequence, thus its result does not change. The app does not copy
+  sequences.
+
+  The change: The same-stream path removes the destination from the cells in [p0, p1) with
+  seq_rm, then adds it to the cells of the source. The next decode of the destination is then
+  bitwise equal to a decode of its history (the tiny model and the 2B, kv_unified 1), and the
+  result of kv_unified = true agrees with that of kv_unified = false.
+
+  The reproducer: tests/fuzz/core/regress/fuzz_recurrent--copy-into-used-sequence.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    src/llama-kv-cache.cpp
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -470,6 +470,15 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
+             return;
+         }
+ 
++        // The copy replaces the destination in [p0, p1), as the copy between two streams (which
++        // resets the stream of the destination) and the recurrent memory (which gives the
++        // destination the cell of the source) do. Without this remove, a destination that holds
++        // cells in the range keeps them next to the cells of the source: two cells at one position
++        // of one sequence, which its attention reads, or an assert in seq_add for a cell that the
++        // two sequences share from an earlier copy. The callers of upstream remove the destination
++        // first (llama-server, the speculative examples), thus their result does not change.
++        seq_rm(seq_id_dst, p0, p1);
++
+         if (p0 < 0) {
+             p0 = 0;
+         }

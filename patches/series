@@ -151,6 +151,7 @@ fuzz-core/0020-check-the-strings-and-the-cell-sequences-of-a-state-blob.patch
 fuzz-core/0021-write-zeros-to-a-used-recurrent-row-before-a-new-sequence.patch
 fuzz-core/0022-refuse-a-gguf-tensor-whose-size-the-alignment-cannot-pad.patch
 fuzz-core/0023-refuse-a-dummy-vocabulary-size-above-2-24.patch
+fuzz-core/0024-replace-the-destination-of-a-sequence-copy-in-one-kv-stream.patch
 
 # The fixes of the defects that the sanitizer matrix of tests/run-suite.sh finds in the tests of llama.cpp.
 # The header of each patch describes its defect and the change.

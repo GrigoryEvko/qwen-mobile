@@ -100,13 +100,11 @@ PHONE_TARGETS="fuzz_npu_decode fuzz_recurrent"
 
 # The switch of each known finding (rule R8 and R13).
 declare -A SWITCH=(
-    [copy-into-used-sequence]=FUZZ_RECURRENT_CLEAR_BEFORE_COPY
 )
 
 # The report of each known finding, as an extended regular expression on the run log. A
 # regression input "reproduces" its finding when its log matches this expression.
 declare -A EXPECT=(
-    [copy-into-used-sequence]='P2: after'
 )
 
 # Print the header comment of this file (from line 2 to the first empty line) as the usage text, then
