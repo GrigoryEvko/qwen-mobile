@@ -271,6 +271,8 @@ int cmd_compare(int argc, char ** argv) {
     std::string              pack, findings;
     std::vector<std::string> results;
     uint64_t                 max_bytes = uint64_t(64) << 20;
+    const char *             list_env  = std::getenv("FUZZ_OPS_COMPARE_LIST");
+    const bool               list_runs = list_env != nullptr && list_env[0] == '1';
     for (int i = 2; i < argc; i++) {
         const std::string a = argv[i];
         if (a == "--pack" && i + 1 < argc) pack = argv[++i];
@@ -381,6 +383,12 @@ int cmd_compare(int argc, char ** argv) {
         // thus its results get the fast-math slack. The HTP results keep the plain rule.
         const bool     fast = rec.tag.rfind("CPU", 0) == 0;
         const case_cmp cc   = compare_case(c, rec.rr.outs, it->second.outs, fast);
+        if (list_runs) {
+            // one line for each run: the evidence for a single case (FUZZ_OPS_COMPARE_LIST=1)
+            std::printf("RUN %u %s %s %s verdict=%s special=%d ratio=%.3g ulp=%.3g | %s\n", rec.idx, rec.tag.c_str(),
+                        c.kind->name, c.path.c_str(), verdict_name(cc.v), (int) c.special, cc.ratio, cc.ulp,
+                        c.desc.c_str());
+        }
         rw.verdicts[cc.v]++;
         rw.special += c.special ? 1 : 0;
         if (cc.ratio > rw.max_ratio) {
