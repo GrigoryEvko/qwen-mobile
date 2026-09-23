@@ -126,11 +126,13 @@ def test_qf3_export_refuses_a_pack_of_another_shape(tmp_path: Path) -> None:
         export(src, tmp_path / "out.gguf", packs, Plan(n_layers=0), LLAMA_DIR, CPU)
 
 
-# --- QF4: general.alignment -----------------------------------------------------------------------
+# --- QF4 (task #168): general.alignment ------------------------------------------------------------
 
-@xfail_open("QF4", "the export copies general.alignment 64, but the writer aligns to 32")
 def test_qf4_export_of_a_source_with_a_custom_alignment_loads(tmp_path: Path) -> None:
-    """quant/export.py:294-300: the output declares alignment 64 with data at 32; gguf-py and ggml refuse it."""
+    """The export of a source with the alignment 64 aligns its data to 64, thus gguf-py and ggml read it.
+
+    Without the fix the output declared the alignment 64 with the data at 32.
+    """
     src = _plain_source(tmp_path / "src.gguf", align=64)
     out = tmp_path / "out.gguf"
     export(src, out, tmp_path / "no-packs", Plan(n_layers=0, bulk="Q8_0", head="Q8_0"), LLAMA_DIR, CPU)

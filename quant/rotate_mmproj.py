@@ -39,13 +39,16 @@ def main() -> None:
     reader = gguf.GGUFReader(str(args.src))
     arch = bytes(reader.fields["general.architecture"].parts[-1]).decode()
     writer = gguf.GGUFWriter(str(args.dst), arch)
-    skip = {"general.architecture", "GGUF.version", "GGUF.tensor_count", "GGUF.kv_count"}
+    # general.alignment goes through add_custom_alignment: a plain copy of the key does not move the data.
+    skip = {"general.architecture", "general.alignment", "GGUF.version", "GGUF.tensor_count", "GGUF.kv_count"}
     for key, field in reader.fields.items():
         if key in skip:
             continue
         vtype = field.types[0]
         sub_type = field.types[-1] if vtype == gguf.GGUFValueType.ARRAY else None
         writer.add_key_value(key, field.contents(), vtype, sub_type=sub_type)
+    if "general.alignment" in reader.fields:
+        writer.add_custom_alignment(int(reader.fields["general.alignment"].contents()))
 
     q: torch.Tensor | None = None
     for t in reader.tensors:

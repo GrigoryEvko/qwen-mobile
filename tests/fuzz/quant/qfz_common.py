@@ -66,7 +66,6 @@ LLAMA_BIN = san_dir() / "llama" / "bin"
 
 # The open findings of the campaign. The regression tests give the file, the line and the example.
 KNOWN_FINDINGS = {
-    "QF4": "the export copies general.alignment, but the writer keeps the alignment 32",
     "QF5": "the export of a source with an empty array field fails after the header is on the disk",
     "QF6": "the export writes an unknown plan type as the source tensor, with no error",
     "QF8": "the export casts the dense maps to F16 with no check, thus an overflow gives inf",

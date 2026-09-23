@@ -17,7 +17,7 @@ The properties of the written file:
 - A small sample of the files runs in llama-perplexity of the build without
   a sanitizer (TOY_BIN), and the logits are finite.
 
-The inputs of the open findings QF4 and QF10 are excluded. Refer to qfz_common.
+The inputs of the open finding QF10 are excluded. Refer to qfz_common.
 The regression tests hold QF5 and QF6, which need a source from raw bytes
 or a plan type name out of the supported set.
 """
@@ -114,7 +114,7 @@ def metadata(draw: st.DrawFn) -> dict[str, tuple[object, gguf.GGUFValueType, ggu
             out[key] = (values, gguf.GGUFValueType.ARRAY, vtype)
         else:
             out[key] = (draw(SCALARS[vtype]), vtype, None)
-    if not known_open("QF4") and draw(st.booleans()):
+    if draw(st.booleans()):
         out["general.alignment"] = (draw(st.sampled_from([64, 128, 256])), gguf.GGUFValueType.UINT32, None)
     return out
 
@@ -212,8 +212,6 @@ CASE_QF10 = ExportCase(SMALL, Plan(n_layers=2, bulk="IQ4_NL"), "tiny", 3, False,
 @counted
 def test_export_writes_what_the_plan_promises(case: ExportCase) -> None:
     """The export of a drawn source and plan gives the promised types, values, metadata, and a loadable file."""
-    if known_open("QF4") and "general.alignment" in case.extra:
-        return
     with scratch() as tmp_path:
         _check_export(tmp_path, case)
 
