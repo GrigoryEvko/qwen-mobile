@@ -221,6 +221,10 @@ fuzz_one() {
     mkdir -p "$out/corpus" "$out/artifacts"
     local log="$out/log.txt"
     : > "$log"
+    # A file of the artifacts directory that is not newer than this mark comes from an earlier
+    # run, thus it is not a finding of this run.
+    local mark="$out/.fuzz-start"
+    touch "$mark"
     # shellcheck source=../../sanitizers/env.sh
     source "$SHARED/env.sh"
     sanitizer_env "$san"
@@ -255,7 +259,7 @@ fuzz_one() {
     cov=$(grep -oE 'cov: [0-9]+ ft: [0-9]+' "$log" | tail -n 1 || true)
     # a slow unit (an input that took more than 10 s, not a crash) is not a finding
     local -a arts=()
-    mapfile -t arts < <(find "$out/artifacts" -type f ! -name 'slow-unit-*' | sort)
+    mapfile -t arts < <(find "$out/artifacts" -type f -newer "$mark" ! -name 'slow-unit-*' | sort)
     result_line "$dir" "$fz" "$san" "$profile" fuzz "$(( SECONDS - start ))" "$execs" "${#arts[@]}" "${arts[@]}"
     echo "core-$profile-$san${TREE_TAG:+-$TREE_TAG} $fz: $(( SECONDS - start )) s, $starts starts, $execs executions, $cov, corpus $(find "$out/corpus" -type f | wc -l), crash files ${#arts[@]}"
 }

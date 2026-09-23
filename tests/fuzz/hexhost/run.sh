@@ -215,6 +215,10 @@ fuzz_one() {
     mkdir -p "$out/corpus" "$out/artifacts" "$HERE/corpus/$t"
     local log="$out/log.txt"
     : > "$log"
+    # A file of the artifacts directory that is not newer than this mark comes from an earlier
+    # run, thus it is not a finding of this run.
+    local mark="$out/.fuzz-start"
+    touch "$mark"
     local -a envs
     mapfile -t envs < <(run_env "$cfg" 1)
     envs+=("FUZZ_ARTIFACT_DIR=$out/artifacts")
@@ -243,7 +247,7 @@ fuzz_one() {
     done < <(rg -o --no-line-number '^#[0-9]+' "$log" | tr -d '#')
     execs=$(( execs + prev ))
     local -a arts=()
-    mapfile -t arts < <(fd -t f . "$out/artifacts" | sort)
+    mapfile -t arts < <(find "$out/artifacts" -type f -newer "$mark" | sort)
     result_line "$dir" "$t" "$prof" "$cfg" fuzz "$(( SECONDS - start ))" "$execs" "${#arts[@]}" "${arts[@]}"
     echo "$AREA-$prof-$cfg $t: $(( SECONDS - start )) s, $starts starts, $execs executions, corpus $(fd -t f . "$out/corpus" | wc -l), crash files ${#arts[@]}"
 }
