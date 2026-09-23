@@ -129,3 +129,4 @@ fuzz-ops/0004-ggml-cpu-quantize-a-strided-src1-of-the-repack-matmul.patch
 # The fixes of the defects that the fuzz harness of tests/fuzz/core finds in the core of llama.cpp.
 # The header of each patch describes its defects and the change.
 fuzz-core/0001-check-the-cell-count-of-a-state-blob.patch
+fuzz-core/0002-clear-the-rollback-index-of-a-removed-sequence.patch

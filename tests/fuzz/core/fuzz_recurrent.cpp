@@ -382,13 +382,6 @@ void run(FuzzedDataProvider & fdp) {
             } else {
                 const llama_pos p0 = fdp.ConsumeIntegralInRange<llama_pos>(-1, kMaxHist);
                 const llama_pos p1 = fdp.ConsumeIntegralInRange<llama_pos>(-1, kMaxHist);
-                // A range that removes the full sequence, but is not [0, end), keeps the pending
-                // rollback index of the sequence (finding recurrent-keep-rollback, the same cause).
-                static const bool known_keep_rb = fuzz::env_long("FUZZ_RECURRENT_KNOWN_KEEP_ROLLBACK", 0) != 0;
-                const bool empties = p0 <= 0 && (p1 < 0 || p1 >= (llama_pos) sh[s].hist.size());
-                if (known_keep_rb && sh[s].pending && empties && p1 >= 0) {
-                    continue;
-                }
                 const bool ok = llama_memory_seq_rm(mem, s, p0, p1);
                 trace("remove seq %d [%d, %d): %s", s, p0, p1, ok ? "done" : "refused");
                 if (ok) {
@@ -429,18 +422,6 @@ void run(FuzzedDataProvider & fdp) {
             // sequence (finding kv-keep-streams: the other streams keep their cells)
             static const bool known_keep = fuzz::env_long("FUZZ_RECURRENT_KNOWN_KV_KEEP", 0) != 0;
             if (known_keep && !p.unified && n_seq > 1) {
-                continue;
-            }
-            // seq_keep removes the other sequences, but it keeps their pending rollback indices
-            // (rs_idx). The next decode of such a sequence reads its first state from a snapshot
-            // group that holds no state of it (finding recurrent-keep-rollback).
-            // FUZZ_RECURRENT_KNOWN_KEEP_ROLLBACK=1 skips a keep when another sequence has a pending rollback.
-            static const bool known_keep_rb = fuzz::env_long("FUZZ_RECURRENT_KNOWN_KEEP_ROLLBACK", 0) != 0;
-            bool other_pending = false;
-            for (int o = 0; o < n_seq; ++o) {
-                other_pending = other_pending || (o != s && sh[o].pending);
-            }
-            if (known_keep_rb && other_pending) {
                 continue;
             }
             llama_memory_seq_keep(mem, s);

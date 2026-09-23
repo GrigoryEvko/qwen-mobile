@@ -1,0 +1,52 @@
+Clear the rollback index of each sequence that the recurrent memory removes
+Fold-into: upstream/memory
+
+The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
+
+- The removal of a sequence keeps its pending rollback index.
+
+  seq_keep removes the other sequences, and seq_rm of a range that removes the last cell of a
+  sequence removes it, but the two keep the pending rollback index rs_idx of that sequence (and
+  its depth). The next decode of the sequence then reads its first state from a snapshot group
+  of an old state. seq_rm(s, -1, -1) and seq_rm(s, 0, -1) clear the index.
+
+  The change: The two paths clear rs_idx and rs_depth of each sequence that they remove.
+
+  The reproducer: tests/fuzz/core/regress/fuzz_recurrent--recurrent-keep-rollback.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    src/llama-memory-recurrent.cpp
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -219,6 +219,13 @@
+             // invalidate tails which will be cleared
+             if (p0 <= cell.pos && cell.pos < p1) {
+                 tail_id = -1;
++                // The sequence goes away, thus its pending rollback index and its depth go away
++                // too. A stale index makes the next decode of the sequence read its first state
++                // from a snapshot group of a different state.
++                set_rs_idx(seq_id, 0);
++                if ((size_t) seq_id < rs_depth.size()) {
++                    rs_depth[seq_id] = 0;
++                }
+             }
+         }
+     } else {
+@@ -329,6 +336,15 @@
+         }
+     }
+ 
++    // [TAG_RECURRENT_ROLLBACK_DEPTH] rs_idx and rs_depth of a sequence describe the cell that it
++    // holds (as in seq_rm and seq_cp). The other sequences go away, thus their values go to 0.
++    for (size_t s = 0; s < rs_idx.size(); ++s) {
++        if ((llama_seq_id) s != seq_id) {
++            rs_idx[s]   = 0;
++            rs_depth[s] = 0;
++        }
++    }
++
+     // If we freed up a slot, set head to it so searching can start there.
+     if (new_head != size && new_head < head) {
+         head = new_head;

@@ -101,7 +101,6 @@ declare -A SWITCH=(
     [ubatch-tail]=FUZZ_RECURRENT_KNOWN_UBATCH_TAIL
     [kv-keep-streams]=FUZZ_RECURRENT_KNOWN_KV_KEEP
     [recurrent-shared-rollback]=FUZZ_RECURRENT_KNOWN_SHARED_ROLLBACK
-    [recurrent-keep-rollback]=FUZZ_RECURRENT_KNOWN_KEEP_ROLLBACK
     [gguf-alignment]=FUZZ_GGUF_KNOWN_ALIGNMENT
     [gguf-early-alloc]=FUZZ_GGUF_KNOWN_EARLY_ALLOC
     [gguf-zero-dim]=FUZZ_GGUF_KNOWN_ZERO_DIM
@@ -142,7 +141,6 @@ declare -A EXPECT=(
     [embd-host-mrope]='llama_batch_allocr::ubatch_add|P2: after decode'
     [kv-keep-streams]='P2: after'
     [recurrent-shared-rollback]='cannot write shared recurrent state|P2: after'
-    [recurrent-keep-rollback]='P2: after'
     [ubatch-tail]='GGML_ASSERT\(n_ubatch > n_keep_tail\)'
     [tsan-topset-counters]='ThreadSanitizer: data race'
 )
