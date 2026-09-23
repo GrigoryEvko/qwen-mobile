@@ -185,3 +185,4 @@ fuzz-hexhost/0012-hexagon-write-the-final-gdn-state-through-the-cache-when-it-sh
 # memory: qwen35 marks its token embedding for the lazy read, thus with LLAMA_LAZY_MODE_ON the embedding
 # stays in a file mapping and takes no anonymous memory.
 memory/0004-llama-qwen35-reads-the-token-embedding-lazily.patch
+fuzz-matrix/0004-sampler-give-each-padding-slot-of-the-penalties-its-own-token-id.patch

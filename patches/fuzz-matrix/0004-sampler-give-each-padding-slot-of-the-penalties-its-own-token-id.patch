@@ -1,0 +1,58 @@
+sampler: give each padding slot of the backend penalties its own token id
+Fold-into: upstream/sampler
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+llama_sampler_penalties_backend_apply pads the inactive slots of
+inp_token_ids with one filler token id that token_count does not hold. Its
+comment says that the ids must be unique, because ggml_set_rows with a
+repeated index gives non-deterministic results, but the one filler repeats
+in each inactive slot. The CPU SET_ROWS gives the rows to the threads, thus
+two threads write the row of the filler: ThreadSanitizer reports a
+write-write data race in ggml_cpu_fp32_to_fp32, called by
+ggml_compute_forward_set_rows_impl. The two threads write equal values
+(count 0 and the unchanged logit), but a data race is undefined behavior,
+and a GPU backend can order the writes differently.
+
+The change: each inactive slot gets its own unused token id, the next id
+that token_count does not hold. n_max is not more than n_vocab, thus there
+are enough ids. The host work is O(n_max) map lookups for each sampling
+step, small next to a decode. The output of the sampler does not change.
+
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+index e50d77d..5eb9619 100644
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -3192,23 +3192,20 @@ static void llama_sampler_penalties_backend_set_input(struct llama_sampler * smp
+         sctx->host_counts   [i] = entries[i].second;
+     }
+ 
+-    // Padding: Finds a filler token id that is not present in token_count.
+-    // Use it to do padding for the arrays, it avoids resizing every time.
+-    // The arrays must always have exactly n_max entries (the GPU tensor is a fixed size).
++    // Padding: the arrays must always have exactly n_max entries (the GPU tensor is a fixed size).
++    // Each inactive slot gets its own token id that is not present in token_count, with count 0.
++    // The ids must differ from each other: ggml_set_rows with a repeated index makes two CPU
++    // threads write the same row (a data race that ThreadSanitizer reports), and other backends
++    // give non-deterministic results. The active_mask step in backend_apply filters the inactive
++    // slots out via ggml_step(counts_f32). There are enough unused ids, because
++    // n_max <= n_vocab and token_count holds n_active ids.
+     int32_t filler = 0;
+-    if (n_active < sctx->n_max) {
++    for (int32_t i = n_active; i < sctx->n_max; ++i) {
+         while (sctx->token_count.find(filler) != sctx->token_count.end()) {
+             ++filler;
+         }
+         GGML_ASSERT(filler < sctx->n_vocab);
+-    }
+-
+-    // Fill the rest of the arrays with the filler token id and count 0.
+-    // Inactive slots are padded with a unique dummy token ID (count = 0).
+-    // The uniqueness matters because ggml_set_rows with duplicate indices can produce non-deterministic or incorrect results.
+-    // Using a filler token with count 0 that isn't in the active set is safe, because the active_mask step in backend_apply filters them out via ggml_step(counts_f32)
+-    for (int32_t i = n_active; i < sctx->n_max; ++i) {
+-        sctx->host_token_ids[i] = filler;
++        sctx->host_token_ids[i] = filler++;
+         sctx->host_counts   [i] = 0;
+     }
+ 
