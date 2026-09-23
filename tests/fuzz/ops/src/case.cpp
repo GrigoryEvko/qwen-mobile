@@ -132,9 +132,15 @@ ggml_tensor * builder::f16(int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, c
     const int64_t      n = ggml_nelements(t);
     std::vector<float> tmp(n);
     gen_f32(tmp.data(), n, ne0, v, leaf_seed(seed, n_leaf++));
+    bool outside = false;
     for (int64_t i = 0; i < n; i++) {
         const uint16_t h = f32_to_f16(tmp[i]);
+        // a wide distribution can go past the f16 range (Inf) or below its normal range (subnormal)
+        outside |= (h & 0x7c00u) == 0x7c00u || ((h & 0x7c00u) == 0 && (h & 0x3ffu) != 0);
         std::memcpy(l.bytes.data() + i * 2, &h, 2);
+    }
+    if (outside) {
+        c.special = true;
     }
     inject(l);
     return t;
