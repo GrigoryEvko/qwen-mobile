@@ -120,6 +120,23 @@ def test_scale_search_is_not_worse_after_the_f16_rounding() -> None:
     assert sse[True] <= sse[False], f"the search gives {sse[True]:.4e}, the plain scale {sse[False]:.4e}"
 
 
+@xfail_open("search-factor-one-inexact", "the candidate at the factor 0.99999994 rounds to another F16 scale")
+def test_scale_search_holds_the_reference_scale() -> None:
+    """The scale search is not worse than the reference scale on a block whose reference scale is subnormal in F16.
+
+    The search factors come from linspace(0.55, 1.05, 41) in float32, and
+    the factor nearest to 1 is 0.99999994. On this block, d0 · 0.99999994
+    rounds to another F16 scale than d0, thus no candidate of the search is
+    the stored reference scale, and each candidate gives a larger error.
+    """
+    spec = MatrixSpec(1, 5, (("spread", "spread", "gauss", "gauss", "sparse"),), ((0, 0, 0, 0, -12),),
+                      3_358_071_818, True)
+    w = torch.from_numpy(spec.build())[:, 128:160]
+    grid = Q4_0Grid()
+    sse = {s: float((dequantize(grid, *quantize(grid, w, search=s)) - w).double().pow(2).sum()) for s in (True, False)}
+    assert sse[True] <= sse[False], f"the search gives {sse[True]:.6e}, the reference scale {sse[False]:.6e}"
+
+
 # --- The export -----------------------------------------------------------------------------------------
 
 def test_export_refuses_a_pack_of_another_shape(tmp_path: Path) -> None:
