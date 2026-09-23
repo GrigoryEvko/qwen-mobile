@@ -1,0 +1,44 @@
+server: give the chat parameters the defaults of common_params
+Fold-into: upstream/jinja
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+struct server_chat_params (tools/server/server-common.h) has no default for
+use_jinja, prefill_assistant, reasoning_format, allow_image, allow_audio and
+allow_video. The server sets each field, but a caller that sets only some of
+them reads an indeterminate value: test-chat sets use_jinja,
+enable_thinking, reasoning_budget and reasoning_format, and
+oaicompat_chat_params_parse then reads opt.prefill_assistant
+(server-common.cpp). MemorySanitizer reports a use of an uninitialized value
+there.
+
+The change: the defaults of common_params (use_jinja true,
+prefill_assistant true, reasoning_format DEEPSEEK) and false for the three
+media flags. The server sets each field, thus its behavior does not change.
+
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+index 9894f5f..2a63d5f 100644
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -306,14 +306,15 @@ std::vector<server_tokens> tokenize_input_prompts(
+ 
+ // global server parameters for chat formatting / parsing
+ struct server_chat_params {
+-    bool use_jinja;
+-    bool prefill_assistant;
+-    common_reasoning_format reasoning_format;
++    // the defaults of common_params: a caller that sets only some fields reads no indeterminate value
++    bool use_jinja = true;
++    bool prefill_assistant = true;
++    common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+     std::map<std::string, std::string> chat_template_kwargs; // mapping key --> json value
+     common_chat_templates_ptr tmpls;
+-    bool allow_image;
+-    bool allow_audio;
+-    bool allow_video;
++    bool allow_image = false;
++    bool allow_audio = false;
++    bool allow_video = false;
+     bool enable_thinking = true;
+     int  reasoning_budget = -1;
+     std::string reasoning_budget_message;

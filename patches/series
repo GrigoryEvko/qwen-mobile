@@ -142,3 +142,5 @@ fuzz-ops/0005-ggml-cpu-run-the-value-asserts-only-with-an-opt-in-macro.patch
 fuzz-ops/0006-ggml-cpu-soft-max-of-a-fully-masked-row-gives-0.patch
 fuzz-hexhost/0006-hexagon-parse-the-init-environment-safely.patch
 fuzz-hexhost/0007-hexagon-saturate-the-k-quant-repack-scales.patch
+fuzz-matrix/0002-server-give-the-chat-parameters-the-defaults-of-common-params.patch
+fuzz-matrix/0003-tests-give-the-tensors-of-test-barrier-defined-data.patch
