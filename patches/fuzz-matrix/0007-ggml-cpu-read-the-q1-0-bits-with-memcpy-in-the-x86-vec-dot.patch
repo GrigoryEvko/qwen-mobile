@@ -1,0 +1,34 @@
+ggml-cpu: read the q1_0 bits with memcpy in the x86 vec_dot
+Fold-into: upstream/ggml-cpu
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+ggml_vec_dot_q1_0_q8_0 of arch/x86/quants.c read the 16 bytes of qs as
+uint32_t through a cast pointer. qs follows the 2-byte scale d of
+block_q1_0, thus it has no 4-byte alignment, and the load is undefined
+behavior. UBSan reports a misaligned load at quants.c in test-quantize-fns
+and test-quantize-perf, in debug and release.
+
+The change: memcpy the 16 bytes into a local uint32_t array. The compiler
+emits the same unaligned load. In the release-none build, the function has
+74 instructions before and after the change, and test-quantize-perf gives
+1.62 cycles for each 32 values of vec_dot_q (q1_0) in 5 of 5 runs before and
+after. test-quantize-fns and test-quantize-perf pass with no report in none
+and ubsan, debug and release.
+
+diff --git a/ggml/src/ggml-cpu/arch/x86/quants.c b/ggml/src/ggml-cpu/arch/x86/quants.c
+index ea54cfe..d444868 100644
+--- a/ggml/src/ggml-cpu/arch/x86/quants.c
++++ b/ggml/src/ggml-cpu/arch/x86/quants.c
+@@ -580,7 +580,10 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
+ 
+     for (int ib = 0; ib < nb; ++ib) {
+         const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+-        const uint32_t * GGML_RESTRICT qs32 = (const uint32_t *) x[ib].qs;
++        // qs follows the 2-byte scale d, thus it has no 4-byte alignment. memcpy is the defined
++        // unaligned read, and the compiler emits one unaligned load for it.
++        uint32_t qs32[QK1_0 / 32];
++        memcpy(qs32, x[ib].qs, sizeof(qs32));
+         const block_q8_0 * GGML_RESTRICT y_ptr = &y[ib * 4];
+ 
+         __m256 acc_block;

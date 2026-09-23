@@ -198,3 +198,4 @@ fuzz-ops/0015-hexagon-htp-reduce-the-rope-angle-with-a-split-pi.patch
 fuzz-matrix/0005-tests-give-the-keys-with-no-array-type-a-valid-gguf-type.patch
 fuzz-ops/0016-hexagon-htp-softplus-in-the-oracle-form.patch
 fuzz-matrix/0006-jinja-compute-the-integer-operators-in-int64.patch
+fuzz-matrix/0007-ggml-cpu-read-the-q1-0-bits-with-memcpy-in-the-x86-vec-dot.patch
