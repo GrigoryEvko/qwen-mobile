@@ -1,0 +1,88 @@
+hexagon: htp: the 32x2 dot adds the k-tiles in the order of the 32x1 dot
+Fold-into: upstream/hexagon-htp
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+The 32x2 dots of Q4_0, Q4_1, Q8_0, IQ4_NL and MXFP4 (hvx-mm-kernels-tiled.h)
+do two k-tiles in each step, and they add the two scaled tile sums first:
+acc + (s_a + s_b). The 32x1 dot, the multirow dots and the CPU reference add
+them one after the other: (acc + s_a) + s_b. The two orders round
+differently, thus each column of the 32x2 dot differs in the last bits from
+the 32x1 dot of the same activation row. In the v79 simulator (k = 2048, 128
+weight rows) 210 of 256 Q8_0 outputs and 190 of 256 Q4_0 outputs differ in
+bits, and the 32x1 dot gives the bits of the sequential reference for each
+output. The app graphs do not reach this condition with the default settings:
+for Q8_0 and Q4_0 at 2 to 4 activation rows the matmul op takes the multirow
+dots, and above 4 rows the HMX. The 32x2 dot runs with GGML_HEXAGON_MULTIROW=0
+and for the other weight types.
+
+This patch adds the two tile sums to the accumulator one after the other.
+Then each column of the 32x2 dot gives the bits of the 32x1 dot (0 of 256
+outputs differ for Q8_0 and for Q4_0). The simulator gives fewer cycles for
+each 32x32 weight tile: 92.6 in place of 106.8 for Q8_0 at 2 rows, 185.1 in
+place of 213.6 at 4 rows, and 98.1 in place of 108.9 for Q4_0 at 2 rows.
+
+diff --git a/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h b/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
+index f5c13d2..785a0af 100644
+--- a/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
++++ b/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
+@@ -481,8 +481,9 @@ static void tiled_vec_dot_q4_0_32x2(const uint32_t n, float * restrict s0, float
+         HVX_Vector v_sum_scaled_c0_1 = hvx_vec_mul_f32_f32(v_sum_sf_c0_1, v_scale_comb_c0_1);
+         HVX_Vector v_sum_scaled_c1_1 = hvx_vec_mul_f32_f32(v_sum_sf_c1_1, v_scale_comb_c1_1);
+ 
+-        v_sum_float_c0 = hvx_vec_add_f32_f32(v_sum_float_c0, hvx_vec_add_f32_f32(v_sum_scaled_c0_0, v_sum_scaled_c0_1));
+-        v_sum_float_c1 = hvx_vec_add_f32_f32(v_sum_float_c1, hvx_vec_add_f32_f32(v_sum_scaled_c1_0, v_sum_scaled_c1_1));
++        // one k-tile after the other, in the order of the 32x1 dot, thus each column gets its bits
++        v_sum_float_c0 = hvx_vec_add_f32_f32(hvx_vec_add_f32_f32(v_sum_float_c0, v_sum_scaled_c0_0), v_sum_scaled_c0_1);
++        v_sum_float_c1 = hvx_vec_add_f32_f32(hvx_vec_add_f32_f32(v_sum_float_c1, v_sum_scaled_c1_0), v_sum_scaled_c1_1);
+     }
+ 
+     for (; kt < n_k_tiles; kt++) {
+@@ -788,8 +789,9 @@ static void tiled_vec_dot_q4_1_32x2(const uint32_t n, float * restrict s0, float
+         HVX_Vector v_scaled_dot_c1_1 = hvx_vec_mul_f32_f32(v_sum_sf_c1_1, v_scale_comb_c1_1);
+         HVX_Vector v_sum_scaled_c1_1 = hvx_vec_add_f32_f32(v_scaled_dot_c1_1, v_offset_comb_c1_1);
+ 
+-        v_sum_float_c0 = hvx_vec_add_f32_f32(v_sum_float_c0, hvx_vec_add_f32_f32(v_sum_scaled_c0_0, v_sum_scaled_c0_1));
+-        v_sum_float_c1 = hvx_vec_add_f32_f32(v_sum_float_c1, hvx_vec_add_f32_f32(v_sum_scaled_c1_0, v_sum_scaled_c1_1));
++        // one k-tile after the other, in the order of the 32x1 dot, thus each column gets its bits
++        v_sum_float_c0 = hvx_vec_add_f32_f32(hvx_vec_add_f32_f32(v_sum_float_c0, v_sum_scaled_c0_0), v_sum_scaled_c0_1);
++        v_sum_float_c1 = hvx_vec_add_f32_f32(hvx_vec_add_f32_f32(v_sum_float_c1, v_sum_scaled_c1_0), v_sum_scaled_c1_1);
+     }
+ 
+     for (; kt < n_k_tiles; kt++) {
+@@ -919,8 +921,9 @@ static void tiled_vec_dot_q8_0_32x2(const uint32_t n, float * restrict s0, float
+         HVX_Vector v_sum_scaled_c0_1 = hvx_vec_mul_f32_f32(v_sum_sf_c0_1, v_scale_comb_c0_1);
+         HVX_Vector v_sum_scaled_c1_1 = hvx_vec_mul_f32_f32(v_sum_sf_c1_1, v_scale_comb_c1_1);
+ 
+-        v_sum_float_c0 = hvx_vec_add_f32_f32(v_sum_float_c0, hvx_vec_add_f32_f32(v_sum_scaled_c0_0, v_sum_scaled_c0_1));
+-        v_sum_float_c1 = hvx_vec_add_f32_f32(v_sum_float_c1, hvx_vec_add_f32_f32(v_sum_scaled_c1_0, v_sum_scaled_c1_1));
++        // one k-tile after the other, in the order of the 32x1 dot, thus each column gets its bits
++        v_sum_float_c0 = hvx_vec_add_f32_f32(hvx_vec_add_f32_f32(v_sum_float_c0, v_sum_scaled_c0_0), v_sum_scaled_c0_1);
++        v_sum_float_c1 = hvx_vec_add_f32_f32(hvx_vec_add_f32_f32(v_sum_float_c1, v_sum_scaled_c1_0), v_sum_scaled_c1_1);
+     }
+ 
+     for (; kt < n_k_tiles; kt++) {
+@@ -1100,8 +1103,9 @@ static void tiled_vec_dot_iq4nl_32x2(const uint32_t n, float * restrict s0, floa
+         HVX_Vector v_sum_scaled_c0_1 = hvx_vec_mul_f32_f32(v_sum_sf_c0_1, v_scale_comb_c0_1);
+         HVX_Vector v_sum_scaled_c1_1 = hvx_vec_mul_f32_f32(v_sum_sf_c1_1, v_scale_comb_c1_1);
+ 
+-        v_sum_float_c0 = hvx_vec_add_f32_f32(v_sum_float_c0, hvx_vec_add_f32_f32(v_sum_scaled_c0_0, v_sum_scaled_c0_1));
+-        v_sum_float_c1 = hvx_vec_add_f32_f32(v_sum_float_c1, hvx_vec_add_f32_f32(v_sum_scaled_c1_0, v_sum_scaled_c1_1));
++        // one k-tile after the other, in the order of the 32x1 dot, thus each column gets its bits
++        v_sum_float_c0 = hvx_vec_add_f32_f32(hvx_vec_add_f32_f32(v_sum_float_c0, v_sum_scaled_c0_0), v_sum_scaled_c0_1);
++        v_sum_float_c1 = hvx_vec_add_f32_f32(hvx_vec_add_f32_f32(v_sum_float_c1, v_sum_scaled_c1_0), v_sum_scaled_c1_1);
+     }
+ 
+     for (; kt < n_k_tiles; kt++) {
+@@ -1255,8 +1259,9 @@ static void tiled_vec_dot_mxfp4_32x2(const uint32_t n, float * restrict s0, floa
+         HVX_Vector v_sum_scaled_c0_1 = hvx_vec_mul_f32_f32(v_sum_sf_c0_1, v_scale_comb_c0_1);
+         HVX_Vector v_sum_scaled_c1_1 = hvx_vec_mul_f32_f32(v_sum_sf_c1_1, v_scale_comb_c1_1);
+ 
+-        v_sum_float_c0 = hvx_vec_add_f32_f32(v_sum_float_c0, hvx_vec_add_f32_f32(v_sum_scaled_c0_0, v_sum_scaled_c0_1));
+-        v_sum_float_c1 = hvx_vec_add_f32_f32(v_sum_float_c1, hvx_vec_add_f32_f32(v_sum_scaled_c1_0, v_sum_scaled_c1_1));
++        // one k-tile after the other, in the order of the 32x1 dot, thus each column gets its bits
++        v_sum_float_c0 = hvx_vec_add_f32_f32(hvx_vec_add_f32_f32(v_sum_float_c0, v_sum_scaled_c0_0), v_sum_scaled_c0_1);
++        v_sum_float_c1 = hvx_vec_add_f32_f32(hvx_vec_add_f32_f32(v_sum_float_c1, v_sum_scaled_c1_0), v_sum_scaled_c1_1);
+     }
+ 
+     for (; kt < n_k_tiles; kt++) {
