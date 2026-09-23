@@ -135,3 +135,7 @@ fuzz-core/0003-tests-state-the-rollback-depth-rule-in-the-recurrent-state-test.p
 # The fixes of the defects that the sanitizer matrix of tests/run-suite.sh finds in the tests of llama.cpp.
 # The header of each patch describes its defect and the change.
 fuzz-matrix/0001-tests-free-the-compute-context-of-test-opt.patch
+
+# fuzz-ops: the value asserts of ggml-cpu behind an opt-in macro, and the fully masked soft_max row.
+fuzz-ops/0005-ggml-cpu-run-the-value-asserts-only-with-an-opt-in-macro.patch
+fuzz-ops/0006-ggml-cpu-soft-max-of-a-fully-masked-row-gives-0.patch

@@ -9,7 +9,7 @@
 //                  [--enumerate KIND:COUNT]... [--enumerate-from KIND:FIRST:COUNT]... [--max-bytes B]
 //       Write a pack of cases: N random cases of each kind of the group, the inputs of libFuzzer
 //       corpora (decoded with the group of the fuzzer that made them; a --tame-corpus with the
-//       tame values of the fuzz suite), and case files of one kind (a file with the prefix
+//       tame values of FUZZ_OPS_TAME=1), and case files of one kind (a file with the prefix
 //       "tame-" decodes with the tame values).
 //   ops_oracle compare --pack PACK --results FILE... [--findings DIR] [--max-bytes B]
 //       Compare the results of the replay driver (the phone) with the oracle, and print the
@@ -23,8 +23,8 @@
 //   ops_oracle show FILE [--kind K | --group G | --index N] [--write OUT]
 //       Decode one case file (or case N of a pack), print it with the facts of its values, and run
 //       the oracle on it.
-//       Give FUZZ_OPS_TAME=1 for an input of the fuzz suite. --write (after --index) writes the
-//       bytes of the case to OUT.
+//       Give FUZZ_OPS_TAME=1 for an input of a run with that switch. --write (after --index) writes
+//       the bytes of the case to OUT.
 //   ops_oracle same RESULTS_A RESULTS_B
 //       Compare the outputs of two result files run by run (the same pack index and backend).
 //       The exit status is 0 only if each paired run is bit-identical.

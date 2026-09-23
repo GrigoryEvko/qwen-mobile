@@ -1,0 +1,443 @@
+ggml-cpu: run the value asserts only with GGML_CPU_VALUE_ASSERTS
+Fold-into: upstream/ggml-cpu
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+A debug build of ggml-cpu (without NDEBUG) examines the data values of some
+ops with assert():
+
+- No NaN and no Inf in the results of GELU, GELU_ERF, GELU_QUICK, SILU,
+  SILU_BACK, REGLU, GEGLU, SWIGLU, SWIGLU_OAI, GEGLU_ERF and GEGLU_QUICK
+- A positive scale in RMS_NORM
+- No NaN after the mask, a positive sum and a finite result in SOFT_MAX
+- No NaN in the inputs and a finite result in SOFT_MAX_BACK,
+  CROSS_ENTROPY_LOSS and CROSS_ENTROPY_LOSS_BACK, and a positive sum in the
+  last of these three ops
+- A positive sum in the backward op of flash attention
+- A finite sum in ggml_vec_dot_f16.
+
+These values come from the input data and not from the code. Thus an input
+with a NaN, an Inf or a value that is too large for f16 stops a debug build,
+and a release build of the same code gives a result.
+
+This patch adds the macro GGML_CPU_VALUE_ASSERT(x) to vec.h. It is assert(x)
+when GGML_CPU_VALUE_ASSERTS is defined, and it does nothing when that macro is
+not defined. Each value assert above uses the macro. The asserts of shapes,
+strides and types do not change. Thus a debug build accepts non-finite inputs
+as a release build does. To enable the value asserts, add
+-DGGML_CPU_VALUE_ASSERTS to the compiler flags of a debug build.
+
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 2300125..c8f0962 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -2148,8 +2148,8 @@ static void ggml_compute_forward_gelu_f32(
+         for (int k = 0; k < nc; k++) {
+             const float x = ((float *) ((char *) dst->data + i3*nb3 + i2*nb2 + i1*(dst->nb[1])))[k];
+             GGML_UNUSED(x);
+-            assert(!isnan(x));
+-            assert(!isinf(x));
++            GGML_CPU_VALUE_ASSERT(!isnan(x));
++            GGML_CPU_VALUE_ASSERT(!isinf(x));
+         }
+ #endif // NDEBUG
+     }
+@@ -2196,8 +2196,8 @@ static void ggml_compute_forward_gelu_f16(
+             const ggml_fp16_t x = ((ggml_fp16_t *) ((char *) dst->data + i3*nb3 + i2*nb2 + i1*( dst->nb[1])))[k];
+             const float v = GGML_CPU_FP16_TO_FP32(x);
+             GGML_UNUSED(v);
+-            assert(!isnan(v));
+-            assert(!isinf(v));
++            GGML_CPU_VALUE_ASSERT(!isnan(v));
++            GGML_CPU_VALUE_ASSERT(!isinf(v));
+         }
+ #endif // NDEBUG
+     }
+@@ -2378,8 +2378,8 @@ static void ggml_compute_forward_gelu_erf_f32(
+         for (int k = 0; k < nc; k++) {
+             const float x = ((float *) ((char *) dst->data + i3*nb3 + i2*nb2 + i1*(dst->nb[1])))[k];
+             GGML_UNUSED(x);
+-            assert(!isnan(x));
+-            assert(!isinf(x));
++            GGML_CPU_VALUE_ASSERT(!isnan(x));
++            GGML_CPU_VALUE_ASSERT(!isinf(x));
+         }
+ #endif // NDEBUG
+     }
+@@ -2426,8 +2426,8 @@ static void ggml_compute_forward_gelu_erf_f16(
+             const ggml_fp16_t x = ((ggml_fp16_t *) ((char *) dst->data + i3*nb3 + i2*nb2 + i1*( dst->nb[1])))[k];
+             const float v = GGML_CPU_FP16_TO_FP32(x);
+             GGML_UNUSED(v);
+-            assert(!isnan(v));
+-            assert(!isinf(v));
++            GGML_CPU_VALUE_ASSERT(!isnan(v));
++            GGML_CPU_VALUE_ASSERT(!isinf(v));
+         }
+ #endif // NDEBUG
+     }
+@@ -2497,8 +2497,8 @@ static void ggml_compute_forward_gelu_quick_f32(
+         for (int k = 0; k < nc; k++) {
+             const float x = ((float *) ((char *) dst->data + i3*nb3 + i2*nb2 + i1*(dst->nb[1])))[k];
+             GGML_UNUSED(x);
+-            assert(!isnan(x));
+-            assert(!isinf(x));
++            GGML_CPU_VALUE_ASSERT(!isnan(x));
++            GGML_CPU_VALUE_ASSERT(!isinf(x));
+         }
+ #endif // NDEBUG
+     }
+@@ -2545,8 +2545,8 @@ static void ggml_compute_forward_gelu_quick_f16(
+             const ggml_fp16_t x = ((ggml_fp16_t *) ((char *) dst->data + i3*nb3 + i2*nb2 + i1*( dst->nb[1])))[k];
+             const float v = GGML_CPU_FP16_TO_FP32(x);
+             GGML_UNUSED(v);
+-            assert(!isnan(v));
+-            assert(!isinf(v));
++            GGML_CPU_VALUE_ASSERT(!isnan(v));
++            GGML_CPU_VALUE_ASSERT(!isinf(v));
+         }
+ #endif // NDEBUG
+     }
+@@ -2616,8 +2616,8 @@ static void ggml_compute_forward_silu_f32(
+         for (int k = 0; k < nc; k++) {
+             const float x = ((float *) ((char *) dst->data + i3*nb3 + i2*nb2 + i1*(dst->nb[1])))[k];
+             GGML_UNUSED(x);
+-            assert(!isnan(x));
+-            assert(!isinf(x));
++            GGML_CPU_VALUE_ASSERT(!isnan(x));
++            GGML_CPU_VALUE_ASSERT(!isinf(x));
+         }
+ #endif // NDEBUG
+     }
+@@ -2664,8 +2664,8 @@ static void ggml_compute_forward_silu_f16(
+             const ggml_fp16_t x = ((ggml_fp16_t *) ((char *) dst->data + i3*nb3 + i2*nb2 + i1*( dst->nb[1])))[k];
+             const float v = GGML_CPU_FP16_TO_FP32(x);
+             GGML_UNUSED(v);
+-            assert(!isnan(v));
+-            assert(!isinf(v));
++            GGML_CPU_VALUE_ASSERT(!isnan(v));
++            GGML_CPU_VALUE_ASSERT(!isinf(v));
+         }
+ #endif // NDEBUG
+     }
+@@ -2814,8 +2814,8 @@ static void ggml_compute_forward_silu_back_f32(
+         for (int k = 0; k < nc; k++) {
+             const float x = ((float *) ((char *) dst->data + i1*( dst->nb[1])))[k];
+             GGML_UNUSED(x);
+-            assert(!isnan(x));
+-            assert(!isinf(x));
++            GGML_CPU_VALUE_ASSERT(!isnan(x));
++            GGML_CPU_VALUE_ASSERT(!isinf(x));
+         }
+ #endif // NDEBUG
+     }
+@@ -2858,8 +2858,8 @@ static void ggml_compute_forward_silu_back_f16(
+             const float x = ((ggml_fp16_t *) ((char *) dst->data + i1*( dst->nb[1])))[k];
+             const float v = GGML_CPU_FP16_TO_FP32(x);
+             GGML_UNUSED(v);
+-            assert(!isnan(v));
+-            assert(!isinf(v));
++            GGML_CPU_VALUE_ASSERT(!isnan(v));
++            GGML_CPU_VALUE_ASSERT(!isinf(v));
+         }
+ #endif // NDEBUG
+     }
+@@ -2941,8 +2941,8 @@ static void ggml_compute_forward_reglu_f32(
+         for (int k = 0; k < nc; k++) {
+             const float x = ((float *) ((char *) dst->data + i1*( dst->nb[1])))[k];
+             GGML_UNUSED(x);
+-            assert(!isnan(x));
+-            assert(!isinf(x));
++            GGML_CPU_VALUE_ASSERT(!isnan(x));
++            GGML_CPU_VALUE_ASSERT(!isinf(x));
+         }
+ #endif // NDEBUG
+     }
+@@ -3001,8 +3001,8 @@ static void ggml_compute_forward_reglu_f16(
+             const ggml_fp16_t x = ((ggml_fp16_t *) ((char *) dst->data + i1*( dst->nb[1])))[k];
+             const float v = GGML_FP16_TO_FP32(x);
+             GGML_UNUSED(v);
+-            assert(!isnan(v));
+-            assert(!isinf(v));
++            GGML_CPU_VALUE_ASSERT(!isnan(v));
++            GGML_CPU_VALUE_ASSERT(!isinf(v));
+         }
+ #endif // NDEBUG
+     }
+@@ -3084,8 +3084,8 @@ static void ggml_compute_forward_geglu_f32(
+         for (int k = 0; k < nc; k++) {
+             const float x = ((float *) ((char *) dst->data + i1*( dst->nb[1])))[k];
+             GGML_UNUSED(x);
+-            assert(!isnan(x));
+-            assert(!isinf(x));
++            GGML_CPU_VALUE_ASSERT(!isnan(x));
++            GGML_CPU_VALUE_ASSERT(!isinf(x));
+         }
+ #endif // NDEBUG
+     }
+@@ -3144,8 +3144,8 @@ static void ggml_compute_forward_geglu_f16(
+             const ggml_fp16_t x = ((ggml_fp16_t *) ((char *) dst->data + i1*( dst->nb[1])))[k];
+             const float v = GGML_FP16_TO_FP32(x);
+             GGML_UNUSED(v);
+-            assert(!isnan(v));
+-            assert(!isinf(v));
++            GGML_CPU_VALUE_ASSERT(!isnan(v));
++            GGML_CPU_VALUE_ASSERT(!isinf(v));
+         }
+ #endif // NDEBUG
+     }
+@@ -3227,8 +3227,8 @@ static void ggml_compute_forward_swiglu_f32(
+         for (int k = 0; k < nc; k++) {
+             const float x = ((float *) ((char *) dst->data + i1*( dst->nb[1])))[k];
+             GGML_UNUSED(x);
+-            assert(!isnan(x));
+-            assert(!isinf(x));
++            GGML_CPU_VALUE_ASSERT(!isnan(x));
++            GGML_CPU_VALUE_ASSERT(!isinf(x));
+         }
+ #endif // NDEBUG
+     }
+@@ -3287,8 +3287,8 @@ static void ggml_compute_forward_swiglu_f16(
+             const ggml_fp16_t x = ((ggml_fp16_t *) ((char *) dst->data + i1*( dst->nb[1])))[k];
+             const float v = GGML_FP16_TO_FP32(x);
+             GGML_UNUSED(v);
+-            assert(!isnan(v));
+-            assert(!isinf(v));
++            GGML_CPU_VALUE_ASSERT(!isnan(v));
++            GGML_CPU_VALUE_ASSERT(!isinf(v));
+         }
+ #endif // NDEBUG
+     }
+@@ -3378,8 +3378,8 @@ static void ggml_compute_forward_swiglu_oai_f32(
+         for (int k = 0; k < nc; k++) {
+             const float x = dst_p[k];
+             GGML_UNUSED(x);
+-            assert(!isnan(x));
+-            assert(!isinf(x));
++            GGML_CPU_VALUE_ASSERT(!isnan(x));
++            GGML_CPU_VALUE_ASSERT(!isinf(x));
+         }
+ #endif // NDEBUG
+     }
+@@ -3457,8 +3457,8 @@ static void ggml_compute_forward_swiglu_clamp_f32(const ggml_compute_params * pa
+         for (int k = 0; k < nc; k++) {
+             const float x = dst_p[k];
+             GGML_UNUSED(x);
+-            assert(!isnan(x));
+-            assert(!isinf(x));
++            GGML_CPU_VALUE_ASSERT(!isnan(x));
++            GGML_CPU_VALUE_ASSERT(!isinf(x));
+         }
+ #endif  // NDEBUG
+     }
+@@ -3516,8 +3516,8 @@ static void ggml_compute_forward_swiglu_clamp_f16(const ggml_compute_params * pa
+         for (int k = 0; k < nc; k++) {
+             const float x = GGML_FP16_TO_FP32(dst_p[k]);
+             GGML_UNUSED(x);
+-            assert(!isnan(x));
+-            assert(!isinf(x));
++            GGML_CPU_VALUE_ASSERT(!isnan(x));
++            GGML_CPU_VALUE_ASSERT(!isinf(x));
+         }
+ #endif  // NDEBUG
+     }
+@@ -3590,8 +3590,8 @@ static void ggml_compute_forward_geglu_erf_f32(
+         for (int k = 0; k < nc; k++) {
+             const float x = ((float *) ((char *) dst->data + i1*( dst->nb[1])))[k];
+             GGML_UNUSED(x);
+-            assert(!isnan(x));
+-            assert(!isinf(x));
++            GGML_CPU_VALUE_ASSERT(!isnan(x));
++            GGML_CPU_VALUE_ASSERT(!isinf(x));
+         }
+ #endif // NDEBUG
+     }
+@@ -3650,8 +3650,8 @@ static void ggml_compute_forward_geglu_erf_f16(
+             const ggml_fp16_t x = ((ggml_fp16_t *) ((char *) dst->data + i1*( dst->nb[1])))[k];
+             const float v = GGML_FP16_TO_FP32(x);
+             GGML_UNUSED(v);
+-            assert(!isnan(v));
+-            assert(!isinf(v));
++            GGML_CPU_VALUE_ASSERT(!isnan(v));
++            GGML_CPU_VALUE_ASSERT(!isinf(v));
+         }
+ #endif // NDEBUG
+     }
+@@ -3733,8 +3733,8 @@ static void ggml_compute_forward_geglu_quick_f32(
+         for (int k = 0; k < nc; k++) {
+             const float x = ((float *) ((char *) dst->data + i1*( dst->nb[1])))[k];
+             GGML_UNUSED(x);
+-            assert(!isnan(x));
+-            assert(!isinf(x));
++            GGML_CPU_VALUE_ASSERT(!isnan(x));
++            GGML_CPU_VALUE_ASSERT(!isinf(x));
+         }
+ #endif // NDEBUG
+     }
+@@ -3793,8 +3793,8 @@ static void ggml_compute_forward_geglu_quick_f16(
+             const ggml_fp16_t x = ((ggml_fp16_t *) ((char *) dst->data + i1*( dst->nb[1])))[k];
+             const float v = GGML_FP16_TO_FP32(x);
+             GGML_UNUSED(v);
+-            assert(!isnan(v));
+-            assert(!isinf(v));
++            GGML_CPU_VALUE_ASSERT(!isnan(v));
++            GGML_CPU_VALUE_ASSERT(!isinf(v));
+         }
+ #endif // NDEBUG
+     }
+@@ -3964,7 +3964,7 @@ static void ggml_compute_forward_rms_norm_f32(
+                 const float scale = 1.0f/sqrtf(mean + eps);
+ 
+                 // if you hit this, likely you got an inf somewhere earlier
+-                assert(scale > 0.0f);
++                GGML_CPU_VALUE_ASSERT(scale > 0.0f);
+ 
+                 float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
+ 
+@@ -5660,7 +5660,7 @@ static void ggml_compute_forward_soft_max_f32(
+ #ifndef NDEBUG
+                 for (int i = 0; i < ne00; ++i) {
+                     //printf("p[%d] = %f\n", i, p[i]);
+-                    assert(!isnan(wp[i]));
++                    GGML_CPU_VALUE_ASSERT(!isnan(wp[i]));
+                 }
+ #endif // NDEBUG
+ 
+@@ -5673,7 +5673,7 @@ static void ggml_compute_forward_soft_max_f32(
+                 }
+ 
+                 ggml_float sum = ggml_vec_soft_max_f32(ne00, dp, wp, max);
+-                assert(sum > 0.0);
++                GGML_CPU_VALUE_ASSERT(sum > 0.0);
+ 
+                 if (sk) {
+                     sum += (ggml_float) expf(sk[i02] - max);
+@@ -5684,8 +5684,8 @@ static void ggml_compute_forward_soft_max_f32(
+ 
+ #ifndef NDEBUG
+                 for (int i = 0; i < ne00; ++i) {
+-                    assert(!isnan(dp[i]));
+-                    assert(!isinf(dp[i]));
++                    GGML_CPU_VALUE_ASSERT(!isnan(dp[i]));
++                    GGML_CPU_VALUE_ASSERT(!isinf(dp[i]));
+                 }
+ #endif // NDEBUG
+             }
+@@ -5758,8 +5758,8 @@ static void ggml_compute_forward_soft_max_ext_back_f32(
+ #ifndef NDEBUG
+         for (int i = 0; i < nc; ++i) {
+             //printf("p[%d] = %f\n", i, p[i]);
+-            assert(!isnan(dy[i]));
+-            assert(!isnan(y[i]));
++            GGML_CPU_VALUE_ASSERT(!isnan(dy[i]));
++            GGML_CPU_VALUE_ASSERT(!isnan(y[i]));
+         }
+ #endif // NDEBUG
+         // Jii = yi - yi*yi
+@@ -5791,8 +5791,8 @@ static void ggml_compute_forward_soft_max_ext_back_f32(
+ 
+ #ifndef NDEBUG
+         for (int i = 0; i < nc; ++i) {
+-            assert(!isnan(dx[i]));
+-            assert(!isinf(dx[i]));
++            GGML_CPU_VALUE_ASSERT(!isnan(dx[i]));
++            GGML_CPU_VALUE_ASSERT(!isinf(dx[i]));
+         }
+ #endif // NDEBUG
+     }
+@@ -9538,7 +9538,7 @@ static void ggml_compute_forward_flash_attn_back_f32(
+ #endif
+                     }
+ 
+-                    assert(sum > 0.0);
++                    GGML_CPU_VALUE_ASSERT(sum > 0.0);
+ 
+                     sum = 1.0/sum;
+                     ggml_vec_scale_f32(masked_begin, SM, sum);
+@@ -11735,8 +11735,8 @@ static void ggml_compute_forward_cross_entropy_loss_f32(
+ #ifndef NDEBUG
+         for (int64_t i = 0; i < nc; ++i) {
+             //printf("p[%d] = %f\n", i, p[i]);
+-            assert(!isnan(s0[i]));
+-            assert(!isnan(s1[i]));
++            GGML_CPU_VALUE_ASSERT(!isnan(s0[i]));
++            GGML_CPU_VALUE_ASSERT(!isnan(s1[i]));
+         }
+ #endif // NDEBUG
+ 
+@@ -11754,8 +11754,8 @@ static void ggml_compute_forward_cross_entropy_loss_f32(
+ 
+ #ifndef NDEBUG
+         for (int64_t i = 0; i < nc; ++i) {
+-            assert(!isnan(st[i]));
+-            assert(!isinf(st[i]));
++            GGML_CPU_VALUE_ASSERT(!isnan(st[i]));
++            GGML_CPU_VALUE_ASSERT(!isinf(st[i]));
+         }
+ #endif // NDEBUG
+     }
+@@ -11827,8 +11827,8 @@ static void ggml_compute_forward_cross_entropy_loss_back_f32(
+ #ifndef NDEBUG
+         for (int64_t i = 0; i < nc; ++i) {
+             //printf("p[%d] = %f\n", i, p[i]);
+-            assert(!isnan(s0[i]));
+-            assert(!isnan(s1[i]));
++            GGML_CPU_VALUE_ASSERT(!isnan(s0[i]));
++            GGML_CPU_VALUE_ASSERT(!isnan(s1[i]));
+         }
+ #endif // NDEBUG
+ 
+@@ -11836,7 +11836,7 @@ static void ggml_compute_forward_cross_entropy_loss_back_f32(
+         float max = -INFINITY;
+         ggml_vec_max_f32(nc, &max, s0);
+         const ggml_float sum = ggml_vec_soft_max_f32(nc, ds0, s0, max);
+-        assert(sum > 0.0);
++        GGML_CPU_VALUE_ASSERT(sum > 0.0);
+         ggml_vec_scale_f32(nc, ds0, 1.0/sum);
+ 
+         // grad(src0f) = (softmax(src0f) - src1f) * grad(cross_entropy_loss(src0f, src1f)) / nr
+@@ -11845,8 +11845,8 @@ static void ggml_compute_forward_cross_entropy_loss_back_f32(
+ 
+ #ifndef NDEBUG
+         for (int64_t i = 0; i < nc; ++i) {
+-            assert(!isnan(ds0[i]));
+-            assert(!isinf(ds0[i]));
++            GGML_CPU_VALUE_ASSERT(!isnan(ds0[i]));
++            GGML_CPU_VALUE_ASSERT(!isinf(ds0[i]));
+         }
+ #endif // NDEBUG
+     }
+diff --git a/ggml/src/ggml-cpu/vec.cpp b/ggml/src/ggml-cpu/vec.cpp
+index ff2b636..c7d0c50 100644
+--- a/ggml/src/ggml-cpu/vec.cpp
++++ b/ggml/src/ggml-cpu/vec.cpp
+@@ -366,7 +366,7 @@ void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * G
+             sumf += (ggml_float)(GGML_CPU_FP16_TO_FP32(x[i])*GGML_CPU_FP16_TO_FP32(y[i]));
+         }
+         // if you hit this, you are likely running outside the FP range
+-        assert(!isnan(sumf) && !isinf(sumf));
++        GGML_CPU_VALUE_ASSERT(!isnan(sumf) && !isinf(sumf));
+     #endif
+ #else
+     for (int i = 0; i < n; ++i) {
+diff --git a/ggml/src/ggml-cpu/vec.h b/ggml/src/ggml-cpu/vec.h
+index 883ef50..e93f03e 100644
+--- a/ggml/src/ggml-cpu/vec.h
++++ b/ggml/src/ggml-cpu/vec.h
+@@ -7,6 +7,17 @@
+ #include "ggml.h"
+ #include "ggml-cpu.h"
+ 
++#include <assert.h>
++
++// A check of a data value in a debug build (NaN, Inf, a zero sum). The value comes from the input
++// data and not from the code, thus a model or a test with a NaN or an Inf stops a debug build
++// that is otherwise correct. The checks are on only with GGML_CPU_VALUE_ASSERTS.
++#if defined(GGML_CPU_VALUE_ASSERTS)
++#define GGML_CPU_VALUE_ASSERT(x) assert(x)
++#else
++#define GGML_CPU_VALUE_ASSERT(x) ((void) 0)
++#endif
++
+ #if defined(GGML_USE_ACCELERATE)
+ #include <Accelerate/Accelerate.h>
+ #endif

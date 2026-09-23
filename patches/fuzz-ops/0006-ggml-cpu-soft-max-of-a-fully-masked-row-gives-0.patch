@@ -1,0 +1,130 @@
+ggml-cpu: soft_max of a fully masked row gives 0
+Fold-into: upstream/ggml-cpu
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+When the mask of SOFT_MAX is -inf in each column of a row, and the sink is
+missing or also -inf, the maximum of the row is -inf. The CPU backend then
+calculates exp(-inf - (-inf)), which is NaN, and each value of the row becomes
+NaN. With GGML_CPU_VALUE_ASSERTS, a debug build stops at the assert
+"sum > 0.0". With a finite sink, the same row gives 0 in each column.
+
+This patch writes 0 into each column of such a row, and it does not calculate
+the exponentials. This is the result of the same row with a finite sink, and
+the result of a flash attention row with no unmasked position.
+
+The patch also adds test_soft_max_masked_row to test-backend-ops. The mask is
+-inf in each column of the first and the last row of each matrix, and 0 in the
+other rows. The cases have three shapes, an F32 or an F16 mask, and a sink or
+no sink. The comparison of test-backend-ops fails on a NaN of either backend.
+With -b CPU, the CPU backend is compared with itself, thus the NaN check tests
+the CPU result.
+
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index c8f0962..3f63b7a 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -5672,6 +5672,14 @@ static void ggml_compute_forward_soft_max_f32(
+                     max = MAX(max, sk[i02]);
+                 }
+ 
++                // A fully masked row (every value and the sink are -inf) has no finite value, thus
++                // exp(x - max) would be exp(-inf + inf) = NaN. Its result is 0 in every column, the
++                // same result as a flash attention row with no unmasked position.
++                if (max == -INFINITY) {
++                    memset(dp, 0, ne00*sizeof(float));
++                    continue;
++                }
++
+                 ggml_float sum = ggml_vec_soft_max_f32(ne00, dp, wp, max);
+                 GGML_CPU_VALUE_ASSERT(sum > 0.0);
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 036d26f..78a06ed 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -5914,6 +5914,69 @@ struct test_soft_max : public test_case {
+     }
+ };
+ 
++// GGML_OP_SOFT_MAX with fully masked rows: the mask is -INFINITY in every column of the first and
++// the last row of each matrix, and 0 in the other rows. The result of a fully masked row is 0 in
++// every column (with a sink too), and the comparison fails on a NaN of either backend.
++struct test_soft_max_masked_row : public test_case {
++    const std::array<int64_t, 4> ne;
++    const ggml_type m_prec;
++    const bool sinks;
++
++    std::string vars() override {
++        return VARS_TO_STR3(ne, m_prec, sinks);
++    }
++
++    double max_nmse_err() override {
++        return 1e-6;
++    }
++
++    test_soft_max_masked_row(std::array<int64_t, 4> ne = {32, 4, 2, 1},
++            ggml_type m_prec = GGML_TYPE_F32,
++            bool sinks = false)
++        : ne(ne), m_prec(m_prec), sinks(sinks) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
++        ggml_set_name(a, "a");
++
++        ggml_tensor * mask = ggml_new_tensor(ctx, m_prec, 4, ne.data());
++        ggml_set_name(mask, "mask");
++
++        ggml_tensor * out = ggml_soft_max_ext(ctx, a, mask, 1.0f, 0.0f);
++        if (sinks) {
++            ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[2]);
++            ggml_set_name(s, "sinks");
++            ggml_soft_max_add_sinks(out, s);
++        }
++        ggml_set_name(out, "out");
++
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            if (strcmp(t->name, "mask") != 0) {
++                init_tensor_uniform(t);
++                continue;
++            }
++            std::vector<float> m(ggml_nelements(t), 0.0f);
++            for (int64_t r = 0; r < ggml_nrows(t); r++) {
++                const int64_t i1 = r % t->ne[1];
++                if (i1 == 0 || i1 == t->ne[1] - 1) {
++                    std::fill(m.begin() + r*t->ne[0], m.begin() + (r + 1)*t->ne[0], -INFINITY);
++                }
++            }
++            if (t->type == GGML_TYPE_F16) {
++                std::vector<ggml_fp16_t> m16(m.size());
++                ggml_fp32_to_fp16_row(m.data(), m16.data(), (int64_t) m.size());
++                ggml_backend_tensor_set(t, m16.data(), 0, m16.size()*sizeof(ggml_fp16_t));
++            } else {
++                ggml_backend_tensor_set(t, m.data(), 0, m.size()*sizeof(float));
++            }
++        }
++    }
++};
++
+ // GGML_OP_SOFT_MAX_BACK
+ struct test_soft_max_back : public test_case {
+     const ggml_type type;
+@@ -10519,6 +10582,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {200000, 4, 1, 1}, false,  false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
+     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {643251, 3, 1, 1}, false,  false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
+ 
++    for (ggml_type m_prec : {GGML_TYPE_F32, GGML_TYPE_F16}) {
++        for (bool sinks : {false, true}) {
++            test_cases.emplace_back(new test_soft_max_masked_row({32,   4, 2, 1}, m_prec, sinks));
++            test_cases.emplace_back(new test_soft_max_masked_row({71,   3, 3, 1}, m_prec, sinks));
++            test_cases.emplace_back(new test_soft_max_masked_row({1024, 8, 2, 1}, m_prec, sinks));
++        }
++    }
++
+     for (float max_bias : {0.0f, 8.0f}) {
+         for (float scale : {1.0f, 0.1f}) {
+             for (int64_t ne0 : {16, 1024}) {

@@ -15,7 +15,6 @@ readonly AREA=ops
 readonly SNAP="$REPO_ROOT/build/fuzz/ops-src"
 readonly SRC="$SNAP/ggml"
 readonly MISC="$REPO_ROOT/build/fuzz/ops"          # the oracle, fixes, phone stage, temporary files
-readonly B_ORACLE="$MISC/oracle"
 readonly B_ORACLE_X86="$REPO_ROOT/build/oracle-x86"   # the naive llama.cpp build, read by other areas
 readonly SHARED_SAN="$REPO_ROOT/tests/sanitizers"
 readonly SHIPPED_LIBS="$REPO_ROOT/android/snapdragon/jniLibs/arm64-v8a"
@@ -29,6 +28,9 @@ if [[ $HOST_SRC != "$SRC" && -z $TAG ]]; then
     echo "fuzz-ops: FUZZ_OPS_SRC needs FUZZ_OPS_TAG, thus the builds of the tree stay apart" >&2
     exit 2
 fi
+# The oracle of a private tree comes from that tree, thus the harness and the oracle run the same
+# ggml code.
+readonly B_ORACLE="$MISC/oracle${TAG:+-$TAG}"
 readonly ALL_GROUPS="matmul gdn attn norm elem data"
 readonly HOST_CONFIGS="none asan ubsan tsan msan"
 readonly PHONE_CONFIGS_ALL="none asan hwasan ubsan"
@@ -67,9 +69,9 @@ ops) to build/fuzz/ops-PROFILE-CONFIG/results.jsonl:
                 outside a tensor or into an input, a decode mismatch between the harness and the
                 oracle, or a result above the loose bound for an input without special values.
   fuzz CONFIG   Run libFuzzer on each group for --budget-seconds (default 600), --jobs groups at
-                a time (default 4). The default is every group. The fuzz suite sets FUZZ_OPS_TAME=1
-                (refer to src/case.cpp): the value asserts of the ggml CPU ops stop every input
-                with a special value, and the test suite reports them.
+                a time (default 4). The default is every group. The inputs include the special
+                values (Inf, NaN, subnormal, huge) and fully masked rows in the two profiles: the
+                value asserts of the ggml CPU ops run only with GGML_CPU_VALUE_ASSERTS.
 
 Other modes:
   phone-build [PROFILE-CONFIG...]  Build ops_replay for arm64 Android: one build for each profile
@@ -137,8 +139,9 @@ Environment (defaults in parentheses):
   PACK_CORPUS    the most inputs from each CPU corpus in the phone pack (40). The pack takes the
                  corpora of the fuzz suites of the none builds (debug and release) only
   PHONE_SECONDS  the seconds of each phone command before its deadline (85)
-  FUZZ_OPS_SRC, FUZZ_OPS_TAG  a different ggml tree for the host builds (the private copy of a
-                 fix) and the suffix of its build directories: build/fuzz/ops-PROFILE-CONFIG-TAG
+  FUZZ_OPS_SRC, FUZZ_OPS_TAG  a different ggml tree for the host builds and the oracle (the private
+                 copy of a fix), and the suffix of their build directories:
+                 build/fuzz/ops-PROFILE-CONFIG-TAG and build/fuzz/ops/oracle-TAG
   FUZZ_OPS_UBSAN_SUPP  a UBSan suppression file in place of tests/sanitizers/ubsan.supp (the check
                  of a fix without the entries of its task)
 EOF
@@ -173,11 +176,11 @@ check_profile() {
 # Build the oracle with gcc, like build/oracle-x86. It is the reference of every profile and every
 # configuration, and it is not a configuration.
 build_oracle() {
-    need_snapshot
+    [[ $HOST_SRC == "$SRC" ]] && need_snapshot
     mkdir -p "$B_ORACLE"
     if [[ ! -f "$B_ORACLE/build.ninja" ]]; then
         CC=gcc CXX=g++ nice -n 10 cmake -S "$HERE" -B "$B_ORACLE" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DFUZZ_OPS_VARIANT=oracle -DFUZZ_SANITIZER=none -DFUZZ_OPS_GGML_SRC="$SRC" > "$B_ORACLE/cmake.log" 2>&1 \
+            -DFUZZ_OPS_VARIANT=oracle -DFUZZ_SANITIZER=none -DFUZZ_OPS_GGML_SRC="$HOST_SRC" > "$B_ORACLE/cmake.log" 2>&1 \
             || die "the configure of the oracle failed, refer to $B_ORACLE/cmake.log"
     fi
     nice -n 10 cmake --build "$B_ORACLE" -j"$BUILD_JOBS" --target ops_oracle > "$B_ORACLE/build.log" 2>&1 \
@@ -310,8 +313,8 @@ test_group() {
         force=${item%%|*}
         f=${item#*|}
         n=$((n + 1))
-        # A regression input from the fuzz suite has the prefix "tame-": the fuzz suite decodes
-        # with FUZZ_OPS_TAME=1, thus the replay must decode it the same way.
+        # A regression input with the prefix "tame-" decodes with FUZZ_OPS_TAME=1 (refer to
+        # src/case.cpp): its case exists only with that decode.
         local tame=0
         [[ $(basename "$f") == tame-* ]] && tame=1
         if ! with_san "$config" env FUZZ_OPS_ORACLE="$B_ORACLE/ops_oracle" FUZZ_OPS_GROUP="$force" \
@@ -376,14 +379,12 @@ fuzz_group() {
     while left=$((end - $(date +%s))); [[ $left -gt 5 && $round -lt 100 ]]; do
         echo "fuzz-ops: round $round, $left s left" >> "$log"
         r0=$(date +%s)
-        # FUZZ_OPS_TAME=1: the value asserts of the ggml CPU ops stop each round at the first input
-        # with a special value; the test suite reports them.
         # The outer timeout stops a process that hangs (for example the TSan report path under
         # libFuzzer can deadlock). libFuzzer stops by itself within -timeout after -max_total_time,
         # thus a kill by the outer timeout is a hang, and the hang is a finding.
         local rc=0
         with_san "$config" env FUZZ_OPS_ORACLE="$B_ORACLE/ops_oracle" FUZZ_OPS_GROUP="$g" FUZZ_OPS_FINDINGS="$f" \
-            FUZZ_OPS_TAME=1 FUZZ_ARTIFACT_DIR="$w/artifacts" \
+            FUZZ_ARTIFACT_DIR="$w/artifacts" \
             timeout -s KILL $((left + 180)) nice -n 10 "$dir/fuzz_ops" -max_total_time="$left" -rss_limit_mb="$RSS_MB" \
             -max_len=512 -timeout=120 -artifact_prefix="$w/artifacts/" -print_final_stats=1 \
             "$w/corpus" "$HERE/corpus/$g" >> "$log" 2>&1 || rc=$?
@@ -482,8 +483,7 @@ phone_build() {
     for g in $ALL_GROUPS; do
         args+=(--corpus "$g:$HERE/corpus/$g")
         for d in "$REPO_ROOT"/build/fuzz/ops-{debug,release}-none/work/"$g"/corpus; do
-            # the fuzz suite decodes with FUZZ_OPS_TAME=1, thus its corpus keeps that decode
-            [[ -d $d ]] && args+=(--tame-corpus "$g:$d")
+            [[ -d $d ]] && args+=(--corpus "$g:$d")
         done
     done
     if [[ -d "$HERE/regress" ]]; then

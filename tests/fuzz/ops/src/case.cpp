@@ -20,11 +20,11 @@ static uint64_t leaf_seed(uint64_t seed, int i) {
 }
 
 // FUZZ_OPS_TAME=1 keeps the special values (Inf, NaN, subnormal, huge), the point injections of
-// raw bits, the very wide magnitudes and the fully masked rows out of the inputs. The value
-// assertions of the ggml CPU ops (silu !isnan, soft_max sum > 0, rms_norm scale > 0,
-// ggml_vec_dot_f16 !isinf) stop each build with assert() on such inputs, and the shared
-// configurations keep assert() on. The fuzz suite sets the switch to go past them; the test suite
-// does not set it, thus those asserts stay reported. The oracle process inherits the variable, thus
+// raw bits, the very wide magnitudes and the fully masked rows out of the inputs, and it reads
+// fewer bytes for the form of a case. Thus the same bytes can give a different case. The suites
+// do not set it: the value asserts of the ggml CPU ops run only with GGML_CPU_VALUE_ASSERTS, and
+// a debug build accepts the special values. The switch remains for the regression inputs with the
+// prefix "tame-", which exist only with this decode. The oracle process inherits the variable, thus
 // the two sides decode the same case. A case of a pack or of a regression input can also carry the
 // switch itself (FORCED_TAME in its forced kind, refer to case.h): build_case sets g_case_tame
 // for the time of the decode.
