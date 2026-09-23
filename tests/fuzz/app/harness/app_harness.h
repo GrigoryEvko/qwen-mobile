@@ -40,8 +40,7 @@ struct Options {
     bool trace = false;
     /**
      * Do not reach the findings that a scenario reproduces already, thus a
-     * long run explores past them: no NaN temperature or top-p (task #164),
-     * and no fault of the draft follow (task #162).
+     * long run explores past them: no NaN temperature or top-p (task #164).
      */
     bool skip_known = false;
 };
@@ -68,7 +67,7 @@ int check_priority(const Options & opt);
 
 /**
  * Run one deterministic scenario that reproduces one finding. The names:
- * image-shape, image-twice, jni-pending, spec-disable, sampler-nan, priority. Returns 0
+ * image-shape, image-twice, jni-pending, spec-disable, spec-parity, sampler-nan, priority. Returns 0
  * when the finding does not occur, 1 when the priority check reports it,
  * and 2 for an unknown name. The other findings abort the process with the
  * message of the check or the report of the sanitizer.

@@ -16,7 +16,8 @@
  * --replay    Run the files as programs, then stop.
  * --check-priority  Run the check of task #66 and stop with its result.
  * --scenario  Run one scenario of a finding (image-shape, image-twice,
- *             jni-pending, spec-disable, sampler-nan, priority) and stop.
+ *             jni-pending, spec-disable, spec-parity, sampler-nan, priority)
+ *             and stop.
  * --speed     Measure the time of one generateNext of the tiny model, REPS
  *             answers without and REPS with speculation, and stop.
  * --selftest-threads  Start one thread, join it, and stop: the first step of

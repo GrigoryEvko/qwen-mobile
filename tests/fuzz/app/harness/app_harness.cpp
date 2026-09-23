@@ -1334,8 +1334,12 @@ void write_embd(const std::string & dir, const std::vector<uint8_t> & image, uin
     cache_io::write_file_atomic(dir + "/" + id + ".embd", {{file.data(), file.size()}});
 }
 
-/** Generate pieces until null, an exception, or the limit, with the checks after each one. Returns the count of pieces. */
-int drain_answer(LiveEngine & le, int limit) {
+/**
+ * Generate pieces until null, an exception, or the limit, with the checks
+ * after each one. With text, the bytes of the pieces go there. Returns the
+ * count of pieces.
+ */
+int drain_answer(LiveEngine & le, int limit, std::string * text = nullptr) {
     int n = 0;
     for (; n < limit; ++n) {
         std::vector<int8_t> piece;
@@ -1347,8 +1351,38 @@ int drain_answer(LiveEngine & le, int limit) {
         if (r != 1) {
             break;
         }
+        if (text != nullptr) {
+            text->append(reinterpret_cast<const char *>(piece.data()), piece.size());
+        }
     }
     return n;
+}
+
+/**
+ * The greedy answer of the tiny model to one message, as bytes. With
+ * speculative, the draft follow fails at the fault_at-th call after the
+ * first piece (-1 for no fault). O(limit) generateNext calls and one load.
+ */
+std::string greedy_answer(Program & p, LoadSpec s, bool speculative, int fault_at, int limit) {
+    s.speculative = speculative;
+    const jlong h = api_load(s);
+    if (h == 0) {
+        fail("scenario spec-parity: the tiny model did not load");
+    }
+    const std::vector<Msg> chat = {Msg{"user", u"Hello, how are you? Tell me about the cat.", -1}};
+    if (api_chat_start(p, h, chat, false, 0.0f, 0.8f, false, false) < 0) {
+        fail("scenario spec-parity: chatStart failed");
+    }
+    LiveEngine le;
+    le.handle = h;
+    start_tracking(le);
+    std::string text;
+    drain_answer(le, 1, &text);
+    g_spec_countdown = fault_at;
+    drain_answer(le, limit - 1, &text);
+    g_spec_countdown = -1;
+    api_free(h);
+    return text;
 }
 
 }  // namespace
@@ -1415,6 +1449,25 @@ int run_scenario(const Options & opt, const std::string & name) {
         fprintf(stderr, "scenario spec-disable: %d more pieces after the fault, %llu faults, no lost token\n", n,
                 (unsigned long long) g_spec_faults.load());
         api_free(h);
+    } else if (name == "spec-parity") {
+        // Task #162, the acceptance: a forced draft failure gives the text of a run with speculation off.
+        s.mmproj.clear();
+        const std::string want = greedy_answer(p, s, false, -1, 48);
+        for (const int fault_at : {-1, 0, 1, 2, 5}) {
+            const uint64_t faults = g_spec_faults.load();
+            const std::string got = greedy_answer(p, s, true, fault_at, 48);
+            size_t at = 0;
+            while (at < want.size() && at < got.size() && want[at] == got[at]) {
+                ++at;
+            }
+            if (got != want) {
+                fail("scenario spec-parity: with the draft fault at %d, the answer has %zu bytes and differs from the "
+                     "%zu bytes without speculation at byte %zu",
+                     fault_at, got.size(), want.size(), at);
+            }
+            fprintf(stderr, "scenario spec-parity: fault at %d (%llu faults), %zu bytes, the same text\n", fault_at,
+                    (unsigned long long) (g_spec_faults.load() - faults), got.size());
+        }
     } else if (name == "sampler-nan") {
         // A NaN temperature (the settings keep NaN, finding settings-nan) reaches the sampler chain.
         s.mmproj.clear();
@@ -1430,7 +1483,9 @@ int run_scenario(const Options & opt, const std::string & name) {
     } else if (name == "priority") {
         result = check_priority(opt);
     } else {
-        fprintf(stderr, "unknown scenario %s: image-shape, image-twice, jni-pending, spec-disable, sampler-nan, priority\n",
+        fprintf(stderr,
+                "unknown scenario %s: image-shape, image-twice, jni-pending, spec-disable, spec-parity, sampler-nan, "
+                "priority\n",
                 name.c_str());
         result = 2;
     }
@@ -1561,10 +1616,7 @@ int run_program(const Options & opt, const uint8_t * data, size_t size) {
         } else if (op == 25) {
             fakejni::arm_alloc_failure(fakejni::env(), fdp.ConsumeIntegralInRange<int>(0, 24));
         } else if (op == 26) {
-            const int countdown = fdp.ConsumeIntegralInRange<int>(0, 12);
-            if (!opt.skip_known) {
-                g_spec_countdown = countdown;
-            }
+            g_spec_countdown = fdp.ConsumeIntegralInRange<int>(0, 12);
         } else if (op == 27) {
             corrupt_cache(p);
         } else if (op == 28) {

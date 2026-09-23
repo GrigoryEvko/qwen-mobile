@@ -1036,6 +1036,11 @@ std::vector<llama_token> sample_and_accept(Engine & e, const llama_tokens & draf
     return out;
 }
 
+/** The error text of an answer that has no free position in the context. */
+std::string context_full_text(const Engine & e) {
+    return "The context is full (" + std::to_string(llama_n_ctx(e.ctx)) + " tokens). Start a new chat.";
+}
+
 /**
  * One step of the answer without a draft: sample the next token from the
  * logits of the context, decode it, and put it in the queue. Returns false
@@ -1043,6 +1048,24 @@ std::vector<llama_token> sample_and_accept(Engine & e, const llama_tokens & draf
  */
 bool plain_step(Engine & e, std::string & error) {
     const llama_vocab * vocab = llama_model_get_vocab(e.model);
+    // The draft driver went off (spec_disable) in a step that gave its last
+    // token to the app. That token is not in the memory, and the logits of
+    // the context belong to the last position of the verified batch. Thus
+    // the token decodes first, and the sample reads its logits: the answer
+    // is the answer of a decode without a draft (task #162).
+    if (e.id_last != LLAMA_TOKEN_NULL) {
+        const llama_token pending = e.id_last;
+        e.id_last = LLAMA_TOKEN_NULL;
+        const int rc = decode_one(e, pending);
+        if (rc != 0) {
+            error = "llama_decode failed during generation with code " + std::to_string(rc);
+            return false;
+        }
+        if ((uint32_t) e.n_past >= llama_n_ctx(e.ctx)) {
+            error = context_full_text(e);
+            return false;
+        }
+    }
     llama_token token = LLAMA_TOKEN_NULL;
     {
         TraceSection trace("sample");
@@ -2172,7 +2195,7 @@ static jbyteArray generate_next_impl(JNIEnv * env, jlong handle) {
     }
     if ((uint32_t) e->n_past >= llama_n_ctx(e->ctx)) {
         e->answer_done = true;
-        throw_java(env, "The context is full (" + std::to_string(llama_n_ctx(e->ctx)) + " tokens). Start a new chat.");
+        throw_java(env, context_full_text(*e));
         return nullptr;
     }
     if (e->cache.empty()) {
