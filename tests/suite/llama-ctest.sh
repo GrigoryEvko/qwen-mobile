@@ -270,6 +270,22 @@ run_local_model_tests() {
     suite_run_record "$RESULTS" "$area" "test-state-restore-fragmented.local-model" "$PROFILE" "$CONFIG" "$limit" \
         "$OUT/logs/test-state-restore-fragmented.local-model.log" \
         "$BUILD/bin/test-state-restore-fragmented" -m "$TINY_MODEL" || failed=1
+    # tsan and msan: test-save-load-state with 8 of the 112 generated
+    # architectures (llama-exclude.tsv gives the reason). The set has the
+    # architectures of the app (qwen35 dense and MoE) and one of each kind
+    # of memory: attention, recurrent (mamba2), hybrid (nemotron_h), MLA
+    # (deepseek2) and sliding window (gemma2).
+    if [[ "$CONFIG" == tsan || "$CONFIG" == msan ]]; then
+        local subset="$OUT/models-subset" m
+        mkdir -p "$subset"
+        for m in qwen35-dense qwen35moe-moe qwen3-dense llama-dense mamba2-dense nemotron_h-dense \
+                 gemma2-dense deepseek2-moe; do
+            ln -sf "$BUILD/tests/test-models/$m.gguf" "$subset/$m.gguf"
+        done
+        suite_run_record "$RESULTS" "$area" "test-save-load-state.subset" "$PROFILE" "$CONFIG" "$limit" \
+            "$OUT/logs/test-save-load-state.subset.log" \
+            "$BUILD/bin/test-save-load-state" --models "$subset" || failed=1
+    fi
     while IFS= read -r sub; do
         if [[ -n "${SAMPLER_EXCLUDE[$sub]:-}" ]]; then
             suite_record "$RESULTS" "$area" "test-backend-sampler.$sub" "$PROFILE" "$CONFIG" test 0 0 0 excluded \

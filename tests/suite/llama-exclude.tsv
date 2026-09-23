@@ -16,3 +16,4 @@ test-thread-safety	all	Model download: the fixture test-download-model supplies 
 test-state-restore-fragmented	all	Model download: the fixture test-download-model supplies its model. The step llama-local-model runs the same binary with a generated model.
 test-arg-parser	all	Network: the last part does HTTP GET requests to http://ggml.ai/ and asserts the status 200 and 404.
 test-backend-sampler	all	Moved: the local-model step runs each sub-test with --test and the tiny model, because the sub-test logit_bias needs a trained model.
+test-save-load-state	tsan,msan	Moved: the 112 generated architectures took more than 3600 s in release-tsan and more than 1200 s in debug-msan (2026-09-23, host load 60 to 110). The local-model step runs the same binary with 8 architectures in tsan and msan. The other configurations run all 112.
