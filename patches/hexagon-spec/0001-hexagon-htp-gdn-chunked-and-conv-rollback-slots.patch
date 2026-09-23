@@ -48,8 +48,8 @@ each slot.
 
 The tail is not new arithmetic. The per-token body of the two sequential threads was the same code
 twice, and this patch moves it into one function, gdn_step_token_f32. The two threads call it, and
-so does the tail. The function is the code that task #74 verified against a float64 reference at
-K = 1 to 4, thus the tail inherits that result.
+so does the tail. The function is the code that a check against a float64 reference verified at
+K = 1 to 4 (11 shapes, NMSE below 3e-13 for each slot), thus the tail inherits that result.
 
 The gate of the chunked kernel becomes the token count outside the tail: the kernel takes the batch
 when n_tokens - K is 32 or more. A shorter batch runs the sequential kernel, which takes every shape.

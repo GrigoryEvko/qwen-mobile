@@ -89,8 +89,10 @@ device counters instead.
 row per DSP thread and a counter track per PMU event. `perfetto/capture.sh`
 takes an Android system trace with the app sections on the boottime clock.
 
-The two are not yet on one clock, thus they cannot be overlaid. Task #102 holds
-the four changes that would join them.
+The two are not on one clock, thus they cannot be overlaid. Four changes can
+join them: keep the absolute qtimer start of each DSP batch, read CNTVCT_EL0
+next to CLOCK_BOOTTIME on the host, read dspqueue_get_stat() for each batch,
+and write the hostprof times as ATrace slices.
 
 ## The order that works
 

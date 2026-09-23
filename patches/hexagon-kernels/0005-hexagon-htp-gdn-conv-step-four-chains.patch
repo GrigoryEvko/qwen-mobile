@@ -1,7 +1,7 @@
 The conv step of the gated delta net: four chains in flight (lab proposal)
 
-The single-token conv is the input path of every gated delta net layer, and repository task #101
-measures it at 245 us per layer. In the lab it costs 592.3 cycles for each block of 32 channels
+The single-token conv is the input path of every gated delta net layer, and the decode profile on the
+phone measures it at 245 us per layer. In the lab it costs 592.3 cycles for each block of 32 channels
 and commits 0.66 instructions per packet, where a packet holds 4. COPROC_BUSY is 51.3 % of its
 cycles.
 

@@ -440,9 +440,9 @@ def cmd_plan(a: argparse.Namespace) -> int:
          base_plan, dict(draft_head=None, verify_row_cost=1.9)),
         ("+ MTP block at Q8_0 (one line in quant/plan.py)",
          replace(base_plan, mtp="Q8_0"), dict(draft_head=None, verify_row_cost=1.9)),
-        ("+ draft head cut to 3072 rows (#103)",
+        ("+ draft head cut to 3072 rows",
          replace(base_plan, mtp="Q8_0"), dict(draft_head=3072, verify_row_cost=1.9)),
-        ("+ verify on the HMX (#104)",
+        ("+ verify on the HMX",
          replace(base_plan, mtp="Q8_0"), dict(draft_head=3072, verify_row_cost=1.0)),
     ]
     print(f"{m.name}, body stays Q8_0 throughout. Acceptance {a.accept:.2f}, draft {a.draft}.")
