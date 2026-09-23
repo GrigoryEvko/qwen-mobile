@@ -17,6 +17,20 @@
 // unless the id of the violation is in the environment variable
 // HEXHOST_IGNORE (a comma list). An ignored refusal gives HTP_STATUS_OK, thus
 // the fuzzer continues past a known finding.
+//
+// The environment variable HEXHOST_EINTR gives the code AEE_EINTERRUPTED of
+// the dspqueue library to the host. The call then moves no packet:
+//   N         Each Nth dspqueue_read and each Nth dspqueue_write of the process
+//             gives the code, as when a signal stops the wait (N is 2 or more).
+//   cancel:N  The Nth dspqueue_read or dspqueue_write of the process stops its
+//             queue, as when the DSP process stops. That call and each later
+//             read and write of the queue give the code, and a different thread
+//             calls the error callback of the queue 2 ms later. The host must
+//             then abort, and not do the call again and again.
+//
+// When the process exits, the fake DSP calls the error callback of each queue
+// that the host did not close, with AEE_ENOSUCH, as the FastRPC library does on
+// the phone. The host must not report this regular exit as an error.
 #pragma once
 
 #include <cstdint>

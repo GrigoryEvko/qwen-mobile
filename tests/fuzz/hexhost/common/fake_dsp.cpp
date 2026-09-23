@@ -17,6 +17,9 @@
 #include "htp-ops.h"
 
 #include <atomic>
+#include <cctype>
+#include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
@@ -60,6 +63,10 @@ struct queue_info {
     std::deque<packet>      rsp;
     bool                    closing = false;
     std::thread             dsp;                // the DSP thread (async mode)
+    dspqueue_callback_t     error_cb = nullptr; // the error callback of the host, or nullptr
+    void *                  cb_ctx   = nullptr; // the context of error_cb
+    bool                    failed   = false;   // HEXHOST_EINTR=cancel:N stopped the queue
+    std::thread             error_thread;       // the thread that calls error_cb after the stop
 };
 
 // One htp_iface session (a remote handle)
@@ -184,6 +191,101 @@ void dsp_thread_main(queue_info * q) {
         q->rsp.push_back(std::move(out));
         q->cv.notify_all();
     }
+}
+
+// The model of the code AEE_EINTERRUPTED of dspqueue_read and dspqueue_write (HEXHOST_EINTR)
+struct intr_config {
+    uint64_t every  = 0;   // each Nth read and each Nth write gives the code (0: off)
+    uint64_t cancel = 0;   // the Nth read or write of the process stops its queue (0: off)
+};
+
+std::atomic<uint64_t> g_reads{0};    // the dspqueue_read calls of the process
+std::atomic<uint64_t> g_writes{0};   // the dspqueue_write calls of the process
+std::atomic<uint64_t> g_calls{0};    // the dspqueue_read and dspqueue_write calls of the process
+
+// Reads HEXHOST_EINTR one time. A value that is not valid stops the process with a message.
+const intr_config & intr() {
+    static const intr_config c = [] {
+        intr_config  r;
+        const char * s = getenv("HEXHOST_EINTR");
+        if (!s || !*s || strcmp(s, "0") == 0) {
+            return r;
+        }
+        const bool   cancel = strncmp(s, "cancel:", 7) == 0;
+        const char * num    = cancel ? s + 7 : s;
+        char *       end    = nullptr;
+        errno               = 0;
+        const unsigned long long n = strtoull(num, &end, 10);
+        if (!isdigit((unsigned char) num[0]) || errno != 0 || *end != '\0' || n < (cancel ? 1u : 2u)) {
+            fprintf(stderr,
+                    "hexhost: HEXHOST_EINTR is '%s'. Give N (2 or more: each Nth dspqueue_read and each Nth "
+                    "dspqueue_write gives AEE_EINTERRUPTED) or cancel:N (1 or more: the Nth call stops its queue).\n",
+                    s);
+            abort();
+        }
+        (cancel ? r.cancel : r.every) = n;
+        return r;
+    }();
+    return c;
+}
+
+// Stops a queue, as the dspqueue library does when the DSP process stops: each later read and
+// write of the queue gives AEE_EINTERRUPTED immediately, and a different thread calls the error
+// callback of the host 2 ms later. The caller holds q->mu.
+void stop_queue(queue_info * q) {
+    q->failed = true;
+    fprintf(stderr, "hexhost: HEXHOST_EINTR=cancel: the queue %llu stops\n", (unsigned long long) q->id);
+    q->error_thread = std::thread([q] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        if (q->error_cb) {
+            q->error_cb((dspqueue_t) (uintptr_t) q->id, AEE_ENOSUCH, q->cb_ctx);
+        }
+    });
+}
+
+std::once_flag g_exit_once;
+
+// When the process exits, the destructor of the FastRPC library stops the DSP process, and the
+// dspqueue library then calls the error callback of each open queue with AEE_ENOSUCH (seen on the
+// phone). This function does the same for each queue that the host did not close. atexit() calls it.
+void exit_notify() {
+    std::vector<queue_info *> open;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        for (const auto & kv : g_queues) {
+            open.push_back(kv.second.get());
+        }
+    }
+    for (queue_info * q : open) {
+        if (q->error_cb) {
+            q->error_cb((dspqueue_t) (uintptr_t) q->id, AEE_ENOSUCH, q->cb_ctx);
+        }
+    }
+}
+
+// Gives true when a dspqueue_read or a dspqueue_write of the queue gives AEE_EINTERRUPTED and
+// moves no packet (HEXHOST_EINTR). calls is the counter of that function.
+bool interrupted(queue_info * q, std::atomic<uint64_t> & calls) {
+    const intr_config & c = intr();
+    if (c.every == 0 && c.cancel == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(q->mu);
+    if (q->failed) {
+        return true;
+    }
+    if (c.cancel != 0) {
+        if (g_calls.fetch_add(1) + 1 == c.cancel) {
+            stop_queue(q);
+            return true;
+        }
+        return false;
+    }
+    if ((calls.fetch_add(1) + 1) % c.every == 0) {
+        count("dspqueue calls interrupted");
+        return true;
+    }
+    return false;
 }
 
 } // namespace
@@ -479,16 +581,18 @@ AEEResult dspqueue_create(int dom, uint32_t flags, uint32_t req_queue_size, uint
                           void * callback_context, dspqueue_t * queue) {
     (void) dom;
     (void) flags;
-    (void) callback_context;
-    if (packet_callback || error_callback) {
-        violation("queue-callback", "dspqueue_create with a callback, the host must read the responses itself");
+    if (packet_callback) {
+        violation("queue-callback", "dspqueue_create with a packet callback, the host must read the responses itself");
     }
     if (req_queue_size < sizeof(htp_opbatch_req) || resp_queue_size < sizeof(htp_opbatch_rsp)) {
         violation("queue-size", "dspqueue_create with queue sizes %u and %u", req_queue_size, resp_queue_size);
     }
+    std::call_once(g_exit_once, [] { atexit(exit_notify); });
     std::lock_guard<std::mutex> lock(g_mu);
-    auto q = std::make_unique<queue_info>();
-    q->id  = g_next_id++;
+    auto q      = std::make_unique<queue_info>();
+    q->id       = g_next_id++;
+    q->error_cb = error_callback;
+    q->cb_ctx   = callback_context;
     if (g_cfg.async) {
         q->dsp = std::thread(dsp_thread_main, q.get());
     }
@@ -520,6 +624,10 @@ AEEResult dspqueue_close(dspqueue_t queue) {
     if (q->dsp.joinable()) {
         q->dsp.join();
     }
+    // As the dspqueue library, the close waits for the error callback
+    if (q->error_thread.joinable()) {
+        q->error_thread.join();
+    }
     if (q->handle) {
         q->handle->queue = nullptr;
     }
@@ -543,6 +651,9 @@ AEEResult dspqueue_write(dspqueue_t queue, uint32_t flags, uint32_t num_buffers,
     if (!q) {
         violation("queue-write", "dspqueue_write to an unknown queue");
         return AEE_EBADPARM;
+    }
+    if (interrupted(q, g_writes)) {
+        return AEE_EINTERRUPTED;
     }
     packet in;
     in.msg.assign(message, message + message_length);
@@ -573,6 +684,9 @@ AEEResult dspqueue_read(dspqueue_t queue, uint32_t * flags, uint32_t max_buffers
     if (!q) {
         violation("queue-read", "dspqueue_read of an unknown queue");
         return AEE_EBADPARM;
+    }
+    if (interrupted(q, g_reads)) {
+        return AEE_EINTERRUPTED;
     }
     std::unique_lock<std::mutex> lock(q->mu);
     if (q->rsp.empty()) {

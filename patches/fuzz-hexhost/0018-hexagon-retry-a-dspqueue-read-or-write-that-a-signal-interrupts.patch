@@ -1,0 +1,179 @@
+hexagon: retry a dspqueue read or write that a signal interrupts
+Fold-into: upstream/hexagon-host
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+A signal to the thread of the host can stop a dspqueue_read or a
+dspqueue_write while it waits. The call then gives AEE_EINTERRUPTED (46,
+0x2e) and moves no packet. The Hexagon SDK tells the host to do such a
+call again (stddef/AEEStdErr.h: "the user should return to the HLOS and
+retry the call"). flush_pending did the read again only for AEE_EEXPIRED
+and AEE_EWOULDBLOCK, and flush_batch did no write again. Thus the host
+stopped with "dspqueue_read failed: 0x0000002e" or "dspqueue_write failed".
+
+On the phone, fuzz_npu_decode with SIGURG (a no-op handler without
+SA_RESTART) to the thread of the decodes every 2 ms stopped at the first
+decode with this abort. The same replay with no signal passed 319 runs.
+The SIGALRM timer of libFuzzer (-timeout=30) gave the same abort. The app
+has the same host code, thus a signal without SA_RESTART to its decode
+thread can stop the app.
+
+The dspqueue library also gives AEE_EINTERRUPTED after a permanent failure
+of the queue, for example when the DSP process stops. The library cancels
+each wait of the queue, and after that each call gives the code
+immediately. Then it calls the error callback of the queue on a different
+thread (error_callback() and wait_signal_locked() in
+src/dspqueue/dspqueue_cpu.c of github.com/quic/fastrpc). Thus a host that
+does each interrupted call again with no limit does not stop, and its
+thread uses a full CPU core.
+
+This patch sets an error callback on the queue of each session. The
+library calls it on a different thread. Thus the callback keeps the code
+in queue_error, a std::atomic<int32_t>, with a release store. The read
+loop and the two writes read queue_error with an acquire load, and they do
+the call again for AEE_EINTERRUPTED only while it is 0. After the error
+callback, they stop the process as before, and the abort message also
+gives the code of the callback.
+
+An interrupted write moves no packet, because the library copies the packet
+only after it gets space in the queue. Thus a write that the host does
+again sends the batch one time.
+
+The callback writes no log line, because the library also calls it at a
+regular exit of the process. The destructor of the FastRPC library stops
+the DSP process, and the dspqueue library then calls the error callback of
+each open queue with AEE_ENOSUCH (0x27). The app and fuzz_npu_decode do not
+call dspqueue_close: the session stays until the process exits. A callback
+that writes the code to the log gives a line at each exit. On the phone,
+each log of such a build ended with "ggml-hex: HTP0 dspqueue error:
+0x00000027" after the summary of the run.
+
+A regular dspqueue_close gives no error callback. It sets the queue to
+INVALID_QUEUE before it cancels the waits, and error_callback() skips such
+a queue.
+
+On the phone, with this patch, the replays of the failed corpus with SIGURG
+every 2 ms and every 1 ms passed 319 runs each (2999 logit checks, no
+abort). The seed run with -timeout=30 for 80 s passed 1119 runs (11029
+logit checks, no abort). No log has a "dspqueue" line, and each log ends
+with the summary of the run.
+
+On the success path, each write compares one more value, thus the speed of
+the decode does not change. The test mode of the hexhost harness gives
+AEE_EINTERRUPTED to each third dspqueue_read and dspqueue_write
+(HEXHOST_EINTR=3 of the fake DSP). Without this patch, 11 of the 14 graph
+inputs and 9 of the 12 model graph paths stop with 0x2e, in the release
+none and the debug ubsan builds. With this patch, all of them pass.
+
+The check queue-cancel of the harness (HEXHOST_EINTR=cancel:2) stops the
+queue of the fake DSP, and the fake DSP calls the error callback 2 ms
+later. With this patch, the host stops with "dspqueue_read failed:
+0x0000002e (queue error 0x00000027)". A host that does the call again with
+no error callback does not stop before the timeout of libFuzzer. At the
+exit of the process, the fake DSP calls the error callback of each open
+queue, as the FastRPC library does. hexhost_graphs then gives no
+"dspqueue" line with this patch, and it gives the line of the exit with a
+callback that writes to the log.
+
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 48a9dc1..5627e25 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -656,6 +656,7 @@ struct ggml_hexagon_session {
+     std::atomic<uint64_t> batch_req_seq{0};
+     std::atomic<uint64_t> batch_rsp_seq{0};
+     std::atomic<uint32_t> last_error{HTP_STATUS_OK};
++    std::atomic<int32_t>  queue_error{0};  // the code of the error callback of the queue, 0 before it (ggml_hexagon_queue_error)
+ 
+     std::unordered_map<uint64_t, ggml_hexagon_graph_cache_entry> graph_cache;        // by graph uid
+     uint64_t                                                     graph_cache_clock = 0;
+@@ -684,6 +685,15 @@ struct ggml_hexagon_session {
+ 
+     const char* c_name() const { return name.c_str(); }
+ 
++    // A signal can stop a dspqueue_read or a dspqueue_write while it waits. The call then gives
++    // AEE_EINTERRUPTED and moves no packet, and the SDK (AEEStdErr.h) tells the host to do the call
++    // again. After a permanent failure of the queue (the DSP process stops), each call gives this code
++    // immediately, and the library calls the error callback. Thus the host does the call again only
++    // before the error callback.
++    bool queue_interrupted(int err) const {
++        return err == AEE_EINTERRUPTED && queue_error.load(std::memory_order_acquire) == 0;
++    }
++
+     void allocate(const ggml_hexagon_device_config & config) noexcept(false);
+     void release() noexcept(true);
+ 
+@@ -3561,14 +3571,15 @@ void ggml_hexagon_session::flush_pending(bool all) {
+         const uint32_t timeo = opt_oppoll ? 0 : DSPQUEUE_TIMEOUT;
+ 
+         int err = dspqueue_read(this->queue, &flags, 1, &n_dbufs, &dbuf, sizeof(rsp), &rsp_size, (uint8_t *) &rsp, timeo);
+-        if (err == AEE_EEXPIRED || err == AEE_EWOULDBLOCK) {
++        if (err == AEE_EEXPIRED || err == AEE_EWOULDBLOCK || this->queue_interrupted(err)) {
+             continue;
+         }
+ 
+         const int64_t t_rsp = opt_hostprof ? ggml_time_us() : 0;
+ 
+         if (err != 0) {
+-            GGML_ABORT("ggml-hex: dspqueue_read failed: 0x%08x\n", (unsigned) err);
++            GGML_ABORT("ggml-hex: dspqueue_read failed: 0x%08x (queue error 0x%08x)\n", (unsigned) err,
++                       (unsigned) this->queue_error.load());
+         }
+ 
+         // Basic sanity checks
+@@ -3660,17 +3671,25 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
+ 
+         HEX_VERBOSE("ggml-hex: %s queue-opbatch: %p size %u\n", sub->c_name(), sub_dbuf.ptr, sub_dbuf.size);
+ 
+-        int err = dspqueue_write(sub->queue, 0, 1, &sub_dbuf, sizeof(sub_req), (const uint8_t*) &sub_req, DSPQUEUE_TIMEOUT);
++        int err;
++        do {
++            err = dspqueue_write(sub->queue, 0, 1, &sub_dbuf, sizeof(sub_req), (const uint8_t*) &sub_req, DSPQUEUE_TIMEOUT);
++        } while (sub->queue_interrupted(err));
+         if (err != 0) {
+-            GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x\n", sub->c_name(), (unsigned) err);
++            GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x (queue error 0x%08x)\n", sub->c_name(), (unsigned) err,
++                       (unsigned) sub->queue_error.load());
+         }
+     }
+ 
+     HEX_VERBOSE("ggml-hex: %s queue-opbatch: %p size %u\n", this->c_name(), dbuf.ptr, dbuf.size);
+ 
+-    int err = dspqueue_write(this->queue, 0, 1, &dbuf, sizeof(req), (const uint8_t*) &req, DSPQUEUE_TIMEOUT);
++    int err;
++    do {
++        err = dspqueue_write(this->queue, 0, 1, &dbuf, sizeof(req), (const uint8_t*) &req, DSPQUEUE_TIMEOUT);
++    } while (this->queue_interrupted(err));
+     if (err != 0) {
+-        GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x\n", this->c_name(), (unsigned) err);
++        GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x (queue error 0x%08x)\n", this->c_name(), (unsigned) err,
++                   (unsigned) this->queue_error.load());
+     }
+ 
+     if (opt_hostprof) {
+@@ -4303,6 +4322,16 @@ static size_t ggml_hexagon_measure_max_vmem(ggml_hexagon_session *sess) {
+     return vmem - step; // backoff to account for overhead from internal mappings
+ }
+ 
++// The error callback of the queue of a session. The dspqueue library calls it on a different thread
++// after a permanent failure of the queue, and also when the process exits (the destructor of the
++// FastRPC library stops the DSP process). Thus it writes no log line, and it only keeps the code.
++// The abort message of a read or a write after the callback gives the code.
++static void ggml_hexagon_queue_error(dspqueue_t queue, AEEResult error, void * context) {
++    GGML_UNUSED(queue);
++    auto * sess = static_cast<ggml_hexagon_session *>(context);
++    sess->queue_error.store(error != 0 ? (int32_t) error : (int32_t) AEE_EFAILED, std::memory_order_release);
++}
++
+ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) noexcept(false) {
+     int phys_idx = config.physical_idx;
+     int virt_idx = config.virtual_idx;
+@@ -4460,7 +4489,7 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
+                           req_q_size,     // Request  queue size (in bytes)
+                           rsp_q_size,     // Response queue size (in bytes)
+                           nullptr,        // Read packet callback (we handle reads explicitly)
+-                          nullptr,        // Error callback (we handle errors during reads)
++                          ggml_hexagon_queue_error,  // Error callback (it sets queue_error)
+                           (void *) this,  // Callback context
+                           &queue);
+     if (err != 0) {

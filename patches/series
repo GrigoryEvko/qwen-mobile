@@ -214,3 +214,4 @@ fuzz-hexhost/0015-hexagon-reject-a-gdn-conv-chain-when-its-slot-stride-is-less-t
 fuzz-hexhost/0016-hexagon-reject-a-gdn-chain-when-a-replaced-tensor-has-a-reader-in-a-different-split.patch
 fuzz-hexhost/0017-hexagon-give-a-replayed-batch-the-node-of-its-last-op.patch
 fuzz-core/0025-reject-a-nan-or-an-inf-in-the-data-of-a-state-blob.patch
+fuzz-hexhost/0018-hexagon-retry-a-dspqueue-read-or-write-that-a-signal-interrupts.patch

@@ -22,6 +22,12 @@ LLAMA_DIR=${HEXHOST_LLAMA_DIR:-$REPO/build/fuzz/$AREA/llama-src}
 LLAMA_COPY=1
 [[ -n ${HEXHOST_LLAMA_DIR:-} ]] && LLAMA_COPY=0
 LLAMA_FRESH=0
+# The suffix of the x86 and graphs build directories of a private tree (HEXHOST_BUILD_TAG)
+BUILD_TAG=${HEXHOST_BUILD_TAG:-}
+# The test mode and the graphs mode give AEE_EINTERRUPTED to each Nth dspqueue_read and each Nth
+# dspqueue_write (HEXHOST_EINTR of common/fake_dsp.h), as a signal to the thread of the host does on
+# the phone. The host must do such a call again. 0 gives no such code.
+TEST_EINTR=${HEXHOST_TEST_EINTR:-3}
 UBSAN_SUPP="$REPO/tests/sanitizers/ubsan.supp"
 PHONE=${PHONE:-192.168.14.130:5555}
 PHONE_DIR=${PHONE_DIR:-/data/local/tmp/qwen/fuzz/hexhost}
@@ -87,8 +93,12 @@ build/fuzz/hexhost-<profile>-<config> (x86) and build/fuzz/hexhost-android-<prof
 
 Modes:
   test <config>         Build, then run each target one time on its seeds (corpus/<target>) and
-                        on its regression inputs (regress/<target>), with no mutation. Then run
-                        the graphs mode. A finding gives a nonzero exit code.
+                        on its regression inputs (regress/<target>), with no mutation. Each third
+                        dspqueue_read and dspqueue_write gives AEE_EINTERRUPTED (HEXHOST_TEST_EINTR).
+                        Then the queue-cancel check: fuzz_graph with HEXHOST_EINTR=cancel:2 on the
+                        graph inputs, where the host must abort after a permanent failure of its
+                        queue and not do the call again and again. Then run the graphs mode. A
+                        finding gives a nonzero exit code.
   graphs                Build hexhost_graphs (graphs/graphs.cpp, no sanitizer) and run the paths
                         of the app on the 2B and the 4B Q8_0 of weights/gguf: decode, decode with
                         4 recurrent state snapshots, prefill 512, the MTP draft step and the image
@@ -118,6 +128,10 @@ Environment:
   HEXHOST_LLAMA_DIR   The llama.cpp tree (default: build/fuzz/hexhost/llama-src, a copy of the
                       patched tree of HEAD that tests/sanitizers/llama-copy.sh makes or
                       refreshes at the start of each build)
+  HEXHOST_BUILD_TAG   A suffix of the x86 and graphs build directories, for a private tree:
+                      build/fuzz/hexhost-<profile>-<config>-<tag> and build/fuzz/hexhost-graphs-<tag>
+  HEXHOST_TEST_EINTR  N: the test and graphs modes give AEE_EINTERRUPTED to each Nth
+                      dspqueue_read and each Nth dspqueue_write (default $TEST_EINTR, 0: none)
   FUZZ_MSAN_PREFIX    The MSan libc++ (default build/fuzz/msan-libcxx/install)
   PHONE, PHONE_DIR    The phone serial ($PHONE) and the work directory on the phone ($PHONE_DIR)
   PHONE_SECONDS       The driver time of each phone run (default $PHONE_SECONDS s, under the 100 s kill)
@@ -139,7 +153,7 @@ die() {
 
 # The build directory of the profile $1 and the x86 config $2
 x86_dir() {
-    echo "$REPO/build/fuzz/$AREA-$1-$2"
+    echo "$REPO/build/fuzz/$AREA-$1-$2${BUILD_TAG:+-$BUILD_TAG}"
 }
 
 # Make or refresh the private copy of llama.cpp, one time for each run of this script, when
@@ -170,7 +184,8 @@ build_x86() {
 }
 
 # Print the environment of a run: the shared sanitizer options (tests/sanitizers/env.sh) and, for
-# the fuzz mode ($2 = 1), the checks of KNOWN_IDS in HEXHOST_IGNORE.
+# the fuzz mode ($2 = 1), the checks of KNOWN_IDS in HEXHOST_IGNORE, or for the test mode
+# ($2 = 0), the interrupts of TEST_EINTR.
 run_env() {
     local cfg=$1 fuzz=$2 v
     (
@@ -185,6 +200,9 @@ run_env() {
     echo "GGML_NO_BACKTRACE=1"
     if [[ $fuzz == 1 && $KNOWN == 1 ]]; then
         echo "HEXHOST_IGNORE=$KNOWN_IDS"
+    fi
+    if [[ $fuzz == 0 ]]; then
+        echo "HEXHOST_EINTR=$TEST_EINTR"
     fi
 }
 
@@ -276,6 +294,56 @@ test_one() {
     echo "$AREA-$prof-$cfg $t: ${#files[@]} inputs, ${#failed[@]} findings${names:+:$names}"
 }
 
+# The queue-cancel check: fuzz_graph with HEXHOST_EINTR=cancel:2 on the seeds and the regression
+# inputs of the graph target, one at a time.
+# The second dspqueue call of the process stops its queue, as when the DSP process stops, and each
+# later call gives AEE_EINTERRUPTED immediately. The host must abort with the code 0x0000002e of the
+# read or the write. A host that does the call again and again gets the libFuzzer timeout or the
+# outer kill. An input with less than two dspqueue calls does not stop the queue, thus the check goes
+# to the next input. The expected abort writes crash files, and the check removes them.
+cancel_one() {
+    local prof=$1 cfg=$2 dir out log last f="" rc=0 n=0 verdict=""
+    dir=$(x86_dir "$prof" "$cfg")
+    out="$dir/runs/queue-cancel"
+    log="$out/test-log.txt"
+    last="$out/last.txt"
+    rm -rf "$out"
+    mkdir -p "$out/artifacts"
+    : > "$log"
+    local -a envs seeds
+    mapfile -t envs < <(run_env "$cfg" 0)
+    envs+=("FUZZ_ARTIFACT_DIR=$out/artifacts" "HEXHOST_EINTR=cancel:2")
+    [[ -d "$HERE/corpus/graph" ]] && mapfile -t -O 0 seeds < <(fd -t f . "$HERE/corpus/graph" | sort)
+    [[ -d "$HERE/regress/graph" ]] && mapfile -t -O "${#seeds[@]}" seeds < <(fd -t f . "$HERE/regress/graph" | sort)
+    local start=$SECONDS
+    for f in "${seeds[@]}"; do
+        n=$(( n + 1 ))
+        rc=0
+        timeout -s KILL 60 env "${envs[@]}" nice -n 10 "$dir/fuzz_graph" -rss_limit_mb=4096 -malloc_limit_mb=4096 \
+            -timeout=30 -artifact_prefix="$out/artifacts/" "$f" > "$last" 2>&1 || rc=$?
+        cat "$last" >> "$log"
+        echo "run.sh: $f gives the code $rc" >> "$log"
+        if ! rg -q 'HEXHOST_EINTR=cancel: the queue [0-9]+ stops' "$last"; then
+            [[ $rc == 0 ]] && continue
+            verdict="the code $rc before the stop of the queue"
+        elif ! rg -q 'dspqueue_(read|write) failed: 0x0000002e' "$last"; then
+            verdict="the code $rc and no abort of the read or the write after the stop of the queue"
+        fi
+        break
+    done
+    [[ -z $verdict && ! -f $last ]] && verdict="no graph input"
+    [[ -z $verdict && $rc == 0 ]] && verdict="no graph input makes two dspqueue calls"
+    rm -rf "$out/artifacts" "$last"
+    local -a failed=()
+    local note=""
+    if [[ -n $verdict ]]; then
+        failed=("$f")
+        note=": ${f#"$HERE"/}: $verdict"
+    fi
+    result_line "$dir" queue-cancel "$prof" "$cfg" test "$(( SECONDS - start ))" "$n" "${#failed[@]}" "${failed[@]}"
+    echo "$AREA-$prof-$cfg queue-cancel: $n inputs, ${#failed[@]} findings$note"
+}
+
 # Run the mode $1 (test or fuzz) with the config $2 on the targets that follow, JOBS at a time,
 # for each profile. Gives the code 1 in the test mode when a target has a finding.
 run_mode() {
@@ -302,6 +370,9 @@ run_mode() {
             fi
         done
         wait
+        if [[ $mode == test && " $targets " == *" graph "* ]]; then
+            cancel_one "$prof" "$cfg" >> "$summary"
+        fi
         cat "$summary"
         echo "run.sh: the JSON lines are in $dir/results.jsonl"
         if rg -q ', [1-9][0-9]* findings' "$summary"; then
@@ -482,7 +553,7 @@ phone_commands() {
 # fuse the GDN conv step (the matcher rejects the layout of the app). The program loads full models,
 # thus it has no sanitizer. Gives the code 1 when a run fails.
 graphs_check() {
-    local dir="$REPO/build/fuzz/$AREA-graphs" m model mmproj rc bad=0
+    local dir="$REPO/build/fuzz/$AREA-graphs${BUILD_TAG:+-$BUILD_TAG}" m model mmproj rc bad=0
     refresh_llama
     mkdir -p "$dir/out"
     # Shared libraries, as the app ships them
@@ -506,7 +577,7 @@ graphs_check() {
             name="$m-${labels[i]}"
             rc=0
             # shellcheck disable=SC2086
-            timeout -s KILL 900 env HEXHOST_RS_SEQ="${rs[i]}" "$dir/hexhost_graphs" "$model" ${args[i]} "$dir/out/$name" \
+            timeout -s KILL 900 env HEXHOST_RS_SEQ="${rs[i]}" HEXHOST_EINTR="$TEST_EINTR" "$dir/hexhost_graphs" "$model" ${args[i]} "$dir/out/$name" \
                 > "$dir/out/$name.stdout" 2>&1 || rc=$?
             conv=$(rg -o '^GDN_CONV_STEP [0-9]+' "$dir/out/$name.ops.txt" 2> /dev/null | cut -d' ' -f2 || true)
             echo "$AREA graphs $name: code $rc, ${conv:-0} fused conv steps, $(tail -n 1 "$dir/out/$name.stdout" | rg -o '[0-9]+ fused state chains, [0-9]+ state tail readers in a later split' || echo 'no summary')"

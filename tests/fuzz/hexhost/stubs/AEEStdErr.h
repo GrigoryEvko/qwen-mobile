@@ -13,5 +13,7 @@
 #define AEE_EBADPARM           (AEE_EOFFSET + 0x00E)
 #define AEE_EUNSUPPORTED       (AEE_EOFFSET + 0x014)
 #define AEE_EITEMBUSY          (AEE_EOFFSET + 0x020)
+#define AEE_ENOSUCH            (39)
+#define AEE_EINTERRUPTED       (46)
 #define AEE_EWOULDBLOCK        (516)
 #define AEE_EUNSUPPORTEDAPI    (AEE_EOFFSET + 0x06C)
