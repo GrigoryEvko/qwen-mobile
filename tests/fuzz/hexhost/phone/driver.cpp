@@ -336,6 +336,17 @@ error compare(const std::vector<float> & a, const std::vector<float> & b) {
     return e;
 }
 
+// The absolute tolerance near 0: the smallest normal FP16 value (2^-14). The HVX and HMX kernels
+// compute in FP16 or in qfloat, and they give 0 for a result below that value, where the CPU keeps a
+// very small float. The nmse of such a tensor is large only because its reference is near 0.
+constexpr double k_abs_tol = 6.103515625e-05;
+
+// True when the NPU value differs from the CPU value: a value that is finite on one side only, or an
+// nmse above the limit with a difference above the absolute tolerance.
+bool differs(const error & e, double limit) {
+    return e.nonfinite > 0 || (e.nmse > limit && e.max_abs > k_abs_tol);
+}
+
 // Prints the tensors that differ. The status of each snapshot: 'd' (the error is more than the
 // limit), 'u' (the NPU value is all zero and the CPU value is not: a node that the NPU did not
 // write, for example the first node of a fusion), or 'o'. With mode.nodes the function also
@@ -347,7 +358,7 @@ void print_detail(const run_result & a, const run_result & b, double limit, cons
         const error e     = compare(a.snaps[i].v, b.snaps[i].v);
         const bool  zero  = std::all_of(a.snaps[i].v.begin(), a.snaps[i].v.end(), [](float x) { return x == 0.0f; });
         const bool  czero = std::all_of(b.snaps[i].v.begin(), b.snaps[i].v.end(), [](float x) { return x == 0.0f; });
-        if (e.nonfinite > 0 || e.nmse > limit) {
+        if (differs(e, limit)) {
             st[i] = (zero && !czero) ? 'u' : 'd';
         }
     }
@@ -384,7 +395,7 @@ void print_detail(const run_result & a, const run_result & b, double limit, cons
                 const std::vector<float> ra(a.snaps[i].v.begin() + j * r, a.snaps[i].v.begin() + (j + 1) * r);
                 const std::vector<float> rb(b.snaps[i].v.begin() + j * r, b.snaps[i].v.begin() + (j + 1) * r);
                 const error              er = compare(ra, rb);
-                if (er.nmse > limit || er.nonfinite > 0) {
+                if (differs(er, limit)) {
                     char buf[64];
                     snprintf(buf, sizeof(buf), " row %zu nmse %.3g", j, er.nmse);
                     rows += buf;
@@ -577,15 +588,15 @@ int gdn_sweep(ggml_backend_dev_t dev, ggml_backend_dev_t cpu, double limit) {
                         continue;
                     }
                     std::string line = "attn " + fmt(compare(a.attn, c.attn).nmse);
-                    bool        bad  = compare(a.attn, c.attn).nmse > limit;
+                    bool        bad  = differs(compare(a.attn, c.attn), limit);
                     for (size_t sl = 0; sl < a.slots.size(); sl++) {
                         const error e = compare(a.slots[sl], c.slots[sl]);
                         line += " slot" + std::to_string(sl) + " " + fmt(e.nmse);
-                        bad |= e.nmse > limit || e.nonfinite > 0;
+                        bad |= differs(e, limit);
                     }
                     const error er = compare(a.reader, c.reader);
                     line += " reader " + fmt(er.nmse);
-                    bad |= er.nmse > limit || er.nonfinite > 0;
+                    bad |= differs(er, limit);
                     n_bad += bad;
                     printf("gdn S_v=%lld H=%lld T=%lld K=%lld: %s %s\n", (long long) S_v, (long long) H, (long long) T,
                            (long long) K, bad ? "mismatch" : "ok", line.c_str());
@@ -594,7 +605,7 @@ int gdn_sweep(ggml_backend_dev_t dev, ggml_backend_dev_t cpu, double limit) {
             }
         }
     }
-    printf("gdn summary: %d shapes above the nmse limit %g\n", n_bad, limit);
+    printf("gdn summary: %d shapes above the nmse limit %g (absolute tolerance %g)\n", n_bad, limit, k_abs_tol);
     return n_bad ? 1 : 0;
 }
 
@@ -723,8 +734,10 @@ int main(int argc, char ** argv) {
             n_bad++;
             continue;
         }
+        // The worst snapshot: the worst one that differs when one differs, else the worst of all
         error       worst;
         std::string where = "-";
+        bool        bad   = false;
         size_t      n_val = 0;
         double      mag   = 0.0;
         for (size_t i = 0; i < a.snaps.size(); i++) {
@@ -739,12 +752,17 @@ int main(int argc, char ** argv) {
             if (unwritten) {
                 continue;
             }
-            if (where == "-" || e.nonfinite > worst.nonfinite || (e.nonfinite == worst.nonfinite && e.nmse > worst.nmse)) {
+            const bool d = differs(e, limit);
+            if (bad && !d) {
+                continue;
+            }
+            if (where == "-" || (d && !bad) || e.nonfinite > worst.nonfinite ||
+                (e.nonfinite == worst.nonfinite && e.nmse > worst.nmse)) {
                 worst = e;
                 where = a.snaps[i].name + " step " + std::to_string(a.snaps[i].step);
             }
+            bad |= d;
         }
-        const bool bad = worst.nonfinite > 0 || worst.nmse > limit;
         printf("%s %s: %s, %zu snapshots, %zu values, mean abs %.3g, worst nmse %.3g max abs %.3g nonfinite %zu at %s\n",
                bad ? "mismatch" : "ok", base, a.desc.c_str(), a.snaps.size(), n_val, n_val ? mag / n_val : 0.0,
                worst.nmse, worst.max_abs, worst.nonfinite, where.c_str());
@@ -757,7 +775,7 @@ int main(int argc, char ** argv) {
             remove(last_saved.c_str());
         }
     }
-    printf("summary: %zu of %zu inputs in %.1f s: %zu ok, %zu skip, %zu mismatch or error (nmse limit %g)\n", n_done,
-           files.size(), elapsed(), n_ok, n_skip, n_bad, limit);
+    printf("summary: %zu of %zu inputs in %.1f s: %zu ok, %zu skip, %zu mismatch or error (nmse limit %g, absolute "
+           "tolerance %g)\n", n_done, files.size(), elapsed(), n_ok, n_skip, n_bad, limit, k_abs_tol);
     return n_bad ? 1 : 0;
 }
