@@ -97,10 +97,11 @@ Modes:
                         on its regression inputs (regress/<target>), with no mutation. Then run
                         the graphs mode. A finding gives a nonzero exit code.
   graphs                Build hexhost_graphs (graphs/graphs.cpp, no sanitizer) and run the paths
-                        of the app on the 2B and the 4B Q8_0 of weights/gguf: decode, prefill 512,
-                        the MTP draft step and the image turn at 576 and 768 image tokens. A run
-                        fails when a llama_decode fails or a node of a later split reads the state
-                        tail of a fused GDN state chain.
+                        of the app on the 2B and the 4B Q8_0 of weights/gguf: decode, decode with
+                        4 recurrent state snapshots, prefill 512, the MTP draft step and the image
+                        turn at 576 and 768 image tokens. A run fails when a llama_decode fails, a
+                        node of a later split reads the state tail of a fused GDN state chain, or a
+                        decode path does not fuse the GDN conv step.
   fuzz <config>         Build, then fuzz each target for the budget. A crash does not stop the
                         target: it starts again until the budget ends.
   phone-build <config>  Build the phone driver (phone/driver.cpp) and the ggml libraries for arm64
@@ -480,10 +481,12 @@ phone_commands() {
 
 # ---- The model graphs
 
-# Build hexhost_graphs and run it on the paths of the app: decode, prefill 512, the MTP draft step and
-# the image turn at 576 and 768 image tokens, on the 2B and on the 4B Q8_0. A run fails when a
-# llama_decode fails or a node of a later split reads the state tail of a fused GDN state chain. The
-# program loads full models, thus it has no sanitizer. Gives the code 1 when a run fails.
+# Build hexhost_graphs and run it on the paths of the app: decode, decode with the 4 recurrent state
+# snapshots of speculative decoding, prefill 512, the MTP draft step and the image turn at 576 and
+# 768 image tokens, on the 2B and on the 4B Q8_0. A run fails when a llama_decode fails, when a node
+# of a later split reads the state tail of a fused GDN state chain, or when a decode path does not
+# fuse the GDN conv step (the matcher rejects the layout of the app). The program loads full models,
+# thus it has no sanitizer. Gives the code 1 when a run fails.
 graphs_check() {
     local dir="$REPO/build/fuzz/$AREA-graphs" m model mmproj rc bad=0
     refresh_llama
@@ -501,15 +504,22 @@ graphs_check() {
             echo "$AREA graphs $m: skip, $model or $mmproj does not exist"
             continue
         fi
-        local -a labels=("decode" "prefill" "mtp" "vision576" "vision768")
-        local -a args=("decode" "prefill 512" "mtp 8" "vision $mmproj 576" "vision $mmproj 768")
-        local i name
+        local -a labels=("decode" "decode-rs4" "prefill" "mtp" "vision576" "vision768")
+        local -a args=("decode" "decode" "prefill 512" "mtp 8" "vision $mmproj 576" "vision $mmproj 768")
+        local -a rs=(0 4 0 0 0 0)
+        local i name conv
         for i in "${!labels[@]}"; do
             name="$m-${labels[i]}"
             rc=0
             # shellcheck disable=SC2086
-            timeout -s KILL 900 "$dir/hexhost_graphs" "$model" ${args[i]} "$dir/out/$name" > "$dir/out/$name.stdout" 2>&1 || rc=$?
-            echo "$AREA graphs $name: code $rc, $(tail -n 1 "$dir/out/$name.stdout" | rg -o '[0-9]+ fused state chains, [0-9]+ state tail readers in a later split' || echo 'no summary')"
+            timeout -s KILL 900 env HEXHOST_RS_SEQ="${rs[i]}" "$dir/hexhost_graphs" "$model" ${args[i]} "$dir/out/$name" \
+                > "$dir/out/$name.stdout" 2>&1 || rc=$?
+            conv=$(rg -o '^GDN_CONV_STEP [0-9]+' "$dir/out/$name.ops.txt" 2> /dev/null | cut -d' ' -f2 || true)
+            echo "$AREA graphs $name: code $rc, ${conv:-0} fused conv steps, $(tail -n 1 "$dir/out/$name.stdout" | rg -o '[0-9]+ fused state chains, [0-9]+ state tail readers in a later split' || echo 'no summary')"
+            if [[ ${labels[i]} == decode* && -z $conv ]]; then
+                echo "$AREA graphs $name: the host does not fuse the GDN conv step of the app"
+                rc=1
+            fi
             [[ $rc == 0 ]] || bad=1
         done
     done

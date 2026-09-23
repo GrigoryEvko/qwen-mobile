@@ -1,0 +1,39 @@
+hexagon: reject a GDN conv chain when its slot stride is less than a slot
+Fold-into: patches/hexagon-fusion/0007-hexagon-htp-gdn-fusions-with-rollback-slots.patch
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+With rollback snapshots, the GDN conv chain writes one row of the conv
+cache into each snapshot slot. The fused op writes the slots from one base
+address and one stride. The matcher takes the distance between two
+adjacent slots as the stride, but it did not compare that stride with the
+size of a slot. Thus it accepted slots with an overlap, for example two
+slots 144 bytes apart with a slot of 288 bytes. The DSP rejects such a
+stride with the status 4, and the compute of the graph then fails.
+
+This patch rejects the fused op when the stride is less than the size of a
+slot. The chain then stays with the unfused ops, and each CPY writes its
+own slot.
+
+On the model graphs of the app, the stride of the snapshot slots is equal
+to the size of a slot, on the 2B and on the 4B. Thus the decode path with
+4 snapshots fuses the conv step as before. hexhost_graphs gives the same
+ops with and without this patch on the decode, prefill, MTP and image
+paths. The check is one comparison when a graph is new to the graph cache.
+
+diff --git a/ggml/src/ggml-hexagon/htp-gdn-match.h b/ggml/src/ggml-hexagon/htp-gdn-match.h
+index 76827fc..910dcaa 100644
+--- a/ggml/src/ggml-hexagon/htp-gdn-match.h
++++ b/ggml/src/ggml-hexagon/htp-gdn-match.h
+@@ -423,6 +423,11 @@ static inline const char * ggml_hexagon_gdn_conv_chain_check(const ggml_cgraph *
+             }
+         }
+     }
++    // The fused op writes the slots from one base and one stride, and the DSP rejects a stride that
++    // is less than the size of a slot. Thus slots with an overlap stay with the unfused ops.
++    if (n_slots > 1 && stride < (size_t) row * sizeof(float)) {
++        return "the slot stride is less than a slot";
++    }
+ 
+     ggml_tensor * P    = cpys[0];
+     ggml_tensor * last = P->src[0];

@@ -23,6 +23,8 @@
 // later split.
 // Environment: GGML_HEXAGON_* as for the app. HEXHOST_IGNORE lists the checks of the fake DSP
 // that do not stop the run (refer to run.sh). HEXHOST_TOUCH=1 makes the fake DSP write the outputs.
+// HEXHOST_RS_SEQ=N gives the decode and prefill modes N recurrent state snapshots, as the app has
+// with speculative decoding (the mtp mode always has 4).
 // The fake DSP has 6 HVX threads, 1 HMX unit and 8 MB of VTCM, as the v79 NPU of the phone.
 
 #include "dsp_model.h"
@@ -457,7 +459,8 @@ int main(int argc, char ** argv) {
     cp.n_batch = 512;
     cp.n_ubatch = 512;
     // The app keeps as many recurrent state snapshots as the longest draft (4)
-    cp.n_rs_seq = mtp ? 4 : 0;
+    const char * rs_seq = getenv("HEXHOST_RS_SEQ");
+    cp.n_rs_seq = mtp ? 4 : (rs_seq ? (uint32_t) atoi(rs_seq) : 0);
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) {
         fprintf(stderr, "hexhost_graphs: cannot make a context\n");
