@@ -26,7 +26,10 @@ set(GGML_HEXAGON OFF CACHE BOOL "" FORCE)
 set(GGML_OPENCL OFF CACHE BOOL "" FORCE)
 set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
 set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
-set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
+# The common library holds the MTP draft driver (common/speculative), and the mtmd library the
+# vision encoder: the two paths of the app beside the decode and the prefill
+set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_MTMD ON CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -41,4 +44,5 @@ target_include_directories(hexhost_graphs PRIVATE "${H}/stubs" "${H}/common" "${
                            "${HEXHOST_LLAMA_DIR}/ggml/src" "${HEXHOST_LLAMA_DIR}/ggml/include")
 target_compile_definitions(hexhost_graphs PRIVATE HEXHOST_ASYNC_DSP=0 _GNU_SOURCE)
 target_compile_options(hexhost_graphs PRIVATE -w)
-target_link_libraries(hexhost_graphs PRIVATE llama ggml ggml-base ggml-cpu)
+target_link_libraries(hexhost_graphs PRIVATE llama-common mtmd llama ggml ggml-base ggml-cpu)
+target_include_directories(hexhost_graphs PRIVATE "${HEXHOST_LLAMA_DIR}/common" "${HEXHOST_LLAMA_DIR}/tools/mtmd")

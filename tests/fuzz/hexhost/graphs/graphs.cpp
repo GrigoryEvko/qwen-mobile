@@ -2,8 +2,9 @@
 //
 // The program registers the host part of the Hexagon backend (ggml-hexagon.cpp, built against
 // the stub SDK and the fake DSP of tests/fuzz/hexhost/common) as the device HTP0, loads a GGUF
-// model onto it, and runs one llama_decode: a batch of prompt tokens (prefill) or one token
-// (decode). It writes:
+// model onto it, and runs the graphs of one path of the app: a batch of prompt tokens (prefill),
+// one token (decode), the MTP draft and its verify batch (mtp), or the vision encoder of an mmproj
+// on HTP0 for three photo shapes (vision). It writes:
 //   - each supports_op decision of HTP0: the op, its type and shape, its source types and
 //     shapes, and the answer (one line each, sorted and without duplicates)
 //   - the count of each HTP op that the host sends to the DSP (the fused ops included)
@@ -12,7 +13,7 @@
 //     product through a view (that node reads bytes that no op wrote)
 // The fake DSP runs the checks of dsp_model.cpp on each op. It computes no values.
 //
-//   hexhost_graphs MODEL.gguf {prefill N | decode} OUT_PREFIX
+//   hexhost_graphs MODEL.gguf {prefill N | decode | mtp N_PROMPT | vision MMPROJ MAX_TOKENS} OUT_PREFIX
 //
 // Outputs: OUT_PREFIX.supports.txt, OUT_PREFIX.ops.txt, OUT_PREFIX.log.txt, OUT_PREFIX.hazards.txt.
 // Environment: GGML_HEXAGON_* as for the app. HEXHOST_IGNORE lists the checks of the fake DSP
@@ -28,6 +29,9 @@
 #include "ggml-backend-impl.h"
 #include "ggml-hexagon.h"
 #include "llama.h"
+#include "mtmd.h"
+#include "speculative.h"
+#include "common.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -171,17 +175,153 @@ template <typename C> bool write_lines(const std::string & path, const C & lines
     return true;
 }
 
+// A batch of tokens from position pos0 in sequence 0, each with logits, as the app decodes a step.
+llama_batch make_batch(const std::vector<llama_token> & toks, llama_pos pos0) {
+    llama_batch b = llama_batch_init((int32_t) toks.size(), 0, 1);
+    b.n_tokens    = (int32_t) toks.size();
+    for (size_t i = 0; i < toks.size(); i++) {
+        b.token[i]     = toks[i];
+        b.pos[i]       = pos0 + (llama_pos) i;
+        b.n_seq_id[i]  = 1;
+        b.seq_id[i][0] = 0;
+        b.logits[i]    = 1;
+    }
+    return b;
+}
+
+// The MTP draft path of the app: a target context with 4 recurrent state snapshots, a prompt, the
+// draft context of the MTP block (common_speculative, type draft-mtp), one draft of up to 4
+// tokens, and the verify batch of the target (1 + the draft). Gives the llama_decode code.
+int run_mtp(llama_model * model, llama_context * ctx, const std::string & model_path, int n_prompt) {
+    const int32_t            n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    std::vector<llama_token> prompt(n_prompt);
+    for (int i = 0; i < n_prompt; i++) {
+        prompt[i] = (llama_token) ((1000 + 7 * i) % n_vocab);
+    }
+    // The draft driver comes first, as setup_speculative of the app: it makes the target context
+    // keep the hidden states that the MTP block reads
+    common_params params;
+    params.model.path              = model_path;
+    params.n_ctx                   = (int32_t) llama_n_ctx(ctx);
+    params.n_batch                 = (int32_t) llama_n_batch(ctx);
+    params.n_ubatch                = (int32_t) llama_n_ubatch(ctx);
+    params.n_parallel              = 1;
+    params.kv_unified              = true;
+    params.speculative.types       = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    params.speculative.draft.n_max = 4;
+    common_params params_dft       = common_base_params_to_speculative(params);
+    auto          init             = common_speculative_init_from_params(params_dft, model, ctx);
+    llama_context * ctx_dft        = init ? init->context() : nullptr;
+    if (!ctx_dft) {
+        fprintf(stderr, "hexhost_graphs: the MTP draft context did not initialize (does the model hold the MTP block?)\n");
+        return -1;
+    }
+    params.speculative.draft.ctx_tgt = ctx;
+    params.speculative.draft.ctx_dft = ctx_dft;
+    common_speculative * spec        = common_speculative_init(params.speculative, 1);
+    if (!spec) {
+        fprintf(stderr, "hexhost_graphs: the speculative driver did not initialize\n");
+        return -1;
+    }
+
+    // The prompt, then the draft context follows it (spec_follow of the app)
+    llama_batch bp = make_batch(prompt, 0);
+    int         rc = llama_decode(ctx, bp);
+    if (rc == 0) {
+        common_speculative_process(spec, bp);
+    }
+    llama_batch_free(bp);
+    if (rc != 0) {
+        common_speculative_free(spec);
+        return rc;
+    }
+    common_speculative_begin(spec, 0, prompt);
+
+    llama_tokens draft;
+    common_speculative_get_draft_params(spec, 0) = { true, 4, (llama_pos) n_prompt, prompt.back(), &prompt, &draft };
+    common_speculative_draft(spec);
+    llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, n_prompt, -1);
+
+    std::vector<llama_token> verify = { prompt.back() };
+    verify.insert(verify.end(), draft.begin(), draft.end());
+    llama_batch bv = make_batch(verify, (llama_pos) n_prompt);
+    rc             = llama_decode(ctx, bv);
+    if (rc == 0) {
+        common_speculative_process(spec, bv);
+        common_speculative_accept(spec, 0, 0);
+    }
+    llama_batch_free(bv);
+    printf("hexhost_graphs: the MTP draft gave %zu tokens\n", draft.size());
+    common_speculative_free(spec);
+    return rc;
+}
+
+// The vision encoder of the app on HTP0: the mmproj with the image token limit of the app, and
+// three photo shapes (4:3, 16:9 and 1:1) of random pixels. Gives 0 when each image encodes.
+int run_vision(llama_model * model, ggml_backend_dev_t htp, const std::string & mmproj, int max_tokens) {
+    mtmd_context_params vp = mtmd_context_params_default();
+    vp.use_gpu             = true;
+    vp.device              = htp;
+    vp.n_threads           = 4;
+    vp.print_timings       = false;
+    vp.warmup              = false;
+    vp.image_max_tokens    = max_tokens;
+    mtmd_context * mctx    = mtmd_init_from_file(mmproj.c_str(), model, vp);
+    if (!mctx) {
+        fprintf(stderr, "hexhost_graphs: the vision projector did not load: %s\n", mmproj.c_str());
+        return -1;
+    }
+    int rc = 0;
+    for (const auto & wh : std::vector<std::pair<uint32_t, uint32_t>>{ { 1024, 768 }, { 1280, 720 }, { 800, 800 } }) {
+        std::vector<unsigned char> rgb((size_t) wh.first * wh.second * 3);
+        uint32_t                   x = 12345;
+        for (auto & c : rgb) {
+            x = x * 1103515245u + 12345u;
+            c = (unsigned char) (x >> 24);
+        }
+        mtmd_bitmap *        bmp    = mtmd_bitmap_init(wh.first, wh.second, rgb.data());
+        mtmd_input_chunks *  chunks = mtmd_input_chunks_init();
+        const std::string    text   = std::string("describe ") + mtmd_default_marker();
+        mtmd_input_text      in     = { text.c_str(), text.size(), true, true };
+        const mtmd_bitmap *  bmps[] = { bmp };
+        int                  t      = mtmd_tokenize(mctx, chunks, &in, bmps, 1);
+        for (size_t i = 0; t == 0 && i < mtmd_input_chunks_size(chunks); i++) {
+            const mtmd_input_chunk * ch = mtmd_input_chunks_get(chunks, i);
+            if (mtmd_input_chunk_get_type(ch) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+                t = mtmd_encode_chunk(mctx, ch);
+            }
+        }
+        printf("hexhost_graphs: image %ux%u: %s\n", wh.first, wh.second, t == 0 ? "encoded" : "failed");
+        rc |= t;
+        mtmd_input_chunks_free(chunks);
+        mtmd_bitmap_free(bmp);
+    }
+    mtmd_free(mctx);
+    return rc;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
-    if (argc < 4 || (strcmp(argv[2], "prefill") == 0 && argc < 5)) {
-        fprintf(stderr, "Usage: %s MODEL.gguf {prefill N | decode} OUT_PREFIX\n", argv[0]);
+    const char * usage = "Usage: %s MODEL.gguf {prefill N | decode | mtp N_PROMPT | vision MMPROJ MAX_TOKENS} OUT_PREFIX\n";
+    if (argc < 4) {
+        fprintf(stderr, usage, argv[0]);
         return 2;
     }
     const std::string model_path = argv[1];
-    const bool        prefill    = strcmp(argv[2], "prefill") == 0;
-    const int         n_tokens   = prefill ? atoi(argv[3]) : 1;
-    const std::string out        = argv[prefill ? 4 : 3];
+    const std::string kind       = argv[2];
+    const bool        prefill    = kind == "prefill";
+    const bool        mtp        = kind == "mtp";
+    const bool        vision     = kind == "vision";
+    const int         n_args     = vision ? 6 : (prefill || mtp) ? 5 : 4;
+    if ((!prefill && !mtp && !vision && kind != "decode") || argc < n_args) {
+        fprintf(stderr, usage, argv[0]);
+        return 2;
+    }
+    const int         n_tokens   = (prefill || mtp) ? atoi(argv[3]) : 1;
+    const std::string mmproj     = vision ? argv[3] : "";
+    const int         max_tokens = vision ? atoi(argv[4]) : 0;
+    const std::string out        = argv[n_args - 1];
     if (n_tokens < 1) {
         fprintf(stderr, "hexhost_graphs: the token count must be positive\n");
         return 2;
@@ -222,6 +362,7 @@ int main(int argc, char ** argv) {
     ggml_backend_dev_t devs[2] = { htp, nullptr };
     mp.devices      = devs;
     mp.n_gpu_layers = 999;
+    mp.load_mtp     = mtp;
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mp);
     if (!model) {
         fprintf(stderr, "hexhost_graphs: cannot load %s\n", model_path.c_str());
@@ -232,6 +373,8 @@ int main(int argc, char ** argv) {
     cp.n_ctx   = 512;
     cp.n_batch = 512;
     cp.n_ubatch = 512;
+    // The app keeps as many recurrent state snapshots as the longest draft (4)
+    cp.n_rs_seq = mtp ? 4 : 0;
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) {
         fprintf(stderr, "hexhost_graphs: cannot make a context\n");
@@ -240,14 +383,21 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // The ops of the one decode: the counters of the fake DSP from here
+    // The ops of the graphs: the counters of the fake DSP from here
     fakedsp::reset_record();
-    std::vector<llama_token> toks(n_tokens);
     const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
-    for (int i = 0; i < n_tokens; i++) {
-        toks[i] = (llama_token) ((1000 + 7 * i) % n_vocab);
+    int           rc      = 0;
+    if (mtp) {
+        rc = run_mtp(model, ctx, model_path, n_tokens);
+    } else if (vision) {
+        rc = run_vision(model, htp, mmproj, max_tokens);
+    } else {
+        std::vector<llama_token> toks(n_tokens);
+        for (int i = 0; i < n_tokens; i++) {
+            toks[i] = (llama_token) ((1000 + 7 * i) % n_vocab);
+        }
+        rc = llama_decode(ctx, llama_batch_get_one(toks.data(), n_tokens));
     }
-    int rc = llama_decode(ctx, llama_batch_get_one(toks.data(), n_tokens));
     llama_synchronize(ctx);
 
     // The count of each HTP op, and for each matmul op also its kernel type, the kernel params of
