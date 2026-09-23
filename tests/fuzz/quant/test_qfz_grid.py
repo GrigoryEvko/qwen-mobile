@@ -14,8 +14,6 @@ The properties:
 - block_error agrees with quantize and dequantize.
 - A value that is not finite, or a block beyond the F16 scale range, gives
   ValueError (qfz_common.scale_domain).
-
-The inputs of the open finding QF2 are excluded. Refer to qfz_common.
 """
 
 from __future__ import annotations
@@ -25,7 +23,7 @@ import dataclasses
 import numpy as np
 import pytest
 import torch
-from hypothesis import assume, example, given
+from hypothesis import example, given
 from hypothesis import strategies as st
 
 import gguf
@@ -231,11 +229,6 @@ def test_results_do_not_depend_on_the_row_chunk(spec, chunk: int, kind: str) -> 
 def test_block_error_agrees_with_the_round_trip(spec, kind: str, seed: int) -> None:
     """block_error is the weighted squared error of quantize with the same weights, then dequantize."""
     w = spec.build()
-    if known_open("QF2"):
-        # QF2: a scale that rounds to zero in F16 and an exact zero in its block give an IndexError.
-        d_rtn = np.abs(_amax(w)) / float(abs(GRIDS[kind]().top))
-        zero_in_block = (block_view(w) == 0).any(-1)
-        assume(not (((d_rtn * 0.55) < 2.0 ** -24) & (d_rtn > 0) & zero_in_block).any())
     grid = GRIDS[kind]()
     wt = torch.from_numpy(w)
     weights = torch.rand(w.shape[1], generator=torch.Generator().manual_seed(seed)) + 0.05

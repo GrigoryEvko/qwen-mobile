@@ -65,8 +65,14 @@ class Grid:
         return self.levels[idx]
 
     def quantize_blocks(self, blocks: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
-        """Indices [rows, nblocks, 32] for the scales d [rows, nblocks]."""
-        return self.round(blocks / d[..., None])
+        """Indices [rows, nblocks, 32] for the scales d [rows, nblocks].
+
+        The F16 rounding of a very small scale gives zero, and a zero scale
+        decodes its block to zero. The division uses 1 in place of such a
+        scale, thus 0/0 gives no NaN, and the cast to int32 has a defined
+        result. Complexity is O(elements).
+        """
+        return self.round(blocks / torch.where(d == 0, torch.ones_like(d), d)[..., None])
 
 
 class Q4_0Grid(Grid):

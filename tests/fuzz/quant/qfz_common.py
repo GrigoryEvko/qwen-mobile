@@ -66,7 +66,6 @@ LLAMA_BIN = san_dir() / "llama" / "bin"
 
 # The open findings of the campaign. The regression tests give the file, the line and the example.
 KNOWN_FINDINGS = {
-    "QF2": "Q4_0Grid.round casts NaN to int32, and a zero or NaN scale gives an IndexError",
     "QF3": "pack_nibbles and the export accept a pack with indices out of 0..15 or with a wrong shape",
     "QF4": "the export copies general.alignment, but the writer keeps the alignment 32",
     "QF5": "the export of a source with an empty array field fails after the header is on the disk",

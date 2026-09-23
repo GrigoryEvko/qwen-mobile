@@ -86,13 +86,13 @@ def test_qf1_q4_0_refuses_a_block_beyond_the_scale_range() -> None:
         quantize(Q4_0Grid(), w, search=True)
 
 
-# --- QF2: NaN to int32 in Q4_0Grid.round --------------------------------------------------------
+# --- QF2 (task #167): a zero F16 scale ------------------------------------------------------------
 
-@xfail_open("QF2", "a scale that rounds to zero in F16 and an exact zero give an IndexError in block_error")
 def test_qf2_block_error_of_a_tiny_block_with_a_zero() -> None:
-    """quant/grids.py:82 and quant/grid.py:115: 0/0 is NaN, NaN to int32 is -2^31, levels[-2^31] raises.
+    """block_error of a block whose scale rounds to zero in F16 is the energy of the block.
 
-    The zero scale decodes the block to zero, thus the correct error is the energy of the block.
+    0/0 gave NaN, NaN to int32 gave -2^31, and levels[-2^31] raised
+    IndexError. The zero scale decodes the block to zero.
     """
     w = torch.zeros(1, 32)
     w[0, 0], w[0, 1] = 1e-7, -5e-8
