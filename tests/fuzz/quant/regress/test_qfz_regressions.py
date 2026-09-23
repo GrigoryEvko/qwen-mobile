@@ -142,11 +142,14 @@ def test_qf4_export_of_a_source_with_a_custom_alignment_loads(tmp_path: Path) ->
         assert ggml_loader_status(out)[0] == 0, "the ggml loader refuses the export"
 
 
-# --- QF5: an empty array in the source ------------------------------------------------------------
+# --- QF5 (task #168): an empty array in the source --------------------------------------------------
 
-@xfail_open("QF5", "an empty array field makes the writer raise after the header is on the disk")
 def test_qf5_export_of_a_source_with_an_empty_array(tmp_path: Path) -> None:
-    """quant/export.py:295-300, 381-382: the export must copy the empty array, or refuse before it writes."""
+    """The export copies an empty array field, or refuses it and leaves no partial file.
+
+    Without the fix the writer raised after the header was on the disk, and
+    a file of 24 bytes stayed.
+    """
     gen = np.random.default_rng(1)
     raw = build_file(
         [("general.architecture", string_value("qwen35")), ("qfz.empty", array_value(5, b"", 0))],

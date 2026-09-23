@@ -290,7 +290,9 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
     if tie_head and (folds is None or "output_norm.weight" not in folds.files):
         out_norm = np.ones_like(out_norm)
 
-    writer = gguf.GGUFWriter(str(out_gguf), arch)
+    # The writer writes a temporary file, and the export renames it at the end, thus a failure leaves no partial file.
+    partial = out_gguf.with_name(out_gguf.name + ".partial")
+    writer = gguf.GGUFWriter(str(partial), arch)
     # general.alignment goes through add_custom_alignment: a plain copy of the key does not move the data.
     skip = {"general.architecture", "general.file_type", "general.alignment", "GGUF.version", "GGUF.tensor_count",
             "GGUF.kv_count"}
@@ -298,6 +300,10 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
         if key in skip:
             continue
         vtype = field.types[0]
+        if vtype == gguf.GGUFValueType.ARRAY and len(field.types) == 1:
+            raise ValueError(f"the metadata field {key} is an empty array, which gguf-py cannot write")
+        if vtype == gguf.GGUFValueType.ARRAY and field.types[1] == gguf.GGUFValueType.ARRAY:
+            raise ValueError(f"the metadata field {key} is an array of arrays, which the export cannot copy")
         sub_type = field.types[-1] if vtype == gguf.GGUFValueType.ARRAY else None
         writer.add_key_value(key, field.contents(), vtype, sub_type=sub_type)
     if "general.alignment" in reader.fields:
@@ -385,10 +391,14 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
             kind = f"keep {t.tensor_type.name}"
         counts[kind] = counts.get(kind, 0) + 1
 
-    writer.write_header_to_file()
-    writer.write_kv_data_to_file()
-    writer.write_tensors_to_file(progress=False)
-    writer.close()
+    try:
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file(progress=False)
+        writer.close()
+        partial.replace(out_gguf)
+    finally:
+        partial.unlink(missing_ok=True)
     if refold is not None:
         for note in refold.notes:
             print(f"  refold {note}")
