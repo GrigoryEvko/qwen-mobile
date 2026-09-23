@@ -22,11 +22,14 @@
 #   2. Builds the executable of each ctest test.
 #   3. Writes the tiny model with a real tokenizer (make-vocab-model.py) to
 #      build/fuzz/matrix/models/tiny-llama-spm.gguf, if it is not there.
-#   4. Runs ctest in two steps. First test-generate-models, which writes the
-#      generated models of each architecture to <build>/tests/test-models.
-#      Then each other test, less the tests of tests/suite/llama-exclude.tsv.
-#      The tests with the label "model" get LLAMACPP_TEST_MODELFILE of the
-#      tiny model. Without it, they skip and give a false pass.
+#   4. Runs ctest in three steps. First test-generate-models, which writes
+#      the generated models of each architecture to <build>/tests/test-models.
+#      Then each other test in parallel, less the tests of
+#      tests/suite/llama-exclude.tsv and less test-opt and test-barrier. Then
+#      test-opt and test-barrier one at a time: they start their own thread
+#      pools. The tests with the label "model" get LLAMACPP_TEST_MODELFILE of
+#      the tiny model. Without it, they skip and give a false pass. Each
+#      test that reads LLAMA_ARG_THREADS gets 8 threads (SUITE_TEST_THREADS).
 #   5. The local-model step runs the tests that need the model download of
 #      upstream (test-thread-safety, test-state-restore-fragmented) and each
 #      sub-test of test-backend-sampler, with the tiny model.
@@ -57,6 +60,12 @@ declare -A SAMPLER_EXCLUDE=(
     [logit_bias]="Needs a trained model: the test asserts that a +10 logit bias wins a dist sample. With random weights the top logits are higher than the biased logit. The upstream fixture downloads stories15M."
 )
 
+# The threads of each test that reads LLAMA_ARG_THREADS.
+readonly TEST_THREADS="${SUITE_TEST_THREADS:-8}"
+# The tests that choose their thread count themselves (test-opt uses
+# hardware_concurrency() / 2) or measure the thread pool (test-barrier). They
+# run one at a time after the parallel step.
+readonly SERIAL_REGEX='^(test-opt|test-barrier)$'
 CONFIG=""
 PROFILE=""
 PHASE="all"
@@ -148,11 +157,12 @@ configure() {
 # Build the executable of each ctest test that the build directory makes.
 # Before the build, ctest --show-only gives no command for a test, because
 # the executable does not exist. Thus the target names come from the
-# resolved paths in tests/CTestTestfile.cmake.
+# resolved paths in tests/CTestTestfile.cmake. CMake 4.3 writes the test
+# name as [=[name]=], CMake 4.4 as "name", thus the pattern takes the two.
 build_tests() {
     local targets
-    mapfile -t targets < <(rg -o --no-filename -r '$1' \
-        "add_test\\(\\[=\\[[^]]+\\]=\\] \"${BUILD}/bin/([^\"/]+)\"" \
+    mapfile -t targets < <(rg -o --no-filename -r '$2' \
+        "add_test\\((\\[=\\[[^]]+\\]=\\]|\"[^\"]+\") \"${BUILD}/bin/([^\"/]+)\"" \
         "$BUILD/tests/CTestTestfile.cmake" | sort -u)
     [[ ${#targets[@]} -gt 0 ]] || suite_die "$PROFILE-$CONFIG: ctest lists no test. Refer to $BUILD/configure.log."
     suite_log "$PROFILE-$CONFIG: build ${#targets[@]} test executables with $JOBS jobs."
@@ -308,6 +318,13 @@ run_tests() {
     rm -f "$RESULTS"
     mkdir -p "$OUT/logs"
     sanitizer_env "$CONFIG"
+    # The tests that take their parameters from common_params use
+    # cpu_get_num_math() threads, which is the count of the physical cores
+    # (192 on a 2-socket build server). ggml then spins at each barrier with
+    # that many threads, and under a loaded host a test that takes seconds
+    # on 8 threads runs for more than 15 minutes. A fixed count also makes
+    # the runs the same on each host.
+    export LLAMA_ARG_THREADS="$TEST_THREADS" LLAMA_ARG_THREADS_BATCH="$TEST_THREADS"
 
     local exclude_names=() exclude_regex failed=0 name reason
     while IFS=$'\t' read -r name reason; do
@@ -328,7 +345,11 @@ run_tests() {
 
     suite_log "$PROFILE-$CONFIG: ctest step 2, the other tests, $TEST_JOBS in parallel, timeout $(test_timeout) s each."
     LLAMACPP_TEST_MODELFILE="$TINY_MODEL" run_ctest main \
-        -E "$exclude_regex|^test-generate-models\$" -FS generate-models -j "$TEST_JOBS" || failed=1
+        -E "$exclude_regex|^test-generate-models\$|$SERIAL_REGEX" -FS generate-models -j "$TEST_JOBS" || failed=1
+
+    suite_log "$PROFILE-$CONFIG: ctest step 3, the tests that start their own thread pools, one at a time."
+    LLAMACPP_TEST_MODELFILE="$TINY_MODEL" run_ctest serial \
+        -R "$SERIAL_REGEX" -E "$exclude_regex" -FS generate-models -j 1 || failed=1
 
     suite_log "$PROFILE-$CONFIG: the local-model step."
     run_local_model_tests || failed=1
