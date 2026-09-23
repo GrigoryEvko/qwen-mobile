@@ -2,6 +2,7 @@ package ai.airi.qwenmobile
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -83,23 +84,36 @@ class SettingsStore private constructor(context: Context) {
         stateFlow.value = next
     }
 
+    /**
+     * The value of one key, or [default] when the file holds a value of
+     * another type there. SharedPreferences then throws ClassCastException,
+     * and read() runs in the constructor of the store, thus one such value
+     * stops the app at each start (task #94).
+     */
+    private inline fun <T> readOr(key: String, default: T, get: () -> T): T = try {
+        get()
+    } catch (e: ClassCastException) {
+        Log.w(FILE, "The setting $key has a value of a wrong type, the default is used", e)
+        default
+    }
+
     private fun read(): AppSettings = sanitize(
         AppSettings(
-            modelPath = prefs.getString(KEY_MODEL, null),
-            backend = prefs.getString(KEY_BACKEND, null)?.let { name ->
+            modelPath = readOr(KEY_MODEL, null) { prefs.getString(KEY_MODEL, null) },
+            backend = readOr(KEY_BACKEND, null) { prefs.getString(KEY_BACKEND, null) }?.let { name ->
                 Backend.entries.firstOrNull { it.name == name }
             } ?: defaultBackend(),
-            threads = prefs.getInt(KEY_THREADS, 4),
-            nCtx = prefs.getInt(KEY_N_CTX, 8192),
-            visionOnGpu = prefs.getBoolean(KEY_VISION_GPU, false),
-            imageDetail = prefs.getString(KEY_IMAGE_DETAIL, null)?.let { name ->
+            threads = readOr(KEY_THREADS, 4) { prefs.getInt(KEY_THREADS, 4) },
+            nCtx = readOr(KEY_N_CTX, 8192) { prefs.getInt(KEY_N_CTX, 8192) },
+            visionOnGpu = readOr(KEY_VISION_GPU, false) { prefs.getBoolean(KEY_VISION_GPU, false) },
+            imageDetail = readOr(KEY_IMAGE_DETAIL, null) { prefs.getString(KEY_IMAGE_DETAIL, null) }?.let { name ->
                 ImageDetail.entries.firstOrNull { it.name == name }
             } ?: ImageDetail.DEFAULT,
-            thinking = prefs.getBoolean(KEY_THINKING, false),
-            temperature = prefs.getFloat(KEY_TEMPERATURE, DEFAULT_TEMPERATURE),
-            topP = prefs.getFloat(KEY_TOP_P, DEFAULT_TOP_P),
-            speculative = prefs.getBoolean(KEY_SPECULATIVE, false),
-            systemPrompt = prefs.getString(KEY_SYSTEM_PROMPT, null) ?: "",
+            thinking = readOr(KEY_THINKING, false) { prefs.getBoolean(KEY_THINKING, false) },
+            temperature = readOr(KEY_TEMPERATURE, DEFAULT_TEMPERATURE) { prefs.getFloat(KEY_TEMPERATURE, DEFAULT_TEMPERATURE) },
+            topP = readOr(KEY_TOP_P, DEFAULT_TOP_P) { prefs.getFloat(KEY_TOP_P, DEFAULT_TOP_P) },
+            speculative = readOr(KEY_SPECULATIVE, false) { prefs.getBoolean(KEY_SPECULATIVE, false) },
+            systemPrompt = readOr(KEY_SYSTEM_PROMPT, null) { prefs.getString(KEY_SYSTEM_PROMPT, null) } ?: "",
         ),
     )
 

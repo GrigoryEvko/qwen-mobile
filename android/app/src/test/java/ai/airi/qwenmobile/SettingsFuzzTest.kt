@@ -163,20 +163,19 @@ class SettingsFuzzTest {
     }
 
     /**
-     * Finding settings-wrong-type: a value of a wrong type in the preferences
-     * file throws ClassCastException from read(), which runs in the
-     * constructor of the store. The store is made on the first screen, thus
-     * the app dies at each start until the file goes.
+     * A value of a wrong type in the preferences file gives the default of
+     * its key (finding settings-wrong-type, task #94). read() runs in the
+     * constructor of the store, which the first screen makes: a
+     * ClassCastException there stops the app at each start.
      */
     @Test
     fun aValueOfAWrongTypeDoesNotStopTheRead() {
-        FuzzSwitch.requireFindings("settings-wrong-type")
         val rnd = Random(FuzzSwitch.seed + 12)
         val failures = ArrayList<String>()
         for ((constant, type) in keyTypes) {
             val k = key(constant)
             try {
-                read(mapOf(k to wrongValue(rnd, type)))
+                assertInRange(read(mapOf(k to wrongValue(rnd, type))), k)
             } catch (t: Throwable) {
                 failures += "$k: $t"
             }
