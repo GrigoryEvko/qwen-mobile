@@ -150,3 +150,6 @@ fuzz-matrix/0003-tests-give-the-tensors-of-test-barrier-defined-data.patch
 # memory: the output limit of a context. llama_decode refuses a batch that asks for more
 # logits rows than n_outputs_max with an error code, not with an abort.
 memory/0001-llama-refuse-a-batch-with-more-outputs-than-n-outputs-max.patch
+# memory: a quantized V cache with flash attention AUTO keeps the probe of the device of each attention
+# layer, and the context creation fails when a layer cannot run flash attention on its device.
+memory/0002-llama-probe-flash-attention-for-a-quantized-v-cache-in-auto-mode.patch

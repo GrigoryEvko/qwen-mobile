@@ -1,0 +1,179 @@
+llama: probe flash attention for a quantized V cache in AUTO mode
+Fold-into: upstream/llama-context
+
+The defect
+
+A quantized V cache needs flash attention. With flash_attn_type AUTO, llama_init_from_model
+changed the type to ENABLED for a quantized V, thus the probe of the device of each attention
+layer (resolve_fused_ops) did not run. When a device cannot run flash attention on the types
+and the shapes of a layer, the scheduler then runs FLASH_ATTN_EXT of that layer on the CPU,
+with no error and no message. On an accelerator that is a large drop in speed, and the caller
+cannot know it.
+
+The change
+
+With AUTO and a quantized V, the context keeps AUTO. The probe runs, and when a layer cannot
+run flash attention on its device, the constructor throws "quantized V cache was requested,
+but this requires Flash Attention on the device of each attention layer", thus
+llama_init_from_model returns null. A caller can then select an F16 cache. ENABLED keeps its
+behavior, and DISABLED with a quantized V is an error as before. Thus a caller of AUTO with a
+quantized V gets a null context and an error line where it got a context that runs such a
+layer on the CPU.
+
+tests/test-kv-quant-auto-fa.cpp makes a Q8_0 K and V context with AUTO on the generated
+qwen35-dense model and decodes (the CPU runs flash attention), and expects the creation with
+DISABLED to fail. A device that refuses the op is necessary for the failure path of AUTO:
+GGML_HEXAGON_OPFILTER=FLASH_ATTN_EXT on HTP0 gives it on the phone.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    src/llama-context.cpp
+    tests/CMakeLists.txt
+    tests/test-kv-quant-auto-fa.cpp
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 76f1fe0..b93c119 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -474,7 +474,8 @@ llama_context::llama_context(
+ 
+         if (!cparams.flash_attn) {
+             if (ggml_is_quantized(params.type_v)) {
+-                throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
++                throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention "
++                                         "on the device of each attention layer");
+             }
+         }
+     }
+@@ -3882,15 +3883,13 @@ llama_context * llama_init_from_model(
+         return nullptr;
+     }
+ 
+-    if (ggml_is_quantized(params.type_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+-        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+-            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for quantized V cache\n", __func__);
+-            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+-        }
+-        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+-            LLAMA_LOG_ERROR("%s: quantized V cache requires flash_attn to be enabled\n", __func__);
+-            return nullptr;
+-        }
++    // A quantized V cache needs flash attention. With AUTO the context keeps the probe of the
++    // device of each attention layer (resolve_fused_ops), and the context creation fails when
++    // a layer cannot run flash attention on its device, thus the caller can select another
++    // cache type. ENABLED runs such a layer on another backend, the CPU for example.
++    if (ggml_is_quantized(params.type_v) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
++        LLAMA_LOG_ERROR("%s: quantized V cache requires flash_attn to be enabled\n", __func__);
++        return nullptr;
+     }
+ 
+     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 794c83f..c8d5ddc 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -150,6 +150,7 @@ endif ()
+ 
+ llama_build(test-recurrent-state-rollback.cpp)
+ llama_build(test-output-limit.cpp)
++llama_build(test-kv-quant-auto-fa.cpp)
+ llama_build(test-save-load-state.cpp)
+ 
+ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+@@ -226,6 +227,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+         FIXTURES_REQUIRED generate-models
+     )
+ 
++    llama_test(
++        test-kv-quant-auto-fa
++        LABEL main
++        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
++    )
++    set_tests_properties(test-kv-quant-auto-fa PROPERTIES
++        FIXTURES_REQUIRED generate-models
++    )
++
+     llama_test(
+         test-recurrent-state-rollback
+         NAME test-recurrent-state-rollback-nemotron-h
+diff --git a/tests/test-kv-quant-auto-fa.cpp b/tests/test-kv-quant-auto-fa.cpp
+new file mode 100644
+index 0000000..2a56821
+--- /dev/null
++++ b/tests/test-kv-quant-auto-fa.cpp
+@@ -0,0 +1,75 @@
++// A quantized V cache and the flash attention type of a context: with AUTO the context
++// initializes and decodes when the device of each attention layer runs flash attention, and
++// with DISABLED the context creation fails.
++
++#include "arg.h"
++#include "common.h"
++#include "ggml-backend.h"
++#include "llama.h"
++
++#include <clocale>
++#include <cstdio>
++
++static llama_context * make_ctx(llama_model * model, ggml_type type_kv, llama_flash_attn_type fa) {
++    llama_context_params cparams = llama_context_default_params();
++    cparams.n_ctx           = 64;
++    cparams.n_batch         = 16;
++    cparams.n_ubatch        = 16;
++    cparams.n_seq_max       = 1;
++    cparams.type_k          = type_kv;
++    cparams.type_v          = type_kv;
++    cparams.flash_attn_type = fa;
++    return llama_init_from_model(model, cparams);
++}
++
++// Decode n tokens of sequence 0 with logits for the last one.
++static bool decode_some(llama_context * ctx, int n) {
++    llama_batch batch = llama_batch_init(n, 0, 1);
++    for (int i = 0; i < n; ++i) {
++        common_batch_add(batch, (llama_token) (i + 1), i, { 0 }, i + 1 == n);
++    }
++    const bool ok = llama_decode(ctx, batch) == 0 && llama_get_logits_ith(ctx, -1) != nullptr;
++    llama_batch_free(batch);
++    return ok;
++}
++
++int main(int argc, char ** argv) {
++    std::setlocale(LC_NUMERIC, "C");
++
++    common_params params;
++    common_init();
++    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
++        return 1;
++    }
++    ggml_backend_load_all();
++
++    llama_model_params mparams = common_model_params_to_llama(params);
++    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
++    if (model == nullptr) {
++        fprintf(stderr, "%s : failed to load the model\n", __func__);
++        return 1;
++    }
++
++    int failures = 0;
++
++    // AUTO: every backend of this test runs flash attention on Q8_0, thus the context initializes.
++    llama_context * ctx_auto = make_ctx(model, GGML_TYPE_Q8_0, LLAMA_FLASH_ATTN_TYPE_AUTO);
++    if (ctx_auto == nullptr || !decode_some(ctx_auto, 8)) {
++        fprintf(stderr, "%s : a Q8_0 KV cache with flash attention AUTO did not initialize and decode\n", __func__);
++        failures++;
++    }
++    llama_free(ctx_auto);
++
++    // DISABLED: a quantized V cannot work without flash attention.
++    llama_context * ctx_off = make_ctx(model, GGML_TYPE_Q8_0, LLAMA_FLASH_ATTN_TYPE_DISABLED);
++    if (ctx_off != nullptr) {
++        fprintf(stderr, "%s : a Q8_0 V cache with flash attention DISABLED initialized\n", __func__);
++        failures++;
++        llama_free(ctx_off);
++    }
++
++    llama_model_free(model);
++
++    fprintf(stderr, "%s : %s\n", __func__, failures == 0 ? "OK" : "FAILED");
++    return failures == 0 ? 0 : 1;
++}
