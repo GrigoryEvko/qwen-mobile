@@ -29,6 +29,13 @@
 //       when no logit is NaN and each sampler parameter is finite. With a NaN,
 //       the order is not defined on either path, thus the harness counts the
 //       differences and FUZZ_SAMPLER_STRICT_NAN=1 makes them failures too.
+//       The harness also counts, and does not fail, a difference between two
+//       tokens whose input logits are at most 4 ulp apart when the chain divides
+//       the logits (temp, temp_ext): with -ffp-model=fast the compiler divides
+//       in the scalar part of a loop and multiplies by the reciprocal in the
+//       vector part, thus a token can get a logit 1 ulp different on the two
+//       paths (it has a different place in the two arrays), and near ties at a
+//       cut can go the other way.
 //   P4  The dist sampler alone, on 2 to 8 candidates from the input: when
 //       exactly one candidate has the logit +Inf and no logit is NaN, dist
 //       selects that candidate, as greedy does.
@@ -48,6 +55,20 @@ constexpr int32_t kPenaltyLastN  = 256;  // the value of the app
 
 bool g_strict_nan = false;
 long g_nan_diff   = 0;
+bool g_div        = false;  // the chain of the input divides the logits by a temperature
+
+/** True when a and b are finite and at most n ulp apart. O(n). */
+bool within_ulp(float a, float b, int n) {
+    if (!std::isfinite(a) || !std::isfinite(b)) {
+        return false;
+    }
+    float x = std::min(a, b);
+    const float y = std::max(a, b);
+    for (int i = 0; i < n && x < y; ++i) {
+        x = std::nextafter(x, y);
+    }
+    return x >= y;
+}
 
 /** A sampler parameter: often a usual value from [lo, hi], sometimes a special float. Sets *nan for a NaN. */
 float param(FuzzedDataProvider & fdp, float lo, float hi, bool * nan) {
@@ -81,6 +102,7 @@ llama_sampler * app_chain(FuzzedDataProvider & fdp, int32_t n_vocab, bool * nan,
         llama_sampler_chain_add(chain, llama_sampler_init_top_k(20));
         llama_sampler_chain_add(chain, llama_sampler_init_top_p(std::min(std::max(top_p, 0.05f), 1.0f), 1));
         llama_sampler_chain_add(chain, llama_sampler_init_temp(temp));
+        g_div = true;
         // The app seeds with LLAMA_DEFAULT_SEED, which reads the clock. A fixed seed keeps the input reproducible.
         llama_sampler_chain_add(chain, llama_sampler_init_dist(seed));
     }
@@ -128,12 +150,14 @@ llama_sampler * random_chain(FuzzedDataProvider & fdp, int32_t n_vocab, bool * n
             case 4: {
                 const float t = param(fdp, 0.0f, 3.0f, nan);
                 s = llama_sampler_init_temp(t);
+                g_div = true;
                 snprintf(buf, sizeof(buf), "temp(%g) ", t);
                 break;
             }
             case 5: {
                 const float t = param(fdp, 0.0f, 3.0f, nan), d = param(fdp, -1.0f, 1.0f, nan), e = param(fdp, 0.0f, 2.0f, nan);
                 s = llama_sampler_init_temp_ext(t, d, e);
+                g_div = true;
                 snprintf(buf, sizeof(buf), "temp_ext(%g, %g, %g) ", t, d, e);
                 break;
             }
@@ -301,6 +325,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
 
     bool nan_param = false;
     std::string desc;
+    g_div = false;
     llama_sampler * chain = fdp.ConsumeBool() ? app_chain(fdp, n_vocab, &nan_param, desc)
                                               : random_chain(fdp, n_vocab, &nan_param, desc);
 
@@ -339,8 +364,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
             llama_token_data_array part_p = { part.data(), part.size(), -1, false };
             llama_sampler_apply(chain, &part_p);
             id_chain = selected(part_p);
+            // the input logits of the two tokens are at most 4 ulp apart and the chain divides (P3)
+            const bool near_tie = g_div && id_chain != id_full && id_chain >= 0 && id_full >= 0 &&
+                                  within_ulp(logits[id_chain], logits[id_full], 4);
             if (id_chain != id_full) {
-                if (strict) {
+                if (strict && !near_tie) {
                     // the first candidates of the two arrays after the chain, for the report
                     for (int side = 0; side < 2; ++side) {
                         const llama_token_data_array & a = side == 0 ? part_p : full_p;
@@ -355,7 +383,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
                                n_top, id_chain, n_vocab, id_full, desc.c_str(), r);
                 }
                 if (++g_nan_diff == 1) {
-                    fprintf(stderr, "note: with a NaN, the top set of %zu selects token %d, all the logits select token %d (%s)\n",
+                    fprintf(stderr, "note: with a NaN or a near tie, the top set of %zu selects token %d, all the logits select token %d (%s)\n",
                             n_top, id_chain, id_full, desc.c_str());
                 }
             }
