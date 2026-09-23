@@ -9,8 +9,9 @@
 #   tests/fuzz/core/run.sh phone-commands <config> [--profile P]
 #
 # The configurations (one sanitizer for each build and each run, never two):
-# none, asan, ubsan, tsan, msan on the host, and none, asan, hwasan, ubsan, tsan
-# on the phone. NDK r29 has the TSan runtime. MSan is not available on Android.
+# none, asan, ubsan, tsan, msan on the host, and none, asan, hwasan, ubsan on the
+# phone. TSan runs on the x86 host only: the TSan runtime of NDK r29 stops on the
+# SM8750 (a CHECK failure in tsan_rtl.cpp). MSan is not available on Android.
 # The profiles: debug and release (the flags of the shipped build). Without
 # --profile, a mode runs the two profiles, debug first. The build directory is
 # build/fuzz/core-<profile>-<config> (build/fuzz/core-android-<profile>-<config>
@@ -547,16 +548,19 @@ phone_commands() {
     local check="$q shell 'pgrep -a fuzz_; dumpsys thermalservice | grep \"Thermal Status\"'"
     local push_files="$out/fuzz_npu_decode $out/fuzz_recurrent $out/libggml-htp-v79.so $out/$san.supp"
     [[ -n $runtime ]] && push_files+=" $out/$runtime"
-    # Step 3: the 2B model on HTP0 against the CPU. The release profile runs 8 inputs. The debug CPU
-    # reference is too slow for that inside the run budget of 90 s: debug none runs one seed with
-    # prompts of at most 4 tokens, and debug hwasan does not load the two copies of the 2B model in 90 s.
-    local step3
+    # Step 3: the 2B model on HTP0 against the CPU. Release none runs 8 inputs. A release build with a
+    # sanitizer runs the 2 seeds only: one input takes up to 18 s there (release ubsan), and 8 inputs
+    # do not complete in the run budget of 90 s. The debug CPU reference is slower: debug none runs
+    # one seed with prompts of at most 4 tokens, and debug hwasan does not load the two copies of the
+    # 2B model in 90 s.
+    local step3 runs2b=8
+    [[ $san == none ]] || runs2b=2
     local npu2b_env="$env FUZZ_DEVICE=HTP0 FUZZ_THREADS=6 FUZZ_MODEL=/data/local/tmp/qwen/models/Qwen3.5-2B-Q8_0.gguf FUZZ_NPU_CALIBRATE=1"
     if [[ $profile == release ]]; then
-        step3="# 3. The 2B Q8_0 model of the app on HTP0 against the CPU, 8 inputs. The two copies of the model
+        step3="# 3. The 2B Q8_0 model of the app on HTP0 against the CPU, $runs2b inputs. The two copies of the model
 #    need more than 4 GB, thus this run has -rss_limit_mb=8192.
 $thermal
-timeout -s KILL 100 $a shell \"$npu2b_env timeout -s KILL 90 ./fuzz_npu_decode -runs=8 -seed=2 -rss_limit_mb=8192 -artifact_prefix=art/npu2b- seeds/fuzz_npu_decode\" > $logs/npu-2b.txt 2>&1; tail -n 4 $logs/npu-2b.txt
+timeout -s KILL 100 $a shell \"$npu2b_env timeout -s KILL 90 ./fuzz_npu_decode -runs=$runs2b -seed=2 -rss_limit_mb=8192 -artifact_prefix=art/npu2b- seeds/fuzz_npu_decode\" > $logs/npu-2b.txt 2>&1; tail -n 4 $logs/npu-2b.txt
 $check"
     elif [[ $san == hwasan ]]; then
         step3="# 3. No 2B step: the debug hwasan build does not load the two copies of the 2B model in the run budget of 90 s."
