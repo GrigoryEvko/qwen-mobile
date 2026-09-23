@@ -1,0 +1,145 @@
+hexagon: htp: the src1 rows of the scalar and same-shape binary paths
+Fold-into: upstream/hexagon-htp
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+The binary ops of the HTP (ADD, SUB, MUL, DIV) divide the src0 rows into
+blocks. Three defects make a block read incorrect src1 rows:
+
+- The scalar path (src1->ne[0] == 1) finds the src1 value of the first row of
+  a block. Then it moves the pointer by nb11 for each row. A block can cross
+  the end of dim 1 or dim 2 of src0, and src1 can repeat along dim 1
+  (ne11 < ne01). Then the pointer reads past the src1 rows.
+- The same-shape path moves one src1 row at the stride nb11 for each src0 row
+  of a block, also when ne11 == 1. Then the block reads the src1 rows of the
+  next planes, or past the end of src1.
+- The split at the end of a plane of dim 3 ignores ne11 > 1. A block that
+  crosses the end of such a plane continues with the next src1 row. But a src1
+  that broadcasts along dim 3 starts again at its first row.
+
+The op fuzzer found the first defect, with relative errors of 0.44 and 0.31,
+for example ADD of f32[52,10,1,2] and f32[1,10,1,1]. An index model of the
+two paths found the other two defects. On the phone, test-backend-ops gave an
+NMSE of 0.75 for ADD of f32[256,8,4,1] and f32[256,1,4,1] with the fix of the
+first defect only. The app graphs do not reach these conditions: none of their
+ADD and MUL ops takes the scalar path, and the index model gives no incorrect
+src1 row for each of their shapes.
+
+This patch finds the src1 value of each row of the scalar path from the
+indices of that row. The same-shape path moves one src1 row for a block when
+ne11 == 1, and each row of the block uses that row. The split at the end of a
+plane of dim 3 also occurs when ne11 > 1.
+
+The patch also adds bin_bcast cases to test-backend-ops: a one-column src1 that
+repeats along dim 1 or broadcasts along dim 3, a src1 of one row for each plane
+of dim 2, and src1 rows that start again at each plane of dim 3.
+
+diff --git a/ggml/src/ggml-hexagon/htp/binary-ops.c b/ggml/src/ggml-hexagon/htp/binary-ops.c
+index bfa849e..fec557b 100644
+--- a/ggml/src/ggml-hexagon/htp/binary-ops.c
++++ b/ggml/src/ggml-hexagon/htp/binary-ops.c
+@@ -238,20 +238,22 @@ static void binary_job_scalar(unsigned int nth, unsigned int ith, void * data) {
+         i02 = fastdiv(rem, &bctx->src0_dim1_div);
+         i01 = rem - i02 * ne01;
+ 
+-        // src1 indices (broadcast/repeat)
+-        uint32_t i13 = fastmodulo(i03, ne13, &bctx->src1_dim3_div);
+-        uint32_t i12 = fastmodulo(i02, ne12, &bctx->src1_dim2_div);
+-        uint32_t i11 = fastmodulo(i01, ne11, &bctx->src1_dim1_div);
+-
+-        uint8_t * src1_ptr = (uint8_t *)src1->data + i13 * nb13 + i12 * nb12 + i11 * nb11;
+-        uint32_t s1_stride = (ne11 == 1) ? 0 : nb11;
+-
+         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
+         for (uint32_t r = 0; r < current_block_size; r++) {
+             uint8_t * r_src0 = s0_spad + r * bctx->src0_row_size_aligned;
+             uint8_t * r_dst  = d_spad + r * bctx->dst_row_size_aligned;
++            // The src1 value of each row comes from the indices of that row (broadcast or repeat). A
++            // block can cross the end of dim 1 or of dim 2 of src0, and src1 can repeat along dim 1
++            // (ne11 < ne01). Thus a fixed stride from the first row of the block can read past src1.
++            const uint32_t jr  = ir + r;
++            const uint32_t j03 = fastdiv(jr, &bctx->src0_dim12_div);
++            const uint32_t jrm = jr - j03 * (ne02 * ne01);
++            const uint32_t j02 = fastdiv(jrm, &bctx->src0_dim1_div);
++            const uint32_t j01 = jrm - j02 * ne01;
++            uint8_t * src1_ptr = (uint8_t *) src1->data + fastmodulo(j03, ne13, &bctx->src1_dim3_div) * nb13 +
++                                 fastmodulo(j02, ne12, &bctx->src1_dim2_div) * nb12 +
++                                 fastmodulo(j01, ne11, &bctx->src1_dim1_div) * nb11;
+             COMPUTE_SCALAR_OP(r_dst, r_src0, src1_ptr, src0_type, ne00);
+-            src1_ptr += s1_stride;
+         }
+         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
+ 
+@@ -276,6 +278,14 @@ static void binary_job_scalar(unsigned int nth, unsigned int ith, void * data) {
+     dma_queue_flush(q);
+ }
+ 
++// The number of src1 rows that the same-shape path moves for a block of src0 rows. With ne11 == 1,
++// all rows of a block use the same src1 row. The split flags keep a block in one plane of dim 2 when
++// ne12 > 1, and in one plane of dim 3 when ne13 > 1. Thus the block moves one src1 row. One src1 row
++// for each src0 row at the stride nb11 reads the rows of the next planes, or past the end of src1.
++static inline uint32_t binary_src1_block_rows(uint32_t ne11, uint32_t block_rows) {
++    return ne11 == 1 ? 1 : block_rows;
++}
++
+ // 2. Vector Same Shape (ne1x == ne0x) or Simple Broadcast
+ static void binary_job_vector_same_shape(unsigned int nth, unsigned int ith, void * data) {
+     struct htp_binary_context * bctx = (struct htp_binary_context *) data;
+@@ -324,7 +334,7 @@ static void binary_job_vector_same_shape(unsigned int nth, unsigned int ith, voi
+ 
+         dma_queue_push(q, dma_make_ptr(dst_curr, d_spad), nb1, bctx->dst_row_size_aligned, row_size_bytes, 0);
+         dma_queue_push(q, dma_make_ptr(s0_spad, src0_curr), bctx->src0_row_size_aligned, nb01, row_size_bytes, current_block_size);
+-        dma_queue_push(q, dma_make_ptr(s1_spad, src1_curr), bctx->src1_row_size_aligned, nb11, row_size_bytes, current_block_size);
++        dma_queue_push(q, dma_make_ptr(s1_spad, src1_curr), bctx->src1_row_size_aligned, nb11, row_size_bytes, binary_src1_block_rows(ne11, current_block_size));
+         ir_prefetch += current_block_size;
+         spad_idx ^= 1;
+     }
+@@ -340,7 +350,7 @@ static void binary_job_vector_same_shape(unsigned int nth, unsigned int ith, voi
+         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
+         for (uint32_t r = 0; r < current_block_size; r++) {
+             uint8_t * r_src0 = s0_spad + r * bctx->src0_row_size_aligned;
+-            uint8_t * r_src1 = s1_spad + r * bctx->src1_row_size_aligned;
++            uint8_t * r_src1 = s1_spad + (ne11 == 1 ? 0 : r * bctx->src1_row_size_aligned);
+             uint8_t * r_dst  = d_spad  + r * bctx->dst_row_size_aligned;
+             COMPUTE_VECTOR_OP_AAA(r_dst, r_src0, r_src1, src0_type, ne00);
+         }
+@@ -370,7 +380,7 @@ static void binary_job_vector_same_shape(unsigned int nth, unsigned int ith, voi
+              uint8_t * s1_next = (uint8_t *)src1->data + p13 * nb13 + p12 * nb12 + p11 * nb11;
+ 
+              dma_queue_push(q, dma_make_ptr(s0_spad, s0_next), bctx->src0_row_size_aligned, nb01, row_size_bytes, next_block_size);
+-             dma_queue_push(q, dma_make_ptr(s1_spad, s1_next), bctx->src1_row_size_aligned, nb11, row_size_bytes, next_block_size);
++             dma_queue_push(q, dma_make_ptr(s1_spad, s1_next), bctx->src1_row_size_aligned, nb11, row_size_bytes, binary_src1_block_rows(ne11, next_block_size));
+ 
+              ir_prefetch += next_block_size;
+         }
+@@ -881,7 +891,10 @@ static int execute_op_binary(struct htp_ops_context * octx) {
+     bool dst_contig_dim2  = (dst->nb[3]  == src0->ne[2] * dst->nb[2]);
+ 
+     bctx.split_at_ne01 = (src0->ne[2] > 1) && ((src1->ne[1] > 1) || (src1->ne[2] > 1) || !src0_contig_dim1 || !dst_contig_dim1);
+-    bctx.split_at_ne02 = (src0->ne[3] > 1) && ((src1->ne[2] > 1) || (src1->ne[3] > 1) || !src0_contig_dim2 || !dst_contig_dim2);
++    // A block that crosses the end of a plane of dim 3 continues with the next src1 row. When src1
++    // broadcasts along dim 3, the correct row is the first src1 row again. Thus the jobs split a block
++    // at the end of a plane of dim 3 also when ne11 > 1, the same as at the end of dim 1.
++    bctx.split_at_ne02 = (src0->ne[3] > 1) && ((src1->ne[1] > 1) || (src1->ne[2] > 1) || (src1->ne[3] > 1) || !src0_contig_dim2 || !dst_contig_dim2);
+ 
+     worker_callback_t worker_func;
+     if (is_add_id)          worker_func = binary_job_add_id;
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 3721e6d..aecb335 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9984,6 +9984,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         //add_test_bin_bcast(type, {3, 3, 2560, 1280}, {2, 1, 1, 1});
+     }
+ 
++    // a src1 of one column (one value for each row) that repeats along dim 1 or broadcasts along
++    // dim 3, one src1 row for each plane of dim 2 (ne11 = 1 and ne12 > 1), and src1 rows that start
++    // again at each plane of dim 3
++    add_test_bin_bcast(GGML_TYPE_F32, {1,   10, 1, 1}, {52,   1, 1, 2});
++    add_test_bin_bcast(GGML_TYPE_F32, {1,    7, 1, 1}, {2560, 2, 1, 1});
++    add_test_bin_bcast(GGML_TYPE_F32, {256,  1, 4, 1}, {1,    8, 1, 1});
++    add_test_bin_bcast(GGML_TYPE_F32, {128,  2, 1, 1}, {1,    1, 1, 3});
++
+     // a src1 row that repeats along dim 0 (ne10 < ne00, both multiples of 4)
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+         add_test_bin_bcast(type, {16, 1, 1, 1}, {2, 12, 1, 1});
