@@ -151,10 +151,13 @@ EOF
 }
 
 # Copy the ggml tree of the submodule into the private snapshot, and record the date and hashes.
+# rsync compares the contents (-c) and does not keep the times of the submodule (no -t): a file with
+# new contents gets the time of the copy, and a file with the same contents keeps its time. Thus
+# ninja builds again each object of a changed file. A copy that keeps the times (cp -a) can give a
+# header a time before its objects, and ninja then keeps the objects of the old header.
 take_snapshot() {
-    rm -rf "$SNAP"
     mkdir -p "$SNAP"
-    cp -a "$LLAMA_SUBMODULE/ggml" "$SNAP/"
+    rsync -rlc --delete "$LLAMA_SUBMODULE/ggml/" "$SNAP/ggml/"
     date > "$SNAP/SNAPSHOT-DATE"
     sha256sum "$SRC/src/ggml-hexagon/ggml-hexagon.cpp" "$SRC/src/ggml-hexagon/htp/htp-ops.h" \
         "$SRC/src/ggml-hexagon/htp-opnode.h" > "$SNAP/SNAPSHOT-HASHES"
