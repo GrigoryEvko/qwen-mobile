@@ -1,0 +1,113 @@
+Check the product of the nonzero dimensions of a GGUF tensor and write a tensor of 0 bytes
+Fold-into: upstream/gguf
+
+The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
+
+- A tensor with a dimension of 0 skips the element-count guard, and ggml_nelements overflows.
+
+  The element-count guard of the reader skips a tensor with a dimension of 0, because its element
+  count is 0. But ggml_nelements multiplies ne[0] * ne[1] * ne[2] * ne[3] from the left, thus for
+  the shape (2^32, 2^41, 0, 1) the product of the first two dimensions overflows int64_t
+  (undefined behavior) before the 0. The byte-size check of the reader calls ggml_nelements, and
+  UBSan reports the overflow on a file of a few hundred bytes. ggml_nrows and the strides multiply
+  the dimensions in other orders.
+
+  The change: The guard multiplies the dimensions that are not 0, and refuses the tensor when that
+  product does not fit int64_t. The byte-size check uses the same product, thus it also bounds the
+  strides of a tensor of 0 elements.
+
+  The reproducer: tests/fuzz/core/regress/fuzz_gguf--gguf-zero-dim-overflow.
+
+- The writer stops on a tensor of 0 bytes that the reader gave no data.
+
+  When each tensor of a file has 0 bytes, the binary blob of the reader has 0 bytes, and the
+  tensors of the ggml context get no data pointer. A write of that context (gguf-split, or a
+  round trip) then stops on GGML_ASSERT(info.t.data), although there is nothing to copy.
+
+  The change: The two writers copy no data for a tensor of 0 bytes.
+
+  The reproducer: tests/fuzz/core/regress/fuzz_gguf--gguf-empty-tensor-write.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    ggml/src/gguf.cpp
+--- a/ggml/src/gguf.cpp
++++ b/ggml/src/gguf.cpp
+@@ -693,6 +693,9 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
+             break;
+         }
+ 
++        // the product of the dimensions that are not 0 (the element-count guard sets it)
++        int64_t nonzero_elements = 1;
++
+         // tensor shape
+         {
+             uint32_t n_dims = 0;
+@@ -720,14 +723,22 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
+ 
+             // check that the total number of elements is representable
+             // (a zero-element tensor is trivially representable; the guard also avoids a division by zero below)
+-            // The guard reads the dimensions, not ggml_nelements: that product can overflow int64_t
+-            // (undefined behavior), wrap to 0 or below, and turn the check off. A failed read leaves the
++            // The guard multiplies the dimensions that are not 0, not ggml_nelements: that product can
++            // overflow int64_t (undefined behavior), wrap to 0 or below, and turn the check off. ggml
++            // multiplies the dimensions in different orders (ggml_nelements, ggml_nrows, the strides),
++            // and a dimension of 0 does not stop an overflow of the product of the dimensions before
++            // it, thus the product of the other dimensions must also fit. A failed read leaves the
+             // later dimensions without a value, thus the guard reads them only when ok is true.
+-            const bool zero_elements = ok && (info.t.ne[0] == 0 || info.t.ne[1] == 0 || info.t.ne[2] == 0 || info.t.ne[3] == 0);
+-            if (ok && !zero_elements &&
+-                ((INT64_MAX/info.t.ne[1] <= info.t.ne[0]) ||
+-                 (INT64_MAX/info.t.ne[2] <= info.t.ne[0]*info.t.ne[1]) ||
+-                 (INT64_MAX/info.t.ne[3] <= info.t.ne[0]*info.t.ne[1]*info.t.ne[2]))) {
++            bool too_large = false;
++            for (int j = 0; ok && !too_large && j < GGML_MAX_DIMS; ++j) {
++                const int64_t n = info.t.ne[j];
++                if (n == 0) {
++                    continue;
++                }
++                too_large = nonzero_elements >= INT64_MAX/n;
++                nonzero_elements = too_large ? nonzero_elements : nonzero_elements*n;
++            }
++            if (ok && too_large) {
+ 
+                 GGML_LOG_ERROR("%s: total number of elements in tensor '%s' with shape "
+                     "(%" PRIi64 ", %" PRIi64 ", %" PRIi64 ", %" PRIi64 ") is >= %" PRIi64 "\n",
+@@ -768,8 +779,9 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
+                 break;
+             }
+ 
+-            // check that the size of the tensor in bytes is representable
+-            if (ok && uint64_t(ggml_nelements(&info.t)/ggml_blck_size(info.t.type)) > SIZE_MAX/ggml_type_size(info.t.type)) {
++            // check that the size of the tensor in bytes is representable. The product of the
++            // dimensions that are not 0 also bounds the strides of a tensor of 0 elements.
++            if (ok && uint64_t(nonzero_elements/ggml_blck_size(info.t.type)) > SIZE_MAX/ggml_type_size(info.t.type)) {
+                 GGML_LOG_ERROR("%s: tensor '%s' with shape (%" PRIi64 ", %" PRIi64 ", %" PRIi64 ", %" PRIi64 ") has a size in bytes > %zu\n",
+                     __func__, info.t.name, info.t.ne[0], info.t.ne[1], info.t.ne[2], info.t.ne[3], SIZE_MAX);
+                 ok = false;
+@@ -1636,7 +1648,11 @@ struct gguf_writer_buf final : public gguf_writer_base {
+         const size_t nbytes = ggml_nbytes(&info.t);
+ 
+         buf.resize(offset + nbytes);
+-        if (info.t.buffer) {
++        // A tensor of 0 bytes has no data: the reader gives it none when all tensors of a file are
++        // empty (the binary blob has 0 bytes).
++        if (nbytes == 0) {
++            // nothing to copy
++        } else if (info.t.buffer) {
+             ggml_backend_tensor_get(&info.t, buf.data() + offset, 0, nbytes);
+         } else {
+             GGML_ASSERT(info.t.data);
+@@ -1680,7 +1696,10 @@ struct gguf_writer_file final : public gguf_writer_base {
+         const size_t nbytes = ggml_nbytes(&info.t);
+ 
+         std::vector<int8_t> buf(nbytes);
+-        if (info.t.buffer) {
++        // a tensor of 0 bytes has no data (refer to the buffer writer)
++        if (nbytes == 0) {
++            // nothing to copy
++        } else if (info.t.buffer) {
+             ggml_backend_tensor_get(&info.t, buf.data(), 0, nbytes);
+         } else {
+             GGML_ASSERT(info.t.data);

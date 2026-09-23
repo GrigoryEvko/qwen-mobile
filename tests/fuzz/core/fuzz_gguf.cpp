@@ -236,7 +236,9 @@ void roundtrip_data(const gguf_context * ctx, ggml_context * ctx_data) {
     compare_ctx(out, again);
     for (const ggml_tensor * t : tensors) {
         const ggml_tensor * t2 = ggml_get_tensor(ctx_data2, t->name);
-        if (t2 == nullptr || ggml_nbytes(t2) != ggml_nbytes(t) || memcmp(t2->data, t->data, ggml_nbytes(t)) != 0) {
+        // a tensor of 0 bytes can have no data pointer, and memcmp must not get a null pointer
+        const size_t nbytes = ggml_nbytes(t);
+        if (t2 == nullptr || ggml_nbytes(t2) != nbytes || (nbytes > 0 && memcmp(t2->data, t->data, nbytes) != 0)) {
             fuzz::fail("round trip: the data of tensor \"%s\" changed", t->name);
         }
     }
