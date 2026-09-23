@@ -4,12 +4,19 @@
 # Usage:
 #   tests/sanitizers/check-rules.sh [--areas core,ops,hexhost,app,quant] [--no-builds]
 #                                   [--write-requests] [--json FILE]
+#   tests/sanitizers/check-rules.sh --copies-only [--areas LIST]
+#                                   [--accept-stamp COMMIT:PATCHES]...
 #
 #   --areas LIST       The fuzz areas to check. The preset value is each
 #                      directory of tests/fuzz. "none" checks only the
 #                      shared files of tests/sanitizers (and the builds).
 #   --no-builds        Do not check build/fuzz (for a clean CI checkout,
 #                      before the builds).
+#   --copies-only      Check only the rule LLAMA-COPY. The other rules do
+#                      not include LLAMA-COPY.
+#   --accept-stamp C:P Also accept the stamp of the llama.cpp commit C and
+#                      the patches tree P (the value of HEAD when an area
+#                      step started). The stamp of HEAD is always accepted.
 #   --write-requests   Write the violations of each area to
 #                      build/fuzz/matrix/requests/<area>-rules.txt.
 #   --json FILE        Also write each violation as one JSON line to FILE.
@@ -52,6 +59,16 @@
 #        of full LTO in lld and clang 22.1.8 can drop the dynamic initializer
 #        of a C++17 inline variable (a minimal program shows it), and the
 #        shipped build has one partition.
+#   LLAMA-COPY (only with --copies-only) A matrix build of an area
+#        (build/fuzz/<area>[-android]-<profile>-<config>) that takes
+#        llama.cpp or ggml from a copy under build/, not from the submodule,
+#        has the stamp .llama-copy-stamp of tests/sanitizers/llama-copy.sh in
+#        the root of the copy (the directory that holds ggml/). The stamp has
+#        the llama.cpp commit and the tree id of patches/ of HEAD. A copy with
+#        an older stamp or with no stamp can hold old llama.cpp code.
+#        tests/run-suite.sh runs this rule after each area step. The other
+#        rules do not include it: each landing makes all copies old at once,
+#        thus it would stop each next landing until each area refreshes.
 #   R13  Each entry of tests/sanitizers/ubsan.supp has a reproducer in
 #        tests/sanitizers/repro/. With the build directories (not
 #        --no-builds): the last run of tests/sanitizers/supp-repro.sh passed
@@ -86,6 +103,8 @@ readonly CONFIG_TOKENS="none asan ubsan tsan msan hwasan"
 
 AREAS=""
 CHECK_BUILDS=1
+COPIES_ONLY=0
+ACCEPT_STAMPS=""
 WRITE_REQUESTS=0
 JSON_OUT=""
 VIOLATIONS=()
@@ -666,6 +685,60 @@ check_lto_partitions() {
                 | xargs -0 -r rg -n --no-heading -e '^CMAKE_[A-Z_]*LINKER_FLAGS[A-Z_]*:STRING=.*-lto-partitions' || true)
 }
 
+# LLAMA-COPY: each copy of llama.cpp or ggml under build/ that a matrix build
+# of an area names in its CMake cache has the stamp of HEAD (the llama.cpp
+# commit and the tree id of patches/), or a stamp of ACCEPT_STAMPS. A build
+# that names the submodule is not checked. Each copy gets one report, with
+# the first build that names it.
+# Complexity: one pass over the cache of each matrix build directory.
+check_llama_copies() {
+    [[ -d "$BUILD_FUZZ" ]] || return 0
+    command -v git > /dev/null && git -C "$REPO" rev-parse --git-dir > /dev/null 2>&1 || return 0
+    local head_stamp dir name area cache value root stamp got build_real
+    local -A seen=()
+    # The caches hold physical paths, and the path of the repository can
+    # hold a symbolic link.
+    build_real="$(cd "$REPO/build" && pwd -P)"
+    head_stamp="$(git -C "$REPO" rev-parse HEAD:third_party/llama.cpp):$(git -C "$REPO" rev-parse HEAD:patches)"
+    for dir in "$BUILD_FUZZ"/*/; do
+        dir="${dir%/}"
+        name="$(basename "$dir")"
+        area="$(area_of "$dir")"
+        [[ " $AREAS " == *" $area "* ]] || continue
+        # Only the matrix builds. A name with a tag after the configuration is
+        # the private build of one check, and its tree can differ on purpose.
+        [[ "$name" =~ ^[a-z]+(-android)?-(debug|release)-(none|asan|ubsan|tsan|msan|hwasan)$ ]] || continue
+        for cache in "$dir/CMakeCache.txt" "$dir/build/CMakeCache.txt"; do
+            [[ -f "$cache" ]] || continue
+            while IFS= read -r value; do
+                # A container build names the repository /workspace.
+                [[ "$value" == /workspace/build/* ]] && value="$build_real/${value#/workspace/build/}"
+                [[ "$value" == "$build_real/"* || "$value" == "$REPO/build/"* ]] || continue
+                value="${value%/}"
+                # The root of the copy is the directory that holds ggml/.
+                if [[ -f "$value/ggml/src/ggml.c" ]]; then
+                    root="$value"
+                elif [[ -f "$value/src/ggml.c" && "$(basename "$value")" == ggml ]]; then
+                    root="$(dirname "$value")"
+                else
+                    continue
+                fi
+                [[ -z "${seen[$root]:-}" ]] || continue
+                seen[$root]=1
+                stamp="$root/.llama-copy-stamp"
+                if [[ ! -f "$stamp" ]]; then
+                    violation LLAMA-COPY "$area" "$root" "the build $name takes llama.cpp from this copy, and the copy has no .llama-copy-stamp: make the copy with tests/sanitizers/llama-copy.sh"
+                    continue
+                fi
+                got="$(rg -o -r '$1' '^commit ([0-9a-f]{40})$' "$stamp" || true):$(rg -o -r '$1' '^patches ([0-9a-f]{40})$' "$stamp" || true)"
+                if [[ "$got" != "$head_stamp" && " $ACCEPT_STAMPS " != *" $got "* ]]; then
+                    violation LLAMA-COPY "$area" "$root" "the build $name takes llama.cpp from this copy, which has the stamp ${got:0:12}:${got:41:12}, but HEAD has ${head_stamp:0:12}:${head_stamp:41:12} (llama.cpp commit:patches tree): make the copy again with tests/sanitizers/llama-copy.sh, then build again"
+                fi
+            done < <(rg -o -r '$1' '^[A-Za-z0-9_.+-]+:[A-Z]+=(/[^;]*)$' "$cache" || true)
+        done
+    done
+}
+
 # NOID: the pattern of a task number or a finding ID. A comment, a message or
 # a name describes the defect in words (the function, the input, the
 # evidence), never with an ID. "[Tt]ask" also finds the start of a sentence.
@@ -715,6 +788,11 @@ main() {
         case "$1" in
             --areas) AREAS="${2//,/ }"; shift 2 ;;
             --no-builds) CHECK_BUILDS=0; shift ;;
+            --copies-only) COPIES_ONLY=1; shift ;;
+            --accept-stamp)
+                [[ "${2:-}" =~ ^[0-9a-f]{40}:[0-9a-f]{40}$ ]] \
+                    || { echo "check-rules: --accept-stamp needs COMMIT:PATCHES (two 40-digit ids)." >&2; exit 2; }
+                ACCEPT_STAMPS+=" $2"; shift 2 ;;
             --write-requests) WRITE_REQUESTS=1; shift ;;
             --json) JSON_OUT="$2"; shift 2 ;;
             -h|--help) print_usage; exit 0 ;;
@@ -738,19 +816,23 @@ main() {
     done
     while IFS= read -r f; do sources+=("$f"); done < <(find "$SAN_DIR" -maxdepth 1 -name '*.cmake' -type f | sort)
 
-    check_sources_r1 "${sources[@]}"
-    check_reasons "${sources[@]}"
-    check_recover_entries
-    check_suppressions
-    check_run_sh
-    check_libfuzzer_commands
-    check_death_callback
-    check_noid
-    check_lto_partitions
-    check_android_asan_runtime
-    check_parity_sources
-    check_repro
-    if [[ $CHECK_BUILDS -eq 1 && -d "$BUILD_FUZZ" ]]; then
+    if [[ $COPIES_ONLY -eq 1 ]]; then
+        check_llama_copies
+    else
+        check_sources_r1 "${sources[@]}"
+        check_reasons "${sources[@]}"
+        check_recover_entries
+        check_suppressions
+        check_run_sh
+        check_libfuzzer_commands
+        check_death_callback
+        check_noid
+        check_lto_partitions
+        check_android_asan_runtime
+        check_parity_sources
+        check_repro
+    fi
+    if [[ $COPIES_ONLY -eq 0 && $CHECK_BUILDS -eq 1 && -d "$BUILD_FUZZ" ]]; then
         for dir in "$BUILD_FUZZ"/*/; do
             dir="${dir%/}"
             case "$(basename "$dir")" in

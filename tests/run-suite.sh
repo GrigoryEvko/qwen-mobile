@@ -44,6 +44,11 @@
 #                failure is an environment failure: no other tsan step of
 #                that profile runs.
 #   areas        tests/fuzz/<area>/run.sh <test|fuzz> <config> --profile <p>.
+#                After each area step, the step llama-copy-<area> runs
+#                check-rules.sh --copies-only for that area: each copy of
+#                llama.cpp that its builds use must have the stamp of HEAD,
+#                or the stamp of HEAD when the area step started. Thus a
+#                result from old llama.cpp code fails the run.
 # The test suite runs rules, llama, app-host, probe-host, lab, supp-repro and
 # the areas in test mode. The fuzz suite runs the areas in fuzz mode.
 #
@@ -297,8 +302,14 @@ area_step() {
     # targets in $JOBS parallel jobs, with a margin of 50 %.
     limit=$(( 60 * 60 ))
     [[ "$mode" == fuzz ]] && limit=$(( limit + BUDGET * 40 * 3 / (2 * (JOBS > 0 ? JOBS : 1)) ))
+    # The stamp of HEAD at the start: a landing during the step makes HEAD
+    # newer than the copy that the step used, and that is not a defect.
+    local start_stamp
+    start_stamp="$(git -C "$SUITE_REPO_ROOT" rev-parse HEAD:third_party/llama.cpp):$(git -C "$SUITE_REPO_ROOT" rev-parse HEAD:patches)"
     run_step "$mode" "area-$area" "$p" "$c" "$limit" "append:$SUITE_REPO_ROOT/build/fuzz/$area-$p-$c/results.jsonl" \
         "$script" "$mode" "$c" --profile "$p" --budget-seconds "$BUDGET" --jobs "$JOBS"
+    run_step "$mode" "llama-copy-$area" "$p" "$c" $(( 5 * 60 )) "" \
+        "$SUITE_REPO_ROOT/tests/sanitizers/check-rules.sh" --copies-only --areas "$area" --accept-stamp "$start_stamp"
 }
 
 # Write summary.json and summary.txt from the records of this run.
