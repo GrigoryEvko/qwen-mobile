@@ -539,6 +539,44 @@ void gdn_pick(builder & b, gdn_shape & s, bool one_token) {
     }
 }
 
+// Return the leaf of a tensor that a builder made with b.f32.
+leaf & leaf_of(builder & b, const ggml_tensor * t) {
+    for (leaf & l : b.c.leaves) {
+        if (l.t == t) {
+            return l;
+        }
+    }
+    GGML_ABORT("fuzz-ops: no leaf for the tensor %s", t->name);
+}
+
+// Keep the gate g and beta of a GDN case in the domain of the model, where each token step is a
+// contraction: g <= 0 (the model makes g = -softplus(...) exp(A)) and beta in [0, 1] (a sigmoid).
+// The wide distributions of a wild case give any sign and magnitude. A finite value moves into the
+// domain: g becomes -|g|, and beta becomes |beta|, or 1/|beta| above 1. A NaN or an Inf stays (a
+// special case). A byte after the other fields of a wild case can keep the values as they are: then
+// the case leaves the domain, and its rule is the growth rule of gdn_growth_bounds. Complexity:
+// O(T H S_v).
+void gdn_domain(builder & b, const ggml_tensor * g, const ggml_tensor * beta) {
+    if (b.wild && b.rd.chance(64)) {
+        return;
+    }
+    const auto fold = [](leaf & l, bool gate) {
+        const size_t n = l.bytes.size() / 4;
+        for (size_t i = 0; i < n; i++) {
+            float x;
+            std::memcpy(&x, l.bytes.data() + i * 4, 4);
+            if (!std::isfinite(x)) {
+                continue;
+            }
+            const float a = std::fabs(x);
+            x = gate ? -a : (a > 1.0f ? 1.0f / a : a);
+            std::memcpy(l.bytes.data() + i * 4, &x, 4);
+        }
+    };
+    fold(leaf_of(b, g), true);
+    fold(leaf_of(b, beta), false);
+}
+
 // Make q or k [S_v, H, T, n_seqs], plain or permuted, and give its l2 norm like qwen35.cpp does.
 ggml_tensor * gdn_qk(builder & b, const gdn_shape & s) {
     ggml_tensor * t;
@@ -567,6 +605,7 @@ bool build_gdn(builder & b) {
     ggml_tensor * g    = b.f32(s.kda ? s.S_v : 1, H, s.T, s.n_seqs, b.vs(gmin, -1e-4f));
     ggml_tensor * beta = b.f32(1, H, s.T, s.n_seqs, b.vs(0.0f, 1.0f));
     ggml_tensor * st   = b.f32(s.S_v, s.S_v, H, s.n_seqs, b.vs(-1.0f, 1.0f));
+    gdn_domain(b, g, beta);
     ggml_tensor * y    = ggml_gated_delta_net(b.ctx, q, k, v, g, beta, st, s.K);
     ggml_build_forward_expand(b.c.gf, y);
     output &      o    = b.out(y, "y");
@@ -603,6 +642,90 @@ void gdn_bounds(double S_v, double T, double M, const std::vector<float> & ref, 
     }
 }
 
+// The strict and the loose bound of one head of one sequence.
+struct gdn_head_bound {
+    double strict, loose;
+};
+
+// The GDN bound of a case outside the domain of the model (a gate g > 0 or a beta outside [0, 1]),
+// where a token step can expand the state. One step turns the state into exp(g) (I - beta k k^T) S
+// plus beta k v^T, and |k| <= 1, thus the 2-norm of a column of the state grows by at most
+// gamma = exp(max g) max(1, |1 - beta|). The rule follows two sequences in double for each head
+// of each sequence: c, a bound of the column norm of the state (c_0 = sqrt(S_v) s0 with s0 the
+// largest |initial state|, then c_t+1 = gamma_t c_t + |beta_t| sqrt(S_v) max|v_t|), and e, a bound
+// of the error of the backend (e_t+1 = gamma_t e_t + 8u (S_v+4) c_t+1, the rounding of one step of
+// the contraction rule, amplified by the later steps). The strict bound of the head is
+// max_t (e_t + 8u (S_v+4) c_t), and the loose bound adds 32 u16 (T+2) max_t c_t. In the domain
+// gamma <= 1, and the rule of gdn_bounds holds. s0 < 0 takes s0 from the state input of y.
+// Returns the bounds in the order ((s H) + h). Complexity: O(T H S_v n_seqs + S_v^2 H n_seqs).
+std::vector<gdn_head_bound> gdn_growth(const built_case & c, const ggml_tensor * y, int64_t T, int64_t n_seqs,
+                                       double s0_all) {
+    const ggml_tensor * v  = y->src[2];
+    const ggml_tensor * g  = y->src[3];
+    const ggml_tensor * bt = y->src[4];
+    const int64_t S_v = v->ne[0], H = v->ne[1], G0 = g->ne[0];
+    const std::vector<double> V = logical_values(c, v), Gv = logical_values(c, g), B = logical_values(c, bt);
+    const std::vector<double> S0 = s0_all < 0.0 ? logical_values(c, y->src[5]) : std::vector<double>();
+    const double rt = std::sqrt((double) S_v), step = 8.0 * EPS32 * ((double) S_v + 4.0);
+    std::vector<gdn_head_bound> out((size_t) (n_seqs * H));
+    for (int64_t s = 0; s < n_seqs; s++) {
+        for (int64_t h = 0; h < H; h++) {
+            double s0 = s0_all < 0.0 ? 0.0 : s0_all;
+            for (int64_t i = 0; i < S_v * S_v && !S0.empty(); i++) {
+                s0 = std::max(s0, std::fabs(S0[(size_t) ((s * H + h) * S_v * S_v + i)]));
+            }
+            double cn = rt * s0, e = 0.0, worst = step * cn, cmax = cn;
+            for (int64_t t = 0; t < T; t++) {
+                double gmax = -std::numeric_limits<double>::infinity(), vmax = 0.0;
+                for (int64_t i = 0; i < G0; i++) {
+                    gmax = std::max(gmax, Gv[(size_t) (((s * T + t) * H + h) * G0 + i)]);
+                }
+                for (int64_t i = 0; i < S_v; i++) {
+                    vmax = std::max(vmax, std::fabs(V[(size_t) (((s * T + t) * H + h) * S_v + i)]));
+                }
+                const double beta  = B[(size_t) ((s * T + t) * H + h)];
+                const double gamma = std::exp(gmax) * std::max(1.0, std::fabs(1.0 - beta));
+                cn    = gamma * cn + std::fabs(beta) * rt * vmax;
+                e     = gamma * e + step * cn;
+                cmax  = std::max(cmax, cn);
+                worst = std::max(worst, e + step * cn);
+            }
+            out[(size_t) (s * H + h)] = { worst, worst + 32.0 * EPS16 * ((double) T + 2.0) * cmax };
+        }
+    }
+    return out;
+}
+
+// Raise the bounds of the GDN output y (the attention part [S_v, H, T, n_seqs], then the state
+// slots [S_v, S_v, H, n_seqs]) to the growth bound of each head.
+void gdn_growth_bounds(const built_case & c, const ggml_tensor * y, int64_t T, int64_t n_seqs,
+                       const std::vector<float> & ref, bound_arrays & ba) {
+    const int64_t S_v = y->src[2]->ne[0], H = y->src[2]->ne[1];
+    const std::vector<gdn_head_bound> hb = gdn_growth(c, y, T, n_seqs, -1.0);
+    const size_t attn = (size_t) (S_v * H * T * n_seqs);
+    for (size_t i = 0; i < ref.size(); i++) {
+        const size_t sh = i < attn ? (i / (size_t) S_v) % (size_t) H + (i / (size_t) (S_v * H * T)) * (size_t) H
+                                   : ((i - attn) / (size_t) (S_v * S_v)) % (size_t) (H * n_seqs);
+        ba.strict[i] = std::max(ba.strict[i], hb[sh].strict);
+        ba.loose[i]  = std::max(ba.loose[i], hb[sh].loose);
+    }
+}
+
+// Return true if each finite gate is <= 0 and each finite beta is in [0, 1]: the domain of the model.
+bool gdn_in_domain(const built_case & c, const ggml_tensor * y) {
+    for (double x : logical_values(c, y->src[3])) {
+        if (std::isfinite(x) && x > 0.0) {
+            return false;
+        }
+    }
+    for (double x : logical_values(c, y->src[4])) {
+        if (std::isfinite(x) && (x < 0.0 || x > 1.0)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void bound_gdn(const built_case & c, size_t o, const std::vector<float> & ref, bound_arrays & ba) {
     const ggml_tensor * y = c.outs[o].t;
     const double S_v = c.prm[0], H = c.prm[1], T = c.prm[2], n_seqs = c.prm[3];
@@ -614,6 +737,9 @@ void bound_gdn(const built_case & c, size_t o, const std::vector<float> & ref, b
         }
     }
     gdn_bounds(S_v, T, M, ref, attn, ba);
+    if (!gdn_in_domain(c, y)) {
+        gdn_growth_bounds(c, y, (int64_t) T, (int64_t) n_seqs, ref, ba);
+    }
 }
 
 const char * TXT_GDN =
@@ -622,7 +748,11 @@ const char * TXT_GDN =
     "contraction and exp(g) <= 1. Each token adds at most (S_v+4)u M of rounding in f32 dot products "
     "of length S_v, and the errors do not grow. The attention output is scale q^T S with |q| = 1, "
     "thus it has the bound of the state. The loose bound adds one f16 rounding of each HMX product "
-    "for each token (the chunked kernel).";
+    "for each token (the chunked kernel). A case outside the domain of the model (a gate g > 0 or a "
+    "beta outside [0, 1], only from a byte after the other fields of a wild case) can expand the state by "
+    "gamma = exp(max g) max(1, |1 - beta|) for each token, and the error grows with it: each output "
+    "of a head also gets max_t (e_t + 8u (S_v+4) c_t), with c the growth bound of the column norm of "
+    "the state and e_t+1 = gamma_t e_t + 8u (S_v+4) c_t+1 (refer to gdn_growth).";
 
 bool build_gdn_state_chain(builder & b) {
     reader &  rd = b.rd;
@@ -651,6 +781,7 @@ bool build_gdn_state_chain(builder & b) {
     ggml_tensor * v     = b.f32(s.S_v, H, 1, 1, b.vs(-0.3f, 5.0f));
     ggml_tensor * g     = b.f32(1, H, 1, 1, b.vs(-5.0f, -1e-4f));
     ggml_tensor * beta  = b.f32(1, H, 1, 1, b.vs(0.0f, 1.0f));
+    gdn_domain(b, g, beta);
     ggml_tensor * G     = ggml_gated_delta_net(b.ctx, q, k, v, g, beta, state, s.K);
     ggml_build_forward_expand(b.c.gf, G);
     const int64_t attn  = s.S_v * H;
@@ -684,6 +815,18 @@ void bound_gdn_chain(const built_case & c, size_t o, const std::vector<float> & 
     // The cache rows that the chain does not write are copies, and the slot row holds the state
     // tail of the GDN output: the rule of the state applies to every element.
     gdn_bounds(c.prm[0], 1.0, M, ref, 0, ba);
+    if (!gdn_in_domain(c, G)) {
+        // outside the domain: the growth bound of the worst head, with the initial state from the
+        // cache table, for each element of the two outputs
+        gdn_head_bound w = { 0.0, 0.0 };
+        for (const gdn_head_bound & hb : gdn_growth(c, G, 1, 1, amax(logical_values(c, cache)))) {
+            w = { std::max(w.strict, hb.strict), std::max(w.loose, hb.loose) };
+        }
+        for (size_t i = 0; i < ref.size(); i++) {
+            ba.strict[i] = std::max(ba.strict[i], w.strict);
+            ba.loose[i]  = std::max(ba.loose[i], w.loose);
+        }
+    }
 }
 
 const char * TXT_GDN_CHAIN =
