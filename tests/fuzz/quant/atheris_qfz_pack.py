@@ -11,12 +11,15 @@ possible. The oracle is the same as in test_qfz_grid.py:
 - A value that is not finite, or a block beyond the F16 scale range, gives
   ValueError, and no input in the range does (qfz_common.scale_domain).
 
-    uv run python tests/fuzz/quant/atheris_qfz_pack.py -max_total_time=600 -timeout=20 \\
+    uv run python tests/fuzz/quant/atheris_qfz_pack.py -max_total_time=600 -runs=200000 -timeout=20 \\
         -rss_limit_mb=4096 -artifact_prefix=build/fuzz/quant/atheris/ build/fuzz/quant/atheris/pack-corpus \\
         tests/fuzz/quant/seeds/pack
 
 Give -artifact_prefix= in each run, else libFuzzer writes crash-* files into
-the working directory.
+the working directory. Give -runs= too: the comparison hook of atheris keeps
+the result of each instrumented comparison of two tensors, thus the process
+grows by approximately 6 KB for each execution (qfz_run.py,
+ATHERIS_RUNS_PER_PROCESS).
 """
 
 from __future__ import annotations

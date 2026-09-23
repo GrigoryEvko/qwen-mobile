@@ -71,6 +71,14 @@ from qfz_common import (  # noqa: E402
 LOG = logging.getLogger("qfz.run")
 PHONE = FUZZ_OUT / "phone"
 _WRITE_LOCK = threading.Lock()
+# The comparison hook of atheris 3.1.0 keeps a reference to the result of each instrumented comparison that
+# does not give a bool, for example a torch tensor or a numpy array. quant.grid and quant.grids compare
+# tensors, thus the atheris-pack process grows by approximately 6 KB for each execution (4 GB after 600000
+# executions). One libFuzzer process runs at most this many executions, and the next process continues with
+# the same corpus. Thus a process stays below approximately 2 GB, and -rss_limit_mb still stops an input
+# that allocates too much memory.
+ATHERIS_RUNS_PER_PROCESS = 200_000
+ATHERIS_RSS_LIMIT_MB = 4096
 
 
 @dataclasses.dataclass
@@ -216,8 +224,24 @@ class Runner:
         r.seconds = time.monotonic() - start
         return r
 
+    def _atheris_process(self, t: Target, args: list[str], timeout: float) -> tuple[int, str, int]:
+        """Run one libFuzzer process of an atheris target and give (exit status, output, executions)."""
+        cmd = [sys.executable, str(HERE / t.file), *args]
+        try:
+            res = subprocess.run(cmd, cwd=ROOT, env=self.env, capture_output=True, text=True, errors="replace",
+                                 timeout=timeout, check=False)
+            status, text = res.returncode, res.stdout + res.stderr
+        except subprocess.TimeoutExpired as exc:
+            status, text = -9, str(exc)
+        m = re.search(r"stat::number_of_executed_units:\s+(\d+)", text) or re.search(r"Done (\d+) runs", text)
+        return status, text, int(m.group(1)) if m else 0
+
     def run_atheris(self, t: Target) -> Result:
-        """A libFuzzer Python fuzzer: the seed files once (test), or libFuzzer for the budget (fuzz)."""
+        """A libFuzzer Python fuzzer: the seed files once (test), or libFuzzer processes for the budget (fuzz).
+
+        In the fuzz mode, each process runs at most ATHERIS_RUNS_PER_PROCESS executions. The next process
+        continues with the same corpus, until the budget ends or a process fails.
+        """
         r = self.result(t.name)
         start = time.monotonic()
         # The failing inputs of regress/ are seeds too, thus the mode test replays them.
@@ -226,20 +250,20 @@ class Runner:
         corpus.mkdir(parents=True, exist_ok=True)
         prefix = self.crashes / f"{t.name}-"
         before = set(self.crashes.glob(f"{t.name}-*"))
-        args = [f"-artifact_prefix={prefix}", "-timeout=20", "-rss_limit_mb=4096", "-print_final_stats=1"]
+        args = [f"-artifact_prefix={prefix}", "-timeout=20", f"-rss_limit_mb={ATHERIS_RSS_LIMIT_MB}",
+                "-print_final_stats=1"]
+        status, text = 0, ""
         if self.mode == "test":
-            args += ["-runs=0", *seeds]
+            status, text, r.executions = self._atheris_process(t, [*args, "-runs=0", *seeds], self.budget + 600)
         else:
-            args += [f"-max_total_time={int(self.budget)}", str(corpus), *seeds]
-        cmd = [sys.executable, str(HERE / t.file), *args]
-        try:
-            res = subprocess.run(cmd, cwd=ROOT, env=self.env, capture_output=True, text=True, errors="replace",
-                                 timeout=self.budget + 600, check=False)
-            status, text = res.returncode, res.stdout + res.stderr
-        except subprocess.TimeoutExpired as exc:
-            status, text = -9, str(exc)
-        m = re.search(r"stat::number_of_executed_units:\s+(\d+)", text) or re.search(r"Done (\d+) runs", text)
-        r.executions = int(m.group(1)) if m else 0
+            while status == 0:
+                left = int(self.budget - (time.monotonic() - start))
+                if left < 1:
+                    break
+                status, text, n = self._atheris_process(
+                    t, [*args, f"-max_total_time={left}", f"-runs={ATHERIS_RUNS_PER_PROCESS}", str(corpus), *seeds],
+                    left + 600)
+                r.executions += n
         new = sorted(set(self.crashes.glob(f"{t.name}-*")) - before)
         r.crash_files = [str(p.relative_to(ROOT)) for p in new]
         if status != 0 or new:
