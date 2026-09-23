@@ -412,14 +412,14 @@ void checker::check_slot(const fakedsp::op_record & op, const fakedsp::tensor_re
     const auto    it   = input_ints_.find(idx.addr);
     if (it == input_ints_.end()) {
         const val v = dev_mem_.get(idx.addr);
-        fakedsp::violation("gdn-slot-stale", "%s: the host gives slot %d, but the index at 0x%" PRIx64
+        fakedsp::violation("gdn-slot-from-input", "%s: the host gives slot %d, but the index at 0x%" PRIx64
                            " is %s, not an input of the graph: the host reads it at enqueue time, before the DSP writes it",
                            fakedsp::opcode_name(op.opcode), slot, idx.addr,
                            (v & CONC) ? "a concrete value" : "the output of an op of the graph");
         return;
     }
     if (it->second != slot) {
-        fakedsp::violation("gdn-slot-stale", "%s: the host gives slot %d, the harness wrote the index %d at 0x%" PRIx64
+        fakedsp::violation("gdn-slot-from-input", "%s: the host gives slot %d, the harness wrote the index %d at 0x%" PRIx64
                            ": the host read bytes that the DSP wrote for a later tensor", fakedsp::opcode_name(op.opcode),
                            slot, it->second, idx.addr);
     }

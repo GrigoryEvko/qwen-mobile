@@ -29,7 +29,7 @@ void log_filter(enum ggml_log_level level, const char * text, void * user) {
         fputs(text, stderr);
     }
     if (g_valid_slots && text && strstr(text, "the unfused ops run")) {
-        fakedsp::violation("gdn-slot-stale", "the host reads a slot index that is not valid, but the harness wrote a valid one: %s",
+        fakedsp::violation("gdn-slot-from-input", "the host reads a slot index that is not valid, but the harness wrote a valid one: %s",
                            text);
     }
 }
