@@ -123,3 +123,4 @@ fuzz-hexhost/0001-hexagon-gdn-slot-index-before-the-first-batch.patch
 fuzz-hexhost/0002-hexagon-mul-mat-add-only-for-the-whole-product.patch
 fuzz-hexhost/0003-hexagon-model-the-dsp-limits-in-supports-op.patch
 fuzz-hexhost/0004-hexagon-no-fastdiv-of-zero-in-the-matmul-params.patch
+fuzz-hexhost/0005-hexagon-tiled-matmul-rows-from-dst.patch
