@@ -36,7 +36,7 @@ exactly and y keeps the same maximum error of 9.54e-07 against the scalar refere
 Two variants are measured and rejected. A tree over the eight terms of a window shortens the chain
 further but needs eight live vectors for each window, and the kernel then spills: 1472 cycles for
 each block, with HVX_LD_L2_OUTSTANDING at 19.8 %. Two blocks in one iteration give 401.5 cycles,
-which is no gain, and COPROC_BUSY returns to 49 %, thus the permutes are now the limit.
+which is no gain, and COPROC_BUSY returns to 49 %, thus the permutes become the limit.
 
 diff -urN a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
 --- a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c	2026-09-20 03:02:40.404555444 +0300

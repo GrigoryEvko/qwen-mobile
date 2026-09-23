@@ -1,3 +1,3 @@
-These proposals no longer apply to the kernel directory, thus the lab does not pick them up.
+These proposals do not apply to the kernel directory, thus the lab does not pick them up.
 0001-hvx-multirow-dot.patch      landed in the patch series as the multi-row dot kernel.
 0002-hvx-gdn-conv-tap-planes.patch  is stale against gdn-conv-ops.c. Its tap-plane layout of the conv state is not in the series.
