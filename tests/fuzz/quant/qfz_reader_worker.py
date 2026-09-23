@@ -92,7 +92,10 @@ class ReaderPool:
 
         package_dir = str(Path(gguf.__file__).resolve().parents[1])
         rest = [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p]
-        env = {**os.environ, "PYTHONPATH": os.pathsep.join([package_dir, *rest])}
+        # OpenBLAS of numpy reserves a buffer for each thread at the import, and a thread for each CPU
+        # does not fit the address-space limit of the worker on a host with many CPUs.
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join([package_dir, *rest]), "OPENBLAS_NUM_THREADS": "1",
+               "OMP_NUM_THREADS": "1"}
         return subprocess.Popen([sys.executable, str(Path(__file__).resolve())], stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, text=True, env=env)
 
