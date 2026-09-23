@@ -196,16 +196,21 @@ class SettingsFuzzTest {
     }
 
     /**
-     * Finding settings-surrogate: take(MAX_SYSTEM_PROMPT) counts UTF-16
-     * units, thus it can cut an emoji in two and leave a lone high surrogate
-     * at the end of the system prompt. GetStringUTFChars gives that unit to
-     * the engine as three bytes that are not UTF-8.
+     * The limit of the system prompt does not cut a surrogate pair in two
+     * (finding settings-surrogate, task #165). A lone high surrogate at the
+     * end goes through GetStringUTFChars to the engine as three bytes that
+     * are not UTF-8.
      */
     @Test
     fun theSystemPromptLimitKeepsSurrogatePairsWhole() {
-        FuzzSwitch.requireFindings("settings-surrogate")
         val prompt = "a".repeat(SettingsStore.MAX_SYSTEM_PROMPT - 1) + "😀"
         val s = SettingsStore.sanitize(AppSettings(modelPath = null, backend = Backend.CPU, systemPrompt = prompt))
-        assertFalse("the prompt ends with a lone high surrogate", s.systemPrompt.last().isHighSurrogate())
+        assertEquals("a".repeat(SettingsStore.MAX_SYSTEM_PROMPT - 1), s.systemPrompt)
+        val rnd = Random(FuzzSwitch.seed + 13)
+        repeat(FuzzSwitch.iterations) { i ->
+            val text = randomString(rnd, SettingsStore.MAX_SYSTEM_PROMPT + 40)
+            val cut = SettingsStore.sanitize(AppSettings(modelPath = null, backend = Backend.CPU, systemPrompt = text)).systemPrompt
+            assertFalse("iteration $i: the prompt ends with a lone high surrogate", cut.isNotEmpty() && cut.last().isHighSurrogate())
+        }
     }
 }

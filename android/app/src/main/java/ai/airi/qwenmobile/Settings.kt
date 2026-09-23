@@ -186,8 +186,17 @@ class SettingsStore private constructor(context: Context) {
             temperature = if (s.temperature.isNaN()) DEFAULT_TEMPERATURE else s.temperature.coerceIn(0f, MAX_TEMPERATURE),
             topP = if (s.topP.isNaN()) DEFAULT_TOP_P else s.topP.coerceIn(MIN_TOP_P, 1f),
             // The prompt costs context on every turn and is prefilled again
-            // whenever it changes, thus it is bounded.
-            systemPrompt = s.systemPrompt.trim().take(MAX_SYSTEM_PROMPT),
+            // whenever it changes, thus it is bounded. The limit counts UTF-16
+            // units: a cut between the two units of a surrogate pair leaves a
+            // high surrogate that is not UTF-8 in the engine, thus the cut
+            // goes before the pair (task #165).
+            systemPrompt = s.systemPrompt.trim().let { p ->
+                if (p.length > MAX_SYSTEM_PROMPT && p[MAX_SYSTEM_PROMPT - 1].isHighSurrogate()) {
+                    p.take(MAX_SYSTEM_PROMPT - 1)
+                } else {
+                    p.take(MAX_SYSTEM_PROMPT)
+                }
+            },
         )
     }
 }
