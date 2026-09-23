@@ -85,9 +85,10 @@ public:
 
     /**
      * The bytes of a snapshot, from RAM or read from its file into RAM.
-     * The snapshot becomes the most recently used one. Returns null when
-     * the file is not readable, and then the snapshot is gone from the
-     * store.
+     * When the file is not there yet, the read waits one time for the
+     * queued writes. The snapshot becomes the most recently used one.
+     * Returns null when the file is not readable, and then the snapshot is
+     * gone from the store.
      */
     std::shared_ptr<const cache_io::Blob> bytes(const Snapshot * snap);
 

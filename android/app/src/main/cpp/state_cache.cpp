@@ -267,16 +267,25 @@ std::shared_ptr<const cache_io::Blob> StateCache::bytes(const Snapshot * snap) {
         return nullptr;
     }
     if (!it->bytes) {
-        Snapshot head;
-        uint64_t body_offset = 0;
         const std::string path = path_of(*it);
-        if (!it->on_disk || !read_head(path, head, body_offset) || head.key != it->key ||
-            head.byte_size != it->byte_size) {
-            erase(it, true);
-            return nullptr;
+        auto read = [&]() -> std::shared_ptr<cache_io::Blob> {
+            Snapshot head;
+            uint64_t body_offset = 0;
+            if (!it->on_disk || !read_head(path, head, body_offset) || head.key != it->key ||
+                head.byte_size != it->byte_size) {
+                return nullptr;
+            }
+            auto blob = std::make_shared<cache_io::Blob>(it->byte_size);
+            return cache_io::read_range(path, body_offset, blob->data.get(), blob->size) ? blob : nullptr;
+        };
+        std::shared_ptr<cache_io::Blob> blob = read();
+        if (!blob && it->on_disk && writer_) {
+            // A snapshot that left RAM before the writer thread wrote its file
+            // has no file yet: the read waits for the queued writes one time.
+            writer_->drain();
+            blob = read();
         }
-        auto blob = std::make_shared<cache_io::Blob>(it->byte_size);
-        if (!cache_io::read_range(path, body_offset, blob->data.get(), blob->size)) {
+        if (!blob) {
             erase(it, true);
             return nullptr;
         }
@@ -289,7 +298,9 @@ std::shared_ptr<const cache_io::Blob> StateCache::bytes(const Snapshot * snap) {
 }
 
 void StateCache::make_resident(List::iterator it, std::shared_ptr<const cache_io::Blob> bytes) {
-    if (it->bytes || !bytes || bytes->size > ram_budget_) {
+    // The RAM counter holds the items too, thus the admission compares the same
+    // sum with the budget.
+    if (it->bytes || !bytes || bytes->size + it->items.size() * sizeof(MemItem) > ram_budget_) {
         return;
     }
     // byte_size stays the one of the entry: the file, the header and the two

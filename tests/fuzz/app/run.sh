@@ -58,9 +58,6 @@
 #   FAKEJNI_RELAX   The checks of the fake VM that only report in the fuzz mode
 #                   (refer to harness/fake_jni.h). The default relaxes none, and
 #                   the test mode relaxes none.
-#   FUZZ_APP_SKIP_KNOWN  1 (the default of the fuzz mode) keeps the fuzzers away
-#                   from the findings that a scenario reproduces already. The
-#                   test mode uses 0.
 #
 # The llama.cpp tree is a private snapshot in build/fuzz/app/llama-snap: the
 # first run copies it from the submodule, thus a later edit of the submodule
@@ -262,7 +259,7 @@ fuzz_one() {
     done
     t0=$(date +%s)
     # shellcheck disable=SC2046
-    env FAKEJNI_RELAX="${FAKEJNI_RELAX-}" FUZZ_APP_SKIP_KNOWN="${FUZZ_APP_SKIP_KNOWN:-1}" \
+    env FAKEJNI_RELAX="${FAKEJNI_RELAX-}" \
         FUZZ_ARTIFACT_DIR="$art" $(env_of "$target" "$san") \
         nice -n 10 timeout -s KILL $((budget + 300)) "$bin" -max_total_time="$budget" -rss_limit_mb=4096 \
         -max_len="$(max_len_of "$target")" -timeout=180 -print_final_stats=1 -close_fd_mask=1 \
@@ -304,7 +301,7 @@ test_one() {
         n=$((n + 1))
         log="$dir/logs/test/$target-$(basename "$f").log"
         # shellcheck disable=SC2046
-        if ! env FAKEJNI_RELAX='' FUZZ_APP_SKIP_KNOWN=0 FUZZ_ARTIFACT_DIR="$dir/artifacts/test-$target" \
+        if ! env FAKEJNI_RELAX='' FUZZ_ARTIFACT_DIR="$dir/artifacts/test-$target" \
             $(env_of "$target" "$san") nice -n 10 timeout -s KILL 900 \
             "$bin" -runs=1 -rss_limit_mb=4096 -artifact_prefix="$dir/artifacts/test-$target/" "$f" > "$log" 2>&1; then
             crashes+=("$f")
@@ -565,7 +562,7 @@ phone_commands() {
         ubsan) rt="UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:suppressions=$d/ubsan.supp" ;;
         none) rt="" ;;
     esac
-    local envs="LD_LIBRARY_PATH=$libs ADSP_LIBRARY_PATH=$d/lib FUZZ_APP_LIBDIR=$d/lib FUZZ_APP_MODEL_DIR=$d/models FUZZ_APP_WORK=$d/work FUZZ_ARTIFACT_DIR=$d/logs FUZZ_APP_SKIP_KNOWN=1 $rt"
+    local envs="LD_LIBRARY_PATH=$libs ADSP_LIBRARY_PATH=$d/lib FUZZ_APP_LIBDIR=$d/lib FUZZ_APP_MODEL_DIR=$d/models FUZZ_APP_WORK=$d/work FUZZ_ARTIFACT_DIR=$d/logs $rt"
     local real="FUZZ_APP_REAL_MODEL=/data/local/tmp/qwen/models/Qwen3.5-2B-Q8_0.gguf FUZZ_APP_REAL_ONLY=1 FUZZ_APP_MAX_OPS=8 FUZZ_APP_MAX_GEN=16 FUZZ_APP_ORACLE=0"
     local thermal="$a shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
     # One run: the thermal status before and after it, and the processes that stay.

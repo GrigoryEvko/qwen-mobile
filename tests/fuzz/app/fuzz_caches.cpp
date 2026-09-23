@@ -115,11 +115,9 @@ void check_states(const StateCache & s) {
         fail("state store: the counters say %zu RAM and %zu disk bytes, the entries hold %zu and %zu", s.ram_bytes_,
              s.disk_bytes_, ram, disk);
     }
-    // make_resident admits a snapshot by its state bytes, but the counter also
-    // holds its items, and evict_ram never evicts the snapshot it keeps. Thus
-    // one resident snapshot can hold the store above the budget. More than
-    // one cannot.
-    if (s.ram_bytes_ > s.ram_budget_ && s.resident() > 1) {
+    // The counter holds the state bytes and the items of each resident
+    // snapshot, and the admission compares the same sum.
+    if (s.ram_bytes_ > s.ram_budget_) {
         fail("state store: %zu bytes in RAM in %zu snapshots, over the budget of %zu", s.ram_bytes_, s.resident(),
              s.ram_budget_);
     }
@@ -237,15 +235,7 @@ void run_states(FuzzedDataProvider & fdp, const std::string & dir) {
                     break;
                 }
                 const std::vector<MemItem> key = snap->items;
-                // FUZZ_CACHES_DRAIN=1 or FUZZ_APP_SKIP_KNOWN=1 waits for the queued writes first. The store
-                // drops a snapshot whose file write is still in the queue, and the switch lets a long run
-                // go past that defect.
-                static const bool drain_first = getenv("FUZZ_CACHES_DRAIN") != nullptr ||
-                                                (getenv("FUZZ_APP_SKIP_KNOWN") != nullptr &&
-                                                 strcmp(getenv("FUZZ_APP_SKIP_KNOWN"), "1") == 0);
-                if (drain_first) {
-                    store->drain();
-                }
+                // The write of the file can still wait in the queue: bytes() then waits for it.
                 std::shared_ptr<const cache_io::Blob> bytes = store->bytes(snap);
                 if (!bytes) {
                     if (store->find(key) != nullptr) {
