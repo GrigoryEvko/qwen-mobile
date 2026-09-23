@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Make or refresh a private copy of the patched llama.cpp submodule, and
+# Make or refresh a private copy of the patched llama.cpp tree of HEAD, and
 # write the stamp that the rule LLAMA-COPY of check-rules.sh reads.
 #
 # Usage:
@@ -8,33 +8,36 @@
 #   DEST     The root of the copy, for example build/fuzz/<area>/llama-src.
 #            A build names DEST (a full copy) or DEST/ggml (--ggml) as its
 #            source tree.
-#   --ggml   Copy only third_party/llama.cpp/ggml, into DEST/ggml.
+#   --ggml   Copy only the ggml directory, into DEST/ggml.
 #
 # The copy:
-#   - It takes the landing lock build/.land.lock as a shared lock. Thus no
-#     landing changes the submodule or patches/series during the copy.
-#   - It stops if the submodule is not at the commit that HEAD records, or if
-#     patches/series has a change that is not in HEAD.
-#   - rsync compares the contents (-c) and does not keep the times of the
-#     submodule (no -t). A file with new contents gets the time of the copy,
-#     thus ninja compiles each object of that file again. A copy that keeps
-#     the times (cp -a, rsync -a) can give a changed header a time before its
-#     objects, and ninja then keeps the objects of the old header.
-#   - --delete removes the files that the submodule does not have.
+#   - The source is the git objects of one commit of the repository (HEAD
+#     when the script starts): the llama.cpp commit that it records, plus
+#     each patch of its patches/series. The work tree of the submodule is not
+#     read, thus an uncommitted edit there, or a landing during the copy,
+#     does not go into the copy.
+#   - rsync compares the contents (-c) and does not keep the times (no -t).
+#     A file with new contents gets the time of the copy, thus ninja
+#     compiles each object of that file again, and a file with the same
+#     contents keeps its time. A copy that keeps the times (cp -a, rsync -a)
+#     can give a changed header a time before its objects, and ninja then
+#     keeps the objects of the old header.
+#   - --delete removes the files that the patched tree does not have.
 #   - The stamp DEST/.llama-copy-stamp has two lines:
-#       commit <the llama.cpp commit of HEAD:third_party/llama.cpp>
-#       series <the git object id of HEAD:patches/series>
-#     The script removes the stamp before the copy and writes it after the
-#     copy. Thus a copy that stops before the end has no stamp.
+#       commit <the llama.cpp commit that the repository commit records>
+#       patches <the git tree id of patches/ in the repository commit>
+#     The tree id changes when a patch file or patches/series changes. The
+#     script removes the stamp before the copy and writes it after the copy.
+#     Thus a copy that stops before the end has no stamp.
 #
 # Exit status: 0 on success, 1 on an error, 2 for a usage error.
-# Complexity: one checksum pass over the submodule (about 400 MB).
+# Time: about 10 s on a loaded build server (the series has about 180
+# patches). Disk: one temporary tree of about 400 MB under build/.
 
 set -euo pipefail
 
 readonly REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly SUBMODULE="$REPO/third_party/llama.cpp"
-readonly LOCK="$REPO/build/.land.lock"
 readonly STAMP_NAME=".llama-copy-stamp"
 
 # Write the usage text, from the header comment of this file.
@@ -54,26 +57,8 @@ die() {
     exit 1
 }
 
-# Copy the tree and write the stamp. The caller holds the shared lock.
-# Arguments: the source directory, the destination directory, the stamp file.
-copy_tree() {
-    local src="$1" dst="$2" stamp="$3" commit series head
-    commit="$(git -C "$REPO" rev-parse HEAD:third_party/llama.cpp)"
-    series="$(git -C "$REPO" rev-parse HEAD:patches/series)"
-    head="$(git -C "$SUBMODULE" rev-parse HEAD)"
-    [[ "$head" == "$commit" ]] \
-        || die "the submodule is at $head, but HEAD records $commit. Update the submodule and run scripts/apply-patches.sh, then try again."
-    [[ "$(git -C "$REPO" hash-object patches/series)" == "$series" ]] \
-        || die "patches/series has a change that is not in HEAD. Commit it (or wait for the landing), then try again."
-    rm -f "$stamp"
-    mkdir -p "$dst"
-    rsync -rlc --delete --exclude .git --exclude '/build*/' --exclude __pycache__ \
-        --exclude "/$STAMP_NAME" "$src/" "$dst/"
-    printf 'commit %s\nseries %s\n' "$commit" "$series" > "$stamp"
-}
-
 main() {
-    local ggml=0 dest="" sub_real
+    local ggml=0 dest="" sub_real head commit patches scratch line src dst
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --ggml) ggml=1; shift ;;
@@ -85,25 +70,46 @@ main() {
     done
     [[ -n "$dest" ]] || { echo "llama-copy: DEST is necessary. Use --help." >&2; exit 2; }
     command -v rsync > /dev/null || die "rsync is necessary."
-    command -v flock > /dev/null || die "flock is necessary."
     # realpath -m: the physical path, also for a DEST that does not exist yet.
     dest="$(realpath -m "$dest")"
     sub_real="$(realpath "$SUBMODULE")"
     [[ "$dest/" != "$sub_real"/* ]] || die "DEST must not be in the submodule."
-    mkdir -p "$dest" "$(dirname "$LOCK")"
 
-    local src="$SUBMODULE" dst="$dest"
+    head="$(git -C "$REPO" rev-parse HEAD)"
+    commit="$(git -C "$REPO" rev-parse "$head:third_party/llama.cpp")"
+    patches="$(git -C "$REPO" rev-parse "$head:patches")"
+    git -C "$SUBMODULE" cat-file -e "$commit^{commit}" 2> /dev/null \
+        || die "the submodule has no object of the llama.cpp commit $commit. Fetch it in third_party/llama.cpp, then try again."
+
+    mkdir -p "$REPO/build" "$dest"
+    scratch="$(mktemp -d "$REPO/build/.llama-copy.XXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$scratch'" EXIT
+    mkdir -p "$scratch/src" "$scratch/patches"
+    git -C "$SUBMODULE" archive --format=tar "$commit" | tar -x -C "$scratch/src"
+    git -C "$REPO" archive --format=tar "$patches" | tar -x -C "$scratch/patches"
+    # The scratch tree is its own git repository, thus git apply resolves the
+    # paths from its root and not from the repository around build/.
+    git -C "$scratch/src" init -q
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        [[ -f "$scratch/patches/$line" ]] || die "patches/series of $head names patches/$line, which does not exist."
+        git -C "$scratch/src" apply --whitespace=nowarn "$scratch/patches/$line" \
+            || die "patches/$line of $head does not apply to llama.cpp $commit."
+    done < "$scratch/patches/series"
+    rm -rf "$scratch/src/.git"
+
+    src="$scratch/src"
+    dst="$dest"
     if [[ $ggml -eq 1 ]]; then
-        src="$SUBMODULE/ggml"
+        src="$scratch/src/ggml"
         dst="$dest/ggml"
     fi
-    # The child shell of flock gets the functions and the constants with
-    # declare, because it does not inherit them.
-    flock -s "$LOCK" bash -c "set -euo pipefail
-        $(declare -p REPO SUBMODULE STAMP_NAME)
-        $(declare -f die copy_tree)
-        copy_tree \"\$1\" \"\$2\" \"\$3\"" _ "$src" "$dst" "$dest/$STAMP_NAME"
-    echo "llama-copy: $dst is a copy of $src, with the stamp $dest/$STAMP_NAME."
+    rm -f "$dest/$STAMP_NAME"
+    mkdir -p "$dst"
+    rsync -rlc --delete --exclude '/build*/' --exclude "/$STAMP_NAME" "$src/" "$dst/"
+    printf 'commit %s\npatches %s\n' "$commit" "$patches" > "$dest/$STAMP_NAME"
+    echo "llama-copy: $dst is the patched llama.cpp tree of $head (llama.cpp ${commit:0:12}, patches ${patches:0:12})."
 }
 
 main "$@"
