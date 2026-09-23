@@ -82,7 +82,9 @@ Other modes:
                 build and prints every UBSan report (the evidence run). "full" runs the pack with
                 the builds of PHONE_BUILDS (default: all staged builds). This script never runs adb.
   compare [RESULT...]      Compare the pulled phone results with the oracle, print the per-op
-                error table, and write the findings to build/fuzz/ops/findings-phone.
+                error table, and write the findings to build/fuzz/ops/findings-phone. The
+                column nf_values counts the non-finite mismatches of all runs, and nf_f16
+                counts the part of them with a finite reference above 65504 (the f16 range).
   summary PROFILE CONFIG   Print the merged statistics of the fuzz runs of one build.
   minimize FILE GROUP KIND VERDICT [PROFILE CONFIG]
                            Minimize a numeric finding with libFuzzer, and write the result to

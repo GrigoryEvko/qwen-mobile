@@ -262,6 +262,8 @@ struct row {
     uint64_t    runs = 0, unsupported = 0, crashed = 0, failed = 0, defects = 0, invalid = 0, oracle_fail = 0;
     uint64_t    verdicts[5] = { 0, 0, 0, 0, 0 };
     uint64_t    special = 0;
+    uint64_t    nf_values = 0; // non-finite mismatches, summed over the elements of all runs
+    uint64_t    nf_f16    = 0; // the part of nf_values with a finite reference above 65504
     double      max_ratio = 0.0, max_ratio_nsp = 0.0, max_ulp = 0.0, max_ulp_nsp = 0.0;
     std::string worst;
     std::string unsupported_example;
@@ -391,6 +393,10 @@ int cmd_compare(int argc, char ** argv) {
         }
         rw.verdicts[cc.v]++;
         rw.special += c.special ? 1 : 0;
+        for (const out_cmp & oc : cc.outs) {
+            rw.nf_values += (uint64_t) oc.n_nonfinite;
+            rw.nf_f16 += (uint64_t) oc.n_nf_f16;
+        }
         if (cc.ratio > rw.max_ratio) {
             rw.max_ratio = cc.ratio;
             rw.worst     = std::to_string(rec.idx) + " " + c.desc;
@@ -409,18 +415,20 @@ int cmd_compare(int argc, char ** argv) {
             }
         }
     }
-    std::printf("%-12s %-16s %-24s %6s %6s %6s %6s %6s %6s %6s %6s %6s %6s %10s %10s %10s\n", "backend", "kind", "path",
-                "runs", "inval", "unsup", "crash", "defect", "pass", "subn", "strict", "loose", "nonfin", "max_ratio",
-                "ratio_nsp", "ulp_nsp");
+    std::printf("%-12s %-16s %-24s %6s %6s %6s %6s %6s %6s %6s %6s %6s %6s %10s %10s %10s %9s %9s\n", "backend", "kind",
+                "path", "runs", "inval", "unsup", "crash", "defect", "pass", "subn", "strict", "loose", "nonfin",
+                "max_ratio", "ratio_nsp", "ulp_nsp", "nf_values", "nf_f16");
     for (const auto & it : table) {
         const row & rw = it.second;
-        std::printf("%-12s %-16s %-24s %6llu %6llu %6llu %6llu %6llu %6llu %6llu %6llu %6llu %6llu %10.3g %10.3g %10.3g\n",
+        std::printf("%-12s %-16s %-24s %6llu %6llu %6llu %6llu %6llu %6llu %6llu %6llu %6llu %6llu %10.3g %10.3g %10.3g %9llu "
+                    "%9llu\n",
                     std::get<0>(it.first).c_str(), std::get<1>(it.first).c_str(), std::get<2>(it.first).c_str(),
                     (unsigned long long) rw.runs, (unsigned long long) rw.invalid, (unsigned long long) rw.unsupported,
                     (unsigned long long) rw.crashed,
                     (unsigned long long) rw.defects, (unsigned long long) rw.verdicts[0], (unsigned long long) rw.verdicts[1],
                     (unsigned long long) rw.verdicts[2], (unsigned long long) rw.verdicts[3],
-                    (unsigned long long) rw.verdicts[4], rw.max_ratio, rw.max_ratio_nsp, rw.max_ulp_nsp);
+                    (unsigned long long) rw.verdicts[4], rw.max_ratio, rw.max_ratio_nsp, rw.max_ulp_nsp,
+                    (unsigned long long) rw.nf_values, (unsigned long long) rw.nf_f16);
     }
     std::printf("\nunsupported examples:\n");
     for (const auto & it : table) {
