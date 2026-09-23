@@ -1,0 +1,5 @@
+# The closed tasks (rule L8). A suppression entry must not name a task of
+# this list: the commit that closes a task removes the entries of that task.
+# tests/sanitizers/check-rules.sh reads the lines that start with "#<number>".
+# Format: #<task number> <date YYYY-MM-DD> <the commit or the reason>
+# The coordinator adds a line when a task closes. The list is empty today.

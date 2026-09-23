@@ -1,0 +1,91 @@
+# The one shared UBSan suppression file (rule R5).
+#
+# Rule R5:
+#   - Each build uses -fsanitize=undefined -fno-sanitize-recover=undefined.
+#     The first report stops the run.
+#   - Only a check with a known, tracked finding can recover, with
+#     -fsanitize-recover=<that check> and the runtime option halt_on_error=1.
+#     tests/sanitizers/ubsan.cmake gives these flags.
+#   - An entry of this file has an effect only for such a recoverable check.
+#   - Each entry names one function. Never a file, never a src: wildcard.
+#   - Each entry has a comment with its reason, its evidence, its task
+#     number and its date.
+#
+# Each pattern is anchored. The sanitizer runtime matches a pattern as a
+# substring of the function name (TemplateMatch of sanitizer_common), thus
+# "function:ggml_compute_forward_mul_mat" also matches
+# ggml_compute_forward_mul_mat_one_chunk, _id and _id_one_chunk. The
+# reproducer showed this on 2026-09-23. Thus:
+#   - A C function: ^name$.
+#   - A C++ function: ^name( (the symbolizer adds the parameter types).
+#   - A C++ function template: name< (the symbolizer puts the return type
+#     first, for example "void ggml_compute_forward_set_rows_impl<float, long>(...)").
+#
+# Rule R13: tests/sanitizers/supp-repro.sh runs the reproducer of each entry
+# (tests/sanitizers/repro/ubsan_ggml.c) in the debug and the release profile.
+# An entry that matches in one profile only has the marker
+# "R13: <profile> only" in its comment.
+#
+# tests/sanitizers/env.sh gives this file to UBSAN_OPTIONS=suppressions=.
+
+# Task #125, 2026-09-23. ggml_graph_nbytes (ggml/src/ggml.c:7451) starts from `void * p = 0`,
+# and incr_ptr_aligned (ggml.c:7444-7449) adds sizes to it: pointer arithmetic on a null pointer.
+# Upstream code, found by fuzz-hexhost under UBSan. Remove this entry when task #125 lands.
+# Evidence (clang 22.1.8): incr_ptr_aligned is inlined. The report shows
+# "#0 incr_ptr_aligned ggml.c:7447" and "#1 ggml_graph_nbytes ggml.c:7454" at the same PC.
+# UBSan matches the out-of-line function of that PC. This entry matches in the debug profile
+# (-O1) and in the release profile (-O3 -flto), with the shared and the static ggml link, on the
+# paths ggml_graph_overhead and ggml_new_graph (supp-repro.sh, 2026-09-23), and in the fuzz_graph
+# target of hexhost (release). An entry "incr_ptr_aligned" matches in no profile of the matrix
+# (only at -O0), thus it is not in this file.
+pointer-overflow:^ggml_graph_nbytes$
+
+# Task #127, 2026-09-23. F-UB-2 of the op fuzzer: the CPU backend calls typed functions
+# (ggml_vec_dot_f32, ggml_vec_dot_f16, ggml_cpu_fp32_to_fp16, ggml_cpu_fp32_to_fp32,
+# dequantize_row_q8_0 and the other type traits) through the generic types ggml_vec_dot_t,
+# ggml_from_float_t and ggml_to_float_t: "call to function ... through pointer to incorrect
+# function type". Upstream code. Each entry names the caller that the report frame shows.
+# Proposed fix: build/fuzz/ops/fixes/ub-function-pointer-casts.patch (not applied).
+# Remove these entries when task #127 lands.
+# Task #127, 2026-09-23. vec_dot through ggml_vec_dot_t, a matrix product (ggml-cpu.c).
+function:^ggml_compute_forward_mul_mat_one_chunk$
+# Task #127, 2026-09-23. from_float through ggml_from_float_t, a F16 matrix product (ggml-cpu.c).
+function:^ggml_compute_forward_mul_mat$
+# Task #127, 2026-09-23. vec_dot through ggml_vec_dot_t, an indirect matrix product (ggml-cpu.c).
+function:^ggml_compute_forward_mul_mat_id_one_chunk$
+# Task #127, 2026-09-23. from_float through ggml_from_float_t, an indirect matrix product (ggml-cpu.c).
+function:^ggml_compute_forward_mul_mat_id$
+# Task #127, 2026-09-23. from_float through ggml_from_float_t, a row store into F16 (ops.cpp,
+# a function template).
+function:ggml_compute_forward_set_rows_impl<
+# Task #127, 2026-09-23. from_float and vec_dot, a flash attention with F16 K and V (ops.cpp).
+function:^ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+# Task #127, 2026-09-23. The call sites of the audit of ggml-cpu (every call through
+# ggml_to_float_t, ggml_from_float_t and ggml_vec_dot_t), each with a reproducer mode:
+# dequantize_row_q through ggml_to_float_t in a copy from Q8_0 (ops.cpp).
+function:^ggml_compute_forward_dup_from_q(
+# Task #127, 2026-09-23. dequantize_row_q in an ADD with a quantized first operand (ops.cpp).
+function:^ggml_compute_forward_add_q_f32(
+# Task #127, 2026-09-23. dequantize_row_q in an ADD1 with a quantized first operand (ops.cpp).
+function:^ggml_compute_forward_add1_q_f32(
+# Task #127, 2026-09-23. dequantize_row_q in an OUT_PROD with a quantized first operand (ops.cpp).
+function:^ggml_compute_forward_out_prod_q_f32(
+# Task #127, 2026-09-23. dequantize_row_q in a GET_ROWS of a quantized matrix, the token
+# embedding lookup of a Q8_0 model (ops.cpp:5017, reported by fuzz-app).
+function:^ggml_compute_forward_get_rows_q(
+# Task #127, 2026-09-23. ggml_fp16_to_fp32_row through ggml_to_float_t in the lightning indexer
+# of DeepSeek V4 with a F16 K (ops.cpp, an extern "C" function, thus no parameter list).
+function:^ggml_compute_forward_lightning_indexer$
+
+# Task #156, 2026-09-23. The supports_op of MUL_MAT_ID (ggml-hexagon.cpp:5122 in
+# ggml_hexagon_precompute_matmul_params_impl, and 5438 in ggml_hexagon_precompute_fused_mmnx_params)
+# calls init_fastdiv_values(ne12 / ne02). With fewer tokens than experts the argument is 0, and
+# hex-fastdiv.h:22 divides by zero. Found by the phone probe of fuzz-hexhost. fuzz-hexhost owns the
+# fix. Remove this entry when task #156 lands.
+# Evidence (supp-repro.sh, regress/kparams/mm-id-div-zero.bin of hexhost, clang 22.1.8): the report
+# frames are "#0 init_fastdiv_values(unsigned int)" and "#1 ggml_hexagon_precompute_matmul_params_impl"
+# at one PC. Here the runtime matches the inlined frame #0: "^ggml_hexagon_precompute_matmul_params_impl("
+# does not match, "init_fastdiv_values" matches. Thus the entry covers each d = 0 of
+# init_fastdiv_values, from each caller. On x86 the division traps with SIGFPE after the suppressed
+# report. On arm64 it gives 0 and the run continues.
+integer-divide-by-zero:^init_fastdiv_values(
