@@ -34,8 +34,12 @@ namespace {
 llama_model * g_model   = nullptr;
 int32_t       g_n_vocab = 0;
 
-/** The work of one thread: decode a prompt, then sample and decode n_gen tokens. */
-void worker(std::vector<llama_token> prompt, int n_gen, bool use_common, float temp, uint32_t seed) {
+/**
+ * The work of one thread: decode a prompt, then sample and decode n_gen tokens. Each token is sampled
+ * reps times from the same logits: the graph of each decode takes the global lock of ggml_init, which
+ * orders the two threads for TSan, thus back-to-back samples make an unordered access visible.
+ */
+void worker(std::vector<llama_token> prompt, int n_gen, int reps, bool use_common, float temp, uint32_t seed) {
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = 128;
     cp.n_batch = 64;
@@ -73,9 +77,12 @@ void worker(std::vector<llama_token> prompt, int n_gen, bool use_common, float t
         fuzz::fail("the prompt decode fails");
     }
     for (int i = 0; i < n_gen; ++i) {
-        llama_token id = cs ? common_sampler_sample(cs, ctx, -1, false) : llama_sampler_sample(chain, ctx, -1);
-        if (id < 0 || id >= g_n_vocab) {
-            fuzz::fail("P2: the sampler gives the token %d", id);
+        llama_token id = LLAMA_TOKEN_NULL;
+        for (int r = 0; r < reps; ++r) {
+            id = cs ? common_sampler_sample(cs, ctx, -1, false) : llama_sampler_sample(chain, ctx, -1);
+            if (id < 0 || id >= g_n_vocab) {
+                fuzz::fail("P2: the sampler gives the token %d", id);
+            }
         }
         if (cs) {
             common_sampler_accept(cs, id, true);
@@ -127,7 +134,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
         for (int i = 0; i < n_prompt; ++i) {
             prompt.push_back(fdp.ConsumeIntegralInRange<llama_token>(0, g_n_vocab - 1));
         }
-        threads.emplace_back(worker, prompt, n_gen, use_common, temp, seed);
+        // one byte of the input (0 when the input is spent) gives 1 to 8 samples for each token
+        const int reps = 1 + fdp.ConsumeIntegralInRange<int>(0, 7);
+        threads.emplace_back(worker, prompt, n_gen, reps, use_common, temp, seed);
     }
     for (auto & t : threads) {
         t.join();
