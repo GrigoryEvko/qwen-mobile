@@ -168,11 +168,10 @@ def test_qf5_export_of_a_source_with_an_empty_array(tmp_path: Path) -> None:
     assert gguf.GGUFReader(str(out)).fields["qfz.empty"].contents() == []
 
 
-# --- QF6: unknown plan types ----------------------------------------------------------------------
+# --- QF6 (task #168): unknown plan types --------------------------------------------------------------
 
-@xfail_open("QF6", "Plan(head='Q6_K') writes the head as the F16 source with no error")
 def test_qf6_export_refuses_an_unknown_plan_type(tmp_path: Path) -> None:
-    """quant/export.py:374-378 (and run.py:355-358 without choices): an unknown type must raise."""
+    """The export refuses Plan(head="Q6_K"), which wrote the head as the F16 source with no error."""
     src = _plain_source(tmp_path / "src.gguf")
     with pytest.raises(ValueError):
         export(src, tmp_path / "out.gguf", tmp_path / "no-packs", Plan(n_layers=0, head="Q6_K"), LLAMA_DIR, CPU)

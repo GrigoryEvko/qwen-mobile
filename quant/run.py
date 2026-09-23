@@ -35,6 +35,9 @@ from .checkpoint import MTP_HNORM_ROT, OUTPUT_ROT, layer_types, load_checkpoint,
 from .paths import ROOT, llama_path
 from .plan import Plan
 
+# The type names of a plan class, as the export writes them.
+PLAN_TYPES = ("Q4_0", "IQ4_NL", "CB4", "Q8_0", "F16")
+
 
 def cmd_transform(args: argparse.Namespace) -> None:
     """Write the transformed checkpoint weights/<model>-<suffix>, tied or untied."""
@@ -357,13 +360,14 @@ def main() -> None:
 def _plan_args(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--bulk", default="Q4_0", choices=("Q4_0", "IQ4_NL", "CB4", "Q8_0"),
                     help="the 4-bit grid of the bulk, or Q8_0 for a round-to-nearest 8-bit file")
-    sp.add_argument("--head", default="Q4_0")
-    sp.add_argument("--embedding", default="Q8_0")
-    sp.add_argument("--kv-proj", default="Q8_0")
-    sp.add_argument("--gdn-gate", default="Q4_0")
-    sp.add_argument("--ssm-out", default=None,
+    sp.add_argument("--head", default="Q4_0", choices=PLAN_TYPES)
+    sp.add_argument("--embedding", default="Q8_0", choices=PLAN_TYPES)
+    sp.add_argument("--kv-proj", default="Q8_0", choices=PLAN_TYPES)
+    sp.add_argument("--gdn-gate", default="Q4_0", choices=PLAN_TYPES)
+    sp.add_argument("--ssm-out", default=None, choices=PLAN_TYPES,
                     help="the GDN output projection, the class with the most KL per byte. The default follows --bulk")
-    sp.add_argument("--ffn-down", default=None, help="the MLP down projection. The default follows --bulk")
+    sp.add_argument("--ffn-down", default=None, choices=PLAN_TYPES,
+                    help="the MLP down projection. The default follows --bulk")
     sp.add_argument("--edge-layers", default="")
     sp.add_argument("--mtp", default="F16", choices=("F16", "Q8_0", "Q4_0", "IQ4_NL"),
                     help="the matrices of the MTP block: F16 as the converter wrote them, or round-to-nearest")

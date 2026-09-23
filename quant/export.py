@@ -41,6 +41,17 @@ from .refold import Geometry, Refold
 
 GGUF_4BIT = {"Q4_0": "Q4_0", "IQ4_NL": "IQ4_NL"}
 FILE_TYPES = {"Q4_0": "MOSTLY_Q4_0", "IQ4_NL": "MOSTLY_IQ4_NL", "Q8_0": "MOSTLY_Q8_0"}
+# The type names that a plan field can hold. CB4 has no GGUF type, and the export refuses it per tensor.
+PLAN_TYPES = set(GGUF_4BIT) | {"Q8_0", "F16", "CB4"}
+PLAN_TYPE_FIELDS = ("bulk", "head", "embedding", "kv_proj", "gdn_gate", "ssm_out", "ffn_down", "edge_type", "mtp")
+
+
+def _check_plan_types(plan: Plan) -> None:
+    """Raise ValueError when a plan field holds a type name that the export cannot write."""
+    for field_name in PLAN_TYPE_FIELDS:
+        value = getattr(plan, field_name)
+        if value is not None and value not in PLAN_TYPES:
+            raise ValueError(f"the plan field {field_name} is {value!r}: the export writes {sorted(PLAN_TYPES)}")
 
 
 def _load_gguf_module(llama_dir: Path):
@@ -246,6 +257,7 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
     exported output norm (refer to ``mtp_map``).
     """
     gguf = _load_gguf_module(llama_dir)
+    _check_plan_types(plan)
     selector = re.compile(only) if only else None
     promoter = re.compile(promote) if promote else None
     if promote_type not in ("Q8_0", "F16"):

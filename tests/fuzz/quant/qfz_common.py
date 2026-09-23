@@ -66,7 +66,6 @@ LLAMA_BIN = san_dir() / "llama" / "bin"
 
 # The open findings of the campaign. The regression tests give the file, the line and the example.
 KNOWN_FINDINGS = {
-    "QF6": "the export writes an unknown plan type as the source tensor, with no error",
     "QF8": "the export casts the dense maps to F16 with no check, thus an overflow gives inf",
     "QF9": "the scale search compares float32 scales but stores their F16 rounding, which can lose to the plain scale",
     "QF10": "the export filter --only applies to Q4_0 and Q8_0, thus an IQ4_NL tensor out of the match stays IQ4_NL",
