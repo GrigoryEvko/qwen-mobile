@@ -93,6 +93,7 @@ PHONE_TARGETS="fuzz_npu_decode fuzz_recurrent"
 # The switch of each known finding (rule R8 and R13).
 declare -A SWITCH=(
     [gguf-enum-load]=FUZZ_GGUF_KNOWN_ENUM_LOAD
+    [gguf-reader-uninit-type]=FUZZ_GGUF_KNOWN_ENUM_LOAD
     [loader-ftype-enum]=FUZZ_MODEL_LOAD_KNOWN_FTYPE
     [loader-meta-leak]=FUZZ_MODEL_LOAD_KNOWN_META_LEAK
     [jinja-float-cast]=FUZZ_CHAT_KNOWN_JINJA
@@ -125,6 +126,7 @@ declare -A EXPECT=(
     [gguf-alignment]='the reader refuses the full file that the writer wrote'
     [gguf-early-alloc]='the reader allocates [0-9]+ bytes for a data section'
     [gguf-enum-load]="not a valid value for type '(enum )?(gguf_type|ggml_type)'"
+    [gguf-reader-uninit-type]="MemorySanitizer: use-of-uninitialized-value|gguf\.cpp:7[0-9][0-9]:[0-9]+: runtime error: load of value .*'enum ggml_type'"
     [gguf-huge-alignment]='the reader accepts the alignment [0-9]+'
     [gguf-key-nul]='GGML_ASSERT\(!key\.empty\(\)|does not return its index'
     [gguf-nelements-overflow]='GGML_ASSERT\(info\.t\.data\)|gguf\.cpp:[0-9]+:[0-9]+: runtime error: signed integer overflow|ggml\.c:[0-9]+:[0-9]+: runtime error: signed integer overflow'
