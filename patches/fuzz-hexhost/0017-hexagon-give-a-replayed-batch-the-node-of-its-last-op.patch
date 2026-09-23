@@ -1,0 +1,87 @@
+hexagon: give a replayed batch the node of its last op
+Fold-into: patches/hexagon-host/0001-hexagon-host-timers-and-batch-cache.patch
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+A replay of the batch cache copies the descriptors of a packed graph into
+the empty op batch. It copied the op nodes only with the profile
+(GGML_HEXAGON_PROFILE). But a fusion of the next op in the same batch
+reads the node of the last op, for example when the next split starts
+with a MUL_MAT that can join the MUL_MAT at the end of the replayed graph.
+Without the profile, that node was the node of the last packing at that
+index. It can be a node of the same graph after a fusion, or a node of a
+different graph with released tensors. For example, the replay of a graph
+with a MUL_MAT at the end gave a MUL_MAT_NX of three products, two of them
+the same, because the node was the MUL_MAT_NX of the last step. The DSP
+then got an op with an incorrect output shape.
+
+This patch keeps the node of the last op in the snapshot, and the replay
+sets it. Thus the fusion after a replay is the fusion after a fresh
+packing. Also, each fusion clears the snapshot mark of the arrays
+(arrays_uid), because it changes the descriptor of the last op in place.
+Before, only a new buffer, a new tensor or a new op cleared that mark.
+
+The cost is one copy of an op node at each replay. On the decode, prefill
+and MTP graphs of the app, HTP0 gets one graph_compute call for each
+llama_decode (hexhost_graphs counts them). Thus no op follows a replay in
+its batch, and the ops do not change. The host time of the packing of a
+replayed decode token stays at 4 to 5 us on x86.
+
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 9fd703e..48a9dc1 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -587,6 +587,7 @@ struct ggml_hexagon_batch_snapshot {
+     size_t                    b_vmem = 0;
+ 
+     std::shared_ptr<const std::vector<htp_opnode>> nodes;  // the op nodes for the profile dump, null without profiling
++    std::shared_ptr<const htp_opnode>              last;   // the node of the last op, which a fusion of the next op reads
+ 
+     std::vector<std::pair<const ggml_tensor *, uint16_t>> t_refs;   // each add_tensor call: the tensor and its index
+     std::vector<const ggml_tensor *>                      o_nodes;  // each op: the ggml node whose op params it copied
+@@ -3325,12 +3326,17 @@ struct ggml_hexagon_opbatch {
+ 
+     bool try_fuse(const htp_opnode & node) {
+         if (!opt_opfusion) return false;
+-        if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_ALLREDUCE_ADD) && try_fuse_allreduce_add(node)) return true;
+-        if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_RMS_NORM_MUL)  && try_fuse_rms_norm_mul(node))  return true;
+-        if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_ADD)   && try_fuse_mul_mat_add(node))   return true;
+-        if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_NX)    && try_fuse_mul_mat_nx(node))    return true;
+-        if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_ID_NX) && try_fuse_mul_mat_id_nx(node)) return true;
+-        return false;
++        const bool fused =
++            (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_ALLREDUCE_ADD) && try_fuse_allreduce_add(node)) ||
++            (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_RMS_NORM_MUL)  && try_fuse_rms_norm_mul(node))  ||
++            (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_ADD)   && try_fuse_mul_mat_add(node))   ||
++            (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_NX)    && try_fuse_mul_mat_nx(node))    ||
++            (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_ID_NX) && try_fuse_mul_mat_id_nx(node));
++        if (fused) {
++            // The fusion changed the descriptor of the last op, thus the arrays hold no snapshot
++            arrays_uid = 0;
++        }
++        return fused;
+     }
+ };
+ 
+@@ -3722,6 +3728,7 @@ void ggml_hexagon_session::batch_snapshot(ggml_hexagon_graph_cache_entry & entry
+     s.ops.assign(b.h_ops.begin(),   b.h_ops.begin()  + b.n_ops);
+     s.b_vmem = b.b_vmem;
+     s.nodes  = opt_profile ? std::make_shared<const std::vector<htp_opnode>>(b.ops.begin(), b.ops.begin() + b.n_ops) : nullptr;
++    s.last   = b.n_ops > 0 ? std::make_shared<const htp_opnode>(b.ops[b.n_ops - 1]) : nullptr;
+     s.t_refs  = b.t_refs;
+     s.o_nodes = b.o_nodes;
+     s.gdn     = b.gdn_refs;
+@@ -3794,6 +3801,13 @@ bool ggml_hexagon_session::batch_replay(ggml_hexagon_graph_cache_entry & entry,
+     b.n_ops  = (unsigned int) s.ops.size();
+     b.b_vmem = s.b_vmem;
+ 
++    // A fusion of the next op changes the last op, and it reads the node of that op. Without the
++    // profile the node array holds the nodes of the last packing, which can come from a different
++    // graph, thus the replay sets the last node.
++    if (s.last && b.n_ops > 0) {
++        b.ops[b.n_ops - 1] = *s.last;
++    }
++
+     // Later ops in the same batch find the buffers. The tensor maps stay empty: such ops add their
+     // tensors again, which costs descriptor entries only.
+     b.b_map.clear();

@@ -211,3 +211,4 @@ fuzz-matrix/0007-ggml-cpu-read-the-q1-0-bits-with-memcpy-in-the-x86-vec-dot.patc
 fuzz-ops/0017-hexagon-htp-the-32x2-dot-adds-the-k-tiles-in-the-order-of-the-32x1-dot.patch
 fuzz-hexhost/0015-hexagon-reject-a-gdn-conv-chain-when-its-slot-stride-is-less-than-a-slot.patch
 fuzz-hexhost/0016-hexagon-reject-a-gdn-chain-when-a-replaced-tensor-has-a-reader-in-a-different-split.patch
+fuzz-hexhost/0017-hexagon-give-a-replayed-batch-the-node-of-its-last-op.patch

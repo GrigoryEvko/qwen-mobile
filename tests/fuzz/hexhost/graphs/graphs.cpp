@@ -12,7 +12,7 @@
 //   - each product that the host can fuse with the ADD after it while one more node reads the
 //     product through a view (that node reads bytes that no op wrote)
 //   - each node of a later split that reads the state tail of a GATED_DELTA_NET output whose
-//     chain the host fuses (the fused op does not write that tail, and the matcher sees one split)
+//     chain the host fuses (the fused op does not write that tail)
 // The fake DSP runs the checks of dsp_model.cpp on each op. It computes no values. The vision path
 // also decodes the text and the image embeddings of each photo with the model (the image turn).
 //
@@ -24,7 +24,8 @@
 // Environment: GGML_HEXAGON_* as for the app. HEXHOST_IGNORE lists the checks of the fake DSP
 // that do not stop the run (refer to run.sh). HEXHOST_TOUCH=1 makes the fake DSP write the outputs.
 // HEXHOST_RS_SEQ=N gives the decode and prefill modes N recurrent state snapshots, as the app has
-// with speculative decoding (the mtp mode always has 4).
+// with speculative decoding (the mtp mode always has 4). HEXHOST_LOG=1 writes each log line of ggml
+// and llama.cpp to stderr.
 // The fake DSP has 6 HVX threads, 1 HMX unit and 8 MB of VTCM, as the v79 NPU of the phone.
 
 #include "dsp_model.h"
@@ -143,9 +144,10 @@ void check_fused_view_readers(const ggml_cgraph * gf) {
 }
 
 // ---- The check of the state tails. The fused GDN_STATE_STEP writes the attention part of the
-// GATED_DELTA_NET output and the slot of the cache, not the state tail of the output. The matcher
-// (htp-gdn-match.h) sees only the nodes of the split that graph_compute gets, thus its privacy check
-// cannot see a reader in a later split, and such a reader gets bytes that no op wrote.
+// GATED_DELTA_NET output and the slot of the cache, not the state tail of the output. A reader of
+// that tail in a later split gets bytes that no op wrote. The matcher (htp-gdn-match.h) sees only the
+// nodes of one split, and it rejects such a chain with the use counts of the full graph. This check
+// finds the readers in the later splits from their nodes, thus it also finds a defect of that rule.
 
 struct fused_state {
     const ggml_tensor * G;           // the GATED_DELTA_NET output
@@ -156,6 +158,8 @@ struct fused_state {
 std::vector<fused_state> g_fused;         // the fused chains of the earlier splits of this llama_decode
 std::vector<std::string> g_tail_hazards;  // one line for each reader of a state tail in a later split
 size_t                   g_fused_chains = 0;
+size_t                   g_computes     = 0;  // the graph_compute calls of HTP0 in this llama_decode
+size_t                   g_computes_max = 0;  // the most graph_compute calls of HTP0 in one llama_decode
 
 // True for a node that makes a view and reads no byte on the device.
 bool is_view_node(const ggml_tensor * t) {
@@ -209,11 +213,19 @@ void check_state_tails(ggml_cgraph * gf) {
 // A llama_decode that starts a new list of fused chains.
 int decode_checked(llama_context * ctx, llama_batch batch) {
     g_fused.clear();
-    return llama_decode(ctx, batch);
+    g_computes    = 0;
+    const int rc  = llama_decode(ctx, batch);
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_computes_max = std::max(g_computes_max, g_computes);
+    return rc;
 }
 
 // The graph_compute of HTP0 with the checks of the view readers and of the state tails first.
 ggml_status compute_checked(ggml_backend_t backend, ggml_cgraph * gf) {
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_computes++;
+    }
     check_fused_view_readers(gf);
     check_state_tails(gf);
     return g_orig_compute(backend, gf);
@@ -229,9 +241,14 @@ ggml_backend_t init_checked(ggml_backend_dev_t dev, const char * params) {
     return b;
 }
 
-// Keeps the warnings and the errors of ggml and llama.cpp.
+// Keeps the warnings and the errors of ggml and llama.cpp. HEXHOST_LOG=1 also writes each log line to
+// stderr (for example the lines of GGML_HEXAGON_VERBOSE and GGML_HEXAGON_HOSTPROF).
 void log_keep(enum ggml_log_level level, const char * text, void * user) {
     (void) user;
+    static const bool all = getenv("HEXHOST_LOG") != nullptr;
+    if (all) {
+        fputs(text, stderr);
+    }
     if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_log.push_back(text);
@@ -540,8 +557,8 @@ int main(int argc, char ** argv) {
     write_lines(out + ".tails.txt", g_tail_hazards);
     printf("hexhost_graphs: %s %s %d: llama_decode %d, %zu supports lines, %zu HTP op kinds, %zu log lines, "
            "%zu products with the MUL_MAT_ADD conditions, %zu of them with a view reader, %zu fused state chains, "
-           "%zu state tail readers in a later split\n",
+           "%zu state tail readers in a later split, %zu HTP0 graph_compute calls at most in one llama_decode\n",
            model_path.c_str(), kind.c_str(), n_tokens, rc, g_supports.size(), ops.size(), g_log.size(), g_candidates,
-           g_hazards.size(), g_fused_chains, g_tail_hazards.size());
+           g_hazards.size(), g_fused_chains, g_tail_hazards.size(), g_computes_max);
     return rc == 0 && g_tail_hazards.empty() ? 0 : 1;
 }
