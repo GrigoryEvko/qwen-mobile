@@ -31,6 +31,8 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "htp-gdn-match.h"
+#include "htp-ops.h"
 
 #include <fuzzer/FuzzedDataProvider.h>
 
@@ -38,6 +40,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -93,6 +96,54 @@ void dump_batches(const graphgen::world & w, uint32_t step, const std::vector<fa
         }
     }
     fflush(stdout);
+}
+
+// The pattern of a known limit of the host: the host fuses the GDN state chain of one split, and a
+// node of a later split reads the state tail of the GATED_DELTA_NET output. The fused op does not
+// write that tail, and the matcher sees only one split. Gives a description of the first such reader,
+// or an empty string. O(splits * nodes * GGML_MAX_SRC).
+std::string later_tail_reader(const graphgen::graph_spec & g, const std::vector<fakedsp::batch_record> & batches) {
+    std::set<uint64_t> fused_out;  // the output of each fused state op of the step
+    for (const auto & b : batches) {
+        for (const auto & op : b.ops) {
+            if (op.opcode == HTP_OP_GDN_STATE_STEP && op.dst[0].present) {
+                fused_out.insert(op.dst[0].addr);
+            }
+        }
+    }
+    if (fused_out.empty()) {
+        return "";
+    }
+    for (size_t s = 0; s + 1 < g.cuts.size(); s++) {
+        ggml_cgraph  view  = ggml_graph_view(g.gf, g.cuts[s], g.cuts[s + 1]);
+        const auto   index = ggml_hexagon_gdn_index(&view);
+        for (int i = 0; i < view.n_nodes; i++) {
+            ggml_hexagon_gdn_state_match m;
+            if (view.nodes[i]->op != GGML_OP_GATED_DELTA_NET || ggml_hexagon_gdn_state_chain_check(&view, index, i, m) ||
+                !fused_out.count((uint64_t) (uintptr_t) m.G->data)) {
+                continue;
+            }
+            const size_t head = (size_t) (m.S_v * m.H) * sizeof(float);
+            for (int j = g.cuts[s + 1]; j < ggml_graph_n_nodes(g.gf); j++) {
+                const ggml_tensor * node = ggml_graph_node(g.gf, j);
+                if (node == m.P || ggml_hexagon_gdn_is_view_op(node) || node->op == GGML_OP_NONE) {
+                    continue;
+                }
+                for (int k = 0; k < GGML_MAX_SRC; k++) {
+                    const ggml_tensor * src = node->src[k];
+                    if (!src || ggml_hexagon_gdn_root(const_cast<ggml_tensor *>(src)) != m.G) {
+                        continue;
+                    }
+                    const size_t begin = src->view_src ? src->view_offs : 0;
+                    if (begin + ggml_nbytes(src) > head) {
+                        return std::string(node->name) + " (" + ggml_op_desc(node) + ", split " + std::to_string(s + 1) +
+                               " or later) reads the state tail of " + m.G->name + " (split " + std::to_string(s) + ")";
+                    }
+                }
+            }
+        }
+    }
+    return "";
 }
 
 } // namespace
@@ -169,6 +220,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
             std::vector<fakedsp::batch_record> batches = fakedsp::take_batches();
             if (getenv("HEXHOST_DUMP_OPS")) {
                 dump_batches(w, step, batches);
+            }
+            // A known limit gives a wrong value by design, thus the input stops before the compare
+            const std::string tail = later_tail_reader(g, batches);
+            if (!tail.empty()) {
+                fakedsp::violation("gdn-state-tail-later-split", "%s: the fused state op does not write that tail",
+                                   tail.c_str());
+                return false;
             }
             chk.run_device(batches);
             chk.run_reference(g);

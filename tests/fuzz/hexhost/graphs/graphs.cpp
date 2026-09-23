@@ -11,11 +11,16 @@
 //   - the host warnings about the fused recurrent ops (the fallback to the unfused ops)
 //   - each product that the host can fuse with the ADD after it while one more node reads the
 //     product through a view (that node reads bytes that no op wrote)
-// The fake DSP runs the checks of dsp_model.cpp on each op. It computes no values.
+//   - each node of a later split that reads the state tail of a GATED_DELTA_NET output whose
+//     chain the host fuses (the fused op does not write that tail, and the matcher sees one split)
+// The fake DSP runs the checks of dsp_model.cpp on each op. It computes no values. The vision path
+// also decodes the text and the image embeddings of each photo with the model (the image turn).
 //
 //   hexhost_graphs MODEL.gguf {prefill N | decode | mtp N_PROMPT | vision MMPROJ MAX_TOKENS} OUT_PREFIX
 //
-// Outputs: OUT_PREFIX.supports.txt, OUT_PREFIX.ops.txt, OUT_PREFIX.log.txt, OUT_PREFIX.hazards.txt.
+// Outputs: OUT_PREFIX.supports.txt, OUT_PREFIX.ops.txt, OUT_PREFIX.log.txt, OUT_PREFIX.hazards.txt,
+// OUT_PREFIX.tails.txt. The exit code is 1 when a llama_decode fails or a state tail has a reader in a
+// later split.
 // Environment: GGML_HEXAGON_* as for the app. HEXHOST_IGNORE lists the checks of the fake DSP
 // that do not stop the run (refer to run.sh). HEXHOST_TOUCH=1 makes the fake DSP write the outputs.
 // The fake DSP has 6 HVX threads, 1 HMX unit and 8 MB of VTCM, as the v79 NPU of the phone.
@@ -28,8 +33,10 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-hexagon.h"
+#include "htp-gdn-match.h"
 #include "llama.h"
 #include "mtmd.h"
+#include "mtmd-helper.h"
 #include "speculative.h"
 #include "common.h"
 
@@ -133,9 +140,80 @@ void check_fused_view_readers(const ggml_cgraph * gf) {
     }
 }
 
-// The graph_compute of HTP0 with the check of the view readers first.
+// ---- The check of the state tails. The fused GDN_STATE_STEP writes the attention part of the
+// GATED_DELTA_NET output and the slot of the cache, not the state tail of the output. The matcher
+// (htp-gdn-match.h) sees only the nodes of the split that graph_compute gets, thus its privacy check
+// cannot see a reader in a later split, and such a reader gets bytes that no op wrote.
+
+struct fused_state {
+    const ggml_tensor * G;           // the GATED_DELTA_NET output
+    const ggml_tensor * P;           // the CPY of the chain, the one permitted reader of the tail
+    size_t              head_bytes;  // the attention part, the bytes before the state tail
+};
+
+std::vector<fused_state> g_fused;         // the fused chains of the earlier splits of this llama_decode
+std::vector<std::string> g_tail_hazards;  // one line for each reader of a state tail in a later split
+size_t                   g_fused_chains = 0;
+
+// True for a node that makes a view and reads no byte on the device.
+bool is_view_node(const ggml_tensor * t) {
+    return t->op == GGML_OP_NONE || t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE ||
+           t->op == GGML_OP_TRANSPOSE;
+}
+
+// Records the readers in this split of the state tails that the earlier splits fused, then the chains
+// that this split fuses. Every chain that the matcher accepts counts as fused (a superset of the host
+// decision, which also depends on the fusion switches). O(nodes * GGML_MAX_SRC * fused chains).
+void check_state_tails(ggml_cgraph * gf) {
+    const int n = ggml_graph_n_nodes(gf);
+    for (int i = 0; i < n; i++) {
+        const ggml_tensor * node = ggml_graph_node(gf, i);
+        if (is_view_node(node)) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            const ggml_tensor * src = node->src[s];
+            if (!src) {
+                continue;
+            }
+            const ggml_tensor * root  = src->view_src ? src->view_src : src;
+            const size_t        begin = src->view_src ? src->view_offs : 0;
+            const size_t        end   = begin + ggml_nbytes(src);
+            for (const auto & f : g_fused) {
+                if (root != f.G || node == f.P || end <= f.head_bytes) {
+                    continue;
+                }
+                char line[512];
+                snprintf(line, sizeof(line), "gdn-tail-later-split: %s (%s) reads bytes [%zu, %zu) of %s, the state "
+                         "tail starts at %zu", node->name, ggml_op_desc(node), begin, end, f.G->name, f.head_bytes);
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_tail_hazards.push_back(line);
+            }
+        }
+    }
+    const auto index = ggml_hexagon_gdn_index(gf);
+    for (int i = 0; i < n; i++) {
+        if (ggml_graph_node(gf, i)->op != GGML_OP_GATED_DELTA_NET) {
+            continue;
+        }
+        ggml_hexagon_gdn_state_match m;
+        if (ggml_hexagon_gdn_state_chain_check(gf, index, i, m) == nullptr) {
+            g_fused.push_back({ m.G, m.P, (size_t) (m.S_v * m.H) * sizeof(float) });
+            g_fused_chains++;
+        }
+    }
+}
+
+// A llama_decode that starts a new list of fused chains.
+int decode_checked(llama_context * ctx, llama_batch batch) {
+    g_fused.clear();
+    return llama_decode(ctx, batch);
+}
+
+// The graph_compute of HTP0 with the checks of the view readers and of the state tails first.
 ggml_status compute_checked(ggml_backend_t backend, ggml_cgraph * gf) {
     check_fused_view_readers(gf);
+    check_state_tails(gf);
     return g_orig_compute(backend, gf);
 }
 
@@ -226,7 +304,7 @@ int run_mtp(llama_model * model, llama_context * ctx, const std::string & model_
 
     // The prompt, then the draft context follows it (spec_follow of the app)
     llama_batch bp = make_batch(prompt, 0);
-    int         rc = llama_decode(ctx, bp);
+    int         rc = decode_checked(ctx, bp);
     if (rc == 0) {
         common_speculative_process(spec, bp);
     }
@@ -245,7 +323,7 @@ int run_mtp(llama_model * model, llama_context * ctx, const std::string & model_
     std::vector<llama_token> verify = { prompt.back() };
     verify.insert(verify.end(), draft.begin(), draft.end());
     llama_batch bv = make_batch(verify, (llama_pos) n_prompt);
-    rc             = llama_decode(ctx, bv);
+    rc             = decode_checked(ctx, bv);
     if (rc == 0) {
         common_speculative_process(spec, bv);
         common_speculative_accept(spec, 0, 0);
@@ -256,9 +334,12 @@ int run_mtp(llama_model * model, llama_context * ctx, const std::string & model_
     return rc;
 }
 
-// The vision encoder of the app on HTP0: the mmproj with the image token limit of the app, and
-// three photo shapes (4:3, 16:9 and 1:1) of random pixels. Gives 0 when each image encodes.
-int run_vision(llama_model * model, ggml_backend_dev_t htp, const std::string & mmproj, int max_tokens) {
+// The image turn of the app on HTP0: the mmproj with the image token limit of the app, and three
+// photo shapes (4:3, 16:9 and 1:1) of random pixels. Each photo goes through the vision encoder, then
+// its text and image embeddings go through the model from an empty memory. Gives 0 when each turn
+// works.
+int run_vision(llama_model * model, llama_context * ctx, ggml_backend_dev_t htp, const std::string & mmproj,
+               int max_tokens) {
     mtmd_context_params vp = mtmd_context_params_default();
     vp.use_gpu             = true;
     vp.device              = htp;
@@ -285,13 +366,14 @@ int run_vision(llama_model * model, ggml_backend_dev_t htp, const std::string & 
         mtmd_input_text      in     = { text.c_str(), text.size(), true, true };
         const mtmd_bitmap *  bmps[] = { bmp };
         int                  t      = mtmd_tokenize(mctx, chunks, &in, bmps, 1);
-        for (size_t i = 0; t == 0 && i < mtmd_input_chunks_size(chunks); i++) {
-            const mtmd_input_chunk * ch = mtmd_input_chunks_get(chunks, i);
-            if (mtmd_input_chunk_get_type(ch) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
-                t = mtmd_encode_chunk(mctx, ch);
-            }
+        llama_pos            n_past = 0;
+        if (t == 0) {
+            llama_memory_clear(llama_get_memory(ctx), true);
+            g_fused.clear();
+            t = mtmd_helper_eval_chunks(mctx, ctx, chunks, 0, 0, (int32_t) llama_n_batch(ctx), true, &n_past);
         }
-        printf("hexhost_graphs: image %ux%u: %s\n", wh.first, wh.second, t == 0 ? "encoded" : "failed");
+        printf("hexhost_graphs: image %ux%u: %s, %d positions\n", wh.first, wh.second, t == 0 ? "the turn works" : "failed",
+               (int) n_past);
         rc |= t;
         mtmd_input_chunks_free(chunks);
         mtmd_bitmap_free(bmp);
@@ -370,7 +452,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx   = 512;
+    // An image turn holds the text and up to MAX_TOKENS image positions
+    cp.n_ctx   = vision ? (uint32_t) std::max(1024, max_tokens + 512) : 512;
     cp.n_batch = 512;
     cp.n_ubatch = 512;
     // The app keeps as many recurrent state snapshots as the longest draft (4)
@@ -390,13 +473,13 @@ int main(int argc, char ** argv) {
     if (mtp) {
         rc = run_mtp(model, ctx, model_path, n_tokens);
     } else if (vision) {
-        rc = run_vision(model, htp, mmproj, max_tokens);
+        rc = run_vision(model, ctx, htp, mmproj, max_tokens);
     } else {
         std::vector<llama_token> toks(n_tokens);
         for (int i = 0; i < n_tokens; i++) {
             toks[i] = (llama_token) ((1000 + 7 * i) % n_vocab);
         }
-        rc = llama_decode(ctx, llama_batch_get_one(toks.data(), n_tokens));
+        rc = decode_checked(ctx, llama_batch_get_one(toks.data(), n_tokens));
     }
     llama_synchronize(ctx);
 
@@ -431,7 +514,7 @@ int main(int argc, char ** argv) {
     for (int i = 0; i < n_bench && rc == 0; i++) {
         llama_token t = (llama_token) ((2000 + 13 * i) % n_vocab);
         const int64_t t0 = ggml_time_us();
-        rc = llama_decode(ctx, llama_batch_get_one(&t, 1));
+        rc = decode_checked(ctx, llama_batch_get_one(&t, 1));
         llama_synchronize(ctx);
         times.push_back((double) (ggml_time_us() - t0));
         fakedsp::take_batches();  // the records of the bench tokens are not needed
@@ -451,9 +534,11 @@ int main(int argc, char ** argv) {
     write_lines(out + ".ops.txt", op_lines);
     write_lines(out + ".log.txt", g_log);
     write_lines(out + ".hazards.txt", g_hazards);
+    write_lines(out + ".tails.txt", g_tail_hazards);
     printf("hexhost_graphs: %s %s %d: llama_decode %d, %zu supports lines, %zu HTP op kinds, %zu log lines, "
-           "%zu products with the MUL_MAT_ADD conditions, %zu of them with a view reader\n",
-           model_path.c_str(), prefill ? "prefill" : "decode", n_tokens, rc, g_supports.size(), ops.size(), g_log.size(),
-           g_candidates, g_hazards.size());
-    return rc == 0 ? 0 : 1;
+           "%zu products with the MUL_MAT_ADD conditions, %zu of them with a view reader, %zu fused state chains, "
+           "%zu state tail readers in a later split\n",
+           model_path.c_str(), kind.c_str(), n_tokens, rc, g_supports.size(), ops.size(), g_log.size(), g_candidates,
+           g_hazards.size(), g_fused_chains, g_tail_hazards.size());
+    return rc == 0 && g_tail_hazards.empty() ? 0 : 1;
 }

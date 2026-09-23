@@ -33,13 +33,19 @@ ASAN_RT=libclang_rt.asan-aarch64-android.so
 # The names of the checks (fake_dsp.cpp: violation) that detect a defect of the backend with no
 # fix in the patch series. In the fuzz mode the harness keeps these conditions off (HEXHOST_IGNORE),
 # thus the fuzzers look for other defects. The test mode does not set them, thus each regression
-# input of such a defect fails.
+# input of such a defect fails. The list is comma-separated, as HEXHOST_IGNORE reads it.
 #
 #   dsp-vtcm-size-wrap  The kernel params keep the VTCM size of a matmul layout in an int32 field,
 #                       and the DSP computes the layout with a 32-bit size_t. A layout of 4 GB or
 #                       more (MUL_MAT_ID with many activation rows) thus gets a small size on the
 #                       two sides, the host packs the op, and the op writes beyond VTCM on the NPU.
-KNOWN_IDS="dsp-vtcm-size-wrap"
+#   gdn-state-tail-later-split
+#                       The fused GDN state op does not write the state tail of the GATED_DELTA_NET
+#                       output, and the matcher sees only the nodes of one split. Thus a reader of
+#                       that tail in a later split gets bytes that no op wrote. The model graphs have
+#                       no such reader: hexhost_graphs checks the decode, prefill, MTP and image
+#                       paths of the 2B and the 4B (graphs mode of this script).
+KNOWN_IDS="dsp-vtcm-size-wrap,gdn-state-tail-later-split"
 
 # The host switches of the phone runs: a name and the GGML_HEXAGON_* variables of each run
 PHONE_RUNS=(
@@ -54,6 +60,7 @@ PHONE_RUNS=(
 usage() {
     cat << EOF
 Usage: tests/fuzz/hexhost/run.sh <test|fuzz> <config> [--profile P] [--budget-seconds N] [--jobs N] [TARGET...]
+       tests/fuzz/hexhost/run.sh graphs
        tests/fuzz/hexhost/run.sh phone-build <config> [--profile P]
        tests/fuzz/hexhost/run.sh phone-commands <config> [--profile P]
 
@@ -64,8 +71,13 @@ build/fuzz/hexhost-<profile>-<config> (x86) and build/fuzz/hexhost-android-<prof
 
 Modes:
   test <config>         Build, then run each target one time on its seeds (corpus/<target>) and
-                        on its regression inputs (regress/<target>), with no mutation. A finding
-                        gives a nonzero exit code.
+                        on its regression inputs (regress/<target>), with no mutation. Then run
+                        the graphs mode. A finding gives a nonzero exit code.
+  graphs                Build hexhost_graphs (graphs/graphs.cpp, no sanitizer) and run the paths
+                        of the app on the 2B and the 4B Q8_0 of weights/gguf: decode, prefill 512,
+                        the MTP draft step and the image turn at 576 and 768 image tokens. A run
+                        fails when a llama_decode fails or a node of a later split reads the state
+                        tail of a fused GDN state chain.
   fuzz <config>         Build, then fuzz each target for the budget. A crash does not stop the
                         target: it starts again until the budget ends.
   phone-build <config>  Build the phone driver (phone/driver.cpp) and the ggml libraries for arm64
@@ -398,6 +410,42 @@ phone_commands() {
     done
 }
 
+# ---- The model graphs
+
+# Build hexhost_graphs and run it on the paths of the app: decode, prefill 512, the MTP draft step and
+# the image turn at 576 and 768 image tokens, on the 2B and on the 4B Q8_0. A run fails when a
+# llama_decode fails or a node of a later split reads the state tail of a fused GDN state chain. The
+# program loads full models, thus it has no sanitizer. Gives the code 1 when a run fails.
+graphs_check() {
+    local dir="$REPO/build/fuzz/$AREA-graphs" m model mmproj rc bad=0
+    mkdir -p "$dir/out"
+    CC=clang CXX=clang++ cmake -S "$HERE/graphs" -B "$dir" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+        -DHEXHOST_LLAMA_DIR="$LLAMA_DIR" > "$dir/configure.log" 2>&1 \
+        || die "the configure of $dir failed. Read $dir/configure.log."
+    nice -n 10 cmake --build "$dir" -j"$BUILD_JOBS" --target hexhost_graphs > "$dir/build.log" 2>&1 \
+        || die "the build of $dir failed. Read $dir/build.log."
+    for m in 2B 4B; do
+        model="$REPO/weights/gguf/Qwen3.5-$m-Q8_0.gguf"
+        mmproj="$REPO/weights/gguf/Qwen3.5-$m-Q8_0.mmproj.gguf"
+        if [[ ! -f $model || ! -f $mmproj ]]; then
+            echo "$AREA graphs $m: skip, $model or $mmproj does not exist"
+            continue
+        fi
+        local -a labels=("decode" "prefill" "mtp" "vision576" "vision768")
+        local -a args=("decode" "prefill 512" "mtp 8" "vision $mmproj 576" "vision $mmproj 768")
+        local i name
+        for i in "${!labels[@]}"; do
+            name="$m-${labels[i]}"
+            rc=0
+            # shellcheck disable=SC2086
+            timeout -s KILL 900 "$dir/hexhost_graphs" "$model" ${args[i]} "$dir/out/$name" > "$dir/out/$name.stdout" 2>&1 || rc=$?
+            echo "$AREA graphs $name: code $rc, $(tail -n 1 "$dir/out/$name.stdout" | rg -o '[0-9]+ fused state chains, [0-9]+ state tail readers in a later split' || echo 'no summary')"
+            [[ $rc == 0 ]] || bad=1
+        done
+    done
+    return $bad
+}
+
 main() {
     [[ $# -ge 1 ]] || { usage; exit 2; }
     local mode=$1
@@ -406,6 +454,7 @@ main() {
         cpu-asan) mode=fuzz; set -- asan "$@" ;;
         cpu-tsan) mode=fuzz; set -- tsan "$@" ;;
         -h|--help|help) usage; exit 0 ;;
+        graphs) graphs_check; exit $? ;;
         *) ;;
     esac
     local cfg=${1:-}
@@ -424,7 +473,14 @@ main() {
     [[ $BUDGET =~ ^[0-9]+$ && $JOBS =~ ^[1-9][0-9]*$ ]] || die "--budget-seconds and --jobs take positive numbers"
     [[ " $ALL_PROFILES " == *" $PROFILES "* || $PROFILES == "$ALL_PROFILES" ]] || die "--profile takes debug or release"
     case $mode in
-        test|fuzz) run_mode "$mode" "$cfg" "${targets[@]}" ;;
+        test)
+            # The targets, then the model graphs (the same check for each config)
+            local code=0
+            run_mode test "$cfg" "${targets[@]}" || code=1
+            graphs_check || code=1
+            return $code
+            ;;
+        fuzz) run_mode "$mode" "$cfg" "${targets[@]}" ;;
         phone-build) phone_build "$cfg" ;;
         phone-commands) phone_commands "$cfg" ;;
         *) usage; exit 2 ;;
