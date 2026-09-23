@@ -1,5 +1,5 @@
 hexagon: convert Q8_0 K and V rows into the HMX tiles two blocks at a time
-Fold-into: upstream/ggml-hexagon
+Fold-into: upstream/hexagon-htp
 
 The defect
 
