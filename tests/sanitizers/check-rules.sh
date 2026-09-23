@@ -26,13 +26,14 @@
 #   R3   Each line of each build/fuzz/*/results.jsonl has the schema, and its
 #        sanitizer and profile agree with the directory name.
 #   R5   A UBSan suppression file exists only as tests/sanitizers/ubsan.supp.
-#        Each entry names a function (no file, no src:, no wildcard), and its
-#        comment has a task number and a date.
+#        Each entry names a function (no file, no src:, no wildcard, and
+#        anchored), and its comment names the defect in words (at least 8
+#        words) and has a date. Each check of a -fsanitize-recover= flag has an
+#        entry of that check.
 #   R6   An ASan, LSan, TSan or MSan suppression file exists only as
 #        tests/sanitizers/<config>.supp, with the same entry rules.
 #   R5/R6 Each -fno-sanitize= and -fsanitize-recover= flag has a comment with
-#        the word "reason", "evidence" or "finding", or a task number, in the
-#        15 lines before it.
+#        the word "reason", "evidence" or "defect" in the 15 lines before it.
 #   R7   A tsan or msan build directory with GGML_OPENMP in its cache has
 #        GGML_OPENMP=OFF. An msan build directory has FUZZ_MSAN_PREFIX, and
 #        GGML_NATIVE=OFF and the x86 SIMD options OFF if it builds ggml.
@@ -48,10 +49,13 @@
 #        tests/sanitizers/repro/. With the build directories (not
 #        --no-builds): the last run of tests/sanitizers/supp-repro.sh passed
 #        for the entry in the two profiles.
-#   T176 No area takes the Android ASan runtime from an NDK, and each copy of
-#        that runtime under build/fuzz has the sha256 of
+#   ASAN-RT No area takes the Android ASan runtime from an NDK, and each copy
+#        of that runtime under build/fuzz has the sha256 of
 #        tests/sanitizers/build-asan-android-runtime.sh.
-#   L8   No suppression comment names a task of tests/sanitizers/closed-tasks.txt.
+#   NOID A tracked file in tests/, patches/, android/app/src/, quant/,
+#        scripts/ or tools/ has no task number and no finding ID (a comment
+#        names the defect in words). NOID_ALLOW below lists the lines of
+#        real code that match the pattern.
 #   L9   Each libFuzzer command of the scripts of an area has -artifact_prefix,
 #        each fuzz run has an outer "timeout -s KILL", and the root of the
 #        repository has no stray crash-*, leak-*, timeout-* or oom-* file.
@@ -129,6 +133,9 @@ area_of() {
     local rel="${1#"$REPO/"}"
     case "$rel" in
         tests/fuzz/*) rel="${rel#tests/fuzz/}"; echo "${rel%%/*}" ;;
+        patches/fuzz-*) rel="${rel#patches/fuzz-}"; echo "${rel%%/*}" ;;
+        quant/*) echo quant ;;
+        android/*) echo app ;;
         tests/sanitizers/*|tests/suite/*|tests/run-suite.sh) echo sanitizers ;;
         build/fuzz/matrix*|build/fuzz/msan-libcxx*) echo matrix ;;
         build/fuzz/*) rel="${rel#build/fuzz/}"; rel="${rel%%/*}"; echo "${rel%%-*}" ;;
@@ -183,17 +190,17 @@ check_reasons() {
             # A comment that names a flag is not a flag.
             [[ "$text" =~ ^[[:space:]]*(#|//) ]] && continue
             start=$(( num > 15 ? num - 15 : 1 ))
-            if ! line_range "$file" "$start" "$num" | rg -q -i -e '(#|//).*(reason|evidence|finding|task #?[0-9]+)'; then
-                violation R5 "$(area_of "$file")" "$file:$num" "-fno-sanitize= or -fsanitize-recover= has no comment with a reason, evidence, finding or task number in the 15 lines before it"
+            if ! line_range "$file" "$start" "$num" | rg -q -i -e '(#|//).*(reason|evidence|defect)'; then
+                violation R5 "$(area_of "$file")" "$file:$num" "-fno-sanitize= or -fsanitize-recover= has no comment with the word reason, evidence or defect in the 15 lines before it"
             fi
         done < <(rg -n -e '-fno-sanitize=' -e '-fsanitize-recover=' "$file" || true)
     done
 }
 
-# R5 and L8: each check in a -fsanitize-recover= list has at least one entry
-# of that check in the shared file tests/sanitizers/ubsan.supp. A recover flag
+# R5: each check in a -fsanitize-recover= list has at least one entry of that
+# check in the shared file tests/sanitizers/ubsan.supp. A recover flag
 # without an entry lets the reports of that check continue with no reason
-# (for example after the fix of its task removed the entry).
+# (for example after a fix removed the entry).
 # The check reads each text file of each area and of tests/sanitizers (CMake,
 # shell, Python, Gradle, JSON presets and the others), not only the build
 # files, thus a recover flag in any place of an area is found. "all" and a
@@ -213,7 +220,7 @@ check_recover_entries() {
             [[ "$list" == *'$'* || "$list" == *'<'* ]] && continue
             for check in ${list//,/ }; do
                 [[ " $types " == *" $check "* ]] \
-                    || violation R5 "$(area_of "$file")" "$file:$num" "-fsanitize-recover=$check has no entry of that check in tests/sanitizers/ubsan.supp: remove the check from the recover list (L8)"
+                    || violation R5 "$(area_of "$file")" "$file:$num" "-fsanitize-recover=$check has no entry of that check in tests/sanitizers/ubsan.supp: remove the check from the recover list"
             done
         done < <(rg -o -e '-fsanitize-recover=[A-Za-z0-9_,$<>{}-]+' <<< "$text" || true)
     done < <(rg -n --no-heading -e '-fsanitize-recover=' "${dirs[@]}" \
@@ -270,8 +277,10 @@ check_supp_entries() {
             # without anchors also matches each longer name.
             violation R5 "$area" "$file:$n" "the entry '$line' is not anchored: use ^name\$ (C), ^name( (C++) or name< (C++ template), because the runtime matches a substring"
         fi
-        if ! rg -q -i -e 'task #?[0-9]+' <<< "$comment"; then
-            violation R5 "$area" "$file:$n" "the entry '$line' has no task number in its comment"
+        # The comment names the defect in words: at least 8 words, the date
+        # and the "#" signs not counted.
+        if [[ "$(tr -d '#' <<< "$comment" | wc -w)" -lt 9 ]]; then
+            violation R5 "$area" "$file:$n" "the entry '$line' has no comment that names the defect in words (the function, the input that causes it, the evidence)"
         fi
         if ! rg -q -e '20[0-9]{2}-[0-9]{2}-[0-9]{2}' <<< "$comment"; then
             violation R5 "$area" "$file:$n" "the entry '$line' has no date (YYYY-MM-DD) in its comment"
@@ -592,12 +601,14 @@ check_death_callback() {
     done
 }
 
-# Task #176: each Android ASan run uses the runtime of
+# ASAN-RT: each Android ASan run uses the runtime of
 # tests/sanitizers/build-asan-android-runtime.sh (compiler-rt 22.1.8), not
-# the runtime of the NDK r29, whose prctl interceptor traps (FEAT_FPAC).
+# the runtime of the NDK r29, whose prctl interceptor signs its return address
+# and traps on a core with FEAT_FPAC when bionic resets the PAC key.
 #   - No script or CMake file of an area copies the ASan runtime of an NDK.
 #   - With the build directories: each copy of
-#     libclang_rt.asan-aarch64-android.so under build/fuzz has the sha256 of
+#     libclang_rt.asan-aarch64-android.so in an Android ASan build or phone
+#     directory has the sha256 of
 #     build/fuzz/asan-android-runtime/libclang_rt.asan-aarch64-android.so.sha256.
 # The order of LD_LIBRARY_PATH on the phone is not a static fact of a file,
 # thus the phone commands of each area give it, and this script does not
@@ -610,7 +621,7 @@ check_android_asan_runtime() {
             while IFS=: read -r num text; do
                 [[ "$text" =~ ^[[:space:]]*(#|//) ]] && continue
                 if [[ "$text" == *android-ndk* || "$text" == *toolchains/llvm/prebuilt* || "$text" == *'$ANDROID_NDK'* || "$text" == *'${ANDROID_NDK'* ]]; then
-                    violation T176 "$area" "$file:$num" "this line takes $rt from an NDK: use build/fuzz/asan-android-runtime/$rt (tests/sanitizers/build-asan-android-runtime.sh, task #176)"
+                    violation ASAN-RT "$area" "$file:$num" "this line takes $rt from an NDK: use build/fuzz/asan-android-runtime/$rt of tests/sanitizers/build-asan-android-runtime.sh"
                 fi
             done < <(rg -n -F -e "$rt" "$file" || true)
         done < <(find "$FUZZ_DIR/$area" \( -name '*.sh' -o -name CMakeLists.txt -o -name '*.cmake' \) -type f 2> /dev/null | sort)
@@ -624,23 +635,53 @@ check_android_asan_runtime() {
         [[ "${copy#"$BUILD_FUZZ"/}" =~ (^|/)([a-z]+-android-(debug|release)-asan|[a-z]+-(debug|release)-asan|phone-(debug|release)-asan)(/|$) ]] || continue
         sum="$(sha256sum "$copy" | cut -d' ' -f1)"
         [[ "$sum" == "$ref" ]] \
-            || violation T176 "$(area_of "$copy")" "$copy" "this ASan runtime has sha256 ${sum:0:16}, not ${ref:0:16} of tests/sanitizers/build-asan-android-runtime.sh (task #176)"
+            || violation ASAN-RT "$(area_of "$copy")" "$copy" "this ASan runtime has sha256 ${sum:0:16}, not ${ref:0:16} of tests/sanitizers/build-asan-android-runtime.sh"
     done < <(find "$BUILD_FUZZ" -name "$rt" -type f \
                 -not -path "$BUILD_FUZZ/asan-android-runtime/*" 2> /dev/null | sort)
 }
 
-# The suppressions of a closed task: a suppression entry must not name a task
-# of tests/sanitizers/closed-tasks.txt (rule L8: the fix removes its entries).
-check_closed_tasks() {
-    local closed="$SAN_DIR/closed-tasks.txt" task file n line
-    [[ -f "$closed" ]] || return 0
-    while IFS= read -r task; do
-        [[ -z "$task" ]] && continue
-        while IFS=: read -r file n line; do
-            violation L8 "$(area_of "$file")" "$file:$n" "the task $task is closed ($closed), but this suppression comment still names it: remove its entries"
-        done < <(find "$FUZZ_DIR" "$SAN_DIR" -name '*.supp' -type f -print0 2> /dev/null \
-                 | xargs -0 -r rg -n -i -e "task ${task}\\b" || true)
-    done < <(rg -o -e '^#[0-9]+' "$closed" || true)
+# NOID: the pattern of a task number or a finding ID. A comment, a message or
+# a name describes the defect in words (the function, the input, the
+# evidence), never with an ID. "[Tt]ask" also finds the start of a sentence.
+readonly NOID_PATTERN='([Tt]ask[s]? #?[0-9]{2,3}|#[0-9]{2,3}\b|\bF-[A-Z0-9]+(-[A-Z0-9]+)*-[0-9]+\b|\bQF[0-9]+\b|[Ff]inding [A-Z]+[0-9-]*[0-9])'
+# The lines of real code that match NOID_PATTERN. Format: <path>:<fixed text
+# of the line>. Each entry has the reason as a comment.
+readonly NOID_ALLOW=(
+    # An assembly immediate of Hexagon ("r7 = #64").
+    'tools/htp-lab/lab/target_hvxcost.c:#64'
+    # A log line of the patch: "op #17 of 96".
+    'patches/hexagon-fusion/0004-hexagon-htp-gdn-slot-index-from-host-and-error-report.patch:op #'
+    # An assembly immediate of Hexagon: "pause(#255)".
+    'patches/hexagon-fusion/0005-hexagon-htp-gdn-chunked-hmx.patch:pause(#255)'
+    # A log line of the patch: "decode #12 tokens".
+    'patches/hexagon-host/0002:decode #'
+)
+readonly NOID_DIRS="tests patches android/app/src quant scripts tools"
+
+# Return 0 if one line of NOID_ALLOW permits this match.
+# Arguments: the path (relative to the repository), the text of the line.
+noid_allowed() {
+    local entry path text
+    for entry in "${NOID_ALLOW[@]}"; do
+        path="${entry%%:*}"
+        text="${entry#*:}"
+        [[ "$1" == "$path"* && "$2" == *"$text"* ]] && return 0
+    done
+    return 1
+}
+
+# NOID: each tracked file of NOID_DIRS has no task number and no finding ID.
+# Complexity: one rg pass over the tracked files of the six directories.
+check_noid() {
+    command -v git > /dev/null && git -C "$REPO" rev-parse --git-dir > /dev/null 2>&1 || return 0
+    local file num text
+    while IFS=: read -r file num text; do
+        # This file holds the pattern and the allowlist themselves.
+        [[ "$file" == tests/sanitizers/check-rules.sh ]] && continue
+        noid_allowed "$file" "$text" && continue
+        violation NOID "$(area_of "$REPO/$file")" "$file:$num" "a task number or a finding ID: describe the defect in words ('${text:0:90}')"
+    done < <(cd "$REPO" && git ls-files -z -- $NOID_DIRS \
+                | xargs -0 -r rg -n --no-heading -e "$NOID_PATTERN" -- 2> /dev/null || true)
 }
 
 main() {
@@ -678,7 +719,7 @@ main() {
     check_run_sh
     check_libfuzzer_commands
     check_death_callback
-    check_closed_tasks
+    check_noid
     check_android_asan_runtime
     check_parity_sources
     check_repro

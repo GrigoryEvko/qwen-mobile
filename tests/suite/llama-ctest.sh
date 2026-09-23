@@ -112,11 +112,10 @@ parse_args() {
 }
 
 # Print the per-test timeout in seconds of the configuration. The slowest
-# test is test-save-load-state (112 generated models). Measured on the
-# 28-core host with a load of 40 to 65 (2026-09-23): 202 s (debug-none),
-# 447 s (debug-asan), 576 s (debug-tsan), more than 1200 s (debug-msan).
-# Each limit is more than four times the measured value of its column
-# where the suite has one.
+# test is test-save-load-state (112 generated models). It takes about 3
+# minutes with no sanitizer, 8 minutes under ASan and 10 minutes under TSan on
+# a 28-core host. Each limit is about four times that, with a margin for a
+# host under load.
 test_timeout() {
     local base
     case "$CONFIG" in

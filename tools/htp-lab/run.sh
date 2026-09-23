@@ -48,7 +48,7 @@
 #   PROPOSALS  The proposal patches to apply, as space-separated names of tools/htp-lab/proposals.
 #              Default: every patch of that directory. "none" applies no patch, thus the "_after"
 #              programs measure the kernels of the checkout.
-#   PROFILE    The code generation flags (task #123 item 3). Empty (the default): the lab flags.
+#   PROFILE    The code generation flags. Empty (the default): the lab flags.
 #              "release": the flags of the shipped DSP library (CMakeLists.txt gives the source).
 #              "debug": the release flags with live asserts (no -DNDEBUG=1). A profile builds in
 #              out/build-<ARCH>-<PROFILE>, thus the lab flags and the two profiles do not mix.

@@ -1,11 +1,13 @@
 /*
  * The reproducers of the entries of tests/sanitizers/ubsan.supp (rule R13).
  *
- * Each mode runs one small ggml computation on the CPU backend, which gives
- * the UBSan report that one or more entries suppress. The two control modes
- * give a report of the same check in a function of this file, which no entry
- * names. With the full suppression file, a control must still stop the run,
- * thus the entries suppress their reports and nothing else.
+ * Each mode runs one small ggml computation on the CPU backend. A mode of an
+ * entry gives the UBSan report that the entry suppresses. A clean mode must
+ * give no report: it runs a path where the sanitizer reported a defect of
+ * ggml that the patch series corrects, thus it is a regression check. The
+ * control modes give a report of a check in a function of this file, which no
+ * entry names. With the full suppression file, a control must still stop the
+ * run, thus the entries suppress their reports and nothing else.
  *
  * tests/sanitizers/supp-repro.sh builds this file with the flags of the
  * ubsan build of one profile, links it with the ggml libraries of that build,
@@ -13,39 +15,36 @@
  *
  * Usage: ubsan_ggml <mode>
  *
- * The map of the entries to the modes. supp-repro.sh and check-rules.sh
- * read these lines. An entry can have more than one mode. It passes if one
- * of its modes stops with a report of its check when the entry is removed.
- *   REPRO-FIXED: pointer-overflow MODE: graph_nbytes
- *   REPRO-FIXED: function MODE: mul_mat_f32
- *   REPRO-FIXED: function MODE: mul_mat_f16
- *   REPRO-FIXED: function MODE: mul_mat_id
- *   REPRO-FIXED: function MODE: set_rows
- *   REPRO-FIXED: function MODE: flash_attn_ext
- *   REPRO-FIXED: function MODE: dup_from_q
- *   REPRO-FIXED: function MODE: add_q
- *   REPRO-FIXED: function MODE: add1_q
- *   REPRO-FIXED: function MODE: out_prod_q
- *   REPRO-FIXED: function MODE: get_rows_q
- *   REPRO-FIXED: function MODE: lightning_indexer
- *   REPRO-FIXED: function MODE: dup_to_q
- *   REPRO-FIXED: function MODE: repack_mul_mat
- *   REPRO-FIXED: function MODE: repack_mul_mat_id
+ * The map of the modes. supp-repro.sh and check-rules.sh read these lines.
+ * An entry can have more than one mode (REPRO-ENTRY: <entry> MODE: <mode>).
+ * It passes if one of its modes stops with a report of its check when the
+ * entry is removed.
+ *   REPRO-CLEAN: pointer-overflow MODE: graph_nbytes
+ *   REPRO-CLEAN: function MODE: mul_mat_f32
+ *   REPRO-CLEAN: function MODE: mul_mat_f16
+ *   REPRO-CLEAN: function MODE: mul_mat_id
+ *   REPRO-CLEAN: function MODE: set_rows
+ *   REPRO-CLEAN: function MODE: flash_attn_ext
+ *   REPRO-CLEAN: function MODE: dup_from_q
+ *   REPRO-CLEAN: function MODE: add_q
+ *   REPRO-CLEAN: function MODE: add1_q
+ *   REPRO-CLEAN: function MODE: out_prod_q
+ *   REPRO-CLEAN: function MODE: get_rows_q
+ *   REPRO-CLEAN: function MODE: lightning_indexer
+ *   REPRO-CLEAN: function MODE: dup_to_q
+ *   REPRO-CLEAN: function MODE: repack_mul_mat
+ *   REPRO-CLEAN: function MODE: repack_mul_mat_id
  *   REPRO-CONTROL: pointer-overflow MODE: control_pointer_overflow
  *   REPRO-CONTROL: function MODE: control_function
  *   REPRO-CONTROL: integer-divide-by-zero MODE: control_divide
- * A REPRO-FIXED line names a mode of a finding whose fix has landed: the
- * mode must give no report with the full file (a regression check).
- * graph_nbytes: task #125 (ggml_graph_nbytes, fixed by patches/fuzz-ops/0001).
- * It reaches ggml_graph_nbytes through ggml_graph_overhead, and each other
- * mode reaches it through ggml_new_graph.
- * The "function" modes: task #127 (the calls through the type traits, fixed
- * by patches/fuzz-ops/0002). Before the fix, each mode from mul_mat_f32 to
- * lightning_indexer gave a "function" report in its op, in debug and
- * release, with the shared and the static link (supp-repro.sh,
- * 2026-09-23). dup_to_q and the repack modes gave no report even before the
- * fix: they call from_float of Q8_0 (quantize_row_q8_0), whose type is the
- * type of ggml_from_float_t.
+ * The clean modes:
+ *   graph_nbytes: ggml_graph_nbytes must compute the size of a graph with no
+ *     arithmetic on a null pointer (patches/fuzz-ops/0001). The mode reaches
+ *     it through ggml_graph_overhead, and each other mode reaches it through
+ *     ggml_new_graph.
+ *   The "function" modes: the CPU backend must call each type trait function
+ *     (to_float, from_float, vec_dot) through a pointer of its own type
+ *     (patches/fuzz-ops/0002). Each mode runs one op that makes such a call.
  */
 
 #include "ggml.h"
@@ -120,7 +119,7 @@ static int mode_add_q(int add1) {
                                   : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 4);
     fill(a);
     fill(b);
-    /* ggml_add1 is deprecated, but the CPU backend still has its op. */
+    /* ggml_add1 is deprecated. The CPU backend has its op, thus the mode calls it. */
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     return compute(ctx, add1 ? ggml_add1(ctx, a, b) : ggml_add(ctx, a, b));

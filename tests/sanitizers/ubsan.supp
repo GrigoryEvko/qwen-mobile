@@ -3,19 +3,18 @@
 # Rule R5:
 #   - Each build uses -fsanitize=undefined -fno-sanitize-recover=undefined.
 #     The first report stops the run.
-#   - Only a check with a known, tracked finding can recover, with
+#   - Only a check with a known defect can recover, with
 #     -fsanitize-recover=<that check> and the runtime option halt_on_error=1.
 #     tests/sanitizers/ubsan.cmake gives these flags.
 #   - An entry of this file has an effect only for such a recoverable check.
 #   - Each entry names one function. Never a file, never a src: wildcard.
-#   - Each entry has a comment with its reason, its evidence, its task
-#     number and its date.
+#   - Each entry has a comment that names the defect in words (the function,
+#     the input that causes it), its evidence and its date.
 #
 # Each pattern is anchored. The sanitizer runtime matches a pattern as a
 # substring of the function name (TemplateMatch of sanitizer_common), thus
 # "function:ggml_compute_forward_mul_mat" also matches
-# ggml_compute_forward_mul_mat_one_chunk, _id and _id_one_chunk. The
-# reproducer showed this on 2026-09-23. Thus:
+# ggml_compute_forward_mul_mat_one_chunk, _id and _id_one_chunk. Thus:
 #   - A C function: ^name$.
 #   - A C++ function: ^name( (the symbolizer adds the parameter types).
 #   - A C++ function template: name< (the symbolizer puts the return type
@@ -27,3 +26,5 @@
 # "R13: <profile> only" in its comment.
 #
 # tests/sanitizers/env.sh gives this file to UBSAN_OPTIONS=suppressions=.
+#
+# The file has no entry: each UBSan report stops the run.

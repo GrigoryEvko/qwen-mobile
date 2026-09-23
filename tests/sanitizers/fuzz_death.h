@@ -1,15 +1,12 @@
 /*
  * The shared death callback of the libFuzzer targets (C and C++).
  *
- * The problem (found by fuzz-core, evidence in build/fuzz/core/triage/tsan-hang/):
- * a TSan report calls Die() while it holds a TSan lock (the slot lock of
- * ReportRace). A death callback that enters an interceptor of TSan then
- * waits for that lock forever:
- *   libFuzzer:     Die -> StaticDeathCallback -> DumpCurrentUnit -> Sha1ToString
- *                  -> free -> OnUserFree -> SlotLock -> FutexWait
- *   open/write/close (the first version of this file, 06:34):
- *                  Die -> fuzz_death_tsan_callback -> close -> FdClose -> SlotLock
- * One tsan run hung for 31 minutes.
+ * The problem: a TSan report calls Die() while it holds a TSan lock (the slot
+ * lock of ReportRace). A death callback that enters an interceptor of TSan
+ * then waits for that lock forever, and the fuzz job hangs:
+ *   the callback of libFuzzer:  Die -> StaticDeathCallback -> DumpCurrentUnit
+ *                               -> Sha1ToString -> free -> OnUserFree -> SlotLock
+ *   open, write or close:       Die -> callback -> close -> FdClose -> SlotLock
  *
  * The solution: in a TSan build, fuzz_death_note_input() puts
  * fuzz_death_tsan_callback() in the place of the callback of libFuzzer. That

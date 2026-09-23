@@ -166,9 +166,9 @@ validate_link() {
         mode_of["$entry"]="${mode_of[$entry]:-}${mode_of[$entry]:+ }$mode"
     done < <(rg -e 'REPRO-ENTRY: ' "$REPRO_SRC")
 
-    # Step 3: each mode with the full file, also the modes of the fixed
-    # findings (REPRO-FIXED), which must stay free of reports.
-    mapfile -t modes < <({ printf '%s\n' ${mode_of[@]}; rg -o -r '$1' 'REPRO-FIXED: \S+ MODE: (\S+)' "$REPRO_SRC" || true; } \
+    # Step 3: each mode with the full file, also the clean modes
+    # (REPRO-CLEAN), which must give no report.
+    mapfile -t modes < <({ printf '%s\n' ${mode_of[@]}; rg -o -r '$1' 'REPRO-CLEAN: \S+ MODE: (\S+)' "$REPRO_SRC" || true; } \
         | { rg -v -e '^\s*$' || true; } | sort -u)
     for mode in "${modes[@]}"; do
         read -r rc n < <(run_mode "$prog" "$mode" "$SUPP" "$logs/$mode.full.log")
@@ -243,7 +243,7 @@ validate_link() {
 # Build the target of one fuzz area with the ubsan flags of ubsan.cmake, in
 # build/fuzz/matrix-supp-repro-<profile>/<area>. The area CMake gets
 # FUZZ_SANITIZER=none, thus the flags come only from this script, and
-# FUZZ_PROFILE gives its profile flags. Only hexhost is known today.
+# FUZZ_PROFILE gives its profile flags. The script knows the hexhost area only.
 # Arguments: the area, the target. Print the path of the program.
 build_external() {
     local area="$1" target="$2" dir="$BUILD/$1" san fp stamp

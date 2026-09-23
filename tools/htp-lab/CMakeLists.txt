@@ -12,7 +12,7 @@ set(HTP_DIR "${LLAMA_DIR}/ggml/src/ggml-hexagon/htp" CACHE PATH "The kernel dire
 set(HTP_PROPOSED_DIR "" CACHE PATH "The patched copy of the kernel directory, empty for none")
 set(HEXAGON_ARCH "v79" CACHE STRING "The Hexagon architecture of the phone")
 
-# LAB_PROFILE (task #123 item 3) selects the code generation flags:
+# LAB_PROFILE selects the code generation flags:
 #   ""        The lab flags below (the preset value, unchanged).
 #   release   The flags of the shipped DSP library: the compile command of ggml-htp-v<N> in
 #             build/native/llama/ggml/src/ggml-hexagon/htp-v<N>-prefix/src/htp-v<N>-build/

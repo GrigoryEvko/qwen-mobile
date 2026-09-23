@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Build the AddressSanitizer runtime for arm64 Android from compiler-rt of
-# LLVM 22.1.8 (task #176).
+# LLVM 22.1.8.
 #
-# The rule for each area (task #176, 2026-09-23):
+# The rule for each area:
 #   - Each Android ASan run uses this runtime, not the runtime of the NDK.
 #     Push libclang_rt.asan-aarch64-android.so with the build, and put its
 #     directory first in LD_LIBRARY_PATH.
@@ -207,7 +207,7 @@ verify_runtime() {
         --stop-address="$(printf '0x%x' $((0x$addr + 4096)))" "$rt")
     [[ "$first" == *"bti"* ]] || die "__interceptor_prctl starts with '$first', not with bti c."
     if grep -q -E 'paciasp|autiasp' <<< "$body"; then
-        die "__interceptor_prctl signs its return address (task #176)."
+        die "__interceptor_prctl signs its return address, thus it traps on a core with FEAT_FPAC."
     fi
     log "OK: $rt ($(cut -c1-16 "$rt.sha256")): SONAME, dependencies, and no PAC in __interceptor_prctl."
 }

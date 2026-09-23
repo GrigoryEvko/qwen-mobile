@@ -19,8 +19,8 @@
 #      exitcode=86, thus a report never gives an exit code that a check
 #      expects (0, 1, 2, 3, 4 or 99).
 # If one of the original lines is not found, the script stops with status 2
-# and tells what changed. The request to add a switch to host-test.sh is in
-# build/fuzz/matrix/requests/tools.txt.
+# and tells what changed. A switch for the flags in host-test.sh itself makes
+# the copy unnecessary.
 #
 # Each PASS or FAIL line of host-test.sh becomes one record in
 # build/fuzz/matrix-probe-<profile>-<config>/results.jsonl (area probe-host).
@@ -93,7 +93,7 @@ replace_once() {
     local old="$2" new="$3" count
     count="$(printf '%s\n' "$text_ref" | rg -c -F -x -- "$old" || true)"
     [[ "$count" == "1" ]] \
-        || suite_die "$ORIGINAL has the line [$old] ${count:-0} times, not 1 time. host-test.sh changed: update tests/suite/probe-host-test.sh, or add the switch of build/fuzz/matrix/requests/tools.txt."
+        || suite_die "$ORIGINAL has the line [$old] ${count:-0} times, not 1 time. host-test.sh changed: update tests/suite/probe-host-test.sh."
     text_ref="${text_ref/"$old"/"$new"}"
 }
 
