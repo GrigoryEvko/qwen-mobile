@@ -34,8 +34,7 @@ ASAN_RT=libclang_rt.asan-aarch64-android.so
 # conditions off (HEXHOST_IGNORE), thus the fuzzers look for new defects. The test mode does not
 # set them, thus each regression input of an open finding fails.
 KNOWN_IDS="env-profile-empty,env-exception,env-devices-range,repack-nonfinite-scale"
-KNOWN_IDS+=",mm-id-div-zero,dsp-vtcm-binary,dsp-vtcm-glu,dsp-vtcm-softmax,dsp-vtcm-concat,dsp-vtcm-rows,dsp-vtcm-gdn"
-KNOWN_IDS+=",dsp-unary-block0,dsp-hmx-align,dsp-cpy-layout,env-int-overflow"
+KNOWN_IDS+=",mm-id-div-zero,env-int-overflow"
 
 # The host switches of the phone runs: a name and the GGML_HEXAGON_* variables of each run
 PHONE_RUNS=(

@@ -1,0 +1,398 @@
+hexagon: model the VTCM and layout limits of the DSP kernels in supports_op
+Fold-into: upstream/hexagon-host
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+Findings dsp-vtcm-binary, dsp-vtcm-glu, dsp-vtcm-softmax, dsp-vtcm-concat,
+dsp-vtcm-rows, dsp-vtcm-gdn, dsp-unary-block0, dsp-hmx-align and
+dsp-cpy-layout of fuzz-hexhost, task #159. For each of these ops the host
+accepted an op in supports_op that the DSP kernel then refuses, or does
+incorrectly. Thus the op does not go to the CPU. On the 8 MB VTCM of the v79
+the shapes of Qwen3.5 are in the limits. Task #62 ships one APK for chips
+with a smaller VTCM, and there these limits apply.
+
+The host now models each check of the DSP. The comments give the file and
+the lines of the kernel:
+
+- The binary ops: each thread holds two rows of src0 and of dst in VTCM (and
+  of src1 for the same shape), and a broadcast row of src1 stays in VTCM
+  one time.
+- The GLU ops: each thread holds one row of src0, src1 and dst.
+- SOFT_MAX: each thread holds two scratch pads of src0 and one of dst, of 4
+  rows each.
+- CONCAT: the 2D path with a transposed src1 holds blocks of rows for each
+  thread.
+- GET_ROWS (with no DMA) and SET_ROWS: the VTCM layout of the kernel params.
+- GATED_DELTA_NET: each thread holds two state blocks of S_v x S_v floats.
+- The unary ops: the VTCM layout of the kernel params, and a layout with no
+  row of src0 in VTCM (BLOCK 0). The fusion of RMS_NORM and MUL does the
+  same check.
+- The HMX matmul: the addresses of src1 and dst, and the batch strides, must
+  be multiples of 128 bytes. Else the HVX path runs.
+- CPY: the layout test of the DSP. There an element stride that is not the
+  type size, or rows that overlap, count as transposed.
+
+For three items the kernel did not refuse the op. This patch adds a check
+that returns HTP_STATUS_VTCM_TOO_SMALL:
+
+- get-rows-ops.c and set-rows-ops.c wrote their VTCM layout with no check of
+  the reservation (dsp-vtcm-rows).
+- gated-delta-net-ops.c had an assert only, and an assert is empty in the
+  release library (dsp-vtcm-gdn).
+- unary-ops.c returned OK with no output for BLOCK 0 (dsp-unary-block0).
+
+Evidence (2026-09-23):
+- The nine regression inputs of these items in tests/fuzz/hexhost/regress/
+  kparams give the finding before this patch (the model of the DSP kernels
+  in the fake DSP of fuzz-hexhost) in the test runs of the campaign, debug
+  and release. With the five patches of fuzz-hexhost they give no finding in
+  the asan build, debug and release.
+- The kparams fuzzer with the conditions of tasks #155 and #159 on ran 6
+  times for 100 s with the patches: no finding.
+- The supports_op decision of each op of the Qwen3.5 graphs is the same
+  before and after, with the values of the v79 (x86, the real-graph tool of
+  fuzz-hexhost with the fake DSP). The dumps of the 2B decode (112
+  decisions), the 2B prefill (147), the 4B decode (118) and the 4B prefill
+  (155) have no difference, and each op stays on HTP0. The count of each op
+  kind of each graph is the same.
+- The DSP libraries for v73, v75, v79 and v81 build with this patch. The
+  kernel lab (tools/htp-lab) has no target that runs these checks. Task #123
+  holds the missing lab targets.
+- The phone check of the five patches of fuzz-hexhost together (OnePlus 13,
+  the 2B Q8_0 on HTP0, thermal status 0, cpu7 cap 4.32 GHz, battery 27.6 to
+  27.7 °C, MemAvailable 8.9 to 9.5 GB):
+  - test-backend-ops on HTP0: GATED_DELTA_NET and SSM_CONV (101 cases),
+    CONCAT CPY GET_ROWS SET_ROWS (267 cases), the binary ops with GLU and
+    SOFT_MAX (385 cases), NORM RMS_NORM SCALE (127 cases). Each group passes
+    before and after.
+  - llama-bench tg32 -r 3 after one warmup at 23.76 t/s: before 23.56 ±
+    0.10, after 23.59 ± 0.27, before 23.63 ± 0.13, after 23.57 ± 0.11 t/s.
+  - llama-speculative-simple with the MTP draft of depth 4, temperature 0,
+    64 tokens: before 23.589 and 23.685 t/s, after 24.076 and 24.029 t/s.
+    Each run accepts 44 drafts (52.381 %), and the four runs give the same
+    text.
+
+Measurement: the host instructions for each decode token of the 4B Q8_0
+graph (x86, the real-graph tool with the fake DSP, perf stat, with
+GGML_HEXAGON_BATCHCACHE=0): 3,709,475 before this patch and 3,730,072 after
+(+0.56 %). The tg32 of the phone check does not change.
+
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 265d5c1..5aa5dc1 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -394,6 +394,15 @@ static void ggml_hexagon_precompute_unary_params(
+     struct htp_unary_kernel_params * kparams
+ );
+ 
++// The unary kernel of the DSP takes BLOCK rows of src0 into VTCM at a time. With no column tiles,
++// BLOCK 0 makes each task return at once and the op returns OK with no output
++// (htp/unary-ops.c:741-748), thus the host must not send such an op.
++static inline bool ggml_hexagon_unary_has_rows(const struct htp_unary_kernel_params & kparams) {
++    return kparams.col_tile > 0 || kparams.block > 0;
++}
++
++static htp_op_code op_remap_to_htp(const ggml_tensor * t);
++
+ static void ggml_hexagon_precompute_get_rows_params(
+     const struct ggml_hexagon_session * sess,
+     const struct ggml_tensor * src0,
+@@ -2784,6 +2793,9 @@ struct ggml_hexagon_opbatch {
+                         sess->c_name(), new_kparams.vtcm_size, sess->vtcm_size);
+             return false;
+         }
++        if (!ggml_hexagon_unary_has_rows(new_kparams)) {
++            return false;
++        }
+ 
+         size_t extra_bufs = 0, extra_vmem = 0, extra_tens = 0;
+         auto fit_t = [&](const ggml_tensor * t) {
+@@ -4782,9 +4794,14 @@ static bool ggml_hexagon_supported_gated_delta_net(const struct ggml_hexagon_ses
+         return false;
+     }
+ 
+-    return true;
++    // Each thread of the sequential kernel holds two S_v x S_v F32 state blocks in VTCM, each
++    // rounded up to 128 bytes (htp/gated-delta-net-ops.c:1076, an assert only on the DSP)
++    const size_t state_block = hex_round_up((size_t) S_v * S_v * sizeof(float), 128);
++    if (2 * state_block * sess->n_threads > sess->vtcm_size) {
++        return false;
++    }
+ 
+-    GGML_UNUSED(sess);
++    return true;
+ }
+ 
+ static bool ggml_hexagon_matmul_is_hmx_eligible(
+@@ -4829,6 +4846,19 @@ static bool ggml_hexagon_matmul_is_hmx_eligible(
+         return false;
+     }
+ 
++    // The HMX kernels read the activation and write dst with aligned vector accesses, and the DSP
++    // refuses an address that is not a multiple of 128 bytes (htp/matmul-ops.c hmx_mm_2d_f32 and
++    // the batched, nx and id forms). The addresses are known after the graph allocation (the
++    // kernel params of graph_compute): a view at such an offset takes the HVX path.
++    if ((src1->data && ((uintptr_t) src1->data % 128) != 0) || (dst && dst->data && ((uintptr_t) dst->data % 128) != 0)) {
++        return false;
++    }
++    // The batched form runs the 2D kernel for each batch at base + i * nb[2] + j * nb[3]
++    if (is_batched && src1->data && (src1->nb[2] % 128 != 0 || src1->nb[3] % 128 != 0 ||
++                                     (dst && (dst->nb[2] % 128 != 0 || dst->nb[3] % 128 != 0)))) {
++        return false;
++    }
++
+     // M alignment: Use HMX when M > HTP_MM_HMX_MIN_NROWS.
+     // For MUL_MAT_ID, src1 shape is [K, n_expert_used, n_tokens, 1], so n_tokens is ne12.
+     const int m = is_matmul_id ? ne12 : ne11;
+@@ -4837,8 +4867,6 @@ static bool ggml_hexagon_matmul_is_hmx_eligible(
+     }
+ 
+     return true;
+-
+-    GGML_UNUSED(dst);
+ }
+ 
+ static bool ggml_hexagon_precompute_hmx_mm_params(
+@@ -5654,9 +5682,34 @@ static bool ggml_hexagon_supported_binary(const struct ggml_hexagon_session * se
+         return false;
+     }
+ 
+-    return true;
++    // The VTCM rows of the DSP (htp/binary-ops.c:782-843): each thread holds two rows of src0 and
++    // of dst (and of src1 when the shapes are the same), each row rounded up to 128 bytes, and a
++    // broadcast row of src1 stays in VTCM once. An empty op (a view of size 0) needs no VTCM.
++    if (ggml_nelements(src0) > 0 && ggml_nelements(src1) > 0) {
++        const size_t es = ggml_type_size(src0->type);
++        const size_t r0 = src0->ne[0] * es, r1 = src1->ne[0] * es, rd = dst->ne[0] * es;
++        const size_t a0 = hex_round_up(r0, 128), a1 = hex_round_up(r1, 128), ad = hex_round_up(rd, 128);
++        const bool   scalar     = src1->ne[0] == 1;
++        const bool   transposed = src0->nb[1] < r0 || src1->nb[1] < r1 || dst->nb[1] < rd;
++        const bool   same_shape = !scalar && !transposed && src1->ne[0] == src0->ne[0] && src0->ne[0] % 128 == 0 &&
++                                  (src1->ne[1] == src0->ne[1] || src1->ne[1] == 1) &&
++                                  (src1->ne[2] == src0->ne[2] || src1->ne[2] == 1) &&
++                                  (src1->ne[3] == src0->ne[3] || src1->ne[3] == 1);
++        const bool   row_bcast  = same_shape && ggml_nrows(src1) == 1;
++        const size_t per_row    = same_shape ? 2 * (a0 + a1 + ad) : 2 * (a0 + ad);
++        size_t       vtcm       = sess->vtcm_size;
++        if (row_bcast) {
++            if (vtcm < a1) {
++                return false;
++            }
++            vtcm -= a1;
++        }
++        if (vtcm / (sess->n_threads * per_row) < 1) {
++            return false;
++        }
++    }
+ 
+-    GGML_UNUSED(sess);
++    return true;
+ }
+ 
+ static bool ggml_hexagon_supported_add_id(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+@@ -5733,9 +5786,18 @@ static bool ggml_hexagon_supported_unary(const struct ggml_hexagon_session * ses
+         return false;
+     }
+ 
+-    return true;
++    // The DSP checks the VTCM layout of the kernel params (htp/unary-ops.c), and a layout with no
++    // row of src0 in VTCM gives no output (ggml_hexagon_unary_has_rows). An empty op (for example
++    // the state_zero SCALE of build_rs with no row to clear) has no kernel params to check.
++    if (ggml_nelements(src0) > 0) {
++        struct htp_unary_kernel_params kparams;
++        ggml_hexagon_precompute_unary_params(sess, op_remap_to_htp(op), src0, nullptr, dst, &kparams);
++        if ((size_t) kparams.vtcm_size > sess->vtcm_size || !ggml_hexagon_unary_has_rows(kparams)) {
++            return false;
++        }
++    }
+ 
+-    GGML_UNUSED(sess);
++    return true;
+ }
+ 
+ static bool ggml_hexagon_supported_sum_rows(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+@@ -5790,9 +5852,14 @@ static bool ggml_hexagon_supported_activations(const struct ggml_hexagon_session
+         }
+     }
+ 
+-    return true;
++    // Each thread of the DSP needs one row of src0, src1 and dst in VTCM, each row rounded up to
++    // 128 bytes (htp/act-ops.c:509-521, htp_act_vtcm_layout_build)
++    const size_t row = hex_round_up((size_t) dst->ne[0] * sizeof(float), 128);
++    if (3 * row * sess->n_threads > sess->vtcm_size) {
++        return false;
++    }
+ 
+-    GGML_UNUSED(sess);
++    return true;
+ }
+ 
+ static bool ggml_hexagon_supported_softmax(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+@@ -5857,9 +5924,15 @@ static bool ggml_hexagon_supported_softmax(const struct ggml_hexagon_session * s
+         return false;
+     }
+ 
+-    return true;
++    // Each thread of the DSP holds two scratch pads of src0 and one of dst, of 4 rows each
++    // (htp/softmax-ops.c:540-560)
++    const size_t pad0 = hex_round_up(4 * src0->nb[1], 128);
++    const size_t padd = hex_round_up(4 * dst->nb[1], 128);
++    if ((2 * pad0 + padd) * sess->n_threads > sess->vtcm_size) {
++        return false;
++    }
+ 
+-    GGML_UNUSED(sess);
++    return true;
+ }
+ 
+ static bool ggml_hexagon_supported_set_rows(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+@@ -5883,9 +5956,16 @@ static bool ggml_hexagon_supported_set_rows(const struct ggml_hexagon_session *
+         return false;
+     }
+ 
+-    return true;
++    // The DSP writes its VTCM layout (htp/set-rows-ops.h) with no check of the reservation
++    if (ggml_nelements(src0) > 0 && ggml_nelements(src1) > 0) {
++        struct htp_set_rows_kernel_params kparams;
++        ggml_hexagon_precompute_set_rows_params(sess, src0, src1, dst, &kparams);
++        if ((size_t) kparams.vtcm_size > sess->vtcm_size) {
++            return false;
++        }
++    }
+ 
+-    GGML_UNUSED(sess);
++    return true;
+ }
+ 
+ static bool ggml_hexagon_supported_get_rows(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+@@ -5916,9 +5996,16 @@ static bool ggml_hexagon_supported_get_rows(const struct ggml_hexagon_session *
+         return false;
+     }
+ 
+-    return true;
++    // Without DMA the DSP writes its VTCM layout (htp/get-rows-ops.h) with no check of the reservation
++    if (ggml_nelements(src0) > 0 && ggml_nelements(src1) > 0) {
++        struct htp_get_rows_kernel_params kparams;
++        ggml_hexagon_precompute_get_rows_params(sess, src0, src1, dst, &kparams);
++        if (!kparams.use_dma && (size_t) kparams.vtcm_size > sess->vtcm_size) {
++            return false;
++        }
++    }
+ 
+-    GGML_UNUSED(sess);
++    return true;
+ }
+ 
+ static bool ggml_hexagon_supported_argsort(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+@@ -7317,7 +7404,13 @@ static bool ggml_hexagon_supported_cpy(const struct ggml_hexagon_session * sess,
+     if ( dst->type != GGML_TYPE_F32 &&  dst->type != GGML_TYPE_F16) return false;
+ 
+     const bool sametype   = (src0->type == dst->type);
+-    const bool transposed = ggml_is_transposed(src0) || ggml_is_transposed(dst);
++    // The layout test of the DSP (htp/cpy-ops.c:437-440): a stride of an element that is not the
++    // type size, or rows that overlap, also count as transposed there
++    const size_t ts0 = ggml_type_size(src0->type);
++    const size_t tsd = ggml_type_size(dst->type);
++    const bool transposed = ggml_is_transposed(src0) || ggml_is_transposed(dst) ||
++                            src0->nb[0] != ts0 || dst->nb[0] != tsd ||
++                            src0->nb[1] < src0->ne[0] * ts0 || dst->nb[1] < dst->ne[0] * tsd;
+     const bool sameshape  = !transposed && ggml_are_same_shape(src0, dst);
+ 
+     // can handle any shape and any same-type (pretty slow if reshaping is required)
+@@ -7378,8 +7471,24 @@ static bool ggml_hexagon_supported_concat(const struct ggml_hexagon_session * se
+         }
+     }
+ 
++    // The 2D path with a transposed src1 holds blocks of rows in VTCM for each thread
++    // (htp/concat-ops.c:256-293)
++    const struct ggml_tensor * src0 = op->src[0];
++    const struct ggml_tensor * src1 = op->src[1];
++    const bool is_2d = op->ne[2] == 1 && op->ne[3] == 1;
++    if (src0 && src1 && dim == 0 && is_2d && src1->nb[0] > src1->nb[1] && !(src0->nb[0] > src0->nb[1]) && op->ne[1] > 0) {
++        const size_t type_size = ggml_type_size(op->type);
++        const size_t block_i   = type_size == 4 ? 32 : 64;
++        const size_t s1_padded = hex_round_up((size_t) src1->ne[0], block_i);
++        const size_t row0      = hex_round_up((src0->ne[0] + s1_padded) * type_size, 128);
++        const size_t pad0      = block_i * row0;
++        const size_t pad1      = s1_padded * block_i * type_size + block_i * 128;
++        if ((pad0 + pad1) * sess->n_threads > sess->vtcm_size) {
++            return false;
++        }
++    }
++
+     return true;
+-    GGML_UNUSED(sess);
+ }
+ 
+ static bool ggml_hexagon_supported_fill(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+diff --git a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
+index 46e0b59..d65ead9 100644
+--- a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
++++ b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
+@@ -1073,7 +1073,13 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
+     size_t state_aligned = (size_t) S_v * S_v * sizeof(float);
+     state_aligned = (state_aligned + 127) & ~(size_t)127;
+ 
+-    assert(octx->ctx->vtcm_size >= 2 * state_aligned * n_threads);
++    // Each thread holds two state blocks in VTCM. An assert is empty in the release library, thus
++    // the kernel must stop here, else it writes past the VTCM reservation.
++    if (octx->ctx->vtcm_size < 2 * state_aligned * n_threads) {
++        FARF(ERROR, "gated-delta-net: VTCM reservation %zu is too small, needed %zu\n", octx->ctx->vtcm_size,
++             2 * state_aligned * n_threads);
++        return HTP_STATUS_VTCM_TOO_SMALL;
++    }
+ 
+     gctx.vtcm_base = octx->ctx->vtcm_base;
+     gctx.vtcm_per_thread = 2 * state_aligned;
+diff --git a/ggml/src/ggml-hexagon/htp/get-rows-ops.c b/ggml/src/ggml-hexagon/htp/get-rows-ops.c
+index d294ba5..4501285 100644
+--- a/ggml/src/ggml-hexagon/htp/get-rows-ops.c
++++ b/ggml/src/ggml-hexagon/htp/get-rows-ops.c
+@@ -264,6 +264,12 @@ int op_get_rows(struct htp_ops_context * octx) {
+ 
+     const uint32_t ne00 = octx->src[0]->ne[0];
+     htp_get_rows_vtcm_layout_build(&grctx.vtcm_layout, octx->src[0]->type, ne00, n_threads);
++    // The DMA path takes no VTCM; the other paths stage the rows in the layout
++    if (!kparams->use_dma && grctx.vtcm_layout.total_bytes > octx->ctx->vtcm_size) {
++        FARF(ERROR, "get-rows: VTCM reservation %zu is too small, needed %zu\n", octx->ctx->vtcm_size,
++             (size_t) grctx.vtcm_layout.total_bytes);
++        return HTP_STATUS_VTCM_TOO_SMALL;
++    }
+ 
+     const bool is_i32 = (octx->src[1]->type == HTP_TYPE_I32);
+ 
+diff --git a/ggml/src/ggml-hexagon/htp/set-rows-ops.c b/ggml/src/ggml-hexagon/htp/set-rows-ops.c
+index fbd5162..8fd8303 100644
+--- a/ggml/src/ggml-hexagon/htp/set-rows-ops.c
++++ b/ggml/src/ggml-hexagon/htp/set-rows-ops.c
+@@ -234,6 +234,11 @@ int op_set_rows(struct htp_ops_context * octx) {
+     srctx.tasks_per_thread = fastdiv(tasks + n_threads - 1, &octx->n_threads_div);
+ 
+     htp_set_rows_vtcm_layout_build(&srctx.vtcm_layout, octx->dst->type, ne00, n_threads);
++    if (srctx.vtcm_layout.total_bytes > octx->ctx->vtcm_size) {
++        FARF(ERROR, "set-rows: VTCM reservation %zu is too small, needed %zu\n", octx->ctx->vtcm_size,
++             (size_t) srctx.vtcm_layout.total_bytes);
++        return HTP_STATUS_VTCM_TOO_SMALL;
++    }
+     srctx.vtcm_base = (uint8_t *)octx->ctx->vtcm_base;
+ 
+     work_queue_func_t q_func = NULL;
+diff --git a/ggml/src/ggml-hexagon/htp/unary-ops.c b/ggml/src/ggml-hexagon/htp/unary-ops.c
+index e8525d7..7e71d63 100644
+--- a/ggml/src/ggml-hexagon/htp/unary-ops.c
++++ b/ggml/src/ggml-hexagon/htp/unary-ops.c
+@@ -1241,6 +1241,14 @@ static int execute_op_unary(struct htp_ops_context * octx) {
+         return HTP_STATUS_VTCM_TOO_SMALL;
+     }
+ 
++    // A row-block task with BLOCK 0 returns at once and writes no output (the BLOCK rule of the
++    // tasks, DEFINE_UNARY_TASK). BLOCK is 0 exactly when the block of the kernel params is 0,
++    // thus the op stops here with an error, and the host sees it.
++    if (!col_tile && kparams->block == 0 && nrows > 0) {
++        FARF(ERROR, "unary-%s : no row of %zu bytes fits in the VTCM of a thread\n", op_type, src0_row_size_aligned);
++        return HTP_STATUS_VTCM_TOO_SMALL;
++    }
++
+     octx->src0_spad.src = NULL;
+     octx->src1_spad.src = NULL;
+     octx->dst_spad.src  = NULL;

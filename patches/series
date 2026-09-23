@@ -121,3 +121,4 @@ fuzz-ops/0003-ggml-cpu-keep-the-sse2-exp-steps-under-fast-math.patch
 # fuzz-hexhost: the fixes of the Hexagon host fuzzer. The header of each patch gives its task.
 fuzz-hexhost/0001-hexagon-gdn-slot-index-before-the-first-batch.patch
 fuzz-hexhost/0002-hexagon-mul-mat-add-only-for-the-whole-product.patch
+fuzz-hexhost/0003-hexagon-model-the-dsp-limits-in-supports-op.patch
