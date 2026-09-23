@@ -436,9 +436,15 @@ phone_build() {
     local rel
     rel=$(phone_rel "$profile" "$san")
     mkdir -p "$copy" "$REPO/$rel/out"
-    # A private copy of the llama.cpp tree (the submodule, or FUZZ_LLAMA_DIR): the main session edits
-    # the HTP sources of the submodule.
-    rsync -a --delete --exclude .git --exclude '/build*/' "${LLAMA_DIR:-$REPO/third_party/llama.cpp}/" "$copy/llama.cpp/"
+    # A private copy of the llama.cpp tree: the main session edits the HTP sources of the submodule.
+    # The copy does not keep the file times, thus ninja compiles each changed file again. The
+    # submodule goes through tests/sanitizers/llama-copy.sh (the shared landing lock, the check
+    # against HEAD, and the stamp of the copy). A private tree (FUZZ_LLAMA_DIR) goes through rsync.
+    if [[ -n $LLAMA_DIR ]]; then
+        rsync -rlc --delete --exclude .git --exclude '/build*/' "$LLAMA_DIR/" "$copy/llama.cpp/"
+    else
+        "$REPO/tests/sanitizers/llama-copy.sh" "$copy/llama.cpp" > /dev/null
+    fi
     local runtime
     runtime=$(phone_runtime "$san")
     container_run "$SNAPDRAGON_IMAGE" bash -euo pipefail -c "
