@@ -241,6 +241,9 @@ void init_tensor(ggml_backend_buffer_t buf, ggml_tensor * t, bool weight) {
 size_t init_from_env() {
     delete opt_opfilter;
     opt_opfilter = nullptr;
+    for (auto & cfg : opt_device_configs) {
+        cfg.mdev_group.clear();
+    }
     ggml_backend_reg reg = { GGML_BACKEND_API_VERSION, ggml_backend_hexagon_reg_i, nullptr };
     ggml_hexagon_init(&reg);
     const size_t n = opt_ndev;
@@ -258,6 +261,23 @@ int profile_items(const char * value, uint32_t * first) {
     } catch (...) {
         return -1;
     }
+}
+
+size_t profile_empty_size() {
+    return vec_to_str<uint32_t, 16>(std::vector<uint32_t>()).size();
+}
+
+size_t max_device_group() {
+    // init_from_env clears the groups first, thus each group here comes from the last parse
+    size_t n = 0;
+    for (const auto & cfg : opt_device_configs) {
+        n = std::max(n, cfg.mdev_group.size() + 1);
+    }
+    return n;
+}
+
+int optrace() {
+    return opt_optrace;
 }
 
 size_t graph_cache_size(device * d) {

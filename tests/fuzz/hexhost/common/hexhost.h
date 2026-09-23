@@ -112,6 +112,15 @@ size_t init_from_env();
 // item count and the first item, or -1 when the parser throws.
 int profile_items(const char * value, uint32_t * first);
 
+// Gives the size of the string that vec_to_str of the backend makes from an empty list: 0 when the
+// backend handles an empty list, else the size after a pop_back of an empty string.
+size_t profile_empty_size();
+
+// The state that the last ggml_hexagon_init left: the largest device group (the physical devices of
+// one device) and the trace size opt_optrace.
+size_t max_device_group();
+int    optrace();
+
 // Gives the graph cache size and the batch cache state of the session, for the
 // checks of the graph fuzzer.
 size_t graph_cache_size(device * d);

@@ -18,13 +18,17 @@
 #include <fuzzer/FuzzedDataProvider.h>
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <typeinfo>
 #include <vector>
 
@@ -136,53 +140,45 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
     cfg.discovery = fdp.ConsumeIntegralInRange<int>(0, 1);
     fakedsp::configure(cfg);
 
+    // Each check of the init has a switch (HEXHOST_IGNORE): the harness then does not set the value
+    // that shows the defect (fuzz mode). The checks after the init look at the behavior, thus a
+    // backend without the defect passes the regression inputs.
+    std::string dev_value;
     {
-        const std::string dev = fuzz_string(fdp, 48);
-        const long        len = widest_range(dev);
-        if (fdp.ConsumeBool() && !(len > 64 && fakedsp::is_ignored("env-devices-range"))) {
-            if (len > 64) {
-                fakedsp::violation("env-devices-range", "GGML_HEXAGON_DEVICES='%s' has a physical range of %ld values: "
-                                   "ggml_hexagon_init (ggml-hexagon.cpp:8108) loops over it with a linear search in each "
-                                   "step, and an end of INT_MAX never stops", dev.c_str(), len);
-            }
-            setenv("GGML_HEXAGON_DEVICES", dev.c_str(), 1);
+        // A physical range "A-B" of GGML_HEXAGON_DEVICES: the parser loops over it with a linear
+        // search in each step, and B = INT_MAX never stops (ggml-hexagon.cpp:8108)
+        dev_value     = fuzz_string(fdp, 48);
+        const long len = widest_range(dev_value);
+        if (fdp.ConsumeBool() && !(len > 16 && fakedsp::is_ignored("env-devices-range"))) {
+            setenv("GGML_HEXAGON_DEVICES", dev_value.c_str(), 1);
         } else {
             unsetenv("GGML_HEXAGON_DEVICES");
         }
     }
     fuzz_env(fdp, "GGML_HEXAGON_NDEV", fuzz_string(fdp, 8));
     fuzz_env(fdp, "GGML_HEXAGON_ARCH", fuzz_string(fdp, 6));
+    bool profile_empty = false;
     {
-        // vec_to_str (ggml-hexagon.cpp:7789) removes the last character of an empty string when the
-        // list of PMU events is empty: mode 1 or a list that has not 1 or 8 items. With
-        // HEXHOST_IGNORE=env-profile-empty the harness does not set such a value.
-        // No sanitizer sees the defect in a release build (the byte goes into the string object),
-        // thus the harness reports the condition itself before the init.
+        // vec_to_str (ggml-hexagon.cpp:7789) calls pop_back on an empty string when the list of PMU
+        // events is empty: mode 1, or a list that has not 1 or 8 items
         const std::string prof  = fuzz_string(fdp, 24);
         uint32_t          first = 0;
         const int         n     = hexhost::profile_items(prof.c_str(), &first);
         const bool        empty = n >= 0 && n != 8 && !(n == 1 && first != 1);
         if (fdp.ConsumeBool() && !(empty && fakedsp::is_ignored("env-profile-empty"))) {
-            if (empty) {
-                fakedsp::violation("env-profile-empty", "GGML_HEXAGON_PROFILE='%s' gives an empty PMU event list, and "
-                                   "vec_to_str (ggml-hexagon.cpp:7789) calls pop_back on an empty string", prof.c_str());
-            }
             setenv("GGML_HEXAGON_PROFILE", prof.c_str(), 1);
+            profile_empty = empty;
         } else {
             unsetenv("GGML_HEXAGON_PROFILE");
         }
     }
     {
         // opt_optrace = opt_opbatch * 256 (ggml-hexagon.cpp:7983) is an int product: an OPBATCH above
-        // INT_MAX / 256 overflows (UB, visible to UBSan only), thus the harness reports it itself
+        // INT_MAX / 256 overflows
         const std::string ob = fuzz_string(fdp, 8);
         const long long   v  = (long long) (int) strtoul(ob.c_str(), nullptr, 0);
         const bool        ov = v > INT32_MAX / 256 || v < INT32_MIN / 256;
         if (fdp.ConsumeBool() && !(ov && fakedsp::is_ignored("env-int-overflow"))) {
-            if (ov) {
-                fakedsp::violation("env-int-overflow", "GGML_HEXAGON_OPBATCH='%s' gives %lld, and opbatch * 256 "
-                                   "overflows int (ggml-hexagon.cpp:7983)", ob.c_str(), v);
-            }
             setenv("GGML_HEXAGON_OPBATCH", ob.c_str(), 1);
         } else {
             unsetenv("GGML_HEXAGON_OPBATCH");
@@ -193,7 +189,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
     fuzz_env(fdp, "GGML_HEXAGON_MBUF", fuzz_string(fdp, 12));
     fuzz_env(fdp, "GGML_HEXAGON_NHVX", fuzz_string(fdp, 6));
 
-    // the op filter: a regex from the input (an invalid regex is a separate finding)
+    // the op filter: a regex from the input (the init must survive a regex that is not valid)
     if (fdp.ConsumeIntegralInRange<int>(0, 7) == 0) {
         setenv("GGML_HEXAGON_OPFILTER", fuzz_string(fdp, 12).c_str(), 1);
     } else {
@@ -217,15 +213,58 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
         unsetenv("ADSP_LIBRARY_PATH");
     }
 
+    // The init runs under a watchdog: a range of devices can make it loop for a very long time
     size_t n_dev = 0;
-    try {
-        n_dev = hexhost::init_from_env();
-    } catch (const std::exception & e) {
-        if (!fakedsp::is_ignored("env-exception")) {
-            fakedsp::violation("env-exception", "ggml_hexagon_init throws %s: %s (the process terminates at the backend init)",
-                               typeid(e).name(), e.what());
+    {
+        std::mutex              m;
+        std::condition_variable cv;
+        bool                    done = false;
+        std::thread             watchdog([&] {
+            std::unique_lock<std::mutex> lock(m);
+            if (!cv.wait_for(lock, std::chrono::seconds(20), [&] { return done; })) {
+                fakedsp::violation("env-devices-range", "ggml_hexagon_init runs for more than 20 s with "
+                                   "GGML_HEXAGON_DEVICES='%s' (the loop over a physical range, ggml-hexagon.cpp:8108)",
+                                   dev_value.c_str());
+            }
+        });
+        auto stop = [&] {
+            {
+                std::lock_guard<std::mutex> lock(m);
+                done = true;
+            }
+            cv.notify_one();
+            watchdog.join();
+        };
+        try {
+            n_dev = hexhost::init_from_env();
+        } catch (const std::exception & e) {
+            stop();
+            if (!fakedsp::is_ignored("env-exception")) {
+                fakedsp::violation("env-exception", "ggml_hexagon_init throws %s: %s (the process terminates at the backend init)",
+                                   typeid(e).name(), e.what());
+            }
+            return 0;
         }
-        return 0;
+        stop();
+    }
+
+    // The behavior after the init
+    if (profile_empty && hexhost::profile_empty_size() != 0) {
+        fakedsp::violation("env-profile-empty", "an empty PMU event list gives a string of %zu characters: vec_to_str "
+                           "(ggml-hexagon.cpp:7789) calls pop_back on an empty string", hexhost::profile_empty_size());
+    }
+    if (hexhost::max_device_group() > 16) {
+        fakedsp::violation("env-devices-range", "GGML_HEXAGON_DEVICES='%s' gives a device group of %zu physical devices, "
+                           "the maximum is 16", dev_value.c_str(), hexhost::max_device_group());
+    }
+    if (!getenv("GGML_HEXAGON_OPTRACE")) {
+        const long long want = std::min<long long>(std::max<long long>((long long) hexhost::get_options().opbatch * 256, 0),
+                                                   INT32_MAX);
+        if (hexhost::optrace() != want) {
+            fakedsp::violation("env-int-overflow", "opbatch %d gives the trace size %d, and the 64-bit product clamped to "
+                               "int is %lld: opbatch * 256 (ggml-hexagon.cpp:7983) overflows int",
+                               hexhost::get_options().opbatch, hexhost::optrace(), want);
+        }
     }
 
     if (n_dev > 16) {
