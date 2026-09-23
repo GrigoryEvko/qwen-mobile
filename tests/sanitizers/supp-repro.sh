@@ -147,6 +147,7 @@ log_has_check() {
     case "$check" in
         pointer-overflow) rg -q -e 'runtime error: (applying (non-)?zero offset|.*pointer.*overflow|addition of unsigned offset)' "$log" ;;
         function) rg -q -e 'runtime error: call to function .* through pointer to incorrect function type' "$log" ;;
+        integer-divide-by-zero) rg -q -e 'runtime error: division by zero' "$log" ;;
         *) rg -q -e 'runtime error:' "$log" ;;
     esac
 }
@@ -167,7 +168,8 @@ validate_link() {
 
     # Step 3: each mode with the full file, also the modes of the fixed
     # findings (REPRO-FIXED), which must stay free of reports.
-    mapfile -t modes < <({ printf '%s\n' ${mode_of[@]}; rg -o -r '$1' 'REPRO-FIXED: \S+ MODE: (\S+)' "$REPRO_SRC" || true; } | sort -u)
+    mapfile -t modes < <({ printf '%s\n' ${mode_of[@]}; rg -o -r '$1' 'REPRO-FIXED: \S+ MODE: (\S+)' "$REPRO_SRC" || true; } \
+        | { rg -v -e '^\s*$' || true; } | sort -u)
     for mode in "${modes[@]}"; do
         read -r rc n < <(run_mode "$prog" "$mode" "$SUPP" "$logs/$mode.full.log")
         if [[ "$rc" -eq 0 && "$n" -eq 0 ]]; then

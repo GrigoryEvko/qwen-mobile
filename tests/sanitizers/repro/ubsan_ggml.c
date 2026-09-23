@@ -17,31 +17,35 @@
  * read these lines. An entry can have more than one mode. It passes if one
  * of its modes stops with a report of its check when the entry is removed.
  *   REPRO-FIXED: pointer-overflow MODE: graph_nbytes
- *   REPRO-ENTRY: function:^ggml_compute_forward_mul_mat_one_chunk$ MODE: mul_mat_f32
- *   REPRO-ENTRY: function:^ggml_compute_forward_mul_mat_one_chunk$ MODE: mul_mat_f16
- *   REPRO-ENTRY: function:^ggml_compute_forward_mul_mat$ MODE: mul_mat_f16
- *   REPRO-ENTRY: function:^ggml_compute_forward_mul_mat_id_one_chunk$ MODE: mul_mat_id
- *   REPRO-ENTRY: function:^ggml_compute_forward_mul_mat_id$ MODE: mul_mat_id
- *   REPRO-ENTRY: function:ggml_compute_forward_set_rows_impl< MODE: set_rows
- *   REPRO-ENTRY: function:^ggml_compute_forward_flash_attn_ext_f16_one_chunk( MODE: flash_attn_ext
- *   REPRO-ENTRY: function:^ggml_compute_forward_dup_from_q( MODE: dup_from_q
- *   REPRO-ENTRY: function:^ggml_compute_forward_add_q_f32( MODE: add_q
- *   REPRO-ENTRY: function:^ggml_compute_forward_add1_q_f32( MODE: add1_q
- *   REPRO-ENTRY: function:^ggml_compute_forward_out_prod_q_f32( MODE: out_prod_q
- *   REPRO-ENTRY: function:^ggml_compute_forward_get_rows_q( MODE: get_rows_q
- *   REPRO-ENTRY: function:^ggml_compute_forward_lightning_indexer$ MODE: lightning_indexer
+ *   REPRO-FIXED: function MODE: mul_mat_f32
+ *   REPRO-FIXED: function MODE: mul_mat_f16
+ *   REPRO-FIXED: function MODE: mul_mat_id
+ *   REPRO-FIXED: function MODE: set_rows
+ *   REPRO-FIXED: function MODE: flash_attn_ext
+ *   REPRO-FIXED: function MODE: dup_from_q
+ *   REPRO-FIXED: function MODE: add_q
+ *   REPRO-FIXED: function MODE: add1_q
+ *   REPRO-FIXED: function MODE: out_prod_q
+ *   REPRO-FIXED: function MODE: get_rows_q
+ *   REPRO-FIXED: function MODE: lightning_indexer
+ *   REPRO-FIXED: function MODE: dup_to_q
+ *   REPRO-FIXED: function MODE: repack_mul_mat
+ *   REPRO-FIXED: function MODE: repack_mul_mat_id
  *   REPRO-CONTROL: pointer-overflow MODE: control_pointer_overflow
  *   REPRO-CONTROL: function MODE: control_function
- * The modes dup_to_q, repack_mul_mat and repack_mul_mat_id have no entry.
- * They call from_float of Q8_0 (quantize_row_q8_0), whose type is the type
- * of ggml_from_float_t, thus they give no report (measured 2026-09-23). They
- * stay as the evidence that ggml_compute_forward_dup_to_q and the repack
- * functions need no entry.
+ *   REPRO-CONTROL: integer-divide-by-zero MODE: control_divide
  * A REPRO-FIXED line names a mode of a finding whose fix has landed: the
  * mode must give no report with the full file (a regression check).
  * graph_nbytes: task #125 (ggml_graph_nbytes, fixed by patches/fuzz-ops/0001).
  * It reaches ggml_graph_nbytes through ggml_graph_overhead, and each other
  * mode reaches it through ggml_new_graph.
+ * The "function" modes: task #127 (the calls through the type traits, fixed
+ * by patches/fuzz-ops/0002). Before the fix, each mode from mul_mat_f32 to
+ * lightning_indexer gave a "function" report in its op, in debug and
+ * release, with the shared and the static link (supp-repro.sh,
+ * 2026-09-23). dup_to_q and the repack modes gave no report even before the
+ * fix: they call from_float of Q8_0 (quantize_row_q8_0), whose type is the
+ * type of ggml_from_float_t.
  */
 
 #include "ggml.h"
@@ -295,6 +299,14 @@ __attribute__((noinline)) static int repro_control_callee(const float * x) {
     return x == NULL ? 7 : 8;
 }
 
+/* The control of integer-divide-by-zero: a division by zero in a function
+ * that no entry names. The report stops the run before the division, thus
+ * x86 does not trap. */
+__attribute__((noinline)) static unsigned repro_control_divide(unsigned d) {
+    volatile unsigned n = 7;
+    return n / d;
+}
+
 /* The control of function: a call through a pointer of the wrong function
  * type, in a function that no entry names. */
 __attribute__((noinline)) static int repro_control_bad_call(void) {
@@ -337,6 +349,9 @@ int main(int argc, char ** argv) {
         rc = mode_repack(1);
     } else if (strcmp(mode, "control_pointer_overflow") == 0) {
         rc = repro_control_null_offset(96) != NULL ? 0 : 3;
+    } else if (strcmp(mode, "control_divide") == 0) {
+        volatile unsigned zero = 0;
+        rc = repro_control_divide(zero) == 0 ? 0 : 3;
     } else if (strcmp(mode, "control_function") == 0) {
         rc = repro_control_bad_call() > 0 ? 0 : 3;
     } else {
