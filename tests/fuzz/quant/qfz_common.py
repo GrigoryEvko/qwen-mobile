@@ -70,8 +70,6 @@ KNOWN_DEFECTS = {
         "the scale search compares float32 scales but stores their F16 rounding, which can lose to the plain scale",
     "only-filter-skips-iq4-nl":
         "the export filter --only applies to Q4_0 and Q8_0, thus an IQ4_NL tensor out of the match stays IQ4_NL",
-    "sys-path-growth":
-        "each export() call puts llama_dir/gguf-py at the front of sys.path again, thus sys.path only grows",
 }
 
 # The largest finite F16 value, and the smallest positive subnormal F16 value.

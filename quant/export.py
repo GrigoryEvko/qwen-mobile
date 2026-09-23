@@ -65,7 +65,10 @@ def _f16(name: str, a: np.ndarray) -> np.ndarray:
 
 
 def _load_gguf_module(llama_dir: Path):
-    sys.path.insert(0, str(llama_dir / "gguf-py"))
+    path = str(llama_dir / "gguf-py")
+    # One entry for each process: an insertion for each call would grow sys.path with each export.
+    if path not in sys.path:
+        sys.path.insert(0, path)
     import gguf  # noqa: E402
 
     return gguf

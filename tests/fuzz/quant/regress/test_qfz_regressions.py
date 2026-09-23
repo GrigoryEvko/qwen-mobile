@@ -215,9 +215,8 @@ def test_only_keeps_every_other_tensor_in_f16(tmp_path: Path) -> None:
     assert got["output.weight"][0] == "F16" and got["token_embd.weight"][0] == "F16"
 
 
-@xfail_open("sys-path-growth", "each call of _load_gguf_module adds one more copy of the same sys.path entry")
 def test_export_does_not_grow_sys_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    """quant/export.py (_load_gguf_module): 100 exports in one process give 100 copies of llama_dir/gguf-py."""
+    """Each call of _load_gguf_module keeps one copy of llama_dir/gguf-py in sys.path, not one more per call."""
     import sys
 
     from quant.export import _load_gguf_module
