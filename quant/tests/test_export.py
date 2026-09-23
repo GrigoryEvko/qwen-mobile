@@ -13,10 +13,10 @@ from quant.blockopt import weighted_low_rank
 from quant.export import LinearAttentionLayout, _f32_of, block_permutation, export, write_adapter
 from quant.grid import dequantize, pack_nibbles, q8_0_dequantize, q8_0_quantize, quantize
 from quant.grids import Q4_0Grid
+from quant.paths import llama_path
 from quant.plan import Plan
 
-ROOT = Path(__file__).resolve().parents[2]
-LLAMA = ROOT / "llama.cpp"
+LLAMA = llama_path("gguf-py").parent
 
 
 def converter_reorder():

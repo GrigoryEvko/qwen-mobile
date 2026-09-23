@@ -32,9 +32,8 @@ from pathlib import Path
 import torch
 
 from .checkpoint import MTP_HNORM_ROT, OUTPUT_ROT, layer_types, load_checkpoint, load_tensor, num_layers, save_checkpoint
+from .paths import ROOT, llama_path
 from .plan import Plan
-
-ROOT = Path(__file__).resolve().parent.parent
 
 
 def cmd_transform(args: argparse.Namespace) -> None:
@@ -76,7 +75,7 @@ def cmd_verify(args: argparse.Namespace) -> None:
 def cmd_convert(args: argparse.Namespace) -> None:
     src = ROOT / "weights" / f"{args.model}-{args.source}"
     out = ROOT / "weights" / "gguf" / f"{args.model}-{args.source}-F16.gguf"
-    cmd = [sys.executable, str(ROOT / "llama.cpp" / "convert_hf_to_gguf.py"), str(src),
+    cmd = [sys.executable, str(llama_path("convert_hf_to_gguf.py")), str(src),
            "--outtype", "f16", "--outfile", str(out)]
     subprocess.run(cmd, check=True)
     print(f"wrote {out}")
@@ -218,7 +217,7 @@ def cmd_export(args: argparse.Namespace) -> None:
     f16 = Path(args.f16) if args.f16 else ROOT / "weights" / "gguf" / f"{args.model}-{args.source}-F16.gguf"
     out = ROOT / "weights" / "gguf" / (args.out or f"{args.model}-{args.tag}.gguf")
     plan = _plan(args, num_layers(ROOT / "weights" / args.model), args.tie_head)
-    export(f16, out, _packs(args), plan, ROOT / "llama.cpp", torch.device(args.device),
+    export(f16, out, _packs(args), plan, llama_path("gguf-py").parent, torch.device(args.device),
            only=args.only, invert=args.invert, source_folded=args.source == "tf",
            tie_head=args.tie_head, rot=Path(args.rot) if args.rot else None,
            promote=args.promote, promote_type=args.promote_type)
@@ -232,7 +231,7 @@ def _packs(args: argparse.Namespace) -> Path:
 def cmd_eval(args: argparse.Namespace) -> None:
     """KL divergence of a GGUF against the F16 logits base, with ``--ngl`` layers on CUDA."""
     base = ROOT / "eval" / f"{args.model}-F16.wiki.c512x16.kld"
-    cmd = [str(ROOT / "llama.cpp" / "build-cuda" / "bin" / "llama-perplexity"), "-m", str(args.gguf), "-ngl", str(args.ngl),
+    cmd = [str(llama_path("build-cuda", "bin", "llama-perplexity")), "-m", str(args.gguf), "-ngl", str(args.ngl),
            "-f", str(ROOT / "data" / "wiki.test.raw"), "-c", "512", "--chunks", "16",
            "--kl-divergence-base", str(base), "--kl-divergence"]
     lora = Path(args.gguf).with_name(Path(args.gguf).stem + "-lora.gguf")

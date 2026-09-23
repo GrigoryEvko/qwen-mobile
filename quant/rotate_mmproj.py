@@ -19,9 +19,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from .paths import llama_path
 from .transform import rotation_matrix
 
-ROOT = Path(__file__).resolve().parent.parent
 MERGER_OUT = "mm.2"
 
 
@@ -33,7 +33,7 @@ def main() -> None:
     p.add_argument("--block", type=int, default=None, help="the block of the rotation, as in the transform")
     args = p.parse_args()
 
-    sys.path.insert(0, str(ROOT / "llama.cpp" / "gguf-py"))
+    sys.path.insert(0, str(llama_path("gguf-py")))
     import gguf  # noqa: E402
 
     reader = gguf.GGUFReader(str(args.src))

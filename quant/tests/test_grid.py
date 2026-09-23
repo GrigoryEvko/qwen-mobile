@@ -16,9 +16,9 @@ import torch
 from quant import grid as grid_module
 from quant.grid import BLOCK, block_error, dequantize, dequantize_pack, pack_nibbles, pack_q8_0, q8_0_quantize, quantize
 from quant.grids import IQ4_NL_TABLE, Grid, IQ4NLGrid, Q4_0Grid
+from quant.paths import llama_path
 
-ROOT = Path(__file__).resolve().parents[2]
-LLAMA = ROOT / "llama.cpp"
+LLAMA = llama_path("gguf-py").parent
 
 
 def gguf_module():

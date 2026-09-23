@@ -75,7 +75,6 @@ KNOWN_FINDINGS = {
     "QF8": "the export casts the dense maps to F16 with no check, thus an overflow gives inf",
     "QF9": "the scale search compares float32 scales but stores their F16 rounding, which can lose to the plain scale",
     "QF10": "the export filter --only applies to Q4_0 and Q8_0, thus an IQ4_NL tensor out of the match stays IQ4_NL",
-    "QF7": "quant/run.py, quant/rotate_mmproj.py and quant/tests use ROOT/llama.cpp, now third_party/llama.cpp",
     "QF11": "each export() call puts llama_dir/gguf-py at the front of sys.path again, thus sys.path only grows",
     "QR1": "the gguf-py reader loops over a scalar array that is longer than the file",
     "QR2": "the gguf-py reader does not check the data range of a tensor: a large offset wraps, a 0-byte tensor passes",

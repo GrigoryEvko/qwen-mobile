@@ -178,11 +178,10 @@ def test_qf6_export_refuses_an_unknown_plan_type(tmp_path: Path) -> None:
         export(src, tmp_path / "out.gguf", tmp_path / "no-packs", Plan(n_layers=0, head="Q6_K"), LLAMA_DIR, CPU)
 
 
-# --- QF7: the stale llama.cpp path ----------------------------------------------------------------
+# --- QF7 (task #169): the llama.cpp path ------------------------------------------------------------
 
-@xfail_open("QF7", "quant/run.py builds ROOT/llama.cpp/convert_hf_to_gguf.py, which does not exist")
 def test_qf7_the_converter_that_run_py_starts_exists(monkeypatch: pytest.MonkeyPatch) -> None:
-    """quant/run.py:79 (also 221, 235, rotate_mmproj.py:36, tests/test_export.py:19, test_grid.py:21).
+    """cmd_convert of quant/run.py starts a converter that exists (quant/paths.py gives the llama.cpp tree).
 
     The test catches the command of cmd_convert and does not start it.
     """
