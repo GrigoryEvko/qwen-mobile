@@ -17,6 +17,7 @@ Usage:
   tests/fuzz/quant/run.sh <test|fuzz> <none|asan|ubsan|tsan|msan> [--profile debug|release]
                           [--budget-seconds N] [--jobs N]
   tests/fuzz/quant/run.sh build <none|asan|ubsan|tsan|msan> [--profile debug|release]
+  tests/fuzz/quant/run.sh build native
   tests/fuzz/quant/run.sh phone-files
   tests/fuzz/quant/run.sh phone-commands
   tests/fuzz/quant/run.sh cpu [--budget-seconds N] [--jobs N]     (the alias of: fuzz none)
@@ -36,11 +37,13 @@ Modes:
   build   Build the native code of one sanitizer and one profile: llama-perplexity
           of third_party/llama.cpp and the GGUF loader check qfz-gguf-check, in
           build/fuzz/quant-<profile>-<sanitizer>. test and fuzz build it when it
-          is missing.
+          is missing. "build native" builds the native reference of the phone set:
+          llama-perplexity with the llama.cpp preset flags (Release, GGML_NATIVE=ON),
+          no fast math and no sanitizer, in build/fuzz/quant/native-host.
   phone-files     Write the phone set into build/fuzz/quant/phone: the fuzzed GGUF
                   files, their KL bases of the x86 oracle, and the host results of
-                  the native build and of the two profiles without a sanitizer. The
-                  target llama-toy runs the same files in each sanitizer build.
+                  the native reference and of the two profiles without a sanitizer.
+                  The target llama-toy runs the same files in each sanitizer build.
   phone-commands  Print the adb commands that run the phone set on HTP0 and on the CPU.
 
 Profiles (FUZZ_PROFILE, or --profile; the preset value runs the two, debug first):
@@ -165,6 +168,20 @@ ensure_built() {
     fi
 }
 
+# Build the native reference of the phone set: llama-perplexity with the llama.cpp preset flags
+# (Release, GGML_NATIVE=ON), no fast math and no sanitizer, in build/fuzz/quant/native-host.
+build_native() {
+    local out="$ROOT/build/fuzz/quant/native-host"
+    mkdir -p "$out/logs"
+    echo "run.sh: build the native host reference into $out (logs in $out/logs)"
+    cmake -S "$ROOT/third_party/llama.cpp" -B "$out/llama" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DGGML_NATIVE=ON -DLLAMA_CURL=OFF \
+        -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TESTS=OFF -DBUILD_SHARED_LIBS=OFF \
+        > "$out/logs/cmake.log" 2>&1
+    nice -n 10 cmake --build "$out/llama" --target llama-perplexity -j "${BUILD_JOBS:-10}" > "$out/logs/build.log" 2>&1
+    echo "run.sh: built $out/llama/bin/llama-perplexity"
+}
+
 cd "$ROOT"
 [[ $# -ge 1 ]] || { usage; exit 2; }
 mode="$1"
@@ -197,7 +214,11 @@ case "$mode" in
         usage
         ;;
     build)
-        member "$san" "${SANITIZERS[@]}" || die "build needs one sanitizer of: ${SANITIZERS[*]}"
+        if [[ "$san" == "native" ]]; then
+            build_native
+            exit 0
+        fi
+        member "$san" "${SANITIZERS[@]}" || die "build needs one sanitizer of: ${SANITIZERS[*]}, or native"
         for p in "${profiles[@]}"; do build "$san" "$p"; done
         ;;
     test|fuzz)
@@ -217,6 +238,7 @@ case "$mode" in
         ;;
     phone-files)
         for p in "${PROFILES[@]}"; do ensure_built none "$p"; done
+        [[ -x "$ROOT/build/fuzz/quant/native-host/llama/bin/llama-perplexity" ]] || build_native
         exec uv run python "$HERE/qfz_phone.py" files
         ;;
     phone-commands)

@@ -31,7 +31,8 @@ REGRESS_DIR = HERE / "regress"
 LLAMA_DIR = ROOT / "third_party" / "llama.cpp"
 FUZZ_OUT = ROOT / "build" / "fuzz" / "quant"
 ORACLE_BIN = ROOT / "build" / "oracle-x86" / "bin"
-HOST_BIN = ROOT / "build" / "host-llama" / "bin"
+# The native reference of the phone set (run.sh build native): preset flags, no fast math, no sanitizer.
+HOST_BIN = FUZZ_OUT / "native-host" / "llama" / "bin"
 SANITIZERS = ("none", "asan", "ubsan", "tsan", "msan")
 PROFILES = ("debug", "release")
 # The sanitizer and the profile of this run: run.sh sets FUZZ_SANITIZER and FUZZ_PROFILE.
