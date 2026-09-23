@@ -1,0 +1,73 @@
+ggml: compute the size of a graph with integers, not from a null pointer
+Fold-into: upstream/ggml-core
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+Finding F-UB-1 of fuzz-ops, task #125. ggml_graph_nbytes starts from a null
+pointer, and incr_ptr_aligned adds the sizes of the parts of the graph to it.
+Arithmetic on a null pointer is undefined behavior. UBSan (pointer-overflow)
+reports "applying non-zero offset 96 to null pointer" at ggml.c:7447 for each
+graph, on the host and on the phone. fuzz-hexhost found it too.
+
+This patch adds incr_size_aligned, which applies the same alignment rule to a
+size_t, and ggml_graph_nbytes uses it. The result is the same number.
+
+Evidence (2026-09-23):
+- The op fuzzer in UBSan with no suppression entry: the seed
+  tests/fuzz/ops/corpus/matmul/mul_mat-0.bin stops with the report before
+  this patch, in the debug profile (-O1) and in the release profile (-O3
+  -flto). With this patch it gives no report.
+- The test suite of the op fuzzer in ubsan and none, debug and release, with
+  this patch and the next one and no UBSan suppression entry: no UBSan report.
+- The phone check (OnePlus 13, thermal status 0): the first 600 cases of the
+  op pack on the CPU give bit-identical outputs with the shipped libraries and
+  with the libraries of this patch and the next one.
+
+Measurement: ggml_graph_nbytes runs once for each graph allocation. It is not
+on a hot path.
+
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 1752814..882ffdb 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -7448,22 +7448,29 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
+     return ptr;
+ }
+ 
++// The size version of incr_ptr_aligned: the same layout as an offset from zero. Pointer arithmetic
++// on a null pointer is undefined behavior, thus the size of a graph uses integers.
++static size_t incr_size_aligned(size_t * n, size_t size, size_t align) {
++    const size_t off = GGML_PAD(*n, align);
++    *n = off + size;
++    return off;
++}
++
+ static size_t ggml_graph_nbytes(size_t size, bool grads) {
+     size_t hash_size = ggml_hash_size(size * 2);
+-    void * p = 0;
+-    incr_ptr_aligned(&p, sizeof(struct ggml_cgraph), 1);
+-    incr_ptr_aligned(&p, size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // nodes
+-    incr_ptr_aligned(&p, size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // leafs
+-    incr_ptr_aligned(&p, hash_size * sizeof(int32_t), sizeof(int32_t)); // use_counts
+-    incr_ptr_aligned(&p, hash_size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // hash keys
++    size_t n = 0;
++    incr_size_aligned(&n, sizeof(struct ggml_cgraph), 1);
++    incr_size_aligned(&n, size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // nodes
++    incr_size_aligned(&n, size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // leafs
++    incr_size_aligned(&n, hash_size * sizeof(int32_t), sizeof(int32_t)); // use_counts
++    incr_size_aligned(&n, hash_size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // hash keys
+     if (grads) {
+-        incr_ptr_aligned(&p, hash_size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // grads
+-        incr_ptr_aligned(&p, hash_size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // grad_accs
++        incr_size_aligned(&n, hash_size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // grads
++        incr_size_aligned(&n, hash_size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // grad_accs
+     }
+-    incr_ptr_aligned(&p, ggml_bitset_size(hash_size) * sizeof(ggml_bitset_t), sizeof(ggml_bitset_t));
++    incr_size_aligned(&n, ggml_bitset_size(hash_size) * sizeof(ggml_bitset_t), sizeof(ggml_bitset_t));
+ 
+-    size_t nbytes = (size_t) p;
+-    return nbytes;
++    return n;
+ }
+ 
+ size_t ggml_graph_overhead_custom(size_t size, bool grads) {

@@ -25,6 +25,8 @@
 
 #include "ggml-backend.h"
 
+#include "../../../sanitizers/fuzz_death.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -203,6 +205,8 @@ extern "C" int LLVMFuzzerInitialize(int * argc, char *** argv) {
 }
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
+    // the death callback of a TSan build without allocation or lock (tests/sanitizers/fuzz_death.h)
+    fuzz_death_note_input(data, size);
     if (size == 0) {
         return -1;
     }

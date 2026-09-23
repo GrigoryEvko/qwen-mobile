@@ -99,7 +99,7 @@ Groups (the targets): matmul gdn attn norm elem data
 Flags and runtime options: the shared files tests/sanitizers/profile-<profile>.cmake,
 tests/sanitizers/<config>.cmake and tests/sanitizers/env.sh. Suppressions: only the shared files
 tests/sanitizers/<config>.supp. The entries of this area in tests/sanitizers/ubsan.supp are for
-task #125 (pointer-overflow) and task #127 (function).
+task #127 (function).
 
 Environment (defaults in parentheses):
   FUZZ_BUDGET, FUZZ_JOBS  the defaults of --budget-seconds and --jobs (600, 4)
@@ -261,6 +261,7 @@ test_group() {
         [[ $(basename "$f") == tame-* ]] && tame=1
         if ! with_san "$config" env FUZZ_OPS_ORACLE="$B_ORACLE/ops_oracle" FUZZ_OPS_GROUP="$force" \
             FUZZ_OPS_FINDINGS="$w/findings" FUZZ_OPS_ABORT="verdict=above-loose,special=0" FUZZ_OPS_TAME=$tame \
+            FUZZ_ARTIFACT_DIR="$w/artifacts" \
             timeout -s KILL 300 "$dir/fuzz_ops" -rss_limit_mb="$RSS_MB" -timeout=120 \
             -artifact_prefix="$w/artifacts/" "$f" >> "$w/log.txt" 2>&1; then
             bad=$((bad + 1))
@@ -327,7 +328,7 @@ fuzz_group() {
         # thus a kill by the outer timeout is a hang, and the hang is a finding.
         local rc=0
         with_san "$config" env FUZZ_OPS_ORACLE="$B_ORACLE/ops_oracle" FUZZ_OPS_GROUP="$g" FUZZ_OPS_FINDINGS="$f" \
-            FUZZ_OPS_TAME=1 \
+            FUZZ_OPS_TAME=1 FUZZ_ARTIFACT_DIR="$w/artifacts" \
             timeout -s KILL $((left + 180)) nice -n 10 "$dir/fuzz_ops" -max_total_time="$left" -rss_limit_mb="$RSS_MB" \
             -max_len=512 -timeout=120 -artifact_prefix="$w/artifacts/" -print_final_stats=1 \
             "$w/corpus" "$HERE/corpus/$g" >> "$log" 2>&1 || rc=$?
@@ -533,7 +534,7 @@ phone_commands() {
         echo "#    variants. The crash buffer of logcat shows a tombstone if debuggerd saw the signal."
         echo "#    The ubsan builds run two times: UBSAN_HALT=0 prints every report (the evidence), then"
         echo "#    UBSAN_HALT=1 shows that the entries of ubsan.supp match on the phone (no report for"
-        echo "#    tasks #125 and #127; a stop is a report that no entry matches)."
+        echo "#    task #127; a stop is a report that no entry matches)."
         local asan_base="detect_leaks=0:halt_on_error=1:abort_on_error=0:external_symbolizer_path=$d/llvm-symbolizer"
         for b in "${staged[@]}"; do
             echo "# probe of $b"
@@ -605,9 +606,10 @@ minimize() {
     rm -rf "$w"
     mkdir -p "$w" "$dst"
     with_san "$config" env FUZZ_OPS_ORACLE="$B_ORACLE/ops_oracle" FUZZ_OPS_GROUP="$g" FUZZ_OPS_FINDINGS="$w/findings" \
-        FUZZ_OPS_ABORT="kind=$kind,verdict=$verdict" timeout -s KILL 900 nice -n 10 \
+        FUZZ_OPS_ABORT="kind=$kind,verdict=$verdict" FUZZ_ARTIFACT_DIR="$w" timeout -s KILL 900 nice -n 10 \
         "$(host_dir "$profile" "$config")/fuzz_ops" \
-        -minimize_crash=1 -max_total_time=300 -runs=100000 -exact_artifact_path="$w/min.bin" "$file" > "$w/log.txt" 2>&1 || true
+        -minimize_crash=1 -max_total_time=300 -runs=100000 -artifact_prefix="$w/" -exact_artifact_path="$w/min.bin" \
+        "$file" > "$w/log.txt" 2>&1 || true
     [[ -f "$w/min.bin" ]] || die "no minimized input, refer to $w/log.txt"
     local name
     name="$(basename "${file%.bin}")-min.bin"

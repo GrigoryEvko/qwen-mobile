@@ -28,18 +28,6 @@
 #
 # tests/sanitizers/env.sh gives this file to UBSAN_OPTIONS=suppressions=.
 
-# Task #125, 2026-09-23. ggml_graph_nbytes (ggml/src/ggml.c:7451) starts from `void * p = 0`,
-# and incr_ptr_aligned (ggml.c:7444-7449) adds sizes to it: pointer arithmetic on a null pointer.
-# Upstream code, found by fuzz-hexhost under UBSan. Remove this entry when task #125 lands.
-# Evidence (clang 22.1.8): incr_ptr_aligned is inlined. The report shows
-# "#0 incr_ptr_aligned ggml.c:7447" and "#1 ggml_graph_nbytes ggml.c:7454" at the same PC.
-# UBSan matches the out-of-line function of that PC. This entry matches in the debug profile
-# (-O1) and in the release profile (-O3 -flto), with the shared and the static ggml link, on the
-# paths ggml_graph_overhead and ggml_new_graph (supp-repro.sh, 2026-09-23), and in the fuzz_graph
-# target of hexhost (release). An entry "incr_ptr_aligned" matches in no profile of the matrix
-# (only at -O0), thus it is not in this file.
-pointer-overflow:^ggml_graph_nbytes$
-
 # Task #127, 2026-09-23. F-UB-2 of the op fuzzer: the CPU backend calls typed functions
 # (ggml_vec_dot_f32, ggml_vec_dot_f16, ggml_cpu_fp32_to_fp16, ggml_cpu_fp32_to_fp32,
 # dequantize_row_q8_0 and the other type traits) through the generic types ggml_vec_dot_t,

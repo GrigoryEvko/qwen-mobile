@@ -108,3 +108,6 @@ hexagon-arch/0001-hexagon-no-device-for-an-unsupported-dsp.patch
 # The Q8_0 activations of the HVX matmul get the bits of quantize_row_q8_0_ref
 # on every Hexagon version: one scale for each 32 values, integer arithmetic.
 hexagon-q8-ref/0001-hexagon-quantize-the-activations-as-the-cpu-reference.patch
+
+# fuzz-ops: the fixes of the op fuzzer. The header of each patch gives its task.
+fuzz-ops/0001-ggml-graph-size-with-integers.patch
