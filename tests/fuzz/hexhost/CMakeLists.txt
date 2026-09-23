@@ -185,6 +185,11 @@ foreach(name kparams graph repack envparse dirty)
     target_link_options(fuzz_${name} PRIVATE -fsanitize=fuzzer)
 endforeach()
 
+# The repacked bytes of the K-quant forms of the tensors of a model (tools/repack_bytes.cpp): two
+# builds against two llama.cpp trees compare a change of the repack on real weights.
+add_executable(hexhost_repack_bytes tools/repack_bytes.cpp)
+target_link_libraries(hexhost_repack_bytes PRIVATE hexhost_core)
+
 # The dirty range tracker of the DSP (htp/htp-tensor.c) runs on x86 with the
 # stubs of stubs/dsp. A copy of the source goes into the build directory, thus
 # its quoted includes find the stubs before the real headers of htp/.
