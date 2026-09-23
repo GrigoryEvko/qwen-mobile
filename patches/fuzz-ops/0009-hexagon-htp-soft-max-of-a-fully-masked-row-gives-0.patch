@@ -1,0 +1,48 @@
+hexagon: htp: soft_max of a fully masked row gives 0
+Fold-into: upstream/hexagon-htp
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+When each value of a SOFT_MAX row is -inf after the mask, the row maximum is
+-inf. The DSP kernel then subtracts -inf from -inf and gives -inf in each
+column. The CPU backend gives 0 for such a row (patches/fuzz-ops/0006). The app
+graphs do not reach this condition: their masks have no fully masked row.
+
+This patch writes 0 into each column of a row whose maximum is -inf, in the
+fast path (hvx_fast_softmax_f32, one compare for each row) and in the other
+path. The v79 simulator gives 0 for fully masked rows of 32, 64 and 1024
+elements, and the rows with some or no masked columns do not change.
+test_soft_max_masked_row of test-backend-ops tests the change.
+
+diff --git a/ggml/src/ggml-hexagon/htp/softmax-ops.c b/ggml/src/ggml-hexagon/htp/softmax-ops.c
+index 53cd5fe..45fce84 100644
+--- a/ggml/src/ggml-hexagon/htp/softmax-ops.c
++++ b/ggml/src/ggml-hexagon/htp/softmax-ops.c
+@@ -326,6 +326,15 @@ static void hvx_fast_softmax_f32(const uint8_t * restrict src, uint8_t * restric
+     }
+     HVX_Vector max_vec = hvx_vec_reduce_max_f32(mx[0]);
+ 
++    // A fully masked row (each value is -inf) has no finite value. Its result is 0 in each column,
++    // as on the CPU, and not the value of exp(-inf - (-inf)). The test is one compare for each row.
++    if (hvx_vec_get_f32(max_vec) == -INFINITY) {
++        for (int i = 0; i < step_of_1; i++) {
++            v_dst[i] = zero_v;
++        }
++        return;
++    }
++
+     // the exponential and its sum. The sum has SM_X chains, and each add takes the value as an
+     // IEEE float directly: the routine of the checkout converted the accumulator back to an IEEE
+     // float at every step and then added, which put two dependent operations on the chain where
+@@ -487,6 +496,11 @@ static void softmax_job_f32(unsigned int nth, unsigned int ith, void * data) {
+             hvx_scale_f32((uint8_t *) wp0, (const uint8_t *) sp, ne00, smctx->scale);
+             apply_mask(wp0, mp_f32, mp_f16, ne00, slope, smctx->use_f16);
+             float max = hvx_reduce_max_f32((const uint8_t *) wp0, ne00);
++            if (max == -INFINITY) {
++                // a fully masked row: 0 in each column, as in hvx_fast_softmax_f32
++                memset(dp, 0, ne00 * sizeof(float));
++                continue;
++            }
+             float sum = hvx_softmax_f32((const uint8_t *) wp0, (uint8_t *) wp2, (uint8_t *) wp1, ne00, max);
+             sum       = sum > 0.0 ? (1.0 / sum) : 1;
+             hvx_scale_f32((uint8_t *) dp, (const uint8_t *) wp2, ne00, sum);
