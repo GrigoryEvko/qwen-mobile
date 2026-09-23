@@ -8,7 +8,8 @@
 // arch is in [73, 81] and the library of that arch is in ADSP_LIBRARY_PATH.
 //
 // ADSP_LIBRARY_PATH can hold a directory of the harness that has an empty
-// libggml-htp-v79.so (a temporary directory that the harness removes at exit).
+// libggml-htp-v79.so: envparse-lib next to the fuzz binary. The parallel jobs of a
+// run share it, and a run that ends with a kill leaves no temporary directory.
 
 #include "fake_dsp.h"
 #include "fuzz_death.h"
@@ -36,12 +37,26 @@ namespace {
 
 std::string g_libdir;   // a directory with libggml-htp-v79.so
 
-// Removes the temporary library directory of the harness.
-void remove_libdir() {
-    if (!g_libdir.empty()) {
-        std::error_code ec;
-        std::filesystem::remove_all(g_libdir, ec);
+// Makes the directory envparse-lib next to the fuzz binary with an empty libggml-htp-v79.so, and
+// gives its path, or an empty string when the directory cannot be made.
+std::string make_libdir() {
+    std::error_code             ec;
+    const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (ec) {
+        return "";
     }
+    const std::filesystem::path dir = exe.parent_path() / "envparse-lib";
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        return "";
+    }
+    // "a" keeps the file of a parallel job that made it first
+    FILE * f = fopen((dir / "libggml-htp-v79.so").c_str(), "a");
+    if (!f) {
+        return "";
+    }
+    fclose(f);
+    return dir.string();
 }
 
 // Gives a short printable string from the input, with the characters that the parsers split on.
@@ -115,17 +130,10 @@ extern "C" int LLVMFuzzerInitialize(int * argc, char *** argv) {
     (void) argc;
     (void) argv;
     harness::init();
-    const char * tmp = getenv("TMPDIR");
-    std::string  tpl = std::string(tmp && *tmp ? tmp : "/tmp") + "/hexhost-envparse-XXXXXX";
-    std::vector<char> buf(tpl.begin(), tpl.end());
-    buf.push_back('\0');
-    if (mkdtemp(buf.data())) {
-        g_libdir = buf.data();
-        FILE * f = fopen((g_libdir + "/libggml-htp-v79.so").c_str(), "w");
-        if (f) {
-            fclose(f);
-        }
-        atexit(remove_libdir);
+    g_libdir = make_libdir();
+    if (g_libdir.empty()) {
+        fprintf(stderr, "fuzz_envparse: cannot make the directory envparse-lib next to the fuzz binary: "
+                        "the inputs with the library directory run without it\n");
     }
     return 0;
 }
@@ -279,7 +287,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
         }
         if (path_set && !path.empty()) {
             const int  eff = a > 81 ? 81 : a;
-            const bool has = eff == 79 && path.find(g_libdir) != std::string::npos;
+            const bool has = eff == 79 && !g_libdir.empty() && path.find(g_libdir) != std::string::npos;
             if (!has && eff == 79) {
                 fakedsp::violation("env-lib-gate", "a device registers for v79 while ADSP_LIBRARY_PATH '%s' has no libggml-htp-v79.so",
                                    path.c_str());
