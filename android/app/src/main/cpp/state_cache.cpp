@@ -120,8 +120,14 @@ bool read_head(const std::string & path, Snapshot & snap, uint64_t & body_offset
     const uint32_t items_bytes = r.get<uint32_t>();
     r.get<uint32_t>();
     const uint64_t body_size   = r.get<uint64_t>();
+    // Each number of the header limits an allocation, thus each one must agree
+    // with the length of the file before it is used (task #177). An item takes
+    // at least its token, thus n_items has a limit of items_bytes / 4: without
+    // it, a damaged count reserves gigabytes. The subtraction below cannot wrap,
+    // where the sum of a huge body_size can.
     if (!r.ok || version != kFileVersion || items_bytes > kMaxItemBytes ||
-        st.size != kHeaderBytes + items_bytes + body_size) {
+        n_items > items_bytes / sizeof(int32_t) || st.size < kHeaderBytes + items_bytes ||
+        body_size != st.size - kHeaderBytes - items_bytes) {
         return false;
     }
     std::vector<uint8_t> block(items_bytes);
