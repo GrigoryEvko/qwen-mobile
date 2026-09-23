@@ -1,0 +1,40 @@
+Refuse the rollback of a sequence whose recurrent cell other sequences share
+Fold-into: upstream/memory
+
+The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
+
+- A rollback of one sequence moves each sequence that shares its recurrent cell.
+
+  After seq_cp, the source and the destination share one cell of llama_memory_recurrent, with one
+  position and one state. A partial seq_rm (a rollback) of one of them sets the position of that
+  cell and the rollback index of that sequence only. Thus the other sequence reports the position
+  of the rollback (seq_pos_max 2 in place of 3), and its next decode reads a snapshot group with a
+  different rollback index. The next decode of a sequence gives it its own cell (find_slot copies
+  a shared tail), thus only a rollback between a copy and a decode shows the defect.
+
+  The change: seq_rm refuses the rollback when the tail cell of the sequence holds more than one
+  sequence. The caller then decodes the sequence again, as for a rollback deeper than the last
+  ubatch. The app does not share cells (n_seq_max = 1).
+
+  The reproducer: tests/fuzz/core/regress/fuzz_recurrent--rollback-shared-cell.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    src/llama-memory-recurrent.cpp
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -209,7 +209,12 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
+                 // the rollback goes to. Only the ubatch that wrote the group gives that, thus
+                 // the depth of that ubatch is the limit, and it is never more than n_rs_seq.
+                 const llama_pos depth = (llama_pos) std::min<uint32_t>(n_rs_seq, rs_depth[seq_id]);
+-                if (!pending && rollback >= 1 && rollback <= depth) {
++                // A cell that other sequences share (seq_cp) holds one position and one state for
++                // all of them. A rollback of one sequence would move the others too, thus it is
++                // refused, and the caller decodes the sequence again. The next decode of a
++                // sequence gives it its own cell.
++                const bool shared = cell.seq_id.size() > 1;
++                if (!pending && !shared && rollback >= 1 && rollback <= depth) {
+                     set_rs_idx(seq_id, (uint32_t) rollback);
+                     cell.pos = p0 - 1;
+                     return true;

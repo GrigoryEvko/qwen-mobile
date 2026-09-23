@@ -144,6 +144,7 @@ fuzz-core/0013-bound-the-rollback-of-the-dsv4-cache-by-the-last-ubatch.patch
 fuzz-core/0014-tests-free-the-contexts-of-the-rollback-test-on-each-return.patch
 fuzz-core/0015-check-the-nonzero-dimensions-of-a-gguf-tensor.patch
 fuzz-core/0016-give-the-softmax-a-defined-result-for-special-logits.patch
+fuzz-core/0017-refuse-the-rollback-of-a-shared-recurrent-cell.patch
 
 # The fixes of the defects that the sanitizer matrix of tests/run-suite.sh finds in the tests of llama.cpp.
 # The header of each patch describes its defect and the change.
