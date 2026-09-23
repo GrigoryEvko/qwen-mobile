@@ -55,12 +55,8 @@ elseif(FUZZ_SANITIZER STREQUAL "asan")
     set(SAN_COMPILE -fsanitize=address)
 elseif(FUZZ_SANITIZER STREQUAL "ubsan")
     # The flags of tests/sanitizers/ubsan.cmake, for the builds without that
-    # initial cache (the phone). Every report stops the run, except
-    # integer-divide-by-zero. Reason: the tracked finding of task #156
-    # (init_fastdiv_values in the supports_op of MUL_MAT_ID of ggml-hexagon.cpp),
-    # which the function-level entry of tests/sanitizers/ubsan.supp removes. A
-    # suppression works only for a recoverable check.
-    set(SAN_COMPILE -fsanitize=undefined -fno-sanitize-recover=undefined -fsanitize-recover=integer-divide-by-zero)
+    # initial cache (the phone): every report stops the run.
+    set(SAN_COMPILE -fsanitize=undefined -fno-sanitize-recover=undefined)
 elseif(FUZZ_SANITIZER STREQUAL "tsan")
     set(SAN_COMPILE -fsanitize=thread)
 elseif(FUZZ_SANITIZER STREQUAL "msan")
