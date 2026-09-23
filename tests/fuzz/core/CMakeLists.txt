@@ -118,6 +118,17 @@ else()
                             "ubsan, tsan. Host: give -C tests/sanitizers/profile-<profile>.cmake -C tests/sanitizers/<sanitizer>.cmake "
                             "(msan needs the MSan libc++ of those files).")
     endif()
+    if (ANDROID AND (FUZZ_SANITIZER STREQUAL "ubsan" OR FUZZ_SANITIZER STREQUAL "none"))
+        # The UBSan runtime links statically (the libFuzzer of the NDK links the UBSan runtime also
+        # with no sanitizer). The shared UBSan runtime of the NDK holds a private copy of the
+        # libc++abi type-info classes, and each executable holds the copy of the static NDK libc++.
+        # The vptr check walks the class hierarchy with a dynamic_cast to the copy of the runtime,
+        # which fails for the type_info objects of the executable. Thus, with the shared runtime,
+        # each check of a derived class gives a false report (dynamic-type-mismatch in the libc++
+        # sstream at the start). The static runtime uses the one copy of the executable, and vptr
+        # stays on without a recovery.
+        string(APPEND fuzz_san_link " -static-libsan")
+    endif()
     string(APPEND CMAKE_C_FLAGS   " ${fuzz_prof} ${fuzz_san}")
     string(APPEND CMAKE_CXX_FLAGS " ${fuzz_prof} ${fuzz_san}")
     if (FUZZ_PROFILE STREQUAL "debug")

@@ -33,12 +33,26 @@
 //
 // The run prints a summary line at exit: the count of checks and the largest
 // difference.
+//
+// Options for a slow configuration and for a diagnosis:
+//   FUZZ_NPU_MAX_TOKENS  The largest prompt of one decode (default 48). A small
+//                        value keeps the CPU reference of a large model inside
+//                        the run budget of a debug build.
+//   FUZZ_NPU_SIGNAL_MS   Send SIGURG (a no-op handler without SA_RESTART) to the
+//                        thread of the decodes every N ms. A blocking call of the
+//                        backend then returns EINTR as a signal of the process
+//                        (the timer of libFuzzer, a profiler) can make it do.
 
 #include "fuzz_common.h"
 
+#include <sys/syscall.h>
+
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <csignal>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -52,6 +66,7 @@ float           g_tol = 0.05f;
 bool            g_calibrate = false;
 long            g_checks = 0;
 float           g_worst  = 0.0f;
+int             g_max_tokens = 48;
 constexpr uint32_t kRsSeq = 4;
 constexpr int      kCtx   = 512;
 
@@ -151,6 +166,27 @@ llama_context * make_ctx(llama_model * model, int n_threads) {
     return llama_init_from_model(model, cp);
 }
 
+/** The SIGURG handler of FUZZ_NPU_SIGNAL_MS: nothing. Its only effect is the EINTR of a blocking call. */
+void signal_noop(int /*sig*/) {}
+
+/** Start the thread of FUZZ_NPU_SIGNAL_MS, which sends SIGURG to the calling thread every ms milliseconds. */
+void start_signal_thread(long ms) {
+    struct sigaction action = {};
+    action.sa_handler = signal_noop;
+    action.sa_flags = 0;  // no SA_RESTART
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGURG, &action, nullptr);
+    const long pid = getpid();
+    const long tid = syscall(SYS_gettid);
+    std::thread([pid, tid, ms] {
+        for (;;) {
+            usleep((useconds_t) (ms * 1000));
+            syscall(SYS_tgkill, pid, tid, SIGURG);
+        }
+    }).detach();
+    fprintf(stderr, "fuzz_npu_decode: SIGURG to the thread of the decodes every %ld ms\n", ms);
+}
+
 }  // namespace
 
 extern "C" int LLVMFuzzerInitialize(int * /*argc*/, char *** /*argv*/) {
@@ -188,9 +224,13 @@ extern "C" int LLVMFuzzerInitialize(int * /*argc*/, char *** /*argv*/) {
     if (g_dev == nullptr || g_cpu == nullptr) {
         fuzz::fail("cannot create the contexts");
     }
-    fprintf(stderr, "fuzz_npu_decode: model %s, device %s, n_vocab %d, tolerance %g\n",
-            path.c_str(), dev ? ggml_backend_dev_name(dev) : "CPU", g_n_vocab, g_tol);
+    g_max_tokens = (int) std::max(1L, std::min(48L, fuzz::env_long("FUZZ_NPU_MAX_TOKENS", 48)));
+    fprintf(stderr, "fuzz_npu_decode: model %s, device %s, n_vocab %d, tolerance %g, prompts of at most %d tokens\n",
+            path.c_str(), dev ? ggml_backend_dev_name(dev) : "CPU", g_n_vocab, g_tol, g_max_tokens);
     atexit(summary);
+    if (const long ms = fuzz::env_long("FUZZ_NPU_SIGNAL_MS", 0); ms > 0) {
+        start_signal_thread(std::min(ms, 60000L));
+    }
     return 0;
 }
 
@@ -206,7 +246,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
     for (int op_i = 0; op_i < n_ops && fdp.remaining_bytes() > 0; ++op_i) {
         const int op = fdp.ConsumeIntegralInRange<int>(0, 9);
         if (op <= 2 || pos == 0) {
-            const int n = fdp.ConsumeIntegralInRange<int>(1, 48);
+            const int n = std::min(fdp.ConsumeIntegralInRange<int>(1, 48), g_max_tokens);
             if (pos + n >= kCtx) {
                 break;
             }

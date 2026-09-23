@@ -6,10 +6,12 @@
 //     (the NPU harness uses it as a check of the session health).
 //   - the data directory: FUZZ_DATA_DIR, or <directory of the executable>/../core/data.
 //     run.sh writes the vocab-only GGUF, the tiny model and the chat template there.
-//   - fuzz_fail(): write a message and call abort(). libFuzzer records the input.
+//   - fuzz_fail(): write a message and call abort(). libFuzzer records the input
+//     (on Android the SIGABRT handler of note_input() does).
 //   - small byte helpers on top of FuzzedDataProvider.
 //   - note_input(): the first call of each target. It records the input for the
-//     shared TSan death callback of tests/sanitizers/fuzz_death.h.
+//     shared TSan death callback of tests/sanitizers/fuzz_death.h. On Android it
+//     also installs the SIGABRT handler that keeps the input of an abort.
 
 #pragma once
 
@@ -22,6 +24,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <csignal>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -31,6 +34,66 @@
 #include <vector>
 
 namespace fuzz {
+
+#if defined(__ANDROID__)
+// On Android the libc installs the handlers of debuggerd (with SA_SIGINFO) for SIGABRT and the other
+// fatal signals in each process, and libFuzzer keeps an existing SA_SIGINFO handler of each signal
+// except SIGSEGV. Thus an abort (fuzz::fail, GGML_ABORT, assert, std::terminate) gives a tombstone
+// but no crash file of libFuzzer, and the input is lost. The handler below keeps it. A sanitizer
+// report does not need it: the death callback of libFuzzer writes that input.
+
+/** The path $FUZZ_ARTIFACT_DIR/crash-abort-<pid> (or ./crash-abort-<pid>), made at the first input. */
+inline char * abort_unit_path() {
+    static char path[1024];
+    return path;
+}
+
+/** The SIGABRT action before the handler of the harness: the handler of debuggerd. */
+inline struct sigaction & old_abort_action() {
+    static struct sigaction action;
+    return action;
+}
+
+/**
+ * The SIGABRT handler: write the input of the running call to the crash file with raw system calls
+ * only (the abort can come from any state of the allocator or of a lock), then run the handler of
+ * debuggerd, which writes the tombstone and ends the process.
+ */
+inline void abort_unit_handler(int sig, siginfo_t * info, void * uctx) {
+    const long fd = syscall(SYS_openat, AT_FDCWD, abort_unit_path(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        const long w = syscall(SYS_write, fd, fuzz_death_data, fuzz_death_size);
+        (void) w;
+        syscall(SYS_close, fd);
+    }
+    static const char msg[] = "fuzz: SIGABRT: the input of this call is in the crash-abort file of FUZZ_ARTIFACT_DIR\n";
+    const long w = syscall(SYS_write, 2, msg, sizeof(msg) - 1);
+    (void) w;
+    const struct sigaction & old = old_abort_action();
+    if ((old.sa_flags & SA_SIGINFO) && old.sa_sigaction != nullptr) {
+        old.sa_sigaction(sig, info, uctx);
+        return;
+    }
+    // no handler before: the default action. abort() raises SIGABRT again when this handler returns.
+    sigaction(sig, &old, nullptr);
+}
+
+/** Make the path of the crash file and install the SIGABRT handler, one time. */
+inline void install_abort_unit_handler() {
+    static bool installed = false;
+    if (installed) {
+        return;
+    }
+    installed = true;
+    const char * dir = getenv("FUZZ_ARTIFACT_DIR");
+    snprintf(abort_unit_path(), 1024, "%s/crash-abort-%d", (dir != nullptr && dir[0] != '\0') ? dir : ".", (int) getpid());
+    struct sigaction action = {};
+    action.sa_sigaction = abort_unit_handler;
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGABRT, &action, &old_abort_action());
+}
+#endif
 
 /** The count of error lines that llama.cpp and ggml wrote since the start. */
 inline std::atomic<long> & log_error_count() {
@@ -61,11 +124,16 @@ inline void quiet_logs() {
 /**
  * Record the input of this call for the shared death callback (tests/sanitizers/fuzz_death.h). In a
  * TSan build the first call installs the callback that writes the input to
- * FUZZ_ARTIFACT_DIR/crash-tsan-<pid> without a deadlock. Each target calls this function first in
- * LLVMFuzzerTestOneInput.
+ * FUZZ_ARTIFACT_DIR/crash-tsan-<pid> without a deadlock. On Android the first call installs the
+ * SIGABRT handler that writes the input to FUZZ_ARTIFACT_DIR/crash-abort-<pid>. libFuzzer sets its
+ * handlers before the first input, thus the first input is the correct time. Each target calls this
+ * function first in LLVMFuzzerTestOneInput.
  */
 inline void note_input(const uint8_t * data, size_t size) {
     fuzz_death_note_input(data, size);
+#if defined(__ANDROID__)
+    install_abort_unit_handler();
+#endif
 }
 
 /** Write a message to stderr and stop the process with abort(). libFuzzer keeps the input as a crash. */

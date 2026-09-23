@@ -414,15 +414,14 @@ make_data() {
     ls -l "$DATA"
 }
 
-# The runtime library that a phone build needs next to its executables. With no sanitizer, the
-# libFuzzer of the NDK links the executables to the UBSan standalone runtime (a NEEDED entry), thus
-# the none build needs that library too.
+# The runtime library that a phone build needs next to its executables. The ubsan and none builds
+# link the UBSan runtime statically (-static-libsan, refer to the vptr text in CMakeLists.txt), thus
+# they need none.
 phone_runtime() {
     case $1 in
         asan)       echo libclang_rt.asan-aarch64-android.so ;;
         hwasan)     echo libclang_rt.hwasan-aarch64-android.so ;;
         tsan)       echo libclang_rt.tsan-aarch64-android.so ;;
-        ubsan|none) echo libclang_rt.ubsan_standalone-aarch64-android.so ;;
         *)          echo "" ;;
     esac
 }
@@ -531,6 +530,26 @@ phone_commands() {
     local check="$q shell 'pgrep -a fuzz_; dumpsys thermalservice | grep \"Thermal Status\"'"
     local push_files="$out/fuzz_npu_decode $out/fuzz_recurrent $out/libggml-htp-v79.so $out/$san.supp"
     [[ -n $runtime ]] && push_files+=" $out/$runtime"
+    # Step 3: the 2B model on HTP0 against the CPU. The release profile runs 8 inputs. The debug CPU
+    # reference is too slow for that inside the run budget of 90 s: debug none runs one seed with
+    # prompts of at most 4 tokens, and debug hwasan does not load the two copies of the 2B model in 90 s.
+    local step3
+    local npu2b_env="$env FUZZ_DEVICE=HTP0 FUZZ_THREADS=6 FUZZ_MODEL=/data/local/tmp/qwen/models/Qwen3.5-2B-Q8_0.gguf FUZZ_NPU_CALIBRATE=1"
+    if [[ $profile == release ]]; then
+        step3="# 3. The 2B Q8_0 model of the app on HTP0 against the CPU, 8 inputs. The two copies of the model
+#    need more than 4 GB, thus this run has -rss_limit_mb=8192.
+$thermal
+timeout -s KILL 100 $a shell \"$npu2b_env timeout -s KILL 90 ./fuzz_npu_decode -runs=8 -seed=2 -rss_limit_mb=8192 -artifact_prefix=art/npu2b- seeds/fuzz_npu_decode\" > $logs/npu-2b.txt 2>&1; tail -n 4 $logs/npu-2b.txt
+$check"
+    elif [[ $san == hwasan ]]; then
+        step3="# 3. No 2B step: the debug hwasan build does not load the two copies of the 2B model in the run budget of 90 s."
+    else
+        step3="# 3. The 2B Q8_0 model of the app on HTP0 against the CPU, one seed, prompts of at most 4 tokens (the
+#    debug CPU reference is slow). The two copies of the model need more than 4 GB, thus -rss_limit_mb=8192.
+$thermal
+timeout -s KILL 100 $a shell \"$npu2b_env FUZZ_NPU_MAX_TOKENS=4 timeout -s KILL 90 ./fuzz_npu_decode -rss_limit_mb=8192 -artifact_prefix=art/npu2b- seeds/fuzz_npu_decode/rand-00\" > $logs/npu-2b.txt 2>&1; tail -n 4 $logs/npu-2b.txt
+$check"
+    fi
     cat <<EOF
 # ---- phone run of the $profile-$san build ----
 mkdir -p $logs
@@ -548,11 +567,7 @@ $thermal
 timeout -s KILL 100 $a shell "$env FUZZ_DEVICE=HTP0 FUZZ_NPU_CALIBRATE=1 timeout -s KILL 90 ./fuzz_npu_decode corpus_npu seeds/fuzz_npu_decode -max_total_time=80 -timeout=30 -rss_limit_mb=4096 -max_len=256 -artifact_prefix=art/npu- -print_final_stats=1" > $logs/npu-tiny.txt 2>&1; tail -n 6 $logs/npu-tiny.txt
 $check
 
-# 3. The 2B Q8_0 model of the app on HTP0 against the CPU, 8 inputs. The two copies of the model
-#    need more than 4 GB, thus this run has -rss_limit_mb=8192.
-$thermal
-timeout -s KILL 100 $a shell "$env FUZZ_DEVICE=HTP0 FUZZ_THREADS=6 FUZZ_MODEL=/data/local/tmp/qwen/models/Qwen3.5-2B-Q8_0.gguf FUZZ_NPU_CALIBRATE=1 timeout -s KILL 90 ./fuzz_npu_decode -runs=8 -seed=2 -rss_limit_mb=8192 -artifact_prefix=art/npu2b- seeds/fuzz_npu_decode" > $logs/npu-2b.txt 2>&1; tail -n 4 $logs/npu-2b.txt
-$check
+$step3
 
 # 4. The recurrent memory target on the CPU of the phone (arm64 kernels), 80 s.
 $thermal
