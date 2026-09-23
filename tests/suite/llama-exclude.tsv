@@ -1,0 +1,18 @@
+# The llama.cpp ctest tests that tests/suite/llama-ctest.sh does not run.
+#
+# Format: three columns, divided by one TAB character:
+#   <test name>	<configurations: all, or a comma list such as asan,msan>	<reason>
+# A line that starts with # is a comment. Each entry has a reason. The suite
+# writes each excluded test to results.jsonl with the status "excluded" and
+# this reason, thus the summary shows it.
+#
+# Rule: a test is excluded only if it needs the network, a model download,
+# or a program that the suite does not supply. A test is never excluded
+# because it gives a sanitizer report.
+
+test-tokenizers-ggml-vocabs	all	Network: test-tokenizers-repo.sh does a git clone of https://huggingface.co/ggml-org/vocabs.
+test-download-model	all	Network: cmake/download-models.cmake downloads tinyllamas/stories15M-q4_0.gguf from Hugging Face.
+test-thread-safety	all	Model download: the fixture test-download-model supplies its model. The step llama-local-model runs the same binary and arguments with a generated model.
+test-state-restore-fragmented	all	Model download: the fixture test-download-model supplies its model. The step llama-local-model runs the same binary with a generated model.
+test-arg-parser	all	Network: the last part does HTTP GET requests to http://ggml.ai/ and asserts the status 200 and 404.
+test-backend-sampler	all	Moved: the local-model step runs each sub-test with --test and the tiny model, because the sub-test logit_bias needs a trained model.
