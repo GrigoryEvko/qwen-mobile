@@ -973,6 +973,45 @@ const char * TXT_ROPE =
     "absolute angle error. The factor 1.5 covers the YaRN magnitude scale. The loose bound adds one f16 "
     "rounding of sin and cos.";
 
+// The positions of the kind rope_model.
+constexpr int32_t ROPE_MODEL_POS[] = { 512, 4096, 8192, 32768, 131072 };
+constexpr size_t  ROPE_MODEL_NPOS  = sizeof(ROPE_MODEL_POS) / sizeof(ROPE_MODEL_POS[0]);
+
+// The rope of the Qwen3.5 text layers at fixed positions, for the phone runs that measure the sin
+// and cos error of a backend against the position (gen --enumerate rope_model:10). Byte 10 of the
+// input selects the entry: the position p of ROPE_MODEL_POS, and one decode token at p (entries 0
+// to 4) or the 32 prefill tokens p to p + 31 (entries 5 to 9). The shape is the Q of the 2B model:
+// IMROPE, head size 256, n_dims 64, the sections 11, 11, 10, base 1e7, 8 heads, in the view of
+// Qcur_full (a row stride of two heads) that qwen35.cpp makes. The positions of the first three
+// sections are p + t and the fourth is 0, as llama gives them to a text token.
+bool build_rope_model(builder & b) {
+    const size_t  entry = b.rd.u8() % (2 * ROPE_MODEL_NPOS);
+    const int32_t p     = ROPE_MODEL_POS[entry % ROPE_MODEL_NPOS];
+    const int64_t T     = entry < ROPE_MODEL_NPOS ? 1 : 32;
+    const int64_t hd = 256, nh = 8;
+    const int     n_dims = 64;
+    int           sections[4] = { 11, 11, 10, 0 };
+    ggml_tensor * full = b.f32(hd * 2, nh, T, 1, b.vs(-2.0f, 2.0f));
+    ggml_tensor * a    = ggml_view_3d(b.ctx, full, hd, nh, T, full->nb[1], full->nb[2], 0);
+    ggml_tensor * pos  = b.i32(4 * T, 1, 1, 1, 0, 0);
+    leaf &        lp   = b.c.leaves.back();
+    for (int64_t t = 0; t < T; t++) {
+        for (int64_t s = 0; s < 4; s++) {
+            const int32_t v = s < 3 ? p + (int32_t) t : 0;
+            std::memcpy(lp.bytes.data() + (size_t) (s * T + t) * 4, &v, 4);
+        }
+    }
+    ggml_tensor * y = ggml_rope_multi(b.ctx, a, pos, nullptr, n_dims, sections, GGML_ROPE_TYPE_IMROPE, 0, 1e7f, 1.0f,
+                                      0.0f, 1.0f, 32.0f, 1.0f);
+    ggml_build_forward_expand(b.c.gf, y);
+    b.out(y, "y");
+    b.c.prm  = { (double) GGML_ROPE_TYPE_IMROPE, (double) n_dims, 1e7, 1.0, 0.0 };
+    b.c.desc = fmt("ROPE model imrope hd=256 n_dims=64 heads=8 T=%lld pos=%d..%d", (long long) T, p,
+                   p + (int32_t) T - 1);
+    b.c.path = fmt("pos%d/T%lld", p, (long long) T);
+    return true;
+}
+
 // ---------------------------------------------------------------------------------------------
 // FLASH_ATTN_EXT
 
@@ -1790,6 +1829,8 @@ const std::vector<kind_def> & kinds() {
         { "concat",           "data",    build_concat,           bound_exact,       TXT_EXACT },
         // not a fuzz group: the fixed model shapes of the phone runs (gen --enumerate mm_model:N)
         { "mm_model",         "shapes",  build_mm_model,         bound_mul_mat,     TXT_MUL_MAT },
+        // not a fuzz group: the rope of the model at fixed positions (gen --enumerate rope_model:10)
+        { "rope_model",       "shapes",  build_rope_model,       bound_rope,        TXT_ROPE },
     };
     return list;
 }
