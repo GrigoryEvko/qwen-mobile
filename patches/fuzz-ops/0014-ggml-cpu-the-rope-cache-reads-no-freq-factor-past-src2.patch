@@ -1,0 +1,95 @@
+ggml-cpu: the rope cache reads no freq factor past src2
+Fold-into: upstream/ggml-cpu
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+ggml_rope_cache_init and ggml_mrope_cache_init fill a cache of ne0 values, and
+they read freq_factors[i0/2] for each i0 < ne0. src2 (the freq factors) can
+have only n_dims/2 values. Thus, with a partial rotation (n_dims < ne0), the
+loop reads past the end of src2. The rotation uses only the cache values with
+an index less than n_dims, thus the results do not change. But the loop reads
+the memory of other tensors, or the memory after the end of a buffer.
+
+ThreadSanitizer shows this read in the op fuzzer as a data race with a write of
+the output by a different thread. An example is ROPE imrope with head size 208,
+n_dims 4 and 2 freq factors. The app graphs do not reach this condition: the
+Qwen3.5 models have no freq factors.
+
+This patch gives the two functions the number of freq factors (n_ff =
+src2->ne[0]), and a factor past n_ff reads 1.0f. The vision mode is the one
+mode with a different result. It rotates all ne0 values, thus it uses n_dims
+freq factors. When src2 has less than n_dims values, the vision mode used the
+memory after src2, and with this patch it uses the factor 1.0f.
+
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 3f63b7a..b71ddb2 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -5980,13 +5980,16 @@ static void rope_yarn(
+     *sin_theta = sinf(theta) * mscale;
+ }
+ 
++// The cache holds ne0 values, but src2 (the freq factors) can have only n_dims/2 values. Thus, a
++// factor past n_ff reads 1.0f and not the memory after src2. The rotation uses only the cache values
++// with an index less than n_dims (less than ne0 in the vision mode).
+ static void ggml_rope_cache_init(
+-     float theta_base, float freq_scale, const float * freq_factors, float corr_dims[2], int64_t ne0, float ext_factor, float mscale,
++     float theta_base, float freq_scale, const float * freq_factors, int64_t n_ff, float corr_dims[2], int64_t ne0, float ext_factor, float mscale,
+      float * cache, float sin_sign, float theta_scale) {
+     // ref: https://github.com/jquesnelle/yarn/blob/master/scaled_rope/LlamaYaRNScaledRotaryEmbedding.py
+     float theta = theta_base;
+     for (int64_t i0 = 0; i0 < ne0; i0 += 2) {
+-        const float ff = freq_factors ? freq_factors[i0/2] : 1.0f;
++        const float ff = freq_factors && i0/2 < n_ff ? freq_factors[i0/2] : 1.0f;
+         rope_yarn(
+             theta/ff, freq_scale, corr_dims, i0, ext_factor, mscale, &cache[i0 + 0], &cache[i0 + 1]
+         );
+@@ -5998,7 +6001,7 @@ static void ggml_rope_cache_init(
+ 
+ static void ggml_mrope_cache_init(
+      float theta_base_t, float theta_base_h, float theta_base_w, float theta_base_e, int sections[4], bool is_imrope, bool indep_sects,
+-     float freq_scale, const float * freq_factors, float corr_dims[2], int64_t ne0, float ext_factor, float mscale,
++     float freq_scale, const float * freq_factors, int64_t n_ff, float corr_dims[2], int64_t ne0, float ext_factor, float mscale,
+      float * cache, float sin_sign, float theta_scale) {
+     // ref: https://github.com/jquesnelle/yarn/blob/master/scaled_rope/LlamaYaRNScaledRotaryEmbedding.py
+     float theta_t = theta_base_t;
+@@ -6011,7 +6014,7 @@ static void ggml_mrope_cache_init(
+     GGML_ASSERT(sect_dims <= ne0);
+ 
+     for (int64_t i0 = 0; i0 < ne0; i0 += 2) {
+-        const float ff = freq_factors ? freq_factors[i0/2] : 1.0f;
++        const float ff = freq_factors && i0/2 < n_ff ? freq_factors[i0/2] : 1.0f;
+ 
+         int sector = (i0 / 2) % sect_dims;
+         if (indep_sects) {
+@@ -6167,10 +6170,12 @@ static void ggml_compute_forward_rope_flt(
+     }
+ 
+     const float * freq_factors = NULL;
++    int64_t       n_ff         = 0;
+     if (src2 != NULL) {
+         GGML_ASSERT(src2->type == GGML_TYPE_F32);
+         GGML_ASSERT(src2->ne[0] >= n_dims / 2);
+         freq_factors = (const float *) src2->data;
++        n_ff         = src2->ne[0];
+     }
+ 
+     // backward process uses inverse rotation by cos and sin.
+@@ -6192,7 +6197,7 @@ static void ggml_compute_forward_rope_flt(
+                 if (last_i2 != i2) {
+                     if (!mrope_used) {
+                         const int64_t p = pos[i2];
+-                        ggml_rope_cache_init(p, freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
++                        ggml_rope_cache_init(p, freq_scale, freq_factors, n_ff, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
+                     }
+                     else {
+                         const int64_t p_t = pos[i2];
+@@ -6201,7 +6206,7 @@ static void ggml_compute_forward_rope_flt(
+                         const int64_t p_e = pos[i2 + ne2 * 3];
+                         ggml_mrope_cache_init(
+                             p_t, p_h, p_w, p_e, sections, is_imrope, is_vision,
+-                            freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
++                            freq_scale, freq_factors, n_ff, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
+                     }
+ 
+                     last_i2 = i2;
