@@ -3,47 +3,18 @@ Fold-into: upstream/ggml-cpu
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 
-Finding F-UB-2 of fuzz-ops, task #127. The type traits of ggml.c (to_float,
-from_float_ref) and of ggml-cpu.c (from_float, vec_dot) hold typed functions,
-for example dequantize_row_q8_0(const block_q8_0 *, float *, int64_t), cast
-to the generic types ggml_to_float_t, ggml_from_float_t and ggml_vec_dot_t.
-A call through a pointer of a different function type is undefined behavior.
-UBSan (-fsanitize=function) reports it at each call: each matrix product,
-copy, ADD and GET_ROWS of a quantized tensor, and the F16 flash attention.
+The type traits of ggml.c (to_float, from_float_ref) and of ggml-cpu.c
+(from_float, vec_dot) hold typed functions, for example
+dequantize_row_q8_0(const block_q8_0 *, float *, int64_t), cast to the generic
+types ggml_to_float_t, ggml_from_float_t and ggml_vec_dot_t. A call through a
+pointer of a different function type is undefined behavior. UBSan
+(-fsanitize=function) reports it at each call: each matrix product, copy, ADD
+and GET_ROWS of a quantized tensor, and the F16 flash attention.
 
-This patch gives each of the 51 casts of ggml.c and the 7 casts of ggml-cpu.c
-a thunk of the generic type, which calls the typed function. No cast of
-these function types remains in ggml/src. The arithmetic does not change.
-
-Evidence (2026-09-23):
-- The UBSan reproducer of the sanitizer matrix
-  (tests/sanitizers/repro/ubsan_ggml.c, the static ggml link) with no
-  suppression entry, in the debug and the release profile: the 15 modes
-  (mul_mat_f32, mul_mat_f16, mul_mat_id, set_rows, flash_attn_ext, dup_to_q,
-  dup_from_q, add_q, add1_q, out_prod_q, get_rows_q, lightning_indexer,
-  repack_mul_mat, repack_mul_mat_id, graph_nbytes) give no report. The two
-  control modes still give their reports.
-- test-quantize-fns with -fsanitize=function: 10 reports before this patch,
-  0 after. The output of the 35 types is the same.
-- The test suite of the op fuzzer in ubsan and none, debug and release, with
-  no UBSan suppression entry: no UBSan report.
-- The phone check (OnePlus 13, thermal status 0): the first 600 cases of the
-  op pack on the CPU give bit-identical outputs with the shipped libraries
-  and with the libraries of this patch.
-
-Measurement: the "after" libraries came from the recipe of
-scripts/build-native.sh in a private tree. The six libraries that this patch
-does not change are byte-identical to the shipped ones. llama-bench on the
-phone CPU (6 threads, -fa 1, 5 repetitions, one warmup run, the order before,
-after, before, after, caps cpu0 1.9968 GHz and cpu7 2.6496 GHz in each run):
-  tg32, 4B Q8_0:  before 6.53 +- 0.84 and 5.98 +- 0.16, after 7.23 +- 0.78
-                  and 5.72 +- 0.36 tokens/s (means 6.26 and 6.48)
-  pp128, 2B Q8_0: before 97.27 +- 9.13 and 141.23 +- 55.03, after
-                  148.96 +- 54.11 and 96.73 +- 6.96 tokens/s (means 119 and 123)
-No difference is above the noise. The arm64 release libggml-cpu.so shows the
-cost: ggml_vec_dot_f16_thunk is one instruction (b ggml_vec_dot_f16@plt), and
-in ggml_vec_dot_f32_thunk, ggml_cpu_fp32_to_fp16_thunk and the thunks of
-ggml.c LTO put the body of the called function into the thunk.
+This patch gives each cast of these two tables a thunk of the generic type,
+which calls the typed function. The arithmetic does not change. With
+optimization, a thunk is one tail call, or LTO puts the called function into
+it.
 
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
 index 87a329f..a710800 100644

@@ -19,9 +19,9 @@ readonly B_ORACLE="$MISC/oracle"
 readonly SHARED_SAN="$REPO_ROOT/tests/sanitizers"
 readonly SHIPPED_LIBS="$REPO_ROOT/android/snapdragon/jniLibs/arm64-v8a"
 readonly SYMBOLIZER="$MISC/tools/llvm-symbolizer-android-arm64"   # run.sh symbolizer builds it
-readonly ASAN_RUNTIME="$REPO_ROOT/build/fuzz/asan-android-runtime/libclang_rt.asan-aarch64-android.so"   # task #176
+readonly ASAN_RUNTIME="$REPO_ROOT/build/fuzz/asan-android-runtime/libclang_rt.asan-aarch64-android.so"   # of compiler-rt 22.1.8
 # FUZZ_OPS_SRC: a different ggml tree for the host builds, for example the private copy of a fix
-# (landing rule L1). FUZZ_OPS_TAG: the suffix of the build directories of that tree.
+# (never the shared submodule). FUZZ_OPS_TAG: the suffix of the build directories of that tree.
 readonly HOST_SRC=${FUZZ_OPS_SRC:-$SRC}
 readonly TAG=${FUZZ_OPS_TAG:-}
 if [[ $HOST_SRC != "$SRC" && -z $TAG ]]; then
@@ -77,7 +77,8 @@ Other modes:
                 android/snapdragon/jniLibs/arm64-v8a (hash-checked against build/hashes-native.txt).
                 Then make the case pack, and stage the phone files in build/fuzz/ops/phone.
   phone-commands [probe|full|diag]   Print the adb commands. "diag" runs the diagnosis pack of
-                tasks #175 and #178 with repeats on HTP0. "probe" runs the first 3 cases of each
+                the HTP0 guard writes and run-to-run differences with repeats on HTP0. "probe" runs
+                the first 3 cases of each
                 build and prints every UBSan report (the evidence run). "full" runs the pack with
                 the builds of PHONE_BUILDS (default: all staged builds). This script never runs adb.
   compare [RESULT...]      Compare the pulled phone results with the oracle, print the per-op
@@ -92,7 +93,7 @@ Other modes:
                            missing). Without it, a sanitizer report on the phone has no function
                            names, and the function-level entries of tests/sanitizers/ubsan.supp do not
                            match. It needs llvm-tblgen on the host and an NDK (NDK_HOST).
-  asan-runtime             Build the ASan runtime of the phone (task #176) with
+  asan-runtime             Build the ASan runtime of the phone (compiler-rt 22.1.8) with
                            tests/sanitizers/build-asan-android-runtime.sh, and check it.
   phone-libs               With FUZZ_OPS_SRC and FUZZ_OPS_TAG: build the app libraries and llama-bench
                            for arm64 Android from the llama.cpp tree above FUZZ_OPS_SRC, with the
@@ -104,18 +105,18 @@ Other modes:
                            with the series (the libraries hold the ggml commit, "c6824a9-dirty").
                            FUZZ_OPS_REPRO_PATHS=1 gives (1) and (2) with bind mounts in the container
                            only; a "git clone --shared" of the submodule gives (3).
-  phone-check-commands     With FUZZ_OPS_TAG: print the phone check of a fix (landing rule L5):
+  phone-check-commands     With FUZZ_OPS_TAG: print the phone check of a fix before it lands:
                            the op pack and llama-bench, the shipped libraries against libs-TAG.
   bounds                   Print the bound rule of each kind.
   help                     Print this text.
-  Aliases of the older modes: cpu-asan = fuzz asan, cpu-tsan = fuzz tsan, regress = test asan.
+  Aliases: cpu-asan = fuzz asan, cpu-tsan = fuzz tsan, regress = test asan.
 
 Groups (the targets): matmul gdn attn norm elem data
 
 Flags and runtime options: the shared files tests/sanitizers/profile-<profile>.cmake,
 tests/sanitizers/<config>.cmake and tests/sanitizers/env.sh. Suppressions: only the shared files
-tests/sanitizers/<config>.supp. The area has no entry there: the fixes of its UBSan findings
-(tasks #125 and #127) are patches/fuzz-ops/0001 and 0002.
+tests/sanitizers/<config>.supp. The area has no entry there: the fixes of its UBSan reports (the
+null pointer of ggml_graph_nbytes, the casts of the type traits) are patches/fuzz-ops/0001 and 0002.
 
 Environment (defaults in parentheses):
   FUZZ_BUDGET, FUZZ_JOBS  the defaults of --budget-seconds and --jobs (600, 4)
@@ -178,7 +179,7 @@ build_oracle() {
 }
 
 # Configure (once) and build the host fuzzer of one profile and one configuration. The flags come
-# from the shared initial caches (rules R1, R4, R7, R11, R12).
+# from the shared initial caches.
 build_config() {
     local profile=$1 config=$2 dir
     dir=$(host_dir "$1" "$2")
@@ -197,7 +198,7 @@ build_config() {
 }
 
 # Run a command with the runtime options of one configuration, from the shared file
-# tests/sanitizers/env.sh (the same options in each area, rule R1). The subshell keeps the
+# tests/sanitizers/env.sh (the same options in each area). The subshell keeps the
 # options away from the other runs.
 with_san() {
     local config=$1
@@ -207,8 +208,8 @@ with_san() {
         source "$SHARED_SAN/env.sh"
         sanitizer_env "$config" || exit 2
         # FUZZ_OPS_UBSAN_SUPP replaces the shared UBSan suppression file for the check of a fix: the
-        # file without the entries of its task shows that the fix removes the reports (rule L4)
-        # before the landing removes the entries from the shared file (rule L8).
+        # file without the entries of a defect shows that its fix removes the reports before the
+        # landing removes the entries from the shared file.
         if [[ $config == ubsan && -n ${FUZZ_OPS_UBSAN_SUPP:-} ]]; then
             UBSAN_OPTIONS="${UBSAN_OPTIONS%%:suppressions=*}:suppressions=$FUZZ_OPS_UBSAN_SUPP"
         fi
@@ -338,8 +339,8 @@ fuzz_group() {
     while left=$((end - $(date +%s))); [[ $left -gt 5 && $round -lt 100 ]]; do
         echo "fuzz-ops: round $round, $left s left" >> "$log"
         r0=$(date +%s)
-        # FUZZ_OPS_TAME=1: the value asserts of the ggml CPU ops (F-ASSERT-1 to 4) stop each round at
-        # the first input with a special value; the test suite reports them (rule R8).
+        # FUZZ_OPS_TAME=1: the value asserts of the ggml CPU ops stop each round at the first input
+        # with a special value; the test suite reports them.
         # The outer timeout stops a process that hangs (for example the TSan report path under
         # libFuzzer can deadlock). libFuzzer stops by itself within -timeout after -max_total_time,
         # thus a kill by the outer timeout is a hang, and the hang is a finding.
@@ -467,7 +468,8 @@ phone_build() {
     fi
     "$B_ORACLE/ops_oracle" "${sargs[@]}"
     fi
-    # The diagnosis pack of tasks #175 and #178: the regression inputs of MUL_MAT_ID and of the
+    # The diagnosis pack of the HTP0 guard writes and run-to-run differences: the regression
+    # inputs of MUL_MAT_ID and of the
     # shared-input MUL_MAT (the HTP0 guard write and the HTP0 run-to-run differences), the Q8_0
     # MUL_MAT of the model shapes at n = 1 to 8 (mm_model entries 0 to 63), and the F32 (2048, 16)
     # MUL_MAT of ssm_alpha and ssm_beta of the 2B model, alone and as a pair with one input
@@ -483,8 +485,8 @@ phone_build() {
         [[ " $PHONE_CONFIGS_ALL " == *" $c "* ]] || die "the phone configuration '$c' is not one of: $PHONE_CONFIGS_ALL"
         local rt="" prebuilt=""
         # the runtime library of the sanitizer; the ubsan build links its runtime statically
-        # (-static-libsan, refer to F-UB-3 in CMakeLists.txt). The asan builds use the runtime of
-        # task #176 in the stage directory asan-rt, not the runtime of the NDK.
+        # (-static-libsan, refer to the vptr text in CMakeLists.txt). The asan builds use the runtime
+        # of compiler-rt 22.1.8 in the stage directory asan-rt, not the runtime of the NDK.
         case $c in
             hwasan) rt=libclang_rt.hwasan-aarch64-android.so ;;
         esac
@@ -524,7 +526,7 @@ fi
         fi
     done
     cp -f "$HERE/phone_run.sh" "$stage/"
-    # The ASan runtime of task #176: phone_run.sh puts asan-rt first in LD_LIBRARY_PATH.
+    # The ASan runtime of compiler-rt 22.1.8: phone_run.sh puts asan-rt first in LD_LIBRARY_PATH.
     build_asan_runtime
     rm -rf "$stage/asan-rt"
     mkdir -p "$stage/asan-rt"
@@ -604,8 +606,8 @@ phone_commands() {
         # 16 F32 cases. Each regression input decodes to one case.
         local DIAG_F32_FIRST
         DIAG_F32_FIRST=$(( $(find "$HERE/regress/mul_mat_id" "$HERE/regress/mul_mat_multi" -name '*.bin' | wc -l) + 64 ))
-        echo "# 2. The diagnosis of tasks #175 and #178 on HTP0 (the release none build, the shipped"
-        echo "#    libraries): diag.pack, each case 20 times with new buffers (--repeat 20). A run with"
+        echo "# 2. The diagnosis of the HTP0 guard writes and run-to-run differences on HTP0 (the"
+        echo "#    $DIAG_BUILD build): diag.pack, each case 20 times with new buffers (--repeat 20). A run with"
         echo "#    different outputs gets NONDET, a write outside a tensor gets GUARD. Three variants:"
         echo "#    the default, one HVX thread (GGML_HEXAGON_NHVX=1), and no graph and batch caches."
         echo "#    Each command resumes the last one; run each command until its log shows 'all runs done'."
@@ -642,7 +644,7 @@ phone_commands() {
         echo "#    The ASan builds run under the ptrace tracer of ops_replay (--trace): it prints the pc, the"
         echo "#    module, the instruction, si_code, BTYPE and a backtrace of each fatal signal of each"
         echo "#    thread, also in a thread that blocks the signal. phone_run.sh starts each ASan run with"
-        echo "#    the thread self-test and the ASan runtime of task #176 (asan-rt). The crash buffer of"
+        echo "#    the thread self-test and the ASan runtime of compiler-rt 22.1.8 (asan-rt). The crash buffer of"
         echo "#    logcat shows a tombstone if debuggerd saw a signal."
         echo "#    The ubsan builds run two times: UBSAN_HALT=0 prints every report (the evidence), then"
         echo "#    UBSAN_HALT=1 shows that the entries of ubsan.supp match on the phone (a stop is a"
@@ -699,7 +701,7 @@ phone_commands() {
     echo "mkdir -p $stage/pulled"
     echo "adb -s $PHONE pull $d/out $stage/pulled/"
     echo
-    echo "# 4. Clean the phone work directory when the campaign is complete."
+    echo "# 4. Clean the phone work directory when all runs are complete."
     echo "adb -s $PHONE shell 'rm -rf $d'"
 }
 
@@ -791,7 +793,7 @@ suite() {
 
 # Build llvm-symbolizer for arm64 Android into $SYMBOLIZER. The sanitizer runtimes on the phone
 # need it: without it a report frame has no function name, thus no function-level entry of
-# tests/sanitizers/ubsan.supp can match it (rule R5). The source is a sparse, shallow clone of
+# tests/sanitizers/ubsan.supp can match it. The source is a sparse, shallow clone of
 # llvm-project at the tag of the host tablegen (the versions must agree). The tool is not part of
 # the code under test, thus the NDK of the host (NDK_HOST) builds it.
 build_symbolizer() {
@@ -833,7 +835,7 @@ build_symbolizer() {
 # Build the libraries of the app and llama-bench for arm64 Android from the private llama.cpp tree
 # of a fix (the parent of FUZZ_OPS_SRC), with the flags of the preset
 # arm64-android-snapdragon-release and the reproducibility flags of scripts/build-native.sh, for
-# the phone check of the fix (landing rule L5). It never writes build/native or the jniLibs of the
+# the phone check of the fix. It never writes build/native or the jniLibs of the
 # app. The output: build/fuzz/ops/phone/libs-TAG/.
 phone_libs() {
     [[ -n $TAG ]] || die "phone-libs needs FUZZ_OPS_SRC and FUZZ_OPS_TAG (the private tree of a fix)"
@@ -880,7 +882,7 @@ cmake --build $bdir -j$BUILD_JOBS --target $LLAMA_LIBS llama-bench
     cat "$out/SHA256SUMS"
 }
 
-# Stage and print the phone check of a fix (landing rule L5): the shipped libraries (before)
+# Stage and print the phone check of a fix before it lands: the shipped libraries (before)
 # against the libraries of the fix (after, from phone-libs), in one command set. Build "after"
 # with FUZZ_OPS_REPRO_PATHS=1 from a git tree: then each library that the fix does not change is
 # byte-identical to the shipped one, and the shipped set is a clean "before".
@@ -924,7 +926,7 @@ phone_check_commands() {
     local status="adb -s $PHONE shell 'dumpsys thermalservice | grep \"Thermal Status\"; cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq /sys/devices/system/cpu/cpu7/cpufreq/scaling_max_freq; dumpsys battery | grep -E \"powered|status|temperature\"'"
     local m4=/data/local/tmp/qwen/models/Qwen3.5-4B-Q8_0.gguf m2=/data/local/tmp/qwen/models/Qwen3.5-2B-Q8_0.gguf
     local bench="$d/check-$TAG-tools/llama-bench -dev none -ngl 0 -t 6 -fa 1 -o md"
-    echo "# The phone check of FUZZ_OPS_TAG=$TAG (landing rule L5), before = $before_dir. Do not run on the charger."
+    echo "# The phone check of FUZZ_OPS_TAG=$TAG, before = $before_dir. Do not run on the charger."
     echo "adb -s $PHONE shell 'mkdir -p $d/out'"
     echo "adb -s $PHONE push $stage/check-$TAG-before $stage/check-$TAG-after $tools $d/"
     echo "adb -s $PHONE shell 'chmod 755 $d/check-$TAG-*/ops_replay $d/check-$TAG-tools/llama-bench; cd $d && sha256sum check-$TAG-*/*.so check-$TAG-tools/llama-bench | cut -c1-16'"
@@ -953,7 +955,7 @@ phone_check_commands() {
     echo "adb -s $PHONE pull $d/out $stage/pulled-check-$TAG/"
 }
 
-# The ASan runtime of the phone (task #176): tests/sanitizers/build-asan-android-runtime.sh
+# The ASan runtime of the phone: tests/sanitizers/build-asan-android-runtime.sh
 # builds it from compiler-rt 22.1.8. The runtime of NDK r29 kills each new thread on the SM8750.
 build_asan_runtime() {
     if [[ ! -f $ASAN_RUNTIME ]]; then

@@ -3,28 +3,13 @@ Fold-into: upstream/ggml-core
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 
-Finding F-UB-1 of fuzz-ops, task #125. ggml_graph_nbytes starts from a null
-pointer, and incr_ptr_aligned adds the sizes of the parts of the graph to it.
-Arithmetic on a null pointer is undefined behavior. UBSan (pointer-overflow)
-reports "applying non-zero offset 96 to null pointer" at ggml.c:7447 for each
-graph, on the host and on the phone. fuzz-hexhost found it too.
+ggml_graph_nbytes starts from a null pointer, and incr_ptr_aligned adds the
+sizes of the parts of the graph to it. Arithmetic on a null pointer is
+undefined behavior, and UBSan (pointer-overflow) reports "applying non-zero
+offset to null pointer" for each graph.
 
 This patch adds incr_size_aligned, which applies the same alignment rule to a
-size_t, and ggml_graph_nbytes uses it. The result is the same number.
-
-Evidence (2026-09-23):
-- The op fuzzer in UBSan with no suppression entry: the seed
-  tests/fuzz/ops/corpus/matmul/mul_mat-0.bin stops with the report before
-  this patch, in the debug profile (-O1) and in the release profile (-O3
-  -flto). With this patch it gives no report.
-- The test suite of the op fuzzer in ubsan and none, debug and release, with
-  this patch and the next one and no UBSan suppression entry: no UBSan report.
-- The phone check (OnePlus 13, thermal status 0): the first 600 cases of the
-  op pack on the CPU give bit-identical outputs with the shipped libraries and
-  with the libraries of this patch and the next one.
-
-Measurement: ggml_graph_nbytes runs once for each graph allocation. It is not
-on a hot path.
+size_t, and ggml_graph_nbytes uses it. The size is the same number.
 
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 index 1752814..882ffdb 100644

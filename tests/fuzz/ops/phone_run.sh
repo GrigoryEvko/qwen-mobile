@@ -67,8 +67,9 @@ case $config in
         ;;
 esac
 
-# The libraries: the build directory, and for asan the runtime of task #176 first (the runtime of
-# NDK r29 kills each new thread on the SM8750, refer to tests/sanitizers/build-asan-android-runtime.sh).
+# The libraries: the build directory, and for asan the runtime of compiler-rt 22.1.8 first (the
+# runtime of NDK r29 kills each new thread on the SM8750, refer to
+# tests/sanitizers/build-asan-android-runtime.sh).
 libpath="$d/$build"
 if [ "$config" = asan ]; then
     [ -f "$d/asan-rt/libclang_rt.asan-aarch64-android.so" ] || { echo "no ASan runtime in $d/asan-rt"; exit 4; }
@@ -78,7 +79,7 @@ if [ "$config" = asan ]; then
     env $san LD_LIBRARY_PATH="$libpath" "$d/$build/ops_replay" --selftest-threads >> "out/log-$build-$tag.txt" 2>&1
     rc=$?
     if [ $rc -ne 0 ]; then
-        echo "build=$build tag=$tag ENVIRONMENT FAILURE: the thread self-test gave rc=$rc (task #176), no case ran"
+        echo "build=$build tag=$tag ENVIRONMENT FAILURE: the thread self-test gave rc=$rc (refer to tests/sanitizers/build-asan-android-runtime.sh), no case ran"
         exit 4
     fi
 fi

@@ -564,7 +564,7 @@ int cmd_bounds() {
 }
 
 // Compare the outputs of two result files run by index, for the check that a fix leaves the
-// output bit-identical (landing rules L5 and L6). A record pairs with the record of the same pack
+// output bit-identical. A record pairs with the record of the same pack
 // index and the same tag after the suffix of the build is removed (the part from the first "-").
 // Print the count of identical, different and unpaired runs and the first differences. The time
 // is O(r log r + b) for r records and b output bytes.

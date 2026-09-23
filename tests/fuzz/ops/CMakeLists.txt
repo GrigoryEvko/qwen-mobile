@@ -18,7 +18,7 @@
 #                             phone-build). Build directory: build/fuzz/ops-<profile>-<sanitizer>/android.
 #                             The flags are below, because the shared files are for x86_64 Linux.
 #
-# FUZZ_PROFILE (rule R11):
+# FUZZ_PROFILE (a build directory has one profile and one sanitizer):
 #   release  the shipped flags of android/snapdragon/CMakeUserPresets.json, preset
 #            arm64-android-snapdragon, CMAKE_BUILD_TYPE=Release: -O3 -DNDEBUG
 #            -march=armv8.7a+fp16+dotprod+i8mm -fvectorize -ffp-model=fast -fno-finite-math-only -flto
@@ -26,11 +26,11 @@
 #            links the shipped libraries themselves (the release "none" phone run).
 #   debug    the same flags with -O1 in place of -O3, no -flto, and no -DNDEBUG.
 #
-# FUZZ_SANITIZER selects one sanitizer (rule R1):
+# FUZZ_SANITIZER selects one sanitizer (never two in one build):
 #   none    no sanitizer
 #   asan    -fsanitize=address
-#   ubsan   -fsanitize=undefined -fno-sanitize-recover=undefined, and -fsanitize-recover only for the
-#           checks with a tracked finding
+#   ubsan   -fsanitize=undefined -fno-sanitize-recover=undefined; -fsanitize-recover only for a check
+#           with a known defect and a function-level entry in tests/sanitizers/ubsan.supp
 #   tsan    -fsanitize=thread, with GGML_OPENMP=OFF (host only)
 #   msan    -fsanitize=memory -fsanitize-memory-track-origins=2, with GGML_OPENMP=OFF, GGML_NATIVE=OFF,
 #           the x86 SIMD options off and the MSan libc++ of FUZZ_MSAN_PREFIX (host only)
@@ -110,10 +110,10 @@ if (FUZZ_OPS_VARIANT STREQUAL "oracle")
     set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS} -ffp-contract=off -fno-fast-math")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ffp-contract=off -fno-fast-math")
 elseif (FUZZ_OPS_VARIANT STREQUAL "fuzz")
-    # The profile and the sanitizer come from the shared initial caches (rules R4, R11).
+    # The profile and the sanitizer come from the shared initial caches.
     if (NOT DEFINED SANMATRIX_PROFILE)
         message(FATAL_ERROR "fuzz_ops: configure the host build with -C tests/sanitizers/profile-<debug|release>.cmake "
-                            "-C tests/sanitizers/<config>.cmake (rules R4 and R11)")
+                            "-C tests/sanitizers/<config>.cmake")
     endif()
     set(expect_flag "")
     if (FUZZ_SANITIZER STREQUAL "asan")
@@ -128,32 +128,20 @@ elseif (FUZZ_OPS_VARIANT STREQUAL "fuzz")
     if (expect_flag AND NOT CMAKE_CXX_FLAGS MATCHES "${expect_flag}")
         message(FATAL_ERROR "fuzz_ops: CMAKE_CXX_FLAGS has no ${expect_flag}: give -C tests/sanitizers/${FUZZ_SANITIZER}.cmake")
     endif()
-    # libFuzzer instrumentation (not a sanitizer, rule R1). The comparison hooks (trace-cmp) in the
-    # loops of the kernels and of the bound rules took 30 % of the time in a profile, thus they are
+    # libFuzzer instrumentation (not a sanitizer). The comparison hooks (trace-cmp) in the
+    # loops of the kernels and of the bound rules make each execution much slower, thus they are
     # off. The edge counters stay on.
     set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS} -fsanitize=fuzzer-no-link -fno-sanitize-coverage=trace-cmp")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=fuzzer-no-link -fno-sanitize-coverage=trace-cmp")
 else()
-    # The sanitizer of the Android builds. No UBSan check recovers (rule R5): the fixes of the
-    # tracked findings are in the patch series (task #125 patches/fuzz-ops/0001, task #127
-    # patches/fuzz-ops/0002, task #156 patches/fuzz-hexhost/0004), thus each report stops the run.
-    #   vptr              F-UB-3 (fuzz-ops, 2026-09-23), a false positive of the build, not of ggml.
-    #                     Evidence (probe of 2026-09-23, build/fuzz/ops/phone-pulled-probe1/out/log-*-ubsan-probe.txt):
-    #                     the 148 vptr reports of each profile all name an object of the expected class
-    #                     or of a class derived from it (UBSan's own note: "object is of type
-    #                     'std::__ndk1::__shared_ptr_emplace<ggml_hexagon_rpcmem_block, ...>'" for the
-    #                     expected type 'std::__shared_ptr_emplace<ggml_hexagon_rpcmem_block, ...>',
-    #                     'ggml::cpu::repack::extra_buffer_type' for 'ggml::cpu::extra_buffer_type',
-    #                     'basic_stringstream' for 'std::istream'). Two modules hold a copy of the
-    #                     libc++abi type-info classes: ops_replay (the static NDK libc++, data symbols
-    #                     "vtable for __cxxabiv1::__si_class_type_info", not exported) and
-    #                     libclang_rt.ubsan_standalone-aarch64-android.so (a private copy, local "d"
-    #                     symbols). The runtime walks the class hierarchy with a dynamic_cast to its own
-    #                     copy, which fails for the type_info objects of ops_replay, thus every
-    #                     derived-class check fails. The fix of the build: -static-libsan links the
-    #                     runtime into ops_replay, and its references resolve to the one copy. vptr stays
-    #                     on and does not recover. The next probe validates this: no vptr report means the
-    #                     cause is confirmed.
+    # The sanitizer of the Android builds. No UBSan check recovers: each report stops the run.
+    # The ubsan build links the UBSan runtime statically (-static-libsan). With the shared runtime,
+    # two modules hold a copy of the libc++abi type-info classes: ops_replay (the static NDK libc++)
+    # and libclang_rt.ubsan_standalone-aarch64-android.so (a private copy). The vptr check walks the
+    # class hierarchy with a dynamic_cast to the copy of the runtime, which fails for the type_info
+    # objects of ops_replay, thus each check of a derived class gives a false report (for example
+    # 'ggml::cpu::repack::extra_buffer_type' for 'ggml::cpu::extra_buffer_type'). With the static
+    # runtime, the references resolve to one copy, and vptr stays on without a recovery.
     set(android_san "")
     set(android_link "")
     if (FUZZ_SANITIZER STREQUAL "asan")
@@ -165,7 +153,7 @@ else()
     elseif (FUZZ_SANITIZER STREQUAL "hwasan")
         set(android_san "-fsanitize=hwaddress")
     endif()
-    # The shipped flags of the preset arm64-android-snapdragon (rule R12). Keep them equal.
+    # The shipped flags of the preset arm64-android-snapdragon. Keep them equal.
     set(shipped "-march=armv8.7a+fp16+dotprod+i8mm -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE")
     if (FUZZ_PROFILE STREQUAL "release")
         set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)

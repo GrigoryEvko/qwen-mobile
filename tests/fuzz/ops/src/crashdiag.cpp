@@ -152,7 +152,7 @@ void handler(int sig, siginfo_t * si, void * uctx) {
     int n = 0;
     _Unwind_Backtrace(trace_one, &n);
     // SA_RESETHAND gave the default action back: a fault instruction runs again and stops the
-    // process, and a raise ends it now.
+    // process, and a raise ends it at once.
     if (si == nullptr || si->si_code <= 0) {
         ::raise(sig);
     }

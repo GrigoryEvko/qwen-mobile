@@ -289,7 +289,7 @@ const char * TXT_MUL_MAT =
 // The exact matrix shapes of the Qwen3.5 2B and 4B models at 1 to 8 activation rows (n = 4 is the
 // verify step of the speculative decode). Byte 10 of the input selects the entry: the weight type
 // (Q8_0, Q4_0), the (k, m) pair and n. The group "shapes" is not a fuzz group: gen --enumerate makes
-// its cases for the phone runs (task #178, the determinism of HTP0). The shapes are larger than the
+// its cases for the phone runs (the check that HTP0 gives the same output each time). The shapes are larger than the
 // limits of the fuzz kinds, thus the oracle takes approximately 1 s for each case.
 bool build_mm_model(builder & b) {
     static const ggml_type types[] = { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 };

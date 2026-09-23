@@ -3,32 +3,18 @@ Fold-into: upstream/ggml-cpu
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 
-Finding F-FM-1 of fuzz-ops, task #174. The SSE2 form of ggml_v_expf (x86
-without AVX2 and FMA) rounds x*log2(e) to an integer with the magic constant
-r = 0x1.8p23: n = (x*log2(e) + r) - r. With -ffast-math or -ffp-model=fast,
-the compiler folds that sum into x*log2(e), and it also joins the two parts of
-the ln(2) product. Then exp(x) has a relative error of up to 38 % (clang 22:
-exp(-0.3) gives 1, exp(-2.4) gives 0.125). SOFT_MAX, SILU, SWIGLU and the GDN
-conv chain use this function in such a build. The MSan builds of the op
-fuzzer (SIMD off, the release flags) found it.
+The SSE2 form of ggml_v_expf (x86 without AVX2 and FMA) rounds x*log2(e) to
+an integer with the magic constant r = 0x1.8p23: n = (x*log2(e) + r) - r.
+With -ffast-math or -ffp-model=fast, the compiler folds that sum into
+x*log2(e), and it also joins the two parts of the ln(2) product. Then exp(x)
+has a relative error of up to 38 % (clang 22: exp(-0.3) gives 1, exp(-2.4)
+gives 0.125). SOFT_MAX, SILU, SWIGLU and the GDN conv chain use this function
+in such a build.
 
 This patch adds three empty asm statements that make z, n and the first ln(2)
 step opaque to the optimizer. The line count of vec.h does not change, thus
-no __LINE__ of the other code changes.
-
-Evidence and measurement (2026-09-23):
-- clang 22, 16001 points in [-80, 80]: the worst relative error is 2.1e-7
-  with -ffp-model=precise; with -ffp-model=fast it is 0.38 before and 2.1e-7
-  with this patch (gcc -ffast-math: 2.2e-7).
-- The op fuzzer, an SSE2 release build with -ffp-model=fast, the 86 seeds and
-  regression inputs: 11 runs above the loose bound before, 0 with this patch.
-- The MSan test suite of the op fuzzer: release 0 findings (7 before); debug
-  only the 3 value asserts of task #128 (10 before).
-- No change where the fast-math fold does not occur: an SSE2 build with
-  -ffp-model=precise gives bit-identical outputs for the 86 inputs. An AVX2
-  and FMA build (the __m256 form) links to the same .text and .rodata. The
-  arm64 libggml-cpu.so and libggml-base.so of the shipped recipe are
-  byte-identical with and without this patch. Thus the phone does not change.
+no __LINE__ of the other code changes. The FMA and the NEON forms keep the
+rounding without it, and their code does not change.
 
 diff --git a/ggml/src/ggml-cpu/vec.h b/ggml/src/ggml-cpu/vec.h
 index 5de9cb5..883ef50 100644
