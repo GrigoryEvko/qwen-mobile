@@ -191,13 +191,12 @@ class ConversationStoreFuzzTest {
     }
 
     /**
-     * Finding conversation-image-path: the image name of a message goes into
-     * File(imageDir, name) as it is, thus "../conversation.json" reads a file
+     * An image name that is not a name of save() reads no file (finding
+     * conversation-image-path, task #166): "../secret.bin" would read a file
      * outside of the image directory as the image of the message.
      */
     @Test
     fun anImageNameOutsideTheImageDirectoryIsNotRead() {
-        FuzzSwitch.requireFindings("conversation-image-path")
         File(folder.root, "images").mkdirs()
         File(folder.root, "secret.bin").writeBytes(byteArrayOf(1, 2, 3))
         val msg = JSONObject().put("role", "user").put("content", "x").put("image", "../secret.bin")

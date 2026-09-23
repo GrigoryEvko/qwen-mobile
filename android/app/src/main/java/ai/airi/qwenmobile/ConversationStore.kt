@@ -142,9 +142,14 @@ class ConversationStore(private val dir: File) {
         return out
     }
 
-    /** The entry of one message object of the file. */
+    /**
+     * The entry of one message object of the file. The image name must have
+     * the form that [hashName] gives, thus a name such as
+     * "../conversation.json" does not read a file outside of the image
+     * directory (task #166).
+     */
     private fun entryOf(obj: JSONObject): Entry {
-        val image = obj.optString("image", "").takeIf { it.isNotEmpty() }
+        val image = obj.optString("image", "").takeIf { IMAGE_NAME.matches(it) }
             ?.let { File(imageDir, it) }?.takeIf { it.isFile }?.readBytes()
         return Entry(
             role = obj.getString("role"),
@@ -202,5 +207,8 @@ class ConversationStore(private val dir: File) {
 
     private companion object {
         const val TAG = "ConversationStore"
+
+        /** The name of an image file: the SHA-1 of its bytes in hexadecimal, then .jpg (refer to hashName). */
+        val IMAGE_NAME = Regex("[0-9a-f]{40}\\.jpg")
     }
 }
