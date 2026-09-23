@@ -17,15 +17,10 @@ include("${CMAKE_CURRENT_LIST_DIR}/common.cmake")
 # traits) has its fix in patches/fuzz-ops/0002, thus each function report
 # stops the run.
 #
-# Reason for -fsanitize-recover=integer-divide-by-zero: the tracked finding
-# of task #156 (2026-09-23). The supports_op of MUL_MAT_ID in
-# ggml-hexagon.cpp calls init_fastdiv_values(ne12 / ne02), which divides by
-# zero when there are fewer tokens than experts. The entry
-# "integer-divide-by-zero:^init_fastdiv_values(" of ubsan.supp suppresses it.
-# On x86 the division then traps with SIGFPE, thus only arm64 (the phone) runs
-# past it. Each other division report stops the run. Remove
-# "integer-divide-by-zero" when task #156 lands.
+# integer-divide-by-zero does not recover: its finding (task #156,
+# init_fastdiv_values in the matmul params of the Hexagon host) has its fix
+# in patches/fuzz-hexhost/0004, thus each division report stops the run.
 sanitizer_matrix_apply(ubsan
-    "-fsanitize=undefined -fno-sanitize-recover=undefined -fsanitize-recover=integer-divide-by-zero"
+    "-fsanitize=undefined -fno-sanitize-recover=undefined"
     "-fsanitize=undefined"
     "")

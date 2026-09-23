@@ -1,0 +1,78 @@
+hexagon: give init_fastdiv_values no divisor of zero in the matmul params
+Fold-into: upstream/hexagon-host
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+Finding mm-id-div-zero of fuzz-hexhost, task #156. The matmul params of the
+host (ggml_hexagon_precompute_matmul_params_impl, which supports_op also
+calls) give five divisors to init_fastdiv_values, and init_fastdiv_values
+divides by its argument. For MUL_MAT_ID, ne02 is the expert count and ne12
+the token count. Thus one token with more than one expert gives
+ne12 / ne02 = 0, and an empty src1 gives ne11 = 0. The division by zero is
+undefined behavior. On x86 it stops the process with SIGFPE. On arm64 the
+division gives 0, thus the phone did not stop.
+
+This patch gives init_fastdiv_values the divisor 1 in place of 0.
+init_fastdiv_values(1) gives the values that the arm64 division by 0 gave,
+thus the DSP gets the same kernel params on the phone.
+ggml_hexagon_precompute_fused_mmnx_params has the same five lines. It runs
+only in the fusion of an op batch, the host puts no empty op into a batch,
+and for a dense product ggml_can_mul_mat gives ne12 / ne02 >= 1.
+
+This patch removes the entry "integer-divide-by-zero:^init_fastdiv_values("
+of tests/sanitizers/ubsan.supp and the recovery of integer-divide-by-zero of
+tests/sanitizers/ubsan.cmake (rule L8).
+
+Evidence (2026-09-23):
+- The regression input tests/fuzz/hexhost/regress/kparams/mm-id-div-zero.bin
+  stops with SIGFPE in init_fastdiv_values (hex-fastdiv.h:22), called from
+  the supports_op of MUL_MAT_ID, before this patch. With the five patches of
+  fuzz-hexhost it gives no finding in the asan build, debug and release.
+- The kparams fuzzer with this condition on ran 6 times for 100 s with the
+  patches: no finding.
+- The phone check of the five patches of fuzz-hexhost together (OnePlus 13,
+  the 2B Q8_0 on HTP0, thermal status 0, cpu7 cap 4.32 GHz, battery 27.6 to
+  27.7 °C, MemAvailable 8.9 to 9.5 GB):
+  - test-backend-ops on HTP0, the MUL_MAT_ID cases (390 cases): pass before
+    and after. The four other op groups also pass before and after.
+  - llama-bench tg32 -r 3 after one warmup at 23.76 t/s: before 23.56 ±
+    0.10, after 23.59 ± 0.27, before 23.63 ± 0.13, after 23.57 ± 0.11 t/s.
+  - llama-speculative-simple with the MTP draft of depth 4, temperature 0,
+    64 tokens: before 23.589 and 23.685 t/s, after 24.076 and 24.029 t/s.
+    Each run accepts 44 drafts (52.381 %), and the four runs give the same
+    text.
+
+Measurement: the patch adds one compare for each of five values of the
+matmul params. The host instructions for each decode token of the 4B Q8_0
+graph (x86, the real-graph tool with the fake DSP, perf stat) are in the
+headers of fuzz-hexhost/0001 to 0003. The tg32 of the phone check does not
+change.
+
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 5aa5dc1..d93e7a5 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -5193,11 +5193,18 @@ static void ggml_hexagon_precompute_matmul_params_impl(
+     ggml_hexagon_precompute_hvx_mm_params(sess, src0, src1, dst, wtype, ne02, ne03, ne10, ne11, ne12, ne13, is_matmul_id, src2_row_size, vtcm_budget, kparams);
+ 
+ finalize:
+-    kparams->div_ne12_ne1 = init_fastdiv_values(ne12 * ne11);
+-    kparams->div_ne1      = init_fastdiv_values(ne11);
+-    kparams->div_r2       = init_fastdiv_values(ne02 > 0 ? ne12 / ne02 : 1);
+-    kparams->div_r3       = init_fastdiv_values(ne03 > 0 ? ne13 / ne03 : 1);
+-    kparams->div_ne11     = init_fastdiv_values(ne11);
++    {
++        // init_fastdiv_values divides by its argument. For MUL_MAT_ID ne02 is the expert count and
++        // ne12 the token count, thus one token with more than one expert gives ne12 / ne02 = 0, and
++        // an empty src1 gives ne11 = 0. A divisor of 0 becomes 1: init_fastdiv_values(1) gives the
++        // values that the arm64 division by 0 gave (it returns 0 there), thus the DSP sees no change.
++        auto div_of = [](int d) { return init_fastdiv_values(d > 0 ? (uint32_t) d : 1u); };
++        kparams->div_ne12_ne1 = div_of(ne12 * ne11);
++        kparams->div_ne1      = div_of(ne11);
++        kparams->div_r2       = div_of(ne02 > 0 ? ne12 / ne02 : 1);
++        kparams->div_r3       = div_of(ne03 > 0 ? ne13 / ne03 : 1);
++        kparams->div_ne11     = div_of(ne11);
++    }
+ }
+ 
+ static void ggml_hexagon_precompute_matmul_params(

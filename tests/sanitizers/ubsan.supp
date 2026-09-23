@@ -27,16 +27,3 @@
 # "R13: <profile> only" in its comment.
 #
 # tests/sanitizers/env.sh gives this file to UBSAN_OPTIONS=suppressions=.
-
-# Task #156, 2026-09-23. The supports_op of MUL_MAT_ID (ggml-hexagon.cpp:5122 in
-# ggml_hexagon_precompute_matmul_params_impl, and 5438 in ggml_hexagon_precompute_fused_mmnx_params)
-# calls init_fastdiv_values(ne12 / ne02). With fewer tokens than experts the argument is 0, and
-# hex-fastdiv.h:22 divides by zero. Found by the phone probe of fuzz-hexhost. fuzz-hexhost owns the
-# fix. Remove this entry when task #156 lands.
-# Evidence (supp-repro.sh, regress/kparams/mm-id-div-zero.bin of hexhost, clang 22.1.8): the report
-# frames are "#0 init_fastdiv_values(unsigned int)" and "#1 ggml_hexagon_precompute_matmul_params_impl"
-# at one PC. Here the runtime matches the inlined frame #0: "^ggml_hexagon_precompute_matmul_params_impl("
-# does not match, "init_fastdiv_values" matches. Thus the entry covers each d = 0 of
-# init_fastdiv_values, from each caller. On x86 the division traps with SIGFPE after the suppressed
-# report. On arm64 it gives 0 and the run continues.
-integer-divide-by-zero:^init_fastdiv_values(

@@ -33,8 +33,7 @@ ASAN_RT=libclang_rt.asan-aarch64-android.so
 # The ids of the known findings (fake_dsp.cpp: violation). In the fuzz mode the harness keeps these
 # conditions off (HEXHOST_IGNORE), thus the fuzzers look for new defects. The test mode does not
 # set them, thus each regression input of an open finding fails.
-KNOWN_IDS="env-profile-empty,env-exception,env-devices-range,repack-nonfinite-scale"
-KNOWN_IDS+=",mm-id-div-zero,env-int-overflow"
+KNOWN_IDS="env-profile-empty,env-exception,env-devices-range,repack-nonfinite-scale,env-int-overflow"
 
 # The host switches of the phone runs: a name and the GGML_HEXAGON_* variables of each run
 PHONE_RUNS=(

@@ -8,4 +8,3 @@
 # integer division by zero, the division itself runs, and x86 traps with
 # SIGFPE. Thus the match criterion is the report line, not the exit status.
 # On arm64 (the phone) a division by zero gives 0, and the run continues.
-REPRO-ENTRY: integer-divide-by-zero:^init_fastdiv_values( AREA: hexhost TARGET: kparams INPUT: tests/fuzz/hexhost/regress/kparams/mm-id-div-zero.bin
