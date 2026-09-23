@@ -124,3 +124,4 @@ fuzz-hexhost/0002-hexagon-mul-mat-add-only-for-the-whole-product.patch
 fuzz-hexhost/0003-hexagon-model-the-dsp-limits-in-supports-op.patch
 fuzz-hexhost/0004-hexagon-no-fastdiv-of-zero-in-the-matmul-params.patch
 fuzz-hexhost/0005-hexagon-tiled-matmul-rows-from-dst.patch
+fuzz-ops/0004-ggml-cpu-quantize-a-strided-src1-of-the-repack-matmul.patch

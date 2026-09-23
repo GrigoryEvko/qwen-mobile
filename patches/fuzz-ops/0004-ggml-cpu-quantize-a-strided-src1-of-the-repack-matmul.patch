@@ -1,0 +1,83 @@
+ggml-cpu: quantize a strided src1 of the repack matmul row by row
+Fold-into: upstream/ggml-cpu
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+Finding F-REPACK-1 of fuzz-ops, task #173. The repack MUL_MAT of ggml-cpu
+(Q4_0 and Q8_0 weights in the repack buffer) quantizes src1 in groups of 4
+rows with ggml_quantize_mat_t, which reads the 4 rows at a stride of ne10
+floats. When src1 is a view with nb11 != ne10 * 4 (for example a view of a
+wider tensor), the group reads the wrong values, and the product is wrong:
+on the phone the error was up to 4.7e9 times the strict bound of the case.
+
+This patch copies each group of 4 rows into a contiguous buffer first when
+the rows of src1 are strided. A contiguous src1 takes the same path as
+before.
+
+Evidence (2026-09-23):
+- The op fuzzer on the host (x86, the release and debug none builds): the
+  12 above-loose findings of the Q4_0 repack matmul kinds pass with this
+  patch. The test suite: release 0 findings; debug only the value asserts of
+  task #128.
+- The phone check (OnePlus 13, thermal status 0, battery 28 C, not on a
+  charger): the first 600 cases of the op pack (sha256 d0474fad) with the
+  libraries of the current series against the same tree with this patch.
+  Only libggml-cpu.so differs between the two sets. On the CPU, 587 runs are
+  bit-identical. The other 13 are Q4_0 repack MUL_MATs with a strided f32
+  src1 of 4 to 212 rows: before this patch each was above the loose bound
+  (ratio 3.3e3 to 4.7e9), with it each is within the loose bound (5 pass, 8
+  above the strict bound only, as the contiguous Q4_0 cases). The CPU
+  verdicts of the 600 cases: above-loose 13 before, 0 after.
+
+Measurement: llama-bench on the phone CPU (6 threads, -fa 1, 5 repetitions,
+one warmup run, the order before, after, before, after):
+  tg32, 4B Q8_0:   before 11.32 +- 0.04 and 11.23 +- 0.15, after
+                   11.40 +- 0.18 and 11.31 +- 0.06 tokens/s
+  pp128, 2B Q8_0:  before 236.81 +- 0.77 and 235.48 +- 0.68, after
+                   233.70 +- 1.84 and 235.86 +- 1.47 tokens/s
+No difference is above the spread. A contiguous src1 adds one compare for
+each group of 4 rows.
+
+diff --git a/ggml/src/ggml-cpu/repack.cpp b/ggml/src/ggml-cpu/repack.cpp
+index f5e419c..31e7581 100644
+--- a/ggml/src/ggml-cpu/repack.cpp
++++ b/ggml/src/ggml-cpu/repack.cpp
+@@ -15,6 +15,7 @@
+ #include <cstring>
+ #include <cassert>
+ #include <cstdio>  // for GGML_ASSERT
++#include <vector>
+ 
+ #include "repack.h"
+ 
+@@ -4290,6 +4291,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+ 
+         const ggml_from_float_t from_float = ggml_get_type_traits_cpu(PARAM_TYPE)->from_float;
+ 
++        // ggml_quantize_mat_t reads 4 rows at a stride of ne10 floats. When the rows of src1 have a
++        // different stride (for example a view of a wider tensor), each group of 4 rows goes into a
++        // contiguous buffer first. The buffer has 4*ne10 floats and exists only for such a src1.
++        GGML_ASSERT(nb10 == sizeof(float));
++        const bool         rows_contiguous = nb11 == (size_t) ne10 * sizeof(float);
++        std::vector<float> rows4(rows_contiguous ? 0 : (size_t) 4 * ne10);
++
+         // INFO: Quantization is done in planes to avoid extra complexity in chunking.
+         // Flattening dimensions not multiple of INTER_SIZE would require extra handling depending on how
+         // the planes are broadcast.
+@@ -4298,8 +4306,14 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+             char * wdata_ptr = wdata + i12 * nbw2;
+ 
+             for (int64_t i11 = ith * 4; i11 < ne11 - ne11 % 4; i11 += nth * 4) {
+-                ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>((float *) (data_ptr + i11 * nb11),
+-                                                            (void *) (wdata_ptr + i11 * nbw1), 4, ne10);
++                float * rows = (float *) (data_ptr + i11 * nb11);
++                if (!rows_contiguous) {
++                    for (int64_t r = 0; r < 4; r++) {
++                        memcpy(rows4.data() + r * ne10, data_ptr + (i11 + r) * nb11, ne10 * sizeof(float));
++                    }
++                    rows = rows4.data();
++                }
++                ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>(rows, (void *) (wdata_ptr + i11 * nbw1), 4, ne10);
+             }
+ 
+             const int64_t i11_processed = ne11 - ne11 % 4;
