@@ -27,8 +27,8 @@
 //   P1  No crash, no sanitizer report, no exception out of the C API.
 //   P2  Oracle: after each decode, the logits of the last token of each
 //       sequence equal the logits of a reference context (n_rs_seq 0, one
-//       sequence) that decodes the shadow tokens of that sequence from
-//       position 0. The limit is FUZZ_RECURRENT_TOL * (1 + the largest
+//       sequence, the same flash attention setting) that decodes the shadow
+//       tokens of that sequence from position 0. The limit is FUZZ_RECURRENT_TOL * (1 + the largest
 //       absolute reference logit), with FUZZ_RECURRENT_TOL 2e-4 as the preset
 //       value. A wrong rollback
 //       slot, a stale snapshot group or a wrong state copy gives the logits of
@@ -68,7 +68,12 @@ struct RefCtx {
 };
 
 llama_model * g_model = nullptr;
-RefCtx        g_ref[kMaxSeq];
+// One set of reference contexts with flash attention off [0] and one with it on [1]. The context
+// under test uses the set of its own setting (auto is on for the CPU), because the two attention
+// paths differ by more than the tolerance in an x86 build without SIMD (8.8e-3 against 7.5e-5
+// with AVX2, the tiny model, three tokens).
+RefCtx        g_ref_sets[2][kMaxSeq];
+RefCtx *      g_ref = g_ref_sets[1];
 int32_t       g_n_vocab = 0;
 float         g_tol   = 2e-4f;
 bool          g_trace = false;
@@ -284,6 +289,8 @@ void run(FuzzedDataProvider & fdp) {
     trace("ctx: n_seq_max %u n_rs_seq %u n_ubatch %u unified %d flash %d threads %d embd_host %d",
           p.n_seq_max, p.n_rs_seq, p.n_ubatch, p.unified, p.flash, p.threads, p.embd_host);
 
+    // the reference contexts with the flash attention setting of this context (auto is on for the CPU)
+    g_ref = g_ref_sets[p.flash == 0 ? 0 : 1];
     llama_context * ctx = make_ctx(p);
     if (ctx == nullptr && p.n_rs_seq > 0 && p.n_ubatch <= p.n_rs_seq + 1) {
         return;  // a refusal of this configuration is the correct answer (see finding ubatch-tail)
@@ -565,10 +572,13 @@ extern "C" int LLVMFuzzerInitialize(int * /*argc*/, char *** /*argv*/) {
     cp.no_perf    = true;
     cp.type_k     = GGML_TYPE_F32;
     cp.type_v     = GGML_TYPE_F32;
-    for (RefCtx & r : g_ref) {
-        r.ctx = llama_init_from_model(g_model, cp);
-        if (r.ctx == nullptr) {
-            fuzz::fail("cannot create a reference context");
+    for (int f = 0; f < 2; ++f) {
+        cp.flash_attn_type = f == 0 ? LLAMA_FLASH_ATTN_TYPE_DISABLED : LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        for (RefCtx & r : g_ref_sets[f]) {
+            r.ctx = llama_init_from_model(g_model, cp);
+            if (r.ctx == nullptr) {
+                fuzz::fail("cannot create a reference context (flash attention %s)", f == 0 ? "off" : "on");
+            }
         }
     }
 
