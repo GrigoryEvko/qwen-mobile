@@ -45,8 +45,9 @@
 #                that profile runs.
 #   areas        tests/fuzz/<area>/run.sh <test|fuzz> <config> --profile <p>.
 #                After each area step, the step llama-copy-<area> runs
-#                check-rules.sh --copies-only for that area: each copy of
-#                llama.cpp that its builds use must have the stamp of HEAD,
+#                check-rules.sh --copies-only for the build
+#                <area>-<profile>-<config> of that step: each copy of
+#                llama.cpp that the build uses must have the stamp of HEAD,
 #                or the stamp of HEAD when the area step started. Thus a
 #                result from old llama.cpp code fails the run.
 # The test suite runs rules, llama, app-host, probe-host, lab, supp-repro and
@@ -308,8 +309,11 @@ area_step() {
     start_stamp="$(git -C "$SUITE_REPO_ROOT" rev-parse HEAD:third_party/llama.cpp):$(git -C "$SUITE_REPO_ROOT" rev-parse HEAD:patches)"
     run_step "$mode" "area-$area" "$p" "$c" "$limit" "append:$SUITE_REPO_ROOT/build/fuzz/$area-$p-$c/results.jsonl" \
         "$script" "$mode" "$c" --profile "$p" --budget-seconds "$BUDGET" --jobs "$JOBS"
+    # Only the build of this step: a phone stage of the area can be older on
+    # purpose (it waits for its phone run), and this step did not use it.
     run_step "$mode" "llama-copy-$area" "$p" "$c" $(( 5 * 60 )) "" \
-        "$SUITE_REPO_ROOT/tests/sanitizers/check-rules.sh" --copies-only --areas "$area" --accept-stamp "$start_stamp"
+        "$SUITE_REPO_ROOT/tests/sanitizers/check-rules.sh" --copies-only --areas "$area" --build "$area-$p-$c" \
+        --accept-stamp "$start_stamp"
 }
 
 # Write summary.json and summary.txt from the records of this run.

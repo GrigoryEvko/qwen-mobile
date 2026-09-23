@@ -4,7 +4,7 @@
 # Usage:
 #   tests/sanitizers/check-rules.sh [--areas core,ops,hexhost,app,quant] [--no-builds]
 #                                   [--write-requests] [--json FILE]
-#   tests/sanitizers/check-rules.sh --copies-only [--areas LIST]
+#   tests/sanitizers/check-rules.sh --copies-only [--areas LIST] [--build NAME]...
 #                                   [--accept-stamp COMMIT:PATCHES]...
 #   tests/sanitizers/check-rules.sh --commit-msg FILE
 #   tests/sanitizers/check-rules.sh --noid-self-test
@@ -16,6 +16,9 @@
 #                      before the builds).
 #   --copies-only      Check only the rule LLAMA-COPY. The other rules do
 #                      not include LLAMA-COPY.
+#   --build NAME       With --copies-only: check only the build directory
+#                      build/fuzz/NAME (for example core-debug-none), not
+#                      each matrix build of the areas. The option can repeat.
 #   --accept-stamp C:P Also accept the stamp of the llama.cpp commit C and
 #                      the patches tree P (the value of HEAD when an area
 #                      step started). The stamp of HEAD is always accepted.
@@ -118,6 +121,7 @@ AREAS=""
 CHECK_BUILDS=1
 COPIES_ONLY=0
 COMMIT_MSG=""
+COPY_BUILDS=""
 NOID_SELF_TEST=0
 ACCEPT_STAMPS=""
 WRITE_REQUESTS=0
@@ -724,6 +728,8 @@ check_llama_copies() {
         # Only the matrix builds. A name with a tag after the configuration is
         # the private build of one check, and its tree can differ on purpose.
         [[ "$name" =~ ^[a-z]+(-android)?-(debug|release)-(none|asan|ubsan|tsan|msan|hwasan)$ ]] || continue
+        # --build: only the build directories of one area step.
+        [[ -z "$COPY_BUILDS" || " $COPY_BUILDS " == *" $name "* ]] || continue
         for cache in "$dir/CMakeCache.txt" "$dir/build/CMakeCache.txt"; do
             [[ -f "$cache" ]] || continue
             while IFS= read -r value; do
@@ -910,6 +916,10 @@ main() {
             --copies-only) COPIES_ONLY=1; shift ;;
             --commit-msg) COMMIT_MSG="${2:-}"; [[ -n "$COMMIT_MSG" ]] || { echo "check-rules: --commit-msg needs a file." >&2; exit 2; }; shift 2 ;;
             --noid-self-test) NOID_SELF_TEST=1; shift ;;
+            --build)
+                [[ "${2:-}" =~ ^[a-z]+(-android)?-(debug|release)-(none|asan|ubsan|tsan|msan|hwasan)$ ]] \
+                    || { echo "check-rules: --build needs the name of a matrix build directory, for example core-debug-none." >&2; exit 2; }
+                COPY_BUILDS+=" $2"; shift 2 ;;
             --accept-stamp)
                 [[ "${2:-}" =~ ^[0-9a-f]{40}:[0-9a-f]{40}$ ]] \
                     || { echo "check-rules: --accept-stamp needs COMMIT:PATCHES (two 40-digit ids)." >&2; exit 2; }
