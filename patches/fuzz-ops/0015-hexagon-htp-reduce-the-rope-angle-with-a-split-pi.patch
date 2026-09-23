@@ -1,0 +1,67 @@
+hexagon: htp: reduce the rope angle with a split pi
+Fold-into: upstream/hexagon-htp
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+hvx_vec_sincos_f32 (the sin and cos of the rope cache) reduces the angle x
+to y = x - n pi, with pi rounded to f32 and the product n pi rounded to f32.
+The error of y grows with n, thus with the position of the token. For the
+Qwen3.5 rope (IMROPE, n_dims 64, base 1e7), the simulator of the v79 gives
+these maximum errors of cos and sin against float64, at 256 positions each:
+
+  position     512      4096     8192     32768    131072   262143
+  error        4.8e-5   3.6e-4   5.0e-4   2.8e-3   1.1e-2   1.4e-2
+
+The CPU and the oracle compute sinf and cosf of the same f32 angle, thus
+their error does not grow with the position. The app graphs reach this
+condition: each full attention layer turns Q and K by angles up to the
+position of the token.
+
+This patch reduces with Cody-Waite: pi is the sum of three parts of 7
+significant bits and one f32 part. For n < 2^17 (all the positions of a
+262144-token context), n times a 7-bit part is exact in f32. The simulator
+then gives a maximum error of 1.8e-7 (sin) and 4.0e-7 (cos) at each of the
+positions above. The reduction costs 12 more cycles for each vector of 32
+angles (138 in place of 126), and the rope cache needs one vector for each
+position of each thread.
+
+diff --git a/ggml/src/ggml-hexagon/htp/hvx-sin-cos.h b/ggml/src/ggml-hexagon/htp/hvx-sin-cos.h
+index 8648af0..9f4acf7 100644
+--- a/ggml/src/ggml-hexagon/htp/hvx-sin-cos.h
++++ b/ggml/src/ggml-hexagon/htp/hvx-sin-cos.h
+@@ -4,12 +4,21 @@
+ #include "hvx-base.h"
+ #include "hvx-floor.h"
+ 
++// Subtract n * part from y (the product and the difference are f32).
++static inline HVX_Vector hvx_vec_sincos_sub_part_f32(HVX_Vector y, HVX_Vector n, float part) {
++    HVX_Vector n_part = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(n, hvx_vec_splat_f32(part)));
++    return Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(y, n_part));
++}
++
+ // Range-reduce x to y in [-pi/2, pi/2] and the quadrant sign (-1)^n.
+ // Floor/truncate need IEEE bits, so convert qf32 back to sf before them.
++// The reduction is Cody-Waite: pi is the sum of three parts of 7 significant bits and one f32 part.
++// For n < 2^17 (|x| < 411774, the rope angles of a 262144-token context), n times a 7-bit part is
++// exact in f32, thus the reduced angle has an error of a few ulp of y. With pi rounded to f32 in
++// one product, the error grows with n (2.8e-3 at x = 32768).
+ static inline void hvx_vec_sincos_reduce_f32(HVX_Vector x, HVX_Vector * y, HVX_Vector * sign) {
+     HVX_Vector const_inv_pi  = hvx_vec_splat_f32(0.3183098861837907f);
+     HVX_Vector const_half    = hvx_vec_splat_f32(0.5f);
+-    HVX_Vector const_pi      = hvx_vec_splat_f32(3.141592653589793f);
+     HVX_Vector const_one     = hvx_vec_splat_f32(1.0f);
+     HVX_Vector const_neg_one = hvx_vec_splat_f32(-1.0f);
+     HVX_Vector const_one_i   = Q6_V_vsplat_R(1);
+@@ -20,8 +29,10 @@ static inline void hvx_vec_sincos_reduce_f32(HVX_Vector x, HVX_Vector * y, HVX_V
+     HVX_Vector n_float = hvx_vec_floor_f32(x_over_pi);
+     HVX_Vector n_int   = hvx_vec_truncate_f32(n_float);
+ 
+-    HVX_Vector n_pi = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(n_float, const_pi));
+-    *y = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(x, n_pi));
++    HVX_Vector r = hvx_vec_sincos_sub_part_f32(x, n_float, 3.125f);
++    r = hvx_vec_sincos_sub_part_f32(r, n_float, 0.016357421875f);
++    r = hvx_vec_sincos_sub_part_f32(r, n_float, 0.0002346038818359375f);
++    *y = hvx_vec_sincos_sub_part_f32(r, n_float, 6.278329465203569e-07f);
+ 
+     HVX_VectorPred is_odd = Q6_Q_vcmp_eq_VwVw(Q6_V_vand_VV(n_int, const_one_i), const_one_i);
+     *sign = Q6_V_vmux_QVV(is_odd, const_neg_one, const_one);
