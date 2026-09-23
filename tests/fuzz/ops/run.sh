@@ -75,7 +75,8 @@ Other modes:
                 all eight. The release none build links the shipped libraries of
                 android/snapdragon/jniLibs/arm64-v8a (hash-checked against build/hashes-native.txt).
                 Then make the case pack, and stage the phone files in build/fuzz/ops/phone.
-  phone-commands [probe|full]   Print the adb commands. "probe" runs the first 3 cases of each
+  phone-commands [probe|full|diag]   Print the adb commands. "diag" runs the diagnosis pack of
+                tasks #175 and #178 with repeats on HTP0. "probe" runs the first 3 cases of each
                 build and prints every UBSan report (the evidence run). "full" runs the pack with
                 the builds of PHONE_BUILDS (default: all staged builds). This script never runs adb.
   compare [RESULT...]      Compare the pulled phone results with the oracle, print the per-op
@@ -434,9 +435,11 @@ phone_build() {
     build_oracle
     local stage="$MISC/phone"
     mkdir -p "$stage"
-    # the pack: seeds, a subset of each CPU corpus, the regression inputs, and random cases
-    local -a args=(gen --out "$stage/cases.pack" --n "$PACK_N" --seed 20260923 --max-per-dir "$PACK_CORPUS")
+    # the pack: seeds, a subset of each CPU corpus, the regression inputs, and random cases.
+    # PHONE_KEEP_PACKS=1 keeps cases.pack and san.pack: a phone run must compare with its own pack.
     local g k d
+    if [[ ${PHONE_KEEP_PACKS:-0} != 1 || ! -f $stage/cases.pack || ! -f $stage/san.pack ]]; then
+    local -a args=(gen --out "$stage/cases.pack" --n "$PACK_N" --seed 20260923 --max-per-dir "$PACK_CORPUS")
     for g in $ALL_GROUPS; do
         args+=(--corpus "$g:$HERE/corpus/$g")
         for d in "$REPO_ROOT"/build/fuzz/ops-{debug,release}-none/work/"$g"/corpus; do
@@ -450,6 +453,27 @@ phone_build() {
         done
     fi
     "$B_ORACLE/ops_oracle" "${args[@]}"
+    # The pack of the sanitizer builds: the seeds and the regression inputs only. The host fuzz
+    # suites give the random coverage, thus the phone runs the full pack in the none builds only.
+    local -a sargs=(gen --out "$stage/san.pack" --n 0)
+    for g in $ALL_GROUPS; do
+        sargs+=(--corpus "$g:$HERE/corpus/$g")
+    done
+    if [[ -d "$HERE/regress" ]]; then
+        for k in "$HERE"/regress/*/; do
+            [[ -d $k ]] && sargs+=(--cases "$(basename "$k"):$k")
+        done
+    fi
+    "$B_ORACLE/ops_oracle" "${sargs[@]}"
+    fi
+    # The diagnosis pack of tasks #175 and #178: the regression inputs of MUL_MAT_ID and of the
+    # shared-input MUL_MAT (the HTP0 guard write and the HTP0 run-to-run differences), the Q8_0
+    # MUL_MAT of the model shapes at n = 1 to 8 (mm_model entries 0 to 63), and the F32 (2048, 16)
+    # MUL_MAT of ssm_alpha and ssm_beta of the 2B model, alone and as a pair with one input
+    # (entries 128 to 143). The Q4_0 entries 64 to 127 are not in the pack.
+    "$B_ORACLE/ops_oracle" gen --out "$stage/diag.pack" --n 0 \
+        --cases "mul_mat_id:$HERE/regress/mul_mat_id" --cases "mul_mat_multi:$HERE/regress/mul_mat_multi" \
+        --enumerate mm_model:64 --enumerate-from mm_model:128:16
     local b
     for b in "${builds[@]}"; do
         p=${b%%-*}
@@ -520,7 +544,9 @@ phone_run_cmd() {
     local build=$1 tag=$2 backends=$3 suffix=$4 fusion=$5 adsp=$6 count=$7 halt=$8 trace=${9:-}
     local d=$PHONE_DIR
     echo "adb -s $PHONE shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
-    echo "adb -s $PHONE shell 'timeout -s KILL 100 sh $d/phone_run.sh $build $tag $backends $suffix $fusion $adsp $PHONE_SECONDS $count $halt $trace'"
+    local penv=""
+    [[ -n ${FUZZ_OPS_CMD_PACK:-} && ${FUZZ_OPS_CMD_PACK} != cases.pack ]] && penv="env FUZZ_OPS_PACK=$FUZZ_OPS_CMD_PACK "
+    echo "adb -s $PHONE shell 'timeout -s KILL 100 ${penv}sh $d/phone_run.sh $build $tag $backends $suffix $fusion $adsp $PHONE_SECONDS $count $halt $trace'"
     echo "adb -s $PHONE shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
     echo "adb -s $PHONE shell 'pgrep -a ops_replay; tail -n 4 $d/out/log-$build-$tag.txt'"
 }
@@ -530,12 +556,20 @@ phone_commands() {
     local stage="$MISC/phone" d=$PHONE_DIR adsp=$ADSP_DIR b
     [[ -f "$stage/cases.pack" && -f "$stage/phone_run.sh" ]] || die "run tests/fuzz/ops/run.sh phone-build first"
     local -a staged=()
-    for b in "$stage"/*-*/; do
+    for b in "$stage"/{debug,release}-{none,asan,hwasan,ubsan}/; do
         [[ -f "$b/ops_replay" ]] && staged+=("$(basename "$b")")
     done
-    echo "# 1. Push the files. The old files of the mixed ASan+UBSan build go first."
+    if [[ $what == diag ]]; then
+        echo "# 1. Push the files of the diagnosis. The work directory stays as it is (the full commands"
+        echo "#    empty it later, thus pull the diagnosis results before them)."
+        echo "adb -s $PHONE shell 'mkdir -p $d/out'"
+        echo "adb -s $PHONE push $stage/phone_run.sh $stage/diag.pack $d/"
+        echo "adb -s $PHONE push $stage/release-none $d/"
+        echo "adb -s $PHONE shell 'chmod 755 $d/release-none/ops_replay; sha256sum $d/diag.pack $d/release-none/ops_replay | cut -c1-16'"
+    else
+    echo "# 1. Push the files into an empty work directory."
     echo "adb -s $PHONE shell 'rm -rf $d && mkdir -p $d/out $d/dsp'"
-    echo "adb -s $PHONE push $stage/phone_run.sh $stage/cases.pack $d/"
+    echo "adb -s $PHONE push $stage/phone_run.sh $stage/cases.pack $stage/san.pack $stage/diag.pack $d/"
     for b in "${staged[@]}"; do
         echo "adb -s $PHONE push $stage/$b $d/"
     done
@@ -547,7 +581,46 @@ phone_commands() {
         adsp="$d/dsp"
         echo "adb -s $PHONE push $stage/libggml-htp-v79.so $d/dsp/"
     fi
+    fi
     echo
+    if [[ $what == diag ]]; then
+        # diag.pack: the regression inputs of mul_mat_id and mul_mat_multi, 64 Q8_0 cases, then the
+        # 16 F32 cases. Each regression input decodes to one case.
+        local DIAG_F32_FIRST
+        DIAG_F32_FIRST=$(( $(find "$HERE/regress/mul_mat_id" "$HERE/regress/mul_mat_multi" -name '*.bin' | wc -l) + 64 ))
+        echo "# 2. The diagnosis of tasks #175 and #178 on HTP0 (the release none build, the shipped"
+        echo "#    libraries): diag.pack, each case 20 times with new buffers (--repeat 20). A run with"
+        echo "#    different outputs gets NONDET, a write outside a tensor gets GUARD. Three variants:"
+        echo "#    the default, one HVX thread (GGML_HEXAGON_NHVX=1), and no graph and batch caches."
+        echo "#    Each command resumes the last one; run each command until its log shows 'all runs done'."
+        echo "#    A fourth variant runs the F32 (2048, 16) cases of ssm_alpha and ssm_beta (the last 16"
+        echo "#    cases of diag.pack, from index $DIAG_F32_FIRST) without the fusions."
+        local variant tag xenv n fusion extra parts
+        for variant in default nhvx1 nocache nofuse-f32; do
+            fusion=1
+            extra="--repeat 20"
+            parts=4
+            case $variant in
+                default)    xenv="" ;;
+                nhvx1)      xenv="GGML_HEXAGON_NHVX=1" ;;
+                nocache)    xenv="GGML_HEXAGON_GRAPHCACHE=0 GGML_HEXAGON_BATCHCACHE=0" ;;
+                nofuse-f32) xenv=""; fusion=0; extra="--repeat 20 --first $DIAG_F32_FIRST"; parts=1 ;;
+            esac
+            tag="diag-$variant"
+            for n in $(seq 1 "$parts"); do
+                echo "# $variant, part $n"
+                echo "adb -s $PHONE shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
+                echo "adb -s $PHONE shell 'timeout -s KILL 100 env FUZZ_OPS_PACK=diag.pack FUZZ_OPS_EXTRA=\"$extra\" FUZZ_OPS_ENV=\"$xenv\" sh $d/phone_run.sh release-none $tag HTP0 -$variant $fusion $adsp $PHONE_SECONDS all 1'"
+                echo "adb -s $PHONE shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
+                echo "adb -s $PHONE shell 'pgrep -a ops_replay; tail -n 2 $d/out/log-release-none-$tag.txt'"
+            done
+        done
+        echo
+        echo "# 3. Pull the logs and results."
+        echo "mkdir -p $stage/pulled-diag"
+        echo "adb -s $PHONE pull $d/out $stage/pulled-diag/"
+        return 0
+    fi
     if [[ $what == probe ]]; then
         echo "# 2. The probe: the first 3 cases on CPU and HTP0 with each build (one profile, one sanitizer)."
         echo "#    The ASan builds run under the ptrace tracer of ops_replay (--trace): it prints the pc, the"
@@ -578,13 +651,28 @@ phone_commands() {
     fi
     local -a runs=("${staged[@]}")
     [[ -n $PHONE_BUILDS ]] && read -r -a runs <<< "$PHONE_BUILDS"
-    echo "# 2. The full runs: each build on CPU and HTP0 with the fusions of the app, then HTP0"
-    echo "#    without the fusions. Repeat each run until its log shows 'all runs done'."
+    echo "# 2. The full runs, in parts of $PHONE_SECONDS s (each command stops at its deadline and the next"
+    echo "#    part resumes). The none builds run cases.pack (1019 cases) on CPU and HTP0 with the"
+    echo "#    fusions of the app, and on HTP0 without the fusions. The sanitizer builds run san.pack"
+    echo "#    (the seeds and the regression inputs) on CPU and HTP0 with the fusions: the sanitizers"
+    echo "#    instrument the host code, and the host fuzz suites give the random coverage. When the log"
+    echo "#    of a run shows 'all runs done', skip its other parts. The part counts are estimates."
+    local parts n pack
     for b in "${runs[@]}"; do
-        echo "# $b: app"
-        phone_run_cmd "$b" app CPU,HTP0 - 1 "$adsp" all 1
-        echo "# $b: nofuse"
-        phone_run_cmd "$b" nofuse HTP0 -nofuse 0 "$adsp" all 1
+        case ${b#*-} in
+            none) parts=3; pack=cases.pack ;; *) parts=1; pack=san.pack ;;
+        esac
+        [[ ${b%%-*} == debug ]] && parts=$((parts + 1))
+        for n in $(seq 1 "$parts"); do
+            echo "# $b: app, part $n of $parts ($pack)"
+            FUZZ_OPS_CMD_PACK=$pack phone_run_cmd "$b" app CPU,HTP0 - 1 "$adsp" all 1
+        done
+        if [[ ${b#*-} == none ]]; then
+            for n in 1 2; do
+                echo "# $b: nofuse, part $n of 2"
+                phone_run_cmd "$b" nofuse HTP0 -nofuse 0 "$adsp" all 1
+            done
+        fi
     done
     echo
     echo "# 3. Pull the results, then run: tests/fuzz/ops/run.sh compare"
@@ -595,21 +683,39 @@ phone_commands() {
     echo "adb -s $PHONE shell 'rm -rf $d'"
 }
 
+# Compare the pulled phone results with the oracle. Each result file goes with its pack: the
+# diagnosis runs (tag diag-*) with diag.pack, the none builds with cases.pack, and the sanitizer
+# builds with san.pack. One table and one findings directory for each pack.
 compare() {
     build_oracle
     local stage="$MISC/phone"
     local -a results=("$@")
     if [[ ${#results[@]} -eq 0 ]]; then
-        mapfile -t results < <(find "$stage/pulled" -name 'res-*.bin' | sort)
+        mapfile -t results < <(find "$stage"/pulled* -name 'res-*.bin' | sort)
     fi
     [[ ${#results[@]} -gt 0 ]] || die "no result files: pull them first (run.sh phone-commands)"
-    local -a args=(compare --pack "$stage/cases.pack" --findings "$MISC/findings-phone")
-    local r
+    local -a cases_r=() san_r=() diag_r=()
+    local r base
     for r in "${results[@]}"; do
-        args+=(--results "$r")
+        base=$(basename "$r")
+        if [[ $base == *-diag-* ]]; then
+            diag_r+=(--results "$r")
+        elif [[ $base == res-debug-none-* || $base == res-release-none-* ]]; then
+            cases_r+=(--results "$r")
+        else
+            san_r+=(--results "$r")
+        fi
     done
     mkdir -p "$MISC/logs"
-    "$B_ORACLE/ops_oracle" "${args[@]}" | tee "$MISC/logs/phone-compare.txt"
+    : > "$MISC/logs/phone-compare.txt"
+    local pack
+    for pack in cases san diag; do
+        local -n list="${pack}_r"
+        [[ ${#list[@]} -gt 0 && -f "$stage/$pack.pack" ]] || continue
+        echo "== $pack.pack" | tee -a "$MISC/logs/phone-compare.txt"
+        "$B_ORACLE/ops_oracle" compare --pack "$stage/$pack.pack" --findings "$MISC/findings-phone-$pack" \
+            "${list[@]}" | tee -a "$MISC/logs/phone-compare.txt"
+    done
 }
 
 minimize() {
@@ -771,14 +877,22 @@ phone_check_commands() {
     local after="$stage/libs-$TAG" tools="$stage/check-$TAG-tools"
     [[ -f $after/tools/llama-bench && -f $stage/release-none/ops_replay && -f $stage/cases.pack ]] \
         || die "run phone-build and phone-libs first"
-    check_shipped
+    # "before": the shipped libraries, or with FUZZ_OPS_CHECK_BEFORE=TAG0 the private build libs-TAG0
+    # (the current series without the fix, when the series has changed since the shipped build)
+    local before_dir="$SHIPPED_LIBS"
+    if [[ -n ${FUZZ_OPS_CHECK_BEFORE:-} ]]; then
+        before_dir="$stage/libs-$FUZZ_OPS_CHECK_BEFORE"
+        [[ -f $before_dir/libggml-cpu.so ]] || die "no libraries in $before_dir (run phone-libs for that tag)"
+    else
+        check_shipped
+    fi
     for side in before after; do
         rm -rf "$stage/check-$TAG-$side"
         mkdir -p "$stage/check-$TAG-$side"
         cp -f "$stage/release-none/ops_replay" "$stage/check-$TAG-$side/"
         for lib in $LLAMA_LIBS; do
             if [[ $side == before ]]; then
-                cp -f "$SHIPPED_LIBS/lib$lib.so" "$stage/check-$TAG-$side/"
+                cp -f "$before_dir/lib$lib.so" "$stage/check-$TAG-$side/"
             else
                 cp -f "$after/lib$lib.so" "$stage/check-$TAG-$side/"
             fi
@@ -790,7 +904,7 @@ phone_check_commands() {
     local status="adb -s $PHONE shell 'dumpsys thermalservice | grep \"Thermal Status\"; cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq /sys/devices/system/cpu/cpu7/cpufreq/scaling_max_freq; dumpsys battery | grep -E \"powered|status|temperature\"'"
     local m4=/data/local/tmp/qwen/models/Qwen3.5-4B-Q8_0.gguf m2=/data/local/tmp/qwen/models/Qwen3.5-2B-Q8_0.gguf
     local bench="$d/check-$TAG-tools/llama-bench -dev none -ngl 0 -t 6 -fa 1 -o md"
-    echo "# The phone check of FUZZ_OPS_TAG=$TAG (landing rule L5). Do not run on the charger."
+    echo "# The phone check of FUZZ_OPS_TAG=$TAG (landing rule L5), before = $before_dir. Do not run on the charger."
     echo "adb -s $PHONE shell 'mkdir -p $d/out'"
     echo "adb -s $PHONE push $stage/check-$TAG-before $stage/check-$TAG-after $tools $d/"
     echo "adb -s $PHONE shell 'chmod 755 $d/check-$TAG-*/ops_replay $d/check-$TAG-tools/llama-bench; cd $d && sha256sum check-$TAG-*/*.so check-$TAG-tools/llama-bench | cut -c1-16'"

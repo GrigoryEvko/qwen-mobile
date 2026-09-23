@@ -6,7 +6,7 @@
 //       Serve the libFuzzer harness on stdin and stdout.
 //   ops_oracle gen --out PACK [--group G] [--n N] [--seed S] [--len L] [--max-per-dir M]
 //                  [--corpus GROUP:DIR]... [--tame-corpus GROUP:DIR]... [--cases KIND:DIR]...
-//                  [--enumerate KIND:COUNT]... [--max-bytes B]
+//                  [--enumerate KIND:COUNT]... [--enumerate-from KIND:FIRST:COUNT]... [--max-bytes B]
 //       Write a pack of cases: N random cases of each kind of the group, the inputs of libFuzzer
 //       corpora (decoded with the group of the fuzzer that made them; a --tame-corpus with the
 //       tame values of the fuzz suite), and case files of one kind (a file with the prefix
@@ -116,7 +116,7 @@ int cmd_gen(int argc, char ** argv) {
     size_t      max_per_dir = 0;
     std::vector<std::pair<std::string, std::string>> corpora, casedirs;
     std::vector<bool>                                corpus_tame;  // one flag for each corpora entry
-    std::vector<std::pair<std::string, int>>         enumerate;    // KIND:COUNT entries
+    std::vector<std::pair<std::string, std::pair<int, int>>> enumerate;  // KIND, (FIRST, COUNT)
     for (int i = 2; i < argc; i++) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -133,14 +133,22 @@ int cmd_gen(int argc, char ** argv) {
         else if (a == "--seed") seed = std::strtoull(next().c_str(), nullptr, 10);
         else if (a == "--max-bytes") max_bytes = std::strtoull(next().c_str(), nullptr, 10);
         else if (a == "--max-per-dir") max_per_dir = (size_t) std::strtoull(next().c_str(), nullptr, 10);
-        else if (a == "--enumerate") {
-            const std::string v = next();
-            const size_t      c = v.find(':');
-            if (c == std::string::npos) {
-                std::fprintf(stderr, "ops_oracle gen: --enumerate takes KIND:COUNT\n");
+        else if (a == "--enumerate" || a == "--enumerate-from") {
+            // KIND:COUNT (the entries 0 to COUNT - 1) or KIND:FIRST:COUNT
+            const std::string v  = next();
+            const size_t      c1 = v.find(':');
+            const size_t      c2 = c1 == std::string::npos ? std::string::npos : v.find(':', c1 + 1);
+            if (c1 == std::string::npos || (a == "--enumerate-from") != (c2 != std::string::npos)) {
+                std::fprintf(stderr, "ops_oracle gen: %s takes %s\n", a.c_str(),
+                             a == "--enumerate" ? "KIND:COUNT" : "KIND:FIRST:COUNT");
                 return 2;
             }
-            enumerate.push_back({ v.substr(0, c), std::atoi(v.substr(c + 1).c_str()) });
+            if (c2 == std::string::npos) {
+                enumerate.push_back({ v.substr(0, c1), { 0, std::atoi(v.substr(c1 + 1).c_str()) } });
+            } else {
+                enumerate.push_back({ v.substr(0, c1), { std::atoi(v.substr(c1 + 1, c2 - c1 - 1).c_str()),
+                                                         std::atoi(v.substr(c2 + 1).c_str()) } });
+            }
         } else if (a == "--corpus" || a == "--tame-corpus" || a == "--cases") {
             const std::string v = next();
             const size_t      c = v.find(':');
@@ -218,7 +226,7 @@ int cmd_gen(int argc, char ** argv) {
             std::fprintf(stderr, "ops_oracle gen: %s is not a kind\n", en.first.c_str());
             return 2;
         }
-        for (int i = 0; i < en.second; i++) {
+        for (int i = en.second.first; i < en.second.first + en.second.second; i++) {
             std::vector<uint8_t> b(11, 0);
             b[0] = (uint8_t) k;
             b[1] = 7;

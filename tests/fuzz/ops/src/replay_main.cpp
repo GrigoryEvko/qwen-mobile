@@ -3,11 +3,12 @@
 //
 //   ops_replay --pack PACK --out RESULTS --progress FILE --backends CPU,HTP0
 //              [--tag-suffix S] [--deadline EPOCH] [--max-bytes B] [--count N]
-//              [--repeat K] [--only KIND,KIND...]
+//              [--repeat K] [--only KIND,KIND...] [--first N]
 //
 // --count N runs only the first N cases of the pack (a short probe run). --repeat K runs each case K
 // times on each backend, each time with new buffers, and flags the run as nondeterministic
 // (FLAG_NONDET) when a repeat gives different output bytes. --only runs only the cases of the kinds.
+// --first N starts at case N of the pack (with --count, the cases N to N + COUNT - 1).
 //
 //   ops_replay [--trace] --selftest-threads
 //
@@ -55,7 +56,7 @@ void usage() {
     std::fprintf(stderr,
                  "usage: ops_replay --pack PACK --out RESULTS --progress FILE --backends CPU,HTP0\n"
                  "                  [--tag-suffix S] [--deadline EPOCH] [--max-bytes B] [--count N]\n"
-                 "                  [--repeat K] [--only KIND,KIND...]\n");
+                 "                  [--repeat K] [--only KIND,KIND...] [--first N]\n");
 }
 
 // Split a comma list. O(length).
@@ -140,6 +141,7 @@ int replay_main(int argc, char ** argv) {
     uint64_t    max_bytes  = uint64_t(64) << 20;
     size_t      count      = SIZE_MAX;
     int         repeat     = 1;
+    size_t      first      = 0;
     std::string only_arg;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -158,6 +160,7 @@ int replay_main(int argc, char ** argv) {
         else if (a == "--count") count = (size_t) std::strtoull(v.c_str(), nullptr, 10);
         else if (a == "--repeat") repeat = std::max(1, std::atoi(v.c_str()));
         else if (a == "--only") only_arg = v;
+        else if (a == "--first") first = (size_t) std::strtoull(v.c_str(), nullptr, 10);
         else {
             usage();
             return 1;
@@ -241,7 +244,8 @@ int replay_main(int argc, char ** argv) {
     std::vector<backend_ctx> bes(devs.size());
     std::vector<bool>        opened(devs.size(), false);
     size_t                   n_run = 0;
-    for (size_t idx = 0; idx < cases.size() && idx < count; idx++) {
+    const size_t last = count == SIZE_MAX ? cases.size() : std::min(cases.size(), first + count);
+    for (size_t idx = first; idx < last; idx++) {
         for (size_t d = 0; d < devs.size(); d++) {
             const std::string tag = devs[d] + suffix;
             if (done.count({ idx, tag }) || dead.count(tag)) {

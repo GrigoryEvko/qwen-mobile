@@ -298,8 +298,28 @@ bool build_mm_model(builder & b) {
         { 2048, 6144 }, { 6144, 2048 }, { 2048, 2048 }, { 2048, 512 },    // 2B: ffn up, ffn down, attn, kv
     };
     const size_t  n_km  = sizeof(km) / sizeof(km[0]);
+    const size_t  n_q   = 2 * n_km * 8;   // the quantized entries
     const uint8_t sel   = b.rd.u8();
-    const size_t  entry = sel % (2 * n_km * 8);
+    const size_t  entry = sel % (n_q + 16);
+    if (entry >= n_q) {
+        // The F32 ssm_alpha and ssm_beta weights of the 2B model, (2048, 16), at n = 1 to 8: one
+        // MUL_MAT (entries n_q to n_q + 7), or the pair of MUL_MATs with the same input as the GDN
+        // layer has it (entries n_q + 8 to n_q + 15), which the HTP0 fusions can join.
+        const bool    pair = entry >= n_q + 8;
+        const int64_t n    = (int64_t) ((entry - n_q) % 8) + 1;
+        ggml_tensor * x    = b.f32(2048, n, 1, 1, b.vs(-4.0f, 4.0f));
+        const int     nw   = pair ? 2 : 1;
+        for (int i = 0; i < nw; i++) {
+            ggml_tensor * w = b.typed(GGML_TYPE_F32, 2048, 16, 1, 1, b.vs(-0.125f, 0.125f), leaf_role::WEIGHT);
+            ggml_tensor * y = ggml_mul_mat(b.ctx, w, x);
+            ggml_build_forward_expand(b.c.gf, y);
+            b.out(y, i == 0 ? "alpha" : "beta");
+        }
+        b.c.desc = fmt("MUL_MAT model%s w=f32[2048,16] x=f32[2048,%lld] (ssm_alpha, ssm_beta of the 2B)",
+                       pair ? " x2 shared x" : "", (long long) n);
+        b.c.path = fmt("f32/%s/n%lld", pair ? "pair" : "one", (long long) n);
+        return true;
+    }
     const ggml_type wt  = types[entry / (n_km * 8)];
     const int64_t k     = km[entry / 8 % n_km][0];
     const int64_t m     = km[entry / 8 % n_km][1];
