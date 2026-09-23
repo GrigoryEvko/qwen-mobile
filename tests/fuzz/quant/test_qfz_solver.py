@@ -68,8 +68,8 @@ def test_solve_grid_is_row_chunk_invariant(spec, kind: str, seed: int, qronos: b
 
     A matrix product of 1 row and of 2 rows can use different BLAS kernels,
     thus a value near a rounding boundary can move by one level, and a scale
-    by some F16 steps (seen with the Qronos refit on 2026-09-23). A slicing
-    defect moves most values. The test thus permits at most 1/16 of the
+    by some F16 steps (the Qronos refit shows it). A slicing defect moves
+    most values. The test thus permits at most 1/16 of the
     blocks with a different scale and 1/16 of the values with a different
     level, each by a small step.
     """
@@ -122,8 +122,8 @@ def test_ste_exports_the_weight_of_its_forward(spec, kind: str, seed: int) -> No
     float32 step. The straight-through sum latent + (w_q − latent) also
     rounds at the step of the latent value. The tolerance accepts these two
     steps. A latent value within 1e-5 of a rounding midpoint can also go to
-    the next level, because of the step of the scale (seen on 2026-09-23 in
-    1 of 20451 examples). Any other different index fails the test.
+    the next level, because of the step of the scale. Any other different
+    index fails the test.
     """
     w = torch.from_numpy(spec.build())
     grid = GRIDS[kind]()

@@ -213,9 +213,9 @@ def kl_statistics(log: str) -> dict[str, float]:
     """Give the final KL statistics of a llama-perplexity output, and refuse an output that has no such block.
 
     llama-perplexity writes the statistics block at the end of the run. A
-    run that stops before it, or that loses its log at the exit (finding
-    QT1, task #172, patches/fuzz-quant/0002), has no result, even with the
-    exit status 0. The chunk lines alone are not a result.
+    run that stops before it, or that loses its log at the exit (a build
+    without patches/fuzz-quant/0002), has no result, even with the exit
+    status 0. The chunk lines alone are not a result.
 
     Args:
         log: The output of the run

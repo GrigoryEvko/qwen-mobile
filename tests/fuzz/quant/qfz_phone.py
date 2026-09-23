@@ -178,8 +178,8 @@ def build_files(seed: int = 20260923) -> dict:
     (OUT / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
     if no_block:
         raise RuntimeError(f"{len(no_block)} host runs have no final KL statistics block: {', '.join(no_block)}. "
-                           f"Their logs are in {host_logs}. A build without patches/fuzz-quant/0002 (task #172) "
-                           "can lose the block at the exit: rebuild it.")
+                           f"Their logs are in {host_logs}. A build without patches/fuzz-quant/0002 can lose "
+                           "the block at the exit: rebuild it.")
     return manifest
 
 
@@ -210,8 +210,8 @@ def phone_commands() -> str:
         "",
         "# 2. The runs: before each run the charger state, the caps and the thermal status; the loop stops at a",
         "#    status other than 0 or on a charger. After each run the status and the llama processes. A run whose",
-        "#    log has no final KL statistics block fails: llama-perplexity without patches/fuzz-quant/0002 (task #172)",
-        "#    can lose the block at the exit with the status 0. The run is not done again.",
+        "#    log has no final KL statistics block fails: llama-perplexity without patches/fuzz-quant/0002 can lose",
+        "#    the block at the exit with the status 0. The run is not done again.",
         "failed=0",
         f"for name in {' '.join(names)}; do",
         "  for dev in htp0 cpu; do",
@@ -294,7 +294,9 @@ def write_seeds() -> list[Path]:
     - seeds/reader: two small toy exports (the gguf-py reader, the atheris
       reader target, the loader check)
     - seeds/pack: raw inputs of the atheris packer target
-    - regress/reader: the minimal files of QR1, QR2 and QR4
+    - regress/reader: the minimal files of three reader defects: a scalar
+      array longer than the file, a tensor offset that wraps, and a block
+      tensor with no dimension
     - regress/ggml: the minimal files of the five reports of the ggml loader
       in the metadata mode (the loader check)
     - regress/ggml-full: the minimal file of the abort of the ggml loader in
@@ -314,12 +316,14 @@ def write_seeds() -> list[Path]:
     written = []
     geo = dataclasses.replace(SMALL, n_embd=32, n_ff=64, n_layer=2, n_vocab=265)
     with scratch() as tmp:
-        for kind, tie in (("Q8_0", False), ("Q4_0", True)):
-            src = write_source(tmp / "src.gguf", geo, "normal", 1, tied=tie)
+        # The seed of the Q8_0 toy gives tensor bytes that hold no text which the label rule (NOID) of
+        # tests/sanitizers/check-rules.sh reports.
+        for kind, tie, seed in (("Q8_0", False, 4), ("Q4_0", True, 1)):
+            src = write_source(tmp / "src.gguf", geo, "normal", seed, tied=tie)
             rot = None
             if tie:
                 rot = tmp / "rot.npy"
-                np.save(rot, output_rot_for(geo, 1))
+                np.save(rot, output_rot_for(geo, seed))
             plan = Plan(bulk=kind, head=kind, embedding=kind, kv_proj=kind, gdn_gate=kind, n_layers=geo.n_layer)
             path = reader / f"toy-{kind.lower()}{'-tied' if tie else ''}.seed"
             export(src.path, tmp / "out.gguf", tmp / "no-packs", plan, LLAMA_DIR, torch.device("cpu"), tie_head=tie,
@@ -332,11 +336,11 @@ def write_seeds() -> list[Path]:
         return raw + b"\0" * ((-len(raw)) % 32) + data
 
     files = {
-        bad_reader / "qr1-long-scalar-array.seed": header(0, [("a", struct.pack("<IIQ", 9, 0, 4_000_000))]),
-        bad_reader / "qr2-offset-wrap.seed": padded(header(1, []) + tensor_info("t", [4], 0, 2**64 - 64),
-                                                    np.arange(4, dtype=np.float32).tobytes()),
-        # QR4: a Q4_0 tensor with no dimension. The atheris reader target found it.
-        bad_reader / "qr4-zero-dim-block-type.seed": padded(header(1, []) + tensor_info("t", [], 2, 0), bytes(32)),
+        bad_reader / "long-scalar-array.seed": header(0, [("a", struct.pack("<IIQ", 9, 0, 4_000_000))]),
+        bad_reader / "offset-wrap.seed": padded(header(1, []) + tensor_info("t", [4], 0, 2**64 - 64),
+                                                np.arange(4, dtype=np.float32).tobytes()),
+        # A Q4_0 tensor with no dimension: one element, not a full block.
+        bad_reader / "zero-dim-block-type.seed": padded(header(1, []) + tensor_info("t", [], 2, 0), bytes(32)),
         # gguf.cpp:576: the KV type 512 goes into enum gguf_type before the range check.
         ggml / "kv-type-enum.seed": header(0, [("a", struct.pack("<I", 512))]),
         # gguf.cpp:585: the array element type 512 goes into enum gguf_type before the range check.

@@ -2,14 +2,14 @@
 
 Every fuzzer of tests/fuzz/quant imports this module. It holds no test.
 
-The known findings are the open defects that the campaign recorded. Each
-finding has an identifier (for example "QF1"). A fuzzer does not make the
-inputs of an open finding, unless the environment variable ``QFZ_KNOWN``
-holds "all" or the identifier.
+KNOWN_DEFECTS holds each known defect of the code under test, with a short
+name that says what is wrong. A fuzzer does not make the inputs of a known
+defect, unless the environment variable ``QFZ_KNOWN`` holds "all" or the
+name.
 
-The directory ``regress`` holds each failing input of the campaign:
+The directory ``regress`` holds each failing input of the fuzzers:
 ``regress/test_qfz_regressions.py`` holds the minimal example of each
-finding as a test, and ``regress/<target>`` holds the input files that the
+defect as a test, and ``regress/<target>`` holds the input files that the
 test mode of run.sh replays. The directory ``seeds`` holds the other seed
 files, which do not fail.
 """
@@ -64,12 +64,16 @@ def san_dir(sanitizer: str | None = None, profile: str | None = None) -> Path:
 CHECK_BIN = san_dir() / "bin" / "qfz-gguf-check"
 LLAMA_BIN = san_dir() / "llama" / "bin"
 
-# The open findings of the campaign. The regression tests give the file, the line and the example.
-KNOWN_FINDINGS = {
-    "QF8": "the export casts the dense maps to F16 with no check, thus an overflow gives inf",
-    "QF9": "the scale search compares float32 scales but stores their F16 rounding, which can lose to the plain scale",
-    "QF10": "the export filter --only applies to Q4_0 and Q8_0, thus an IQ4_NL tensor out of the match stays IQ4_NL",
-    "QF11": "each export() call puts llama_dir/gguf-py at the front of sys.path again, thus sys.path only grows",
+# The known defects of the code under test. The regression tests give the file and the minimal example of each.
+KNOWN_DEFECTS = {
+    "dense-map-f16-overflow":
+        "the export casts the dense maps to F16 with no check, thus an overflow gives inf",
+    "searched-scale-f16-rounding":
+        "the scale search compares float32 scales but stores their F16 rounding, which can lose to the plain scale",
+    "only-filter-skips-iq4-nl":
+        "the export filter --only applies to Q4_0 and Q8_0, thus an IQ4_NL tensor out of the match stays IQ4_NL",
+    "sys-path-growth":
+        "each export() call puts llama_dir/gguf-py at the front of sys.path again, thus sys.path only grows",
 }
 
 # The largest finite F16 value, and the smallest positive subnormal F16 value.
@@ -109,44 +113,44 @@ def scale_domain(w: np.ndarray, kind: str) -> str:
     return "edge" if amax >= top * 65519.0 / SEARCH_FACTOR[kind] else "in"
 
 
-def fixed(finding: str) -> bool:
-    """Tell if a run must treat a finding as fixed: QFZ_FIXED holds "all" or the identifier.
+def fixed(defect: str) -> bool:
+    """Tell if a run must treat a defect as fixed: QFZ_FIXED holds "all" or the name of the defect.
 
-    The regression tests expect a failure of each open finding (strict
-    xfail). A run against a tree with the proposed patches sets QFZ_FIXED,
-    and the tests then expect the correct behavior.
+    The regression tests expect a failure of each open defect (strict
+    xfail). A run against a tree with a proposed fix sets QFZ_FIXED, and
+    the tests then expect the correct behavior.
 
     Args:
-        finding: The identifier of the finding
+        defect: The name of the defect, a key of KNOWN_DEFECTS
 
     Returns:
-        True when the run treats the finding as fixed
+        True when the run treats the defect as fixed
 
     Raises:
-        KeyError: If the identifier is not in KNOWN_FINDINGS
+        KeyError: If the name is not in KNOWN_DEFECTS
     """
-    if finding not in KNOWN_FINDINGS:
-        raise KeyError(f"{finding} is not a known finding. The known findings are {sorted(KNOWN_FINDINGS)}")
+    if defect not in KNOWN_DEFECTS:
+        raise KeyError(f"{defect} is not a known defect. The known defects are {sorted(KNOWN_DEFECTS)}")
     wanted = {part.strip() for part in os.environ.get("QFZ_FIXED", "").split(",") if part.strip()}
-    return "all" in wanted or finding in wanted
+    return "all" in wanted or defect in wanted
 
 
-def known_open(finding: str) -> bool:
-    """Tell if a fuzzer must skip the inputs of an open finding.
+def known_open(defect: str) -> bool:
+    """Tell if a fuzzer must skip the inputs of an open defect.
 
     Args:
-        finding: The identifier of the finding, for example "QF1"
+        defect: The name of the defect, a key of KNOWN_DEFECTS
 
     Returns:
         True when the fuzzer must skip those inputs. QFZ_KNOWN="all" or a
-        list that holds the identifier makes the fuzzer keep them. A finding
-        that QFZ_FIXED holds is not open, thus the fuzzer also keeps them.
+        list that holds the name makes the fuzzer keep them. A defect that
+        QFZ_FIXED holds is not open, thus the fuzzer also keeps them.
 
     Raises:
-        KeyError: If the identifier is not in KNOWN_FINDINGS
+        KeyError: If the name is not in KNOWN_DEFECTS
     """
     wanted = {part.strip() for part in os.environ.get("QFZ_KNOWN", "").split(",") if part.strip()}
-    return not (fixed(finding) or "all" in wanted or finding in wanted)
+    return not (fixed(defect) or "all" in wanted or defect in wanted)
 
 
 @contextmanager

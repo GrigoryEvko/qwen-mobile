@@ -146,8 +146,8 @@ def test_mtp_transform_keeps_the_draft_logits(db: tuple[int, int | None], tie: b
 
     The width is 8 or more. At the width 2 the chained RMSNorm of three
     steps turns a float32 rounding of 1e-7 into 1e-3 in the logits: the
-    same 1e-7 noise on the original weights gives 5e-4 to 1.1e-3 (measured
-    on 2026-09-23), thus the transform is not the cause there.
+    same 1e-7 noise on the original weights gives 5e-4 to 1.1e-3, thus the
+    transform is not the cause there.
     """
     d, block = db
     gen = torch.Generator().manual_seed(seed)

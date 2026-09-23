@@ -29,7 +29,7 @@ Modes:
           the seed files and the phone set. tests/fuzz/quant/seeds holds the
           seed files, tests/fuzz/quant/regress holds each failing input and the
           regression tests (regress/test_qfz_regressions.py). The exit status is
-          not zero when a target has a finding. An open finding (a strict xfail
+          not zero when a target has a finding. A known defect (a strict xfail
           of the regression tests) is a finding (rule R8).
   fuzz    Generate new inputs for each target for the budget (the preset
           value is 600 s for each target).
@@ -61,9 +61,7 @@ Sanitizers (one sanitizer for each build and each run, never two):
           the Python process.
   asan    -fsanitize=address. The native targets only.
   ubsan   -fsanitize=undefined -fno-sanitize-recover=undefined. The native targets
-          only. The first report stops the run. The ggml core gives a report
-          before our files matter (a null-base pointer offset in ggml_graph_nbytes),
-          thus llama-toy reports it as a finding.
+          only. The first report stops the run.
   tsan    -fsanitize=thread. The native targets only.
   msan    -fsanitize=memory with the MSan libc++ at FUZZ_MSAN_PREFIX
           (preset: build/fuzz/msan-libcxx/install). The native targets only.
@@ -81,12 +79,15 @@ Options:
   --profile P          debug or release (preset: the two)
   --budget-seconds N   The time of each target in the mode fuzz (preset 600)
   --jobs N             The number of targets that run at the same time (preset 1)
+  --targets LIST       A comma list of target names (preset: each target that applies)
 
 Results: one JSON line per target in build/fuzz/quant-<profile>-<sanitizer>/results.jsonl,
 and a copy in build/fuzz/quant-<sanitizer>/results.jsonl:
   {area, target, sanitizer, profile, mode, seconds, executions, findings, crash_files}
-Environment: QFZ_KNOWN (fuzz the inputs of open findings too), QFZ_FIXED (expect the
-fixed behavior), FUZZ_SANITIZER, FUZZ_PROFILE, FUZZ_MSAN_PREFIX. The GPU stays hidden.
+Environment: QFZ_KNOWN (fuzz the inputs of the known defects too), QFZ_FIXED (expect the
+correct behavior of a known defect), FUZZ_SANITIZER, FUZZ_PROFILE, FUZZ_MSAN_PREFIX. The
+names of the known defects are the keys of KNOWN_DEFECTS in qfz_common.py. The GPU stays
+hidden.
 EOF
 }
 

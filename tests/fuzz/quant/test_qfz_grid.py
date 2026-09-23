@@ -38,15 +38,16 @@ from quant.grids import IQ4NLGrid, Q4_0Grid
 Q8 = gguf.GGMLQuantizationType.Q8_0
 GRIDS = {"Q4_0": Q4_0Grid, "IQ4_NL": IQ4NLGrid}
 
-# The explicit examples: the seeds of the mode "test", and the minimal examples of the findings.
+# The explicit examples: the seeds of the mode "test", a block with a subnormal F16 scale, a tiny block with a
+# scale that rounds to zero, and a block beyond the F16 scale range of Q8_0.
 SPEC_MIXED = MatrixSpec(2, 2, (("gauss", "spike"), ("zero", "ties")), ((0, -30), (5, -10)), 1, False)
 SPEC_EDGES = MatrixSpec(2, 3, (("opposite", "const", "sparse"), ("spread", "gauss", "zero")),
                         ((10, -14, 3), (-12, 15, 0)), 7, True)
-SPEC_QF9 = MatrixSpec(3, 6, (("gauss",) * 6, ("spread",) + ("gauss",) * 5, ("gauss",) * 6),
-                      ((0,) * 6, (-12, 0, 0, 0, 0, 0), (0,) * 6), 264, True)
-SPEC_QF2 = MatrixSpec(1, 1, (("sparse",),), ((-26,),), 0, False)
-W_QF1 = np.zeros((1, 32), np.float32)
-W_QF1[0, 0] = 8.4e6
+SPEC_SUBNORMAL_SCALE = MatrixSpec(3, 6, (("gauss",) * 6, ("spread",) + ("gauss",) * 5, ("gauss",) * 6),
+                                  ((0,) * 6, (-12, 0, 0, 0, 0, 0), (0,) * 6), 264, True)
+SPEC_TINY_BLOCK = MatrixSpec(1, 1, (("sparse",),), ((-26,),), 0, False)
+W_BEYOND_F16 = np.zeros((1, 32), np.float32)
+W_BEYOND_F16[0, 0] = 8.4e6
 
 
 def _amax(w: np.ndarray) -> np.ndarray:
@@ -110,7 +111,7 @@ def test_q8_0_packs_within_the_format_bound(spec) -> None:
 @fuzz_settings(0.5)
 @given(w=raw_float_matrices())
 @example(w=np.linspace(-3.0, 3.0, 64, dtype=np.float32).reshape(2, 32))
-@example(w=W_QF1)
+@example(w=W_BEYOND_F16)
 @counted
 def test_q8_0_element_by_element(w: np.ndarray) -> None:
     """Q8_0 with each value drawn on its own, thus the shrinker gives the smallest failing value."""
@@ -147,7 +148,7 @@ def test_grid4_packs_and_decodes_in_gguf_py(spec, kind: str, search: bool, f16: 
 
 @fuzz_settings()
 @given(spec=matrices(min_exp=-12, max_exp=12), kind=st.sampled_from(sorted(GRIDS)))
-@example(spec=SPEC_QF9, kind="IQ4_NL")
+@example(spec=SPEC_SUBNORMAL_SCALE, kind="IQ4_NL")
 @example(spec=SPEC_EDGES, kind="Q4_0")
 @counted
 def test_scale_search_is_not_worse_than_the_reference_scale(spec, kind: str) -> None:
@@ -155,8 +156,9 @@ def test_scale_search_is_not_worse_than_the_reference_scale(spec, kind: str) -> 
 
     The factor 1 is a candidate of the search, thus only the F16 rounding
     of the winner can make it worse. The tolerance is 1/64 of the error of
-    the reference scale, plus the float32 noise. The open finding QF9 is a
-    loss in the F16 subnormal range, thus those blocks are excluded.
+    the reference scale, plus the float32 noise. The known defect
+    searched-scale-f16-rounding is a loss in the F16 subnormal range, thus
+    those blocks are excluded while it is in KNOWN_DEFECTS.
     """
     w = spec.build()
     grid = GRIDS[kind]()
@@ -168,7 +170,7 @@ def test_scale_search_is_not_worse_than_the_reference_scale(spec, kind: str) -> 
     err_p = ((block_view(plain) - block_view(w.astype(np.float64))) ** 2).sum(-1)
     noise = 64.0 * np.spacing(_amax(w).astype(np.float32)).astype(np.float64) ** 2
     worse = err_s - err_p * (1.0 + 1.0 / 64.0) - noise
-    if known_open("QF9"):
+    if known_open("searched-scale-f16-rounding"):
         worse = np.where(np.abs(d_p.to(torch.float32).numpy()) >= 2.0 ** -14, worse, -1.0)
     assert (worse <= 0).all(), (f"the search error is larger than the reference error in {int((worse > 0).sum())} "
                                 f"blocks, worst {float(worse.max()):.3e} over the tolerance")
@@ -224,7 +226,7 @@ def test_results_do_not_depend_on_the_row_chunk(spec, chunk: int, kind: str) -> 
 @fuzz_settings()
 @given(spec=matrices(min_exp=-30, max_exp=12), kind=st.sampled_from(sorted(GRIDS)), seed=st.integers(0, 1000))
 @example(spec=SPEC_EDGES, kind="IQ4_NL", seed=3)
-@example(spec=SPEC_QF2, kind="Q4_0", seed=0)
+@example(spec=SPEC_TINY_BLOCK, kind="Q4_0", seed=0)
 @counted
 def test_block_error_agrees_with_the_round_trip(spec, kind: str, seed: int) -> None:
     """block_error is the weighted squared error of quantize with the same weights, then dequantize."""

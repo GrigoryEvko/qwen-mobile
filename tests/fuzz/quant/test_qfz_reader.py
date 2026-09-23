@@ -63,8 +63,8 @@ def seeds() -> Seeds:
     """Give the seed files: toy exports of the pipeline in three types, tied and untied, then the committed seeds.
 
     The committed seeds are tests/fuzz/quant/seeds/reader (two toy exports)
-    and tests/fuzz/quant/regress/reader (the minimal files of QR1, QR2 and QR4),
-    thus the mode "test" replays them.
+    and tests/fuzz/quant/regress/reader (the minimal files of three reader
+    defects), thus the mode "test" replays them.
     """
     out = Seeds()
     with scratch() as tmp:

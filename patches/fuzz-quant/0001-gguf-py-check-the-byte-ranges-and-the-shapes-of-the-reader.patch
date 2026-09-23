@@ -3,20 +3,20 @@ Fold-into: upstream/gguf-py
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 
-GGUFReader did not compare its reads with the size of the file. The fuzz
-campaign of the quantization pipeline (task #171) found four defects:
+GGUFReader does not compare its reads with the size of the file. This
+gives four defects on a malformed file:
 
-- QR1: an array with a large item count and no data made the reader loop
-  over the count. A file of 49 bytes with the count 4000000 took 18 s and
-  4.7 GB of memory.
-- QR2: the offset of a tensor was a uint64 sum. The offset 2^64 - 64
-  wrapped to the start of the file, and the tensor data was the header,
-  with only a RuntimeWarning. A tensor of 0 bytes after the end of the file
-  also passed.
-- QR3: a truncated file gave IndexError "index 0 is out of bounds" with no
+- An array with a large item count and no data makes the reader loop over
+  the count, with a time and a memory in proportion to the count, not to
+  the file.
+- The offset of a tensor is a uint64 sum. The offset 2^64 - 64 wraps to
+  the start of the file, and the tensor data is the header, with only a
+  RuntimeWarning. A tensor of 0 bytes after the end of the file also
+  passes.
+- A truncated file gives IndexError "index 0 is out of bounds" with no
   offset and no size.
-- QR4: a tensor of a block type with no dimension gave IndexError "tuple
-  index out of range" in quant_shape_to_byte_shape.
+- A tensor of a block type with no dimension gives IndexError "tuple index
+  out of range" in quant_shape_to_byte_shape.
 
 This patch adds four checks. Each check raises ValueError:
 
@@ -28,10 +28,8 @@ This patch adds four checks. Each check raises ValueError:
 - A tensor with no dimension has one element, as in ggml. Thus a block type
   gets the error of a row that is not a multiple of the block size.
 
-The reader gives the same fields and tensors for the 30 GGUF files of
-weights/ and the 9 files of the fuzz phone set (a digest of each field and
-of the name, type, shape, offset and size of each tensor). The regression
-tests are in tests/fuzz/quant/regress/test_qfz_regressions.py.
+A correct file passes each check. The regression tests are in
+tests/fuzz/quant/regress/test_qfz_regressions.py.
 
 diff --git a/gguf-py/gguf/gguf_reader.py b/gguf-py/gguf/gguf_reader.py
 --- a/gguf-py/gguf/gguf_reader.py

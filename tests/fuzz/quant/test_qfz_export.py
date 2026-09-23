@@ -17,9 +17,11 @@ The properties of the written file:
 - A small sample of the files runs in llama-perplexity of the build without
   a sanitizer (TOY_BIN), and the logits are finite.
 
-The inputs of the open finding QF10 are excluded. Refer to qfz_common.
-The regression tests hold QF5 and QF6, which need a source from raw bytes
-or a plan type name out of the supported set.
+The expected type of a filtered IQ4_NL tensor follows the known defect
+only-filter-skips-iq4-nl while it is in qfz_common.KNOWN_DEFECTS. The
+regression tests hold the export of a source with an empty array and of a
+plan with an unknown type name, which need a source from raw bytes or a
+type name out of the supported set.
 """
 
 from __future__ import annotations
@@ -109,7 +111,7 @@ def metadata(draw: st.DrawFn) -> dict[str, tuple[object, gguf.GGUFValueType, ggu
         vtype = draw(st.sampled_from(sorted(SCALARS, key=int)))
         key = f"qfz.extra.{i}"
         if draw(st.booleans()):
-            # gguf-py cannot write an empty array, thus the regression test of QF5 builds that source from raw bytes.
+            # gguf-py cannot write an empty array, thus a regression test builds that source from raw bytes.
             values = draw(st.lists(SCALARS[vtype], min_size=1, max_size=4))
             out[key] = (values, gguf.GGUFValueType.ARRAY, vtype)
         else:
@@ -137,11 +139,12 @@ def expected_kind(plan: Plan, name: str, only: str | None, invert: bool) -> str:
 
     The docstring of export() says that the filter keeps every tensor out
     of the match in F16. The code applies the filter to Q4_0 and Q8_0 only,
-    thus an IQ4_NL tensor out of the match stays IQ4_NL: the open finding
-    QF10. The expectation follows the code while QF10 is open.
+    thus an IQ4_NL tensor out of the match stays IQ4_NL: the known defect
+    only-filter-skips-iq4-nl. The expectation follows the code while that
+    defect is in KNOWN_DEFECTS.
     """
     kind = plan.type_of(name)
-    filtered = ("Q4_0", "Q8_0") if known_open("QF10") else ("Q4_0", "IQ4_NL", "Q8_0")
+    filtered = ("Q4_0", "Q8_0") if known_open("only-filter-skips-iq4-nl") else ("Q4_0", "IQ4_NL", "Q8_0")
     if only is not None and kind in filtered and (re.search(only, name) is None) != invert:
         kind = "keep"
     return kind
@@ -198,17 +201,17 @@ CASE_PACKED = ExportCase(dataclasses.replace(SMALL, mtp=True), Plan(n_layers=2, 
 CASE_FILTERED = ExportCase(SMALL, Plan(n_layers=2, bulk="IQ4_NL", head="Q8_0", embedding="F16", ffn_down="Q8_0"),
                            "large", 1, True, r"ffn_", True,
                            {"qfz.extra.0": ([1, 2], gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.INT32)}, 0.5, 2)
-CASE_QF4 = ExportCase(SMALL, Plan(n_layers=2, bulk="Q8_0"), "mixed", 2, False, None, False,
+CASE_ALIGNMENT = ExportCase(SMALL, Plan(n_layers=2, bulk="Q8_0"), "mixed", 2, False, None, False,
                       {"general.alignment": (64, gguf.GGUFValueType.UINT32, None)}, 0.0, 0)
-CASE_QF10 = ExportCase(SMALL, Plan(n_layers=2, bulk="IQ4_NL"), "tiny", 3, False, r"^token_embd", False, {}, 0.0, 0)
+CASE_ONLY_IQ4_NL = ExportCase(SMALL, Plan(n_layers=2, bulk="IQ4_NL"), "tiny", 3, False, r"^token_embd", False, {}, 0.0, 0)
 
 
 @fuzz_settings(0.5)
 @given(case=export_cases())
 @example(case=CASE_PACKED)
 @example(case=CASE_FILTERED)
-@example(case=CASE_QF4)
-@example(case=CASE_QF10)
+@example(case=CASE_ALIGNMENT)
+@example(case=CASE_ONLY_IQ4_NL)
 @counted
 def test_export_writes_what_the_plan_promises(case: ExportCase) -> None:
     """The export of a drawn source and plan gives the promised types, values, metadata, and a loadable file."""

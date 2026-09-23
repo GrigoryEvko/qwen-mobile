@@ -21,7 +21,7 @@ the two passes (rule R13):
 - grid, layout, transform, solver, export, reader: Hypothesis fuzzers.
   test replays the explicit examples and the database; fuzz generates in
   rounds with new seeds until the budget ends, and stops at a failure.
-- regressions: the minimal example of each finding. Each open finding (a
+- regressions: the minimal example of each defect. Each known defect (a
   strict xfail) counts as a finding with its evidence file (rule R8).
 - atheris-reader, atheris-pack: coverage-guided (libFuzzer) Python fuzzers.
 
@@ -58,7 +58,7 @@ sys.path.insert(0, str(HERE.parents[2]))
 
 from qfz_common import (  # noqa: E402
     FUZZ_OUT,
-    KNOWN_FINDINGS,
+    KNOWN_DEFECTS,
     ORACLE_BIN,
     PROFILES,
     REGRESS_DIR,
@@ -194,7 +194,7 @@ class Runner:
         return r
 
     def run_regressions(self, t: Target) -> Result:
-        """The minimal examples of the findings: each open finding (strict xfail) and each failure is a finding."""
+        """The minimal examples of the defects: each known defect (strict xfail) and each failure is a finding."""
         r = self.result(t.name)
         start = time.monotonic()
         status, text, _ = self._pytest(t.file, {}, [], 1800)
@@ -202,11 +202,11 @@ class Runner:
         findings_dir = self.out / "findings"
         findings_dir.mkdir(exist_ok=True)
         for line in text.splitlines():
-            m = re.match(r"XFAIL (\S+) - (Q[FR]\d+): (.*)", line)
-            if m:
-                test_id, finding, reason = m.groups()
-                path = findings_dir / f"{finding}-{test_id.split('::')[-1]}.txt"
-                path.write_text(f"finding {finding}: {KNOWN_FINDINGS.get(finding, '')}\ntest {test_id}\n"
+            m = re.match(r"XFAIL (\S+) - ([a-z0-9-]+): (.*)", line)
+            if m and m.group(2) in KNOWN_DEFECTS:
+                test_id, defect, reason = m.groups()
+                path = findings_dir / f"{defect}-{test_id.split('::')[-1]}.txt"
+                path.write_text(f"defect {defect}: {KNOWN_DEFECTS[defect]}\ntest {test_id}\n"
                                 f"evidence: {reason}\nfix: build/fuzz/quant/fixes\n")
                 r.crash_files.append(str(path.relative_to(ROOT)))
                 r.findings += 1
@@ -329,7 +329,7 @@ class Runner:
             """Run one model in this build against the base of the oracle, and count a finding.
 
             A run with the exit status 0 and no final KL statistics block is a
-            finding too (the check of task #172).
+            finding too.
             """
             status, log = run_perplexity(self._llama_bin(), model, text, base, write_base=False, threads=threads,
                                          extra_env=env, timeout=900)
@@ -353,7 +353,7 @@ class Runner:
             text = PHONE / "text.txt"
             for model in phone:
                 check(model, text, model.with_suffix(".kld"), model.stem)
-            # The reproducer of QT1 (rule R13): 20 more runs of one comparison. Each run needs its statistics.
+            # 20 more runs of one comparison: the log of each run must end with its statistics (rule R13).
             for i in range(20):
                 check(phone[0], text, phone[0].with_suffix(".kld"), f"{phone[0].stem}-repeat{i}")
         else:
@@ -385,13 +385,13 @@ class Runner:
                         break
                     check(model, text, base, f"{profile}-{kind}-{seed}")
                     if self.mode == "test" and n == 0:
-                        # The reproducer of QT1 (rule R13): 20 more runs of one comparison.
+                        # 20 more runs of one comparison: the log of each run must end with its statistics.
                         for i in range(20):
                             check(model, text, base, f"{profile}-{kind}-{seed}-repeat{i}")
                 n += 1
         if no_block:
             r.note = (f"{len(no_block)} runs with the exit status 0 had no final KL statistics block "
-                      f"(the defect of QT1, task #172): {', '.join(no_block[:4])}")
+                      f"(llama-perplexity lost its log at the exit): {', '.join(no_block[:4])}")
         r.seconds = time.monotonic() - start
         return r
 

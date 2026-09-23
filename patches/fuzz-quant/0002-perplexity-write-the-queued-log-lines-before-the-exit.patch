@@ -7,23 +7,11 @@ common_log_main() does not delete its log (upstream issue 22142). Thus,
 when main() returns, the worker thread of the log can hold lines that it
 did not write. llama-perplexity writes the last chunk and the KL
 statistics immediately before the return, thus a run with the exit status
-0 can have no KL statistics (finding QT1, task #172). The KL harness then
-reads no result, or a wrong one from the chunks that it has.
+0 can have no KL statistics. A KL harness then reads no result, or a wrong
+one from the chunks that it has. A high load of the host makes the loss
+more frequent.
 
 This patch calls common_log_flush(common_log_main()) before the return.
-
-Measured on the x86 host on 2026-09-23, 60 runs of the KL comparison of one
-toy model for each build (host load 40 to 85):
-
-| Build | Runs without the KL statistics |
-|---|---|
-| debug, no sanitizer | 5 of 60 |
-| debug, no sanitizer, with this patch | 0 of 60 |
-| release (the shipped flags), no sanitizer | 4 of 60 |
-| release, no sanitizer, with this patch | 0 of 60 |
-
-An earlier measurement gave 12 of 60 for the native host build. Under a
-high load the loss occurred in 6 runs in a row.
 
 diff --git a/tools/perplexity/main.cpp b/tools/perplexity/main.cpp
 --- a/tools/perplexity/main.cpp

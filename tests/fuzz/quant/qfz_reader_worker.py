@@ -1,8 +1,9 @@
 """The isolated worker of the gguf-py reader fuzzer, and the pool that drives it.
 
-A defect of the reader can make it loop for minutes or use all the memory
-(finding QR1 did). Thus the reader runs in a separate process that imports
-numpy and gguf only, with an address-space limit and an alarm per file.
+A defect of the reader can make it loop for minutes or use all the memory,
+for example a loop over an array count that the file cannot hold. Thus the
+reader runs in a separate process that imports numpy and gguf only, with an
+address-space limit and an alarm per file.
 The pool starts a new worker after a timeout or a memory error.
 
 The worker reads one JSON request per line on stdin and writes one JSON
