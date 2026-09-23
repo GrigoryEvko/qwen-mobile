@@ -681,12 +681,16 @@ phone_commands() {
         [[ ${b%%-*} == debug ]] && parts=$((parts + 1))
         for n in $(seq 1 "$parts"); do
             echo "# $b: app, part $n of $parts ($pack)"
-            FUZZ_OPS_CMD_PACK=$pack phone_run_cmd "$b" app CPU,HTP0 - 1 "$adsp" all 1
+            # release-none links the shipped host libraries, thus it pairs with the shipped DSP
+            # library (ADSP_DIR); the other builds have the host code of the snapshot
+            local badsp=$adsp
+            [[ $b == release-none ]] && badsp=$ADSP_DIR
+            FUZZ_OPS_CMD_PACK=$pack phone_run_cmd "$b" app CPU,HTP0 - 1 "$badsp" all 1
         done
         if [[ ${b#*-} == none ]]; then
             for n in 1 2; do
                 echo "# $b: nofuse, part $n of 2"
-                phone_run_cmd "$b" nofuse HTP0 -nofuse 0 "$adsp" all 1
+                phone_run_cmd "$b" nofuse HTP0 -nofuse 0 "$badsp" all 1
             done
         fi
     done
