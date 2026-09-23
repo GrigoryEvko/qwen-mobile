@@ -1,0 +1,27 @@
+tests: free the compute context of test-opt
+Fold-into: upstream/ggml-core
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+test_regression() of tests/test-opt.cpp creates ctx_compute with ggml_init
+and does not free it: ggml_opt_fit and ggml_opt_free free only the contexts
+of the optimizer, not a context of the caller. LeakSanitizer reports the
+ggml_context of each of the two optimizer types and its memory. The upstream
+CMake file does not build test-opt with LLAMA_SANITIZE_ADDRESS for this
+reason.
+
+The change: ggml_free(ctx_compute) at the end of test_regression. Test code
+only.
+
+diff --git a/tests/test-opt.cpp b/tests/test-opt.cpp
+index 8dcb4a7..7220f46 100644
+--- a/tests/test-opt.cpp
++++ b/tests/test-opt.cpp
+@@ -834,6 +834,7 @@ static std::pair<int, int> test_regression(
+ 
+     ggml_backend_buffer_free(buf);
+     ggml_free(ctx_static);
++    ggml_free(ctx_compute);
+     ggml_opt_dataset_free(dataset);
+ 
+     return std::make_pair(npass, ntest);
