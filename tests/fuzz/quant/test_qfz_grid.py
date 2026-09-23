@@ -28,7 +28,7 @@ from hypothesis import strategies as st
 
 import gguf
 import quant.grid as grid_module
-from qfz_common import F16_MAX, block_view, known_open, q8_0_error_bound, scale_domain
+from qfz_common import F16_MAX, block_view, q8_0_error_bound, scale_domain
 from qfz_hyp import counted, fuzz_settings
 from qfz_strategies import MatrixSpec, matrices, raw_float_matrices
 from quant.grid import (block_error, dequantize, pack_nibbles, pack_q8_0, q8_0_dequantize, q8_0_quantize,
@@ -154,11 +154,12 @@ def test_grid4_packs_and_decodes_in_gguf_py(spec, kind: str, search: bool, f16: 
 def test_scale_search_is_not_worse_than_the_reference_scale(spec, kind: str) -> None:
     """The searched scale gives a block error that is not larger than the error of the reference scale.
 
-    The factor 1 is a candidate of the search, thus only the F16 rounding
-    of the winner can make it worse. The tolerance is 1/64 of the error of
-    the reference scale, plus the float32 noise. The known defect
-    searched-scale-f16-rounding is a loss in the F16 subnormal range, thus
-    those blocks are excluded while it is in KNOWN_DEFECTS.
+    The factor 1 is a candidate of the search, and the search measures each
+    candidate after its F16 rounding, thus the stored scale is not worse
+    than the stored reference scale, also in the F16 subnormal range. The
+    search sums the error in float32 and the test in float64, thus the
+    tolerance is 1e-5 of the error of the reference scale, plus the float32
+    noise.
     """
     w = spec.build()
     grid = GRIDS[kind]()
@@ -169,9 +170,7 @@ def test_scale_search_is_not_worse_than_the_reference_scale(spec, kind: str) -> 
     err_s = ((block_view(searched) - block_view(w.astype(np.float64))) ** 2).sum(-1)
     err_p = ((block_view(plain) - block_view(w.astype(np.float64))) ** 2).sum(-1)
     noise = 64.0 * np.spacing(_amax(w).astype(np.float32)).astype(np.float64) ** 2
-    worse = err_s - err_p * (1.0 + 1.0 / 64.0) - noise
-    if known_open("searched-scale-f16-rounding"):
-        worse = np.where(np.abs(d_p.to(torch.float32).numpy()) >= 2.0 ** -14, worse, -1.0)
+    worse = err_s - err_p * (1.0 + 1e-5) - noise
     assert (worse <= 0).all(), (f"the search error is larger than the reference error in {int((worse > 0).sum())} "
                                 f"blocks, worst {float(worse.max()):.3e} over the tolerance")
 

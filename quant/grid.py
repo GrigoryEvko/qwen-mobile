@@ -34,8 +34,11 @@ def scale_search(grid: Grid, blocks: torch.Tensor, weights: torch.Tensor | None 
     points have the step 0.0125, thus the reference scale (factor 1) is a
     candidate and a block that is already on the grid keeps its scale. This
     is the diagonal-Hessian scale search of NeUQI for a grid without zero
-    point. ``weights`` [cols] weights the error per input column.
-    Complexity is O(rows · cols · n_candidates).
+    point. ``weights`` [cols] weights the error per input column. Each
+    candidate is rounded to F16 before its error is measured, thus the
+    winner is the scale that the file stores, also in the F16 subnormal
+    range. A candidate that rounds to zero decodes its block to zero
+    (Grid.quantize_blocks). Complexity is O(rows · cols · n_candidates).
     """
     d0 = grid.scale_rtn(blocks)
     factors = torch.linspace(lo, hi, n_candidates, device=blocks.device, dtype=blocks.dtype)
@@ -45,7 +48,7 @@ def scale_search(grid: Grid, blocks: torch.Tensor, weights: torch.Tensor | None 
     if weights is not None:
         wgt = weights.reshape(1, -1, BLOCK).to(blocks.dtype)
     for f in factors:
-        d = d0 * f
+        d = (d0 * f).to(torch.float16).to(blocks.dtype)
         err = (blocks - grid.value(grid.quantize_blocks(blocks, d)) * d[..., None]).pow(2)
         if wgt is not None:
             err = err * wgt

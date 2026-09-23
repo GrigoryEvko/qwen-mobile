@@ -106,10 +106,12 @@ def test_pack_nibbles_refuses_an_index_out_of_range() -> None:
         pack_nibbles(idx, torch.ones(1, 1, dtype=torch.float16))
 
 
-@xfail_open("searched-scale-f16-rounding",
-            "in the F16 subnormal range the searched scale loses to the plain reference scale")
 def test_scale_search_is_not_worse_after_the_f16_rounding() -> None:
-    """quant/grid.py:47-56: the search compares float32 candidates, and the store rounds the winner to F16."""
+    """The stored searched scale is not worse than the stored reference scale of a subnormal F16 block.
+
+    A search that compares float32 candidates, and stores the F16 rounding
+    of the winner, loses to the reference scale on this block.
+    """
     spec = MatrixSpec(3, 6, (("gauss",) * 6, ("spread",) + ("gauss",) * 5, ("gauss",) * 6),
                       ((0,) * 6, (-12, 0, 0, 0, 0, 0), (0,) * 6), seed=264, f16=True)
     w = torch.from_numpy(spec.build())[1:2, :32]
