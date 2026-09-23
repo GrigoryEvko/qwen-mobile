@@ -20,6 +20,7 @@ Usage:
     tools/prof/run.py check
     tools/prof/run.py bench --model /sdcard/qwen/models/Qwen3.5-4B-Q8_0.gguf --set stalls
     tools/prof/run.py bench --model ... --set bandwidth   # runs both passes
+    tools/prof/run.py bench --model ... --set stalls --ctk q8_0 --ctv q8_0 --depth 16384 --pp 0 --tg 16 --reps 1
 
 This driver never installs anything and never writes outside /data/local/tmp on
 the phone.
@@ -236,7 +237,8 @@ def cmd_bench(a: argparse.Namespace) -> int:
             f"ADSP_LIBRARY_PATH={shlex.quote(libdir)} "
             f"GGML_HEXAGON_PROFILE={evt} "
             f"./llama-bench -m {shlex.quote(a.model)} "
-            f"-dev {a.dev} -ngl 99 -p {a.pp} -n {a.tg} -r {a.reps} -v "
+            f"-dev {a.dev} -ngl 99 -p {a.pp} -n {a.tg} -r {a.reps} "
+            f"-ctk {a.ctk} -ctv {a.ctv} -d {a.depth} -fa {a.fa} -v "
             f"> {remote_log} 2>&1; echo rc=$?; tail -n 12 {remote_log}")
         print(f"--- pass {i} of {len(passes)}: {', '.join(names)}", file=sys.stderr)
         t0 = time.time()
@@ -264,6 +266,7 @@ def cmd_bench(a: argparse.Namespace) -> int:
         "when": stamp, "set": a.set, "model": a.model, "dev": a.dev,
         "bindir": a.bindir, "libdir": libdir,
         "pp": a.pp, "tg": a.tg, "reps": a.reps,
+        "ctk": a.ctk, "ctv": a.ctv, "depth": a.depth, "fa": a.fa,
         "device_before": asdict(d), "device_after": asdict(after),
         "passes": records,
     }
@@ -314,6 +317,13 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--tg", type=int, default=128)
     b.add_argument("--reps", type=int, default=5)
     b.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    b.add_argument("--ctk", default="f16", help="the type of the K cache (llama-bench -ctk)")
+    b.add_argument("--ctv", default="f16", help="the type of the V cache (llama-bench -ctv)")
+    b.add_argument("--depth", type=int, default=0,
+                   help="the tokens in the context before the test (llama-bench -d). The profile then "
+                        "also holds the prompt batches of this prefill")
+    b.add_argument("--fa", default="auto", choices=("on", "off", "auto"),
+                   help="flash attention (llama-bench -fa). A quantized V cache needs it")
     b.set_defaults(fn=cmd_bench)
 
     a = ap.parse_args(argv)

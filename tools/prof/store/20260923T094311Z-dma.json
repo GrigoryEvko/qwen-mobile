@@ -1,0 +1,49 @@
+{
+  "when": "20260923T094311Z",
+  "set": "dma",
+  "model": "/data/local/tmp/qwen/models/Qwen3.5-2B-Q8_0.gguf",
+  "dev": "HTP0",
+  "bindir": "/data/local/tmp/qwen/memory/b/bin",
+  "libdir": "/data/local/tmp/qwen/memory/b/lib",
+  "pp": 0,
+  "tg": 16,
+  "reps": 1,
+  "ctk": "q8_0",
+  "ctv": "q8_0",
+  "depth": 16384,
+  "fa": "on",
+  "device_before": {
+    "serial": "192.168.14.130:5555",
+    "model": "PJZ110",
+    "charging": false,
+    "thermal": 0,
+    "battery": 60
+  },
+  "device_after": {
+    "serial": "192.168.14.130:5555",
+    "model": "PJZ110",
+    "charging": false,
+    "thermal": 0,
+    "battery": 59
+  },
+  "passes": [
+    {
+      "pass": 1,
+      "events": [
+        "COMMITTED_PKT_ANY",
+        "UDMA_ACTIVE",
+        "L2_UDMA_BYPASS_RD",
+        "L2FETCH_ACCESS",
+        "L2FETCH_MISS",
+        "L2_DU_READ_MISS",
+        "DU_CACHE_MISS_PVIEW_CYCLES",
+        "HVX_LD_L2_OUTSTANDING"
+      ],
+      "events_hex": "0x3,0x240,0x256,0x7e,0x7f,0x7d,0xe9,0x103",
+      "seconds": 37.6,
+      "log": "20260923T094311Z-dma-p1.log",
+      "log_bytes": 7986876,
+      "tail": "rc=0\n| model                          |       size |     params | backend    | ngl | type_k | type_v |  fa | dev          |            test |                  t/s |\n| ------------------------------ | ---------: | ---------: | ---------- | --: | -----: | -----: | --: | ------------ | --------------: | -------------------: |\n| qwen35 2B Q8_0                 |   1.98 GiB |     1.94 B | OpenCL,HTP |  99 |   q8_0 |   q8_0 |   1 | HTP0         |   tg16 @ d16384 |          8.19 \u00b1 0.00 |\nllama_perf_context_print:        load time =    4727.61 ms\nllama_perf_context_print: prompt eval time =       0.00 ms / 16384 tokens (    0.00 ms per token,      inf tokens per second)\nllama_perf_context_print:        eval time =       0.00 ms /    17 runs   (    0.00 ms per token,      inf tokens per second)\nllama_perf_context_print:       total time =   17339.17 ms / 16401 tokens\nllama_perf_context_print:    graphs reused =         15\n~llama_context:       HTP0 compute buffer size is 493.0000 MiB, matches expectation of 493.0000 MiB\n~llama_context:        CPU compute buffer size is  24.5352 MiB, matches expectation of  24.5352 MiB\n\nbuild: c6824a9 (11008)"
+    }
+  ]
+}
