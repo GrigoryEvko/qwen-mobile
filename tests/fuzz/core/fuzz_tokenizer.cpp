@@ -52,7 +52,7 @@ std::vector<llama_token> tokenize(const std::string & text, bool add_special, bo
     int32_t n = llama_tokenize(g_vocab, text.data(), (int32_t) text.size(), tokens.data(), (int32_t) tokens.size(),
                                add_special, parse_special);
     if (n == INT32_MIN) {
-        fuzz::fail("tokenize reports an overflow for a text of %zu bytes", text.size());
+        fuzz::fail("tokenize fails (an overflow or an error of the tokenizer) for a text of %zu bytes", text.size());
     }
     if (n < 0) {
         tokens.resize((size_t) -n);
@@ -132,21 +132,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
     const bool parse_special   = flags & 2;
     const bool remove_special  = flags & 4;
     const bool unparse_special = flags & 8;
-    std::string text((const char *) data, size - 1);
-
-    // A 4-byte sequence above U+10FFFF (lead byte F4 with 90..BF, or F5..F7) decodes to a code
-    // point that unicode_cpt_to_utf8 refuses with an exception, which leaves llama_tokenize
-    // (finding tokenizer-codepoint). FUZZ_TOKENIZER_KNOWN_CODEPOINT=1 replaces such lead bytes.
-    static const bool known_cpt = fuzz::env_long("FUZZ_TOKENIZER_KNOWN_CODEPOINT", 0) != 0;
-    if (known_cpt) {
-        for (size_t i = 0; i < text.size(); ++i) {
-            const unsigned char c = (unsigned char) text[i];
-            const bool high = c >= 0xF5 || (c == 0xF4 && i + 1 < text.size() && (unsigned char) text[i + 1] >= 0x90);
-            if (high) {
-                text[i] = '?';
-            }
-        }
-    }
+    const std::string text((const char *) data, size - 1);
 
     const std::vector<llama_token> tokens = tokenize(text, add_special, parse_special);
     for (const llama_token id : tokens) {

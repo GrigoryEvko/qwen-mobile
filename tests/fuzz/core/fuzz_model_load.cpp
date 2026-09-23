@@ -17,9 +17,7 @@
 //     detokenize accepts those ids
 //   - the chat template of the model is a C string
 //
-// The switches of the known findings: FUZZ_GGUF_KNOWN_ENUM_LOAD (gguf-enum-load),
-// FUZZ_MODEL_LOAD_KNOWN_DUP_TOKENS, _BYTE_TYPE (known_bad_file), _NONE_VOCAB and
-// _SPM_BYTES (check_vocab).
+// The switch of a known finding: FUZZ_GGUF_KNOWN_ENUM_LOAD (gguf-enum-load).
 
 #include "fuzz_common.h"
 
@@ -28,8 +26,6 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#include <algorithm>
-#include <set>
 #include <string>
 #include <vector>
 
@@ -45,65 +41,16 @@ const char * const kTexts[] = {
     "",
 };
 
-/** The switches of the known findings that a file can show during the load. */
-struct KnownSwitches {
-    bool dup;        // FUZZ_MODEL_LOAD_KNOWN_DUP_TOKENS: vocab-dup-tokens
-    bool byte;       // FUZZ_MODEL_LOAD_KNOWN_BYTE_TYPE: vocab-byte-type
-};
-
 /**
- * True when the GGUF metadata in data shows a known finding of a switch that is on:
- *   - dup:       a token text two times in tokenizer.ggml.tokens (vocab-dup-tokens)
- *   - byte:      a token of type BYTE (6) in a WPM vocabulary, or a BYTE token with a text of
- *                fewer than 5 bytes (vocab-byte-type: token_to_byte aborts or throws during the load)
- * The caller must first make sure that the GGUF reader can read data without a known finding
- * (fuzz::gguf_bad_enum). O(n log n) in the count of tokens.
+ * Check the vocabulary of a loaded model. Stop with fuzz::fail() on a broken property. A vocabulary of
+ * type NONE ("no_vocab") has token ids but no token data: the token functions give neutral values
+ * for it.
  */
-bool known_bad_file(const uint8_t * data, size_t size, const KnownSwitches & sw) {
-    gguf_context * ctx = gguf_init_from_buffer(data, size, { /*no_alloc =*/ true, /*ctx =*/ nullptr });
-    if (ctx == nullptr) {
-        return false;
-    }
-    const bool dup = sw.dup, byte = sw.byte;
-    bool bad = false;
-    const int64_t key = gguf_find_key(ctx, "tokenizer.ggml.tokens");
-    const bool tokens_ok = key >= 0 && gguf_get_kv_type(ctx, key) == GGUF_TYPE_ARRAY && gguf_get_arr_type(ctx, key) == GGUF_TYPE_STRING;
-    if (dup && tokens_ok) {
-        std::set<std::string> seen;
-        const size_t n = gguf_get_arr_n(ctx, key);
-        for (size_t i = 0; i < n && !bad; ++i) {
-            bad = !seen.insert(gguf_get_arr_str(ctx, key, i)).second;
-        }
-    }
-    const int64_t tkey = gguf_find_key(ctx, "tokenizer.ggml.token_type");
-    const int64_t mkey = gguf_find_key(ctx, "tokenizer.ggml.model");
-    if (byte && !bad && tokens_ok && tkey >= 0 && gguf_get_kv_type(ctx, tkey) == GGUF_TYPE_ARRAY &&
-        gguf_get_arr_type(ctx, tkey) == GGUF_TYPE_INT32) {
-        const bool wpm = mkey >= 0 && gguf_get_kv_type(ctx, mkey) == GGUF_TYPE_STRING &&
-                         strcmp(gguf_get_val_str(ctx, mkey), "bert") == 0;
-        const int32_t * types = (const int32_t *) gguf_get_arr_data(ctx, tkey);
-        const size_t n = std::min(gguf_get_arr_n(ctx, tkey), gguf_get_arr_n(ctx, key));
-        for (size_t i = 0; i < n && !bad; ++i) {
-            bad = types[i] == 6 && (wpm || strlen(gguf_get_arr_str(ctx, key, i)) < 5);
-        }
-    }
-    gguf_free(ctx);
-    return bad;
-}
-
-/** Check the vocabulary of a loaded model. Stop with fuzz::fail() on a broken property. */
 void check_vocab(const llama_model * model) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
     if (n_vocab < 0) {
         fuzz::fail("n_vocab is negative: %d", n_vocab);
-    }
-    // A vocabulary of type NONE ("no_vocab") has token ids, but llama_vocab_get_text and the
-    // other token functions stop on GGML_ASSERT(type != LLAMA_VOCAB_TYPE_NONE) (finding
-    // vocab-none-assert). FUZZ_MODEL_LOAD_KNOWN_NONE_VOCAB=1 skips such a model.
-    static const bool known_none = fuzz::env_long("FUZZ_MODEL_LOAD_KNOWN_NONE_VOCAB", 0) != 0;
-    if (known_none && llama_vocab_type(vocab) == LLAMA_VOCAB_TYPE_NONE) {
-        return;
     }
 
     const llama_token specials[] = {
@@ -142,24 +89,8 @@ void check_vocab(const llama_model * model) {
         }
     }
 
-    // An SPM vocabulary without the 256 byte tokens <0x00>..<0xFF> loads, and then
-    // llama_tokenize throws std::out_of_range from byte_to_token (finding spm-byte-tokens).
-    // FUZZ_MODEL_LOAD_KNOWN_SPM_BYTES=1 skips the tokenizer calls for such a vocabulary.
-    static const bool known_spm = fuzz::env_long("FUZZ_MODEL_LOAD_KNOWN_SPM_BYTES", 0) != 0;
-    if (known_spm && llama_vocab_type(vocab) == LLAMA_VOCAB_TYPE_SPM) {
-        std::set<std::string> texts;
-        for (llama_token id = 0; id < n_vocab; ++id) {
-            texts.insert(llama_vocab_get_text(vocab, id));
-        }
-        for (int b = 0; b < 256; ++b) {
-            char name[8];
-            snprintf(name, sizeof(name), "<0x%02X>", b);
-            if (texts.count(name) == 0) {
-                return;
-            }
-        }
-    }
-
+    // llama_tokenize gives INT32_MIN when the tokenizer fails (for example an SPM vocabulary without
+    // the byte tokens <0x00>..<0xFF>), and a negative count when the buffer is too small.
     std::vector<llama_token> tokens(512);
     for (const char * text : kTexts) {
         for (const bool parse_special : { false, true }) {
@@ -217,18 +148,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
             return 0;
         }
     }
-    // Two equal texts in tokenizer.ggml.tokens stop the load with
-    // GGML_ASSERT(id_to_token.size() == token_to_id.size()) (finding vocab-dup-tokens).
-    // FUZZ_MODEL_LOAD_KNOWN_DUP_TOKENS=1 skips such a file. known_bad_file() gives the other switches.
-    static const KnownSwitches sw = {
-        fuzz::env_long("FUZZ_MODEL_LOAD_KNOWN_DUP_TOKENS", 0) != 0,
-        fuzz::env_long("FUZZ_MODEL_LOAD_KNOWN_BYTE_TYPE", 0) != 0,
-    };
-    // the pre-parse uses the GGUF reader too, thus it comes after the enum check
-    if ((sw.dup || sw.byte) && known_bad_file(data, size, sw)) {
-        return 0;
-    }
-
     llama_model_params mp = llama_model_default_params();
     mp.vocab_only = true;
     mp.load_mode  = LLAMA_LOAD_MODE_MMAP;

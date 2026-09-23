@@ -1,0 +1,188 @@
+Refuse a defective vocabulary with an error and keep the C API free of aborts
+Fold-into: upstream/vocab
+
+The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
+
+- Two equal token texts stop the load with an assert.
+
+  Two equal texts in tokenizer.ggml.tokens stop the load with GGML_ASSERT(id_to_token.size() == token_to_id.size()).
+
+  The change: The load throws an error with the count of tokens and the count of different token texts, and
+  llama_model_load_from_file returns NULL.
+
+  The reproducer: tests/fuzz/core/regress/fuzz_model_load--vocab-dup-tokens.
+
+- A BYTE token that the vocabulary cannot decode stops the load.
+
+  A token of type BYTE in a WPM vocabulary, or a BYTE token with a text of fewer than 5 bytes,
+  stops the load in token_to_byte with GGML_ABORT.
+
+  The change: token_to_byte decodes a BYTE token only when its text is <0xHH>, for the SPM, UGM, BPE and WPM
+  vocabularies. Each other BYTE token gives the byte '?', and the load continues.
+
+  The reproducer: tests/fuzz/core/regress/fuzz_model_load--vocab-byte-type.
+
+- The token functions of the C API abort for a vocabulary of type NONE.
+
+  A vocab-only model with tokenizer.ggml.model = no_vocab loads, and then llama_vocab_get_text and
+  the other token functions of the C API stop on GGML_ASSERT(type != LLAMA_VOCAB_TYPE_NONE).
+
+  The change: The C functions give neutral values for such a vocabulary: an empty text, 0, no tokens.
+
+  The reproducer: tests/fuzz/core/regress/fuzz_model_load--vocab-none-assert.
+
+- An exception of the tokenizer leaves llama_tokenize.
+
+  An SPM vocabulary without the byte tokens <0x00> to <0xFF> loads, and then byte_to_token throws
+  std::out_of_range through llama_tokenize. An exception out of a C function stops the caller in
+  std::terminate.
+
+  The change: llama_tokenize catches the exception, writes an error line and returns INT32_MIN.
+
+  The reproducer: tests/fuzz/core/regress/fuzz_model_load--spm-byte-tokens.
+
+- The UTF-8 decoder accepts a 4-byte sequence above U+10FFFF.
+
+  unicode_cpt_from_utf8 accepts a lead byte F4 with 90..BF and F5..F7, which give a value above
+  U+10FFFF. unicode_cpt_to_utf8 then throws std::invalid_argument outside of each handler, and the
+  exception leaves llama_tokenize.
+
+  The change: The decoder refuses such a value, and unicode_cpts_from_utf8 replaces it with U+FFFD, as for each other invalid sequence.
+
+  The reproducer: tests/fuzz/core/regress/fuzz_tokenizer--tokenizer-codepoint.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    src/llama-vocab.cpp
+    src/unicode.cpp
+--- a/src/llama-vocab.cpp
++++ b/src/llama-vocab.cpp
+@@ -2516,7 +2516,12 @@
+             }
+         }
+     }
+-    GGML_ASSERT(id_to_token.size() == token_to_id.size());
++    // Two equal token texts give one map entry. That is a defect of the file, not of the program,
++    // thus the load fails with an error that the caller gets, and the process continues.
++    if (id_to_token.size() != token_to_id.size()) {
++        throw std::runtime_error(format("the vocabulary has %zu tokens but only %zu different token texts",
++                                        id_to_token.size(), token_to_id.size()));
++    }
+ 
+     // hybriddna: the marker suffix kept k-mer ids distinct in token_to_id; erase
+     // it from id_to_token so the k-mers detokenize to the bare DNA sequence. The
+@@ -3166,20 +3171,19 @@
+     GGML_ASSERT(get_type() != LLAMA_VOCAB_TYPE_NONE);
+     GGML_ASSERT(is_byte(id));
+     const auto & token_data = id_to_token.at(id);
++    // The type of a token comes from the file (tokenizer.ggml.token_type). A byte token has the
++    // text <0xHH>. Any other text, or a byte token in a WPM vocabulary, is a defect of the file:
++    // the load builds the piece of each token, thus an abort or a std::out_of_range from substr
++    // here stops the load of the model. Such a token gives the byte '?'.
++    const std::string & text = token_data.text;
++    const bool valid = text.size() == 6 && text.compare(0, 3, "<0x") == 0 && text[5] == '>' &&
++                       isxdigit((unsigned char) text[3]) && isxdigit((unsigned char) text[4]);
+     switch (get_type()) {
+         case LLAMA_VOCAB_TYPE_SPM:
+-        case LLAMA_VOCAB_TYPE_UGM: {
+-            auto buf = token_data.text.substr(3, 2);
+-            return strtol(buf.c_str(), NULL, 16);
+-        }
+-        case LLAMA_VOCAB_TYPE_BPE: {
+-            // Gemma4 uses BPE with SPM-style byte fallback tokens (<0xXX>)
+-            auto buf = token_data.text.substr(3, 2);
+-            return strtol(buf.c_str(), NULL, 16);
+-        }
+-        case LLAMA_VOCAB_TYPE_WPM: {
+-            GGML_ABORT("fatal error");
+-        }
++        case LLAMA_VOCAB_TYPE_UGM:
++        case LLAMA_VOCAB_TYPE_BPE:  // Gemma4 uses BPE with SPM-style byte fallback tokens (<0xXX>)
++        case LLAMA_VOCAB_TYPE_WPM:
++            return valid ? (uint8_t) strtol(text.substr(3, 2).c_str(), NULL, 16) : (uint8_t) '?';
+         default:
+             GGML_ABORT("fatal error");
+     }
+@@ -4223,15 +4227,28 @@
+     return vocab->get_type();
+ }
+ 
++// A model without a vocabulary (tokenizer.ggml.model = "no_vocab") has token ids but no token
++// data, and the member functions stop the process with GGML_ASSERT on it. The C functions answer
++// with neutral values instead.
++
+ const char * llama_vocab_get_text(const struct llama_vocab * vocab, llama_token token) {
++    if (vocab->get_type() == LLAMA_VOCAB_TYPE_NONE) {
++        return "";
++    }
+     return vocab->token_get_text(token);
+ }
+ 
+ float llama_vocab_get_score(const struct llama_vocab * vocab, llama_token token) {
++    if (vocab->get_type() == LLAMA_VOCAB_TYPE_NONE) {
++        return 0.0f;
++    }
+     return vocab->token_get_score(token);
+ }
+ 
+ enum llama_token_attr llama_vocab_get_attr(const struct llama_vocab * vocab, llama_token token) {
++    if (vocab->get_type() == LLAMA_VOCAB_TYPE_NONE) {
++        return LLAMA_TOKEN_ATTR_UNDEFINED;
++    }
+     return vocab->token_get_attr(token);
+ }
+ 
+@@ -4433,7 +4450,17 @@
+                      int32_t   n_tokens_max,
+                         bool   add_special,
+                         bool   parse_special) {
+-    return vocab->tokenize(text, text_len, tokens, n_tokens_max, add_special, parse_special);
++    if (vocab->get_type() == LLAMA_VOCAB_TYPE_NONE) {
++        return 0;  // no vocabulary, no tokens (see llama_vocab_get_text)
++    }
++    // An exception must not leave a C function: a vocabulary without its byte tokens makes
++    // byte_to_token throw std::out_of_range, and the caller then dies in std::terminate.
++    try {
++        return vocab->tokenize(text, text_len, tokens, n_tokens_max, add_special, parse_special);
++    } catch (const std::exception & err) {
++        LLAMA_LOG_ERROR("%s: the tokenizer failed: %s\n", __func__, err.what());
++        return INT32_MIN;
++    }
+ }
+ 
+ int32_t llama_token_to_piece(
+@@ -4443,6 +4470,9 @@
+                      int32_t   length,
+                      int32_t   lstrip,
+                         bool   special) {
++    if (vocab->get_type() == LLAMA_VOCAB_TYPE_NONE) {
++        return 0;  // no vocabulary, no text (see llama_vocab_get_text)
++    }
+     return vocab->token_to_piece(token, buf, length, lstrip, special);
+ }
+ 
+@@ -4454,5 +4484,8 @@
+                      int32_t   text_len_max,
+                         bool   remove_special,
+                         bool   unparse_special) {
++    if (vocab->get_type() == LLAMA_VOCAB_TYPE_NONE) {
++        return 0;  // no vocabulary, no text (see llama_vocab_get_text)
++    }
+     return vocab->detokenize(tokens, n_tokens, text, text_len_max, remove_special, unparse_special);
+ }
+--- a/src/unicode.cpp
++++ b/src/unicode.cpp
+@@ -58,6 +58,12 @@
+             throw std::invalid_argument("invalid character");
+         }
+         auto result = ((utf8[offset + 0] & 0x07) << 18) | ((utf8[offset + 1] & 0x3f) << 12) | ((utf8[offset + 2] & 0x3f) << 6) | (utf8[offset + 3] & 0x3f);
++        // A lead byte F4 with 90..BF, or F5..F7, gives a value above U+10FFFF, which
++        // unicode_cpt_to_utf8 refuses with an exception outside of any handler. Refuse it
++        // here, where unicode_cpts_from_utf8 replaces it with U+FFFD.
++        if (result > 0x10FFFF) {
++            throw std::invalid_argument("invalid character");
++        }
+         offset += 4;
+         return result;
+     }

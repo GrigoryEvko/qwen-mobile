@@ -284,19 +284,9 @@ void run_messages(FuzzedDataProvider & fdp) {
                    params.prompt.size());
     }
 
-    // The app tokenizes the prompt with add_special and parse_special. A 4-byte sequence above
-    // U+10FFFF makes the tokenizer throw out of llama_tokenize (finding tokenizer-codepoint).
-    // FUZZ_TOKENIZER_KNOWN_CODEPOINT=1 skips such a prompt.
-    static const bool known_cpt = fuzz::env_long("FUZZ_TOKENIZER_KNOWN_CODEPOINT", 0) != 0;
-    bool high_cpt = false;
-    for (size_t i = 0; i < params.prompt.size() && known_cpt; ++i) {
-        const unsigned char c = (unsigned char) params.prompt[i];
-        high_cpt = high_cpt || c >= 0xF5 || (c == 0xF4 && i + 1 < params.prompt.size() && (unsigned char) params.prompt[i + 1] >= 0x90);
-    }
-    if (!high_cpt) {
-        const std::vector<llama_token> ids = common_tokenize(llama_model_get_vocab(g_model), params.prompt, true, true);
-        (void) ids;
-    }
+    // The app tokenizes the prompt with add_special and parse_special.
+    const std::vector<llama_token> ids = common_tokenize(llama_model_get_vocab(g_model), params.prompt, true, true);
+    (void) ids;
 
     // The output parser of the template, on a random model output, full and partial.
     const std::string output = text(fdp) + fdp.ConsumeRemainingBytesAsString();
