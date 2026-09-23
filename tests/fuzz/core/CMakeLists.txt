@@ -143,13 +143,19 @@ else()
 endif()
 string(APPEND CMAKE_C_FLAGS   " ${FUZZ_COV_FLAGS}")
 string(APPEND CMAKE_CXX_FLAGS " ${FUZZ_COV_FLAGS}")
+# A shared library of llama.cpp gives its coverage to libFuzzer, thus its link gets the same flags.
+string(APPEND CMAKE_SHARED_LINKER_FLAGS " ${FUZZ_COV_FLAGS}")
 message(STATUS "fuzz core: profile ${FUZZ_PROFILE}, sanitizer ${FUZZ_SANITIZER}, type ${CMAKE_BUILD_TYPE}")
 
-# llama.cpp as a static library set, with the CPU backend. The OpenMP runtime
+# llama.cpp with the CPU backend. On the host, the profile file gives BUILD_SHARED_LIBS (shared
+# libraries, as the app ships them), and the build RPATH finds the libraries. On Android the
+# libraries are static, because phone-commands pushes only the executables. The OpenMP runtime
 # is not instrumented, thus TSan and MSan cannot see its barriers. GGML_OPENMP=OFF
 # gives the ggml thread pool, which is the pool of the app (the Android preset
 # sets the same value).
-set(BUILD_SHARED_LIBS       OFF CACHE BOOL "" FORCE)
+if (ANDROID)
+    set(BUILD_SHARED_LIBS   OFF CACHE BOOL "" FORCE)
+endif()
 set(LLAMA_BUILD_COMMON      ON  CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TESTS       OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TOOLS       OFF CACHE BOOL "" FORCE)
