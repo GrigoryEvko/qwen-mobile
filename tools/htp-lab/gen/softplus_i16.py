@@ -18,10 +18,15 @@ octave the lookup gives 0 for each coefficient, which is the correct limit of D.
 
     softplus(x) = relu(x) + log(2) - D(|x|)
 
-The f32 path evaluates t = e^-|x| with the exp of this backend and then log1p(t) = t * P(t),
-where P is a polynomial of degree LOG1P_DEGREE on [0, 1]. P(0) = 1 and the factor t is exact,
-thus the f32 path keeps its relative accuracy for a large negative x, where the result is e^x
-and no fixed-point number can hold it.
+The f32 path gives the result of the CPU reference, logf(1.0f + expf(x)) for x <= 20 and x above
+(the oracle form), to a few ulp. It evaluates t = e^-|x| with the exp of this backend. For a
+negative x (t = e^x) it rounds 1 + t to an f32, as the reference does, and takes t = (1 + t) - 1,
+which is exact. Then it evaluates log1p(t) = t * P(t), where P is a polynomial of degree
+LOG1P_DEGREE on [0, 1], thus the result is log of the rounded sum. For a positive x,
+log(1 + e^x) = x + log1p(e^-x), and the rounded sum of the reference moves its result by at most
+one half ulp. The rounded sum has an absolute error of up to 2^-24, thus the relative error of the
+oracle form against the exact function grows for a large negative x (the result is 0 below -16.6),
+and this path has that error too.
 
 Usage:
     tools/htp-lab/gen/softplus_i16.py > hvx-softplus.h
@@ -119,30 +124,75 @@ def eval_f32(x: np.ndarray, p: np.ndarray) -> np.ndarray:
         softplus as float64
     """
     t = np.exp(-np.abs(x).astype(np.float32)).astype(np.float32)
+    one = np.float32(1.0)
+    t = np.where(np.signbit(x), ((one + t).astype(np.float32) - one).astype(np.float32), t)
     acc = np.full_like(t, p[LOG1P_DEGREE])
     for d in range(LOG1P_DEGREE - 1, -1, -1):
         acc = (acc * t + p[d]).astype(np.float32)
     return np.maximum(x.astype(np.float64), 0.0) + (t * acc).astype(np.float32)
 
 
+def oracle_form(x: np.ndarray) -> np.ndarray:
+    """The CPU reference in f32 with correctly rounded expf and logf. O(len(x)).
+
+    Args:
+        x: The inputs as float32
+
+    Returns:
+        x > 20 ? x : logf(1.0f + expf(x)), as float32
+    """
+    e = np.exp(x.astype(np.float64)).astype(np.float32)
+    s = (np.float32(1.0) + e).astype(np.float32)
+    return np.where(x > 20, x, np.log(s.astype(np.float64)).astype(np.float32))
+
+
+def ulp32(v: np.ndarray) -> np.ndarray:
+    """The spacing of float32 values at |v|, and the smallest subnormal at 0. O(len(v))."""
+    a = np.abs(v.astype(np.float32))
+    return np.maximum(np.spacing(a), np.float32(1.4e-45)).astype(np.float64)
+
+
+def check_inputs() -> np.ndarray:
+    """The inputs of the check: the range [-30, 30], a normal spread, and values near 0. O(1)."""
+    rng = np.random.default_rng(1)
+    return np.concatenate([rng.uniform(-30, 30, 400000), rng.normal(0, 1.5, 400000),
+                           rng.normal(0, 0.05, 100000), rng.uniform(-1e-3, 1e-3, 50000)]).astype(np.float32)
+
+
+def f32_oracle_ulp(x: np.ndarray, p: np.ndarray) -> np.ndarray:
+    """The distance of the f32 path from the oracle form, in ulp of the oracle form, for x >= -10.
+
+    Below -10 the result is less than 4.6e-5, and an exp that differs by one ulp from the correctly
+    rounded one can move the rounded sum 1 + e^x by one ulp of 1, which is 2^-23 in the result: a
+    large distance in ulp of a small result. The check prints the absolute distance for all x.
+    O(len(x)).
+    """
+    x = x[x >= -10]
+    orc = oracle_form(x)
+    return np.abs(eval_f32(x, p) - orc.astype(np.float64)) / ulp32(orc)
+
+
 def check() -> int:
-    """Print the error of each path against a float64 reference.
+    """Print the error of each path against a float64 reference, and the f32 path against the
+    oracle form in ulp.
 
     Returns:
         The exit status
     """
-    rng = np.random.default_rng(1)
-    x = np.concatenate([rng.uniform(-30, 30, 400000), rng.normal(0, 1.5, 400000),
-                        rng.normal(0, 0.05, 100000), rng.uniform(-1e-3, 1e-3, 50000)]).astype(np.float32)
+    x = check_inputs()
     ref = np.log1p(np.exp(-np.abs(x.astype(np.float64)))) + np.maximum(x.astype(np.float64), 0.0)
     q, p = table(), log1p_coeffs()
     print(f"{'path':<6} {'max abs':>10} {'rms abs':>10} {'nmse':>10} {'max rel':>10} {'max rel, x<-8':>14}")
     tail = x < -8
-    for name, y in (("i16", eval_i16(x, q)), ("f32", eval_f32(x, p))):
+    orc = oracle_form(x)
+    for name, y in (("i16", eval_i16(x, q)), ("f32", eval_f32(x, p)), ("oracle", orc.astype(np.float64))):
         e = y - ref
         rel = np.abs(e) / ref
         print(f"{name:<6} {np.max(np.abs(e)):10.3e} {np.sqrt(np.mean(e ** 2)):10.3e}"
               f" {np.sum(e ** 2) / np.sum(ref ** 2):10.2e} {np.max(rel):10.3e} {np.max(rel[tail]):14.3e}")
+    d = f32_oracle_ulp(x, p)
+    print(f"f32 against the oracle form: max abs {np.max(np.abs(eval_f32(x, p) - orc)):.3e}; for x >= -10 "
+          f"max {np.max(d):.1f} ulp, mean {np.mean(d):.3f} ulp, equal {np.mean(d == 0) * 100:.1f} %")
     return 0
 
 
@@ -151,16 +201,23 @@ HEADER = '''// The softplus in vector form for the HVX. tools/htp-lab/gen/softpl
 //
 // softplus(x) = log(1 + e^x) = relu(x) + log(1 + e^-|x|). The identity holds for every x and it
 // has no cancellation: relu(x) is exact in the float domain and the second term is a smooth bump
-// in (0, log 2]. The op of the checkout evaluates logf(1.0f + expf(x)) one element at a time.
+// in (0, log 2]. The CPU reference (the oracle form) evaluates logf(1.0f + expf(x)) for x <= 20.
 //
 // Two paths, both of which write the same result the CPU reference writes for x > 20 (the result
 // is x, because the bump is below the resolution of an f32 there).
 //
-//   hvx_softplus_f32_aa    t = e^-|x| with the exp of this backend, then log1p(t) = t * P(t) with
-//                          P of degree {log1p_degree} on [0, 1]. P(0) = 1 and the factor t is exact, thus
-//                          this path keeps its relative accuracy where the result is e^x and no
-//                          fixed-point number can hold it. Measured against a float64 reference:
-//                          NMSE 7.1e-18, worst relative error 2.3e-7 over x in [-30, 30].
+//   hvx_softplus_f32_aa    the oracle form to a few ulp. t = e^-|x| with the exp of this backend.
+//                          For a negative x (t = e^x), t becomes (1 + t) - 1 with both steps in
+//                          f32, as the reference rounds 1 + e^x before its logf, and the second
+//                          step is exact. Then log1p(t) = t * P(t) with P of degree {log1p_degree} on
+//                          [0, 1], thus the result is log of the rounded sum. The rounded sum has
+//                          an absolute error of up to 2^-24, thus against the exact function the
+//                          relative error grows for a large negative x (the result is 0 below
+//                          -16.6), the same as the reference. The model of this path in the
+//                          generator (--check) gives a mean of {orc_mean_ulp} ulp against the oracle
+//                          form for x >= -10, and {orc_within} % of the values within 4 ulp. Where the
+//                          exp differs by one ulp from expf, the rounded sum can move by one
+//                          ulp of 1, thus the largest difference is 2^-23 absolute.
 //
 //   hvx_softplus_i16_f32_aa  D(u) = log(2) - log(1 + e^-u) from a piecewise int16 table, then
 //                          softplus = relu(x) + log(2) - D(|x|). One polynomial of degree {degree}
@@ -230,6 +287,15 @@ static inline __attribute__((always_inline)) void hvx_softplus_f32_x4(const HVX_
     }}
     for (int i = 0; i < 4; i++) {{
         t[i] = hvx_vec_exp_f32(t[i]);
+    }}
+
+    // For a negative x, the rounded sum of the reference: t = (1 + t) - 1, both steps in f32. A
+    // negative f32 is a negative int32, thus the word compare with 0 selects the negative lanes.
+    const HVX_Vector one = Q6_V_vsplat_R(0x3f800000);
+    for (int i = 0; i < 4; i++) {{
+        const HVX_Vector s  = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(one, t[i]));
+        const HVX_Vector ts = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(s, one));
+        t[i] = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VwVw(zero, x[i]), ts, t[i]);
     }}
 
     // log1p(t) = t * P(t), by Horner over the four chains. The first step multiplies the top
@@ -421,8 +487,10 @@ def main(argv: list[str] | None = None) -> int:
     p = log1p_coeffs()
     bits = [int(np.float32(c).view(np.uint32)) for c in p]
     log1p_rows = "\n".join(f"    0x{b:08x},   // {c:+.9g} * t^{i}" for i, (b, c) in enumerate(zip(bits, p)))
+    d = f32_oracle_ulp(check_inputs(), p)
     sys.stdout.write(HEADER.format(degree=DEGREE, scale=SCALE, log1p_degree=LOG1P_DEGREE,
-                                   e_base=E_LO + 15, rows="\n".join(rows), log1p_rows=log1p_rows))
+                                   e_base=E_LO + 15, rows="\n".join(rows), log1p_rows=log1p_rows,
+                                   orc_mean_ulp=f"{np.mean(d):.2f}", orc_within=f"{np.mean(d <= 4) * 100:.1f}"))
     return 0
 
 
