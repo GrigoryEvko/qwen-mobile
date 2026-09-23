@@ -121,7 +121,7 @@ bool read_head(const std::string & path, Snapshot & snap, uint64_t & body_offset
     r.get<uint32_t>();
     const uint64_t body_size   = r.get<uint64_t>();
     // Each number of the header limits an allocation, thus each one must agree
-    // with the length of the file before it is used (task #177). An item takes
+    // with the length of the file before it is used. An item takes
     // at least its token, thus n_items has a limit of items_bytes / 4: without
     // it, a damaged count reserves gigabytes. The subtraction below cannot wrap,
     // where the sum of a huge body_size can.

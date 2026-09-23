@@ -430,7 +430,7 @@ void rebuild_sampler(Engine & e, bool thinking, float temp, float top_p) {
     // A value that is not a finite number (NaN from a damaged settings file)
     // takes the recommended value of the mode. With NaN logits the dist
     // sampler finds no token: an assert in a build with assertions, and the
-    // last candidate in a release build (task #164).
+    // last candidate in a release build.
     if (!std::isfinite(temp)) {
         temp = thinking ? 1.0f : 0.7f;
     }
@@ -1062,7 +1062,7 @@ bool plain_step(Engine & e, std::string & error) {
     // token to the app. That token is not in the memory, and the logits of
     // the context belong to the last position of the verified batch. Thus
     // the token decodes first, and the sample reads its logits: the answer
-    // is the answer of a decode without a draft (task #162).
+    // is the answer of a decode without a draft.
     if (e.id_last != LLAMA_TOKEN_NULL) {
         const llama_token pending = e.id_last;
         e.id_last = LLAMA_TOKEN_NULL;
@@ -1687,7 +1687,7 @@ void clear_queue(Engine & e) {
 
 std::string jstring_to_std(JNIEnv * env, jstring s) {
     // With a pending exception, JNI permits only some calls, and CheckJNI stops
-    // the app on each other call. The caller examines the exception after its reads (task #161).
+    // the app on each other call. The caller examines the exception after its reads.
     if (s == nullptr || env->ExceptionCheck()) {
         return {};
     }

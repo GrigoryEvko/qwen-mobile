@@ -145,7 +145,7 @@ void reset();
 
 /**
  * Turn one check off by its name: "capacity" (the local reference
- * capacity). Thus a fuzz run continues past a finding that it recorded.
+ * capacity). Thus a fuzz run continues past a defect that it recorded.
  * The environment variable FAKEJNI_RELAX holds a comma-separated list of
  * names at the first call.
  */

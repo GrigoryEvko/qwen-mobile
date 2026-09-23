@@ -16,8 +16,8 @@ import kotlin.random.Random
 /**
  * The fuzz tests of the load path of [ConversationStore]: random files,
  * damaged files, files with wrong key types, and saved conversations with
- * random text and images. Refer to [FuzzSwitch] for the iteration count, the
- * seed, and the switch of the finding tests.
+ * random text and images. Refer to [FuzzSwitch] for the iteration count and
+ * the seed.
  *
  * The properties of load():
  * - It returns and does not throw, whatever the file holds.
@@ -173,9 +173,9 @@ class ConversationStoreFuzzTest {
      * A deeply nested file loads as an empty conversation. The org.json of
      * the tests stops at a nesting depth of 512 with a JSONException. The
      * org.json of Android has no such limit and its parser is recursive, thus
-     * there the same file gives a StackOverflowError, which load() catches
-     * (finding conversation-deep-nesting, task #94 D9, from the source, not
-     * from a run on a phone).
+     * there the same file gives a StackOverflowError, which load() catches.
+     * The Android part of this statement comes from the source of org.json,
+     * not from a run on a phone.
      */
     @Test
     fun aDeeplyNestedFileLoadsAsAnEmptyConversation() {
@@ -191,8 +191,8 @@ class ConversationStoreFuzzTest {
     }
 
     /**
-     * An image name that is not a name of save() reads no file (finding
-     * conversation-image-path, task #166): "../secret.bin" would read a file
+     * An image name that is not a name of save() reads no file:
+     * "../secret.bin" would read a file
      * outside of the image directory as the image of the message.
      */
     @Test
@@ -208,8 +208,7 @@ class ConversationStoreFuzzTest {
 
     /**
      * One message without a role or a content does not lose the other
-     * messages, and the file stays whole as conversation.json.bad (finding
-     * conversation-all-or-nothing, task #94 D9).
+     * messages, and the file stays whole as conversation.json.bad.
      */
     @Test
     fun oneBadMessageDoesNotLoseTheOthers() {
@@ -226,7 +225,7 @@ class ConversationStoreFuzzTest {
     /**
      * A file that does not parse goes to conversation.json.bad, thus the next
      * save does not write over it. A second damaged file does not overwrite
-     * the first one, and the same bytes are kept one time (task #94 D9).
+     * the first one, and the same bytes are kept one time.
      */
     @Test
     fun aFileThatDoesNotParseIsKeptAndNotOverwritten() {

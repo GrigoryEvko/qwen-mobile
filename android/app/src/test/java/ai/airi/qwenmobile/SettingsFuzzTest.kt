@@ -164,7 +164,7 @@ class SettingsFuzzTest {
 
     /**
      * A value of a wrong type in the preferences file gives the default of
-     * its key (finding settings-wrong-type, task #94). read() runs in the
+     * its key. read() runs in the
      * constructor of the store, which the first screen makes: a
      * ClassCastException there stops the app at each start.
      */
@@ -184,9 +184,8 @@ class SettingsFuzzTest {
     }
 
     /**
-     * A NaN temperature or top-p in the file takes the default (finding
-     * settings-nan, task #164). coerceIn keeps NaN, and NaN stops the sampler
-     * of the engine.
+     * A NaN temperature or top-p in the file takes the default. coerceIn
+     * keeps NaN, and NaN stops the sampler of the engine.
      */
     @Test
     fun aNanTemperatureAndTopPAreSanitized() {
@@ -196,8 +195,8 @@ class SettingsFuzzTest {
     }
 
     /**
-     * The limit of the system prompt does not cut a surrogate pair in two
-     * (finding settings-surrogate, task #165). A lone high surrogate at the
+     * The limit of the system prompt does not cut a surrogate pair in two.
+     * A lone high surrogate at the
      * end goes through GetStringUTFChars to the engine as three bytes that
      * are not UTF-8.
      */

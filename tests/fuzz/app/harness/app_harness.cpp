@@ -7,7 +7,7 @@
  *
  * - common_speculative_process: a fault plan makes the draft context refuse
  *   a batch, as a failed decode on the NPU does.
- * - setpriority and closedir: the check of the thread priorities (task #66).
+ * - setpriority and closedir: the check of the thread priorities.
  * - ggml_threadpool_free: the thread that destroys an engine.
  *
  * The checks after each operation, for each live engine:
@@ -20,7 +20,7 @@
  *   of the draft driver is the text of the items.
  * - A token that went to the app is in the memory: an engine without a
  *   draft driver has no token of a step (id_last) in an open answer.
- * - The exactness oracle (task #87, #95): the state of the engine, restored
+ * - The exactness oracle: the state of the engine, restored
  *   into a new context, gives the same logits for a probe token as a new
  *   context that decodes the items of the engine from the start.
  *
@@ -545,8 +545,8 @@ std::string pick_role(FuzzedDataProvider & fdp) {
 
 /**
  * A temperature or a top-p: the usual value, the edges, and values out of
- * range. NaN and the infinities go to the check of rebuild_sampler (finding
- * sampler-nan, task #164): NaN logits stop llama_sampler_dist_apply.
+ * range. NaN and the infinities go to the check of rebuild_sampler: NaN
+ * logits stop llama_sampler_dist_apply.
  */
 float pick_float(FuzzedDataProvider & fdp, float usual) {
     switch (fdp.ConsumeIntegralInRange<int>(0, 10)) {
@@ -1450,7 +1450,7 @@ int run_scenario(const Options & opt, const std::string & name) {
                 (unsigned long long) g_spec_faults.load());
         api_free(h);
     } else if (name == "spec-parity") {
-        // Task #162, the acceptance: a forced draft failure gives the text of a run with speculation off.
+        // A forced draft failure must give the text of a run with speculation off.
         s.mmproj.clear();
         const std::string want = greedy_answer(p, s, false, -1, 48);
         for (const int fault_at : {-1, 0, 1, 2, 5}) {
@@ -1469,7 +1469,7 @@ int run_scenario(const Options & opt, const std::string & name) {
                     (unsigned long long) (g_spec_faults.load() - faults), got.size());
         }
     } else if (name == "sampler-nan") {
-        // A NaN temperature (the settings keep NaN, finding settings-nan) reaches the sampler chain.
+        // A NaN temperature (a damaged settings file can hold one) reaches the sampler chain.
         s.mmproj.clear();
         const jlong h = api_load(s);
         const int rc = api_chat_start(p, h, {user(u"Hello", -1)}, false, std::numeric_limits<float>::quiet_NaN(), 0.8f,

@@ -88,7 +88,7 @@ class SettingsStore private constructor(context: Context) {
      * The value of one key, or [default] when the file holds a value of
      * another type there. SharedPreferences then throws ClassCastException,
      * and read() runs in the constructor of the store, thus one such value
-     * stops the app at each start (task #94).
+     * stops the app at each start.
      */
     private inline fun <T> readOr(key: String, default: T, get: () -> T): T = try {
         get()
@@ -182,14 +182,14 @@ class SettingsStore private constructor(context: Context) {
             backend = if (!LlamaEngine.ready || LlamaEngine.has(s.backend)) s.backend else defaultBackend(),
             threads = s.threads.coerceIn(MIN_THREADS, MAX_THREADS),
             nCtx = if (s.nCtx in CONTEXT_LENGTHS) s.nCtx else 8192,
-            // coerceIn keeps NaN, and NaN stops the sampler of the engine, thus NaN takes the default (task #164).
+            // coerceIn keeps NaN, and NaN stops the sampler of the engine, thus NaN takes the default.
             temperature = if (s.temperature.isNaN()) DEFAULT_TEMPERATURE else s.temperature.coerceIn(0f, MAX_TEMPERATURE),
             topP = if (s.topP.isNaN()) DEFAULT_TOP_P else s.topP.coerceIn(MIN_TOP_P, 1f),
             // The prompt costs context on every turn and is prefilled again
             // whenever it changes, thus it is bounded. The limit counts UTF-16
             // units: a cut between the two units of a surrogate pair leaves a
             // high surrogate that is not UTF-8 in the engine, thus the cut
-            // goes before the pair (task #165).
+            // goes before the pair.
             systemPrompt = s.systemPrompt.trim().let { p ->
                 if (p.length > MAX_SYSTEM_PROMPT && p[MAX_SYSTEM_PROMPT - 1].isHighSurrogate()) {
                     p.take(MAX_SYSTEM_PROMPT - 1)

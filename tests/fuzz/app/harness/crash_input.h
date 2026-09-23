@@ -6,7 +6,7 @@
  * libFuzzer writes the input from inside that signal: ThreadSanitizer then
  * reports "signal-unsafe call inside of a signal" and stops before the file
  * is written. Thus stop() writes the input itself, to the directory of the
- * environment variable FUZZ_ARTIFACT_DIR (the one variable of the campaign
+ * environment variable FUZZ_ARTIFACT_DIR (the one variable of all fuzz areas
  * for crash files, refer to tests/sanitizers/fuzz_death.h), and stops with _exit(1).
  *
  * No other dependency, thus each fuzzer includes this header.

@@ -52,7 +52,7 @@ void init_once(const Options & opt);
 int run_program(const Options & opt, const uint8_t * data, size_t size);
 
 /**
- * The check of task #66: a thread of the app that starts during a load,
+ * The check of the thread priorities: a thread of the app that starts during a load,
  * after the first listing of /proc/self/task, gets the compute priority and
  * a place in the ADPF session. The check starts such a thread, loads the
  * tiny model, and reports the priority calls. Returns 0 when the load did not
@@ -61,16 +61,16 @@ int run_program(const Options & opt, const uint8_t * data, size_t size);
 int check_priority(const Options & opt);
 
 /**
- * Run one deterministic scenario that reproduces one finding. The names:
+ * Run one deterministic scenario of a defect class. The names:
  * image-shape, image-twice, jni-pending, spec-disable, spec-parity, sampler-nan, priority. Returns 0
- * when the finding does not occur, 1 when the priority check reports it,
- * and 2 for an unknown name. The other findings abort the process with the
+ * when the defect does not occur, 1 when the priority check reports it,
+ * and 2 for an unknown name. The other defects stop the process with the
  * message of the check or the report of the sanitizer.
  */
 int run_scenario(const Options & opt, const std::string & name);
 
 /**
- * The speed of the answer path on the host, for the fixes of the decode and
+ * The speed of the answer path on the host, to compare two builds of the decode and
  * sample path: the tiny model (F32, one thread) answers one message with up
  * to 64 tokens, reps times without and reps times with speculation. Prints
  * the median, the minimum and the maximum of the time of one generateNext

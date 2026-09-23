@@ -97,7 +97,7 @@ class ConversationStore(private val dir: File) {
 
     /**
      * Read the messages, or an empty list when there is no file. A message
-     * that is not readable is skipped, and the others load (task #94, D9).
+     * that is not readable is skipped, and the others load.
      *
      * A file that did not load in full stays on the disk as
      * conversation.json.bad (refer to [keepDamaged]). A file that gives no
@@ -146,7 +146,7 @@ class ConversationStore(private val dir: File) {
      * The entry of one message object of the file. The image name must have
      * the form that [hashName] gives, thus a name such as
      * "../conversation.json" does not read a file outside of the image
-     * directory (task #166).
+     * directory.
      */
     private fun entryOf(obj: JSONObject): Entry {
         val image = obj.optString("image", "").takeIf { IMAGE_NAME.matches(it) }

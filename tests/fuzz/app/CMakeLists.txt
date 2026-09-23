@@ -38,7 +38,7 @@ if(NOT LLAMA_CPP_DIR OR NOT EXISTS "${LLAMA_CPP_DIR}/CMakeLists.txt")
     message(FATAL_ERROR "LLAMA_CPP_DIR is not a llama.cpp tree: '${LLAMA_CPP_DIR}'. Use a private snapshot, not the submodule.")
 endif()
 
-# The native sources of the app. A different directory (a copy with a fix patch applied) tests the fix.
+# The native sources of the app. Another directory holds another version of them, for example a copy with a patch.
 set(FUZZ_APP_CPP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../android/app/src/main/cpp" CACHE PATH "The native sources of the app")
 get_filename_component(APP_CPP_DIR "${FUZZ_APP_CPP_DIR}" ABSOLUTE)
 
@@ -48,7 +48,7 @@ get_filename_component(APP_CPP_DIR "${FUZZ_APP_CPP_DIR}" ABSOLUTE)
 set(SAN_COMPILE "")
 set(SAN_LINK "")
 if(CMAKE_CXX_FLAGS MATCHES "-fsanitize=")
-    # The initial cache of the campaign (cmake -C tests/sanitizers/<value>.cmake,
+    # The shared initial cache (cmake -C tests/sanitizers/<value>.cmake,
     # which run.sh gives on the host) holds the flags of the configuration.
     message(STATUS "app fuzz: the sanitizer flags come from the initial cache: ${CMAKE_CXX_FLAGS}")
 elseif(FUZZ_SANITIZER STREQUAL "asan")
@@ -62,8 +62,8 @@ elseif(FUZZ_SANITIZER STREQUAL "tsan")
 elseif(FUZZ_SANITIZER STREQUAL "msan")
     if(NOT EXISTS "${FUZZ_MSAN_PREFIX}/include/c++/v1/vector")
         message(FATAL_ERROR "msan needs an MSan-instrumented libc++ in FUZZ_MSAN_PREFIX='${FUZZ_MSAN_PREFIX}' "
-                            "(include/c++/v1 and lib). The sanitizer-matrix agent builds it into "
-                            "build/fuzz/msan-libcxx/install. That directory does not exist yet.")
+                            "(include/c++/v1 and lib). tests/sanitizers/build-msan-libcxx.sh builds it into "
+                            "build/fuzz/msan-libcxx/install, and that directory does not exist.")
     endif()
     set(SAN_COMPILE -fsanitize=memory -fsanitize-memory-track-origins=2 -stdlib=libc++ -nostdinc++
                     -isystem ${FUZZ_MSAN_PREFIX}/include/c++/v1)
@@ -94,18 +94,18 @@ add_link_options(${SAN_COMPILE} ${SAN_LINK})
 # (android/snapdragon/CMakeUserPresets.json, preset arm64-android-snapdragon):
 #   -march=armv8.7a+fp16+dotprod+i8mm -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE
 # with CMAKE_BUILD_TYPE=Release (-O3 -DNDEBUG). The x86 builds use GGML_NATIVE=ON
-# in place of the -march of arm64 (msan keeps the SIMD off under rule R7).
+# in place of the -march of arm64 (msan keeps the SIMD off: MSan cannot follow the SIMD intrinsics).
 # libqwenmobile.so (android/snapdragon/CMakeLists.txt, scripts/build-native.sh)
 # builds the app sources with CMAKE_BUILD_TYPE=Release and no more flags than the
-# NDK gives: -O3 -DNDEBUG, no -flto, no floating-point flags. The campaign
-# applies the flags of the profile to every target (rule R12, the same as the
-# shared initial caches on x86), thus the app sources here get them too.
+# NDK gives: -O3 -DNDEBUG, no -flto, no floating-point flags. The fuzz builds
+# apply the flags of the profile to every target, as the shared initial caches
+# on x86 do, thus the app sources here get them too.
 set(LLAMA_FP_FLAGS -fvectorize -ffp-model=fast -fno-finite-math-only -D_GNU_SOURCE)
 if(ANDROID)
     list(APPEND LLAMA_FP_FLAGS -march=armv8.7a+fp16+dotprod+i8mm)
 endif()
 if(DEFINED SANMATRIX_PROFILE)
-    # The x86 builds of run.sh take the shared initial caches of the campaign
+    # The x86 builds of run.sh take the shared initial caches
     # (tests/sanitizers/profile-<profile>.cmake, then <sanitizer>.cmake). They
     # give the build type, the optimizer, the floating-point flags and LTO to
     # every target, and tests/sanitizers/check-rules.sh compares them with the

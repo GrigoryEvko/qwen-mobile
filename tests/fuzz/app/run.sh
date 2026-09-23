@@ -13,8 +13,8 @@
 # The modes:
 #   test            Build build/fuzz/app-<profile>-<sanitizer> and run each
 #                   fuzzer one time on each of its seeds and regression inputs,
-#                   with no mutation, then the scenario of each finding. Stop
-#                   with the code 1 when one of them reports a finding.
+#                   with no mutation, then each scenario of the driver. Stop
+#                   with the code 1 when one of them reports a defect.
 #   fuzz            Build build/fuzz/app-<profile>-<sanitizer> and mutate each
 #                   target for the budget (the default is 600 seconds):
 #                   fuzz_jni_api, fuzz_jni_threads, fuzz_jni_threads_free
@@ -22,15 +22,15 @@
 #   build           Only build.
 #   jvm             Run the JVM fuzz tests (*FuzzTest) with Gradle in the APK
 #                   container, on a staged copy of android/. The environment
-#                   variables QWEN_FUZZ_ITERATIONS, QWEN_FUZZ_SEED and
-#                   QWEN_FUZZ_FINDINGS=1 go to the tests.
+#                   variables QWEN_FUZZ_ITERATIONS and QWEN_FUZZ_SEED go to the
+#                   tests.
 #   phone-build     Build the fuzzers and the driver for arm64 Android in the
 #                   Snapdragon container into
 #                   build/fuzz/app-android-<profile>-<sanitizer>, and stage the
 #                   files for the phone into build/fuzz/app/phone-<profile>-<sanitizer>.
 #                   An ASan build uses the ASan runtime of compiler-rt 22.1.8
-#                   from build/fuzz/asan-android-runtime (task #176: the runtime
-#                   of NDK r29 traps in each new thread on the phone).
+#                   from build/fuzz/asan-android-runtime (the runtime of NDK
+#                   r29 traps in each new thread on the phone).
 #   phone-commands  Print the adb commands that push and run a phone build.
 #                   This script never runs adb.
 #   phone-apk       Build libqwenmobile.so from the working tree against
@@ -44,7 +44,7 @@
 # for llama.cpp; refer to tests/fuzz/app/CMakeLists.txt). Without --profile,
 # test, fuzz and build run debug, then release.
 #
-# The older names stay: cpu-asan [S] is "fuzz asan --budget-seconds S",
+# Short names: cpu-asan [S] is "fuzz asan --budget-seconds S",
 # cpu-tsan [S] is "fuzz tsan --budget-seconds S", and regress and scenarios
 # are "test asan".
 #
@@ -132,10 +132,10 @@ models() {
         --gguf-py "$SNAP/gguf-py" --template "$SNAP/models/templates/Qwen3.5-4B.jinja" --out "$MODELS"
 }
 
-# The one suppression file of UBSan of the campaign (rule R5). This area has no file of its own.
+# The one suppression file of UBSan for all fuzz areas. This area has no file of its own.
 UBSAN_SUPP="$REPO/tests/sanitizers/ubsan.supp"
 
-# Set the runtime options of the sanitizer $1: the shared ones of the campaign
+# Set the runtime options of the sanitizer $1: the shared ones of all fuzz areas
 # (tests/sanitizers/env.sh) when they exist, else the same values here.
 runtime_options() {
     case $1 in
@@ -159,14 +159,14 @@ runtime_options() {
 }
 
 # Configure and build the host fuzzers with the sanitizer $1 into build/fuzz/app-$1. The flags
-# come from the initial cache tests/sanitizers/$1.cmake of the campaign when it exists.
+# come from the shared initial cache tests/sanitizers/$1.cmake when it exists.
 build_host() {
     local san=$1 dir
     dir=$(bdir "$1")
     local -a init=()
     snapshot
     models
-    # The shared initial caches of the campaign give the flags: the profile
+    # The shared initial caches give the flags: the profile
     # first, then the sanitizer. Without them tests/fuzz/app/CMakeLists.txt
     # gives the same flags itself.
     if [[ -f "$REPO/tests/sanitizers/profile-$PROFILE.cmake" && -f "$REPO/tests/sanitizers/$san.cmake" ]]; then
@@ -228,18 +228,7 @@ max_len_of() {
     esac
 }
 
-# The task of a known report outside of this area that stops a run, or nothing: $1 the log.
-# Task #127: the type traits of ggml-cpu are called through a function pointer of another
-# type (UBSan function-type-mismatch in get_rows of a Q8_0 model). fuzz-ops owns the fix.
-blocker_of() {
-    if grep -q 'through pointer to incorrect function type' "$1" 2> /dev/null; then
-        echo "#127"
-    fi
-}
-
 # Append one result line: target, sanitizer, mode, seconds, executions, then the crash files.
-# With BLOCKED=<task> and BLOCKED_LOG=<log> set, the line records a run that a known
-# report outside of this area stopped: no finding of this area, and not a pass.
 result() {
     local target=$1 san=$2 mode=$3 seconds=$4 executions=$5
     shift 5
@@ -247,10 +236,8 @@ result() {
     files=$(printf '%s\n' "$@" | jq -R . | jq -sc 'map(select(length > 0))')
     jq -nc --arg profile "$PROFILE" --arg target "$target" --arg san "$san" --arg mode "$mode" \
         --argjson seconds "$seconds" --argjson executions "$executions" --argjson files "$files" \
-        --arg blocked "${BLOCKED:-}" --arg blocked_log "${BLOCKED_LOG:-}" \
         '{area: "app", profile: $profile, target: $target, sanitizer: $san, mode: $mode, seconds: $seconds,
-          executions: $executions, findings: ($files | length), crash_files: $files}
-         + (if $blocked == "" then {} else {blocked_by: $blocked, blocked_log: $blocked_log} end)' \
+          executions: $executions, findings: ($files | length), crash_files: $files}' \
         >> "$(bdir "$san")/results.jsonl"
 }
 
@@ -284,26 +271,19 @@ fuzz_one() {
     runs=$(grep -o 'stat::number_of_executed_units: *[0-9]*' "$log" | grep -o '[0-9]*$' || true)
     local -a crashes=()
     # The outer timeout killed a run that did not stop by itself: a hang (for
-    # example ThreadSanitizer in the death callback of libFuzzer). It is a finding.
+    # example ThreadSanitizer in the death callback of libFuzzer). It is a defect.
     if ((rc == 137)); then
         echo "==HARNESS== hang: the run did not stop within $((budget + 300)) s and was killed" >> "$log"
         crashes+=("$log")
     fi
     for f in "$art"/*; do
-        # A slow-unit file of libFuzzer is an input that took more than 10 s, not a finding.
+        # A slow-unit file of libFuzzer is an input that took more than 10 s, not a defect.
         case ${f##*/} in
             crash-* | leak-* | timeout-* | oom-*) [[ -z "${before[$f]:-}" ]] && crashes+=("$f") ;;
         esac
     done
     if ((${#crashes[@]} == 0)) && grep -qE 'ERROR: (AddressSanitizer|ThreadSanitizer|MemorySanitizer|LeakSanitizer|libFuzzer)|WARNING: (ThreadSanitizer|MemorySanitizer)|runtime error:|==FAKEJNI== [^r]|==FUZZ-' "$log"; then
         crashes=("$log")
-    fi
-    local blocked
-    blocked=$(blocker_of "$log")
-    if [[ -n "$blocked" ]]; then
-        BLOCKED=$blocked BLOCKED_LOG=$log result "$target" "$san" fuzz $((t1 - t0)) "${runs:-0}"
-        echo "run.sh: fuzz $PROFILE-$san $target: ${runs:-0} executions in $((t1 - t0)) s, blocked by $blocked"
-        return
     fi
     result "$target" "$san" fuzz $((t1 - t0)) "${runs:-0}" "${crashes[@]}"
     echo "run.sh: fuzz $PROFILE-$san $target: ${runs:-0} executions in $((t1 - t0)) s, ${#crashes[@]} findings"
@@ -313,7 +293,7 @@ fuzz_one() {
 test_one() {
     local target=$1 san=$2 dir
     dir=$(bdir "$2")
-    local bin inputs=() crashes=() t0 t1 f n=0 log blocked="" blocked_log=""
+    local bin inputs=() crashes=() t0 t1 f n=0 log
     bin="$dir/$(binary_of "$target")"
     mkdir -p "$dir/logs/test" "$dir/artifacts/test-$target"
     for f in "$(seeds_of "$target")"/* "$HERE/regress/$(binary_of "$target")"/*; do
@@ -327,21 +307,16 @@ test_one() {
         if ! env FAKEJNI_RELAX='' FUZZ_APP_SKIP_KNOWN=0 FUZZ_ARTIFACT_DIR="$dir/artifacts/test-$target" \
             $(env_of "$target" "$san") nice -n 10 timeout -s KILL 900 \
             "$bin" -runs=1 -rss_limit_mb=4096 -artifact_prefix="$dir/artifacts/test-$target/" "$f" > "$log" 2>&1; then
-            if [[ -n "$(blocker_of "$log")" ]]; then
-                blocked=$(blocker_of "$log")
-                blocked_log=$log
-            else
-                crashes+=("$f")
-            fi
+            crashes+=("$f")
         fi
     done
     t1=$(date +%s)
-    BLOCKED=$blocked BLOCKED_LOG=$blocked_log result "$target" "$san" test $((t1 - t0)) "$n" "${crashes[@]}"
-    echo "run.sh: test $PROFILE-$san $target: $n inputs, ${#crashes[@]} findings${blocked:+, blocked by $blocked}"
-    ((${#crashes[@]} == 0)) && [[ -z "$blocked" ]]
+    result "$target" "$san" test $((t1 - t0)) "$n" "${crashes[@]}"
+    echo "run.sh: test $PROFILE-$san $target: $n inputs, ${#crashes[@]} findings"
+    ((${#crashes[@]} == 0))
 }
 
-# Run the scenario of each finding with the driver of the build: $1 the sanitizer.
+# Run each scenario of the driver of the build one time: $1 the sanitizer.
 test_scenarios() {
     local san=$1 dir s rc t0 t1 status=0
     dir=$(bdir "$1")
@@ -353,10 +328,6 @@ test_scenarios() {
         t1=$(date +%s)
         if ((rc == 0)); then
             result "scenario:$s" "$san" test $((t1 - t0)) 1
-        elif [[ -n "$(blocker_of "$dir/logs/test/scenario-$s.log")" ]]; then
-            BLOCKED=$(blocker_of "$dir/logs/test/scenario-$s.log") BLOCKED_LOG="$dir/logs/test/scenario-$s.log" \
-                result "scenario:$s" "$san" test $((t1 - t0)) 1
-            status=1
         else
             result "scenario:$s" "$san" test $((t1 - t0)) 1 "$dir/logs/test/scenario-$s.log"
             status=1
@@ -393,7 +364,7 @@ mode_fuzz() {
         done
     done
     wait
-    # The exit code is not 0 when one target of this run reported a finding.
+    # The exit code is not 0 when one target of this run reported a defect.
     found=$(tail -n +$((lines + 1)) "$results" | jq -s 'map(.findings) | add // 0')
     ((found == 0))
 }
@@ -422,7 +393,6 @@ jvm() {
         -e GRADLE_USER_HOME=/workspace/build/cache/gradle \
         -e ANDROID_USER_HOME=/workspace/build/cache/home/.android \
         -e QWEN_FUZZ_ITERATIONS="${QWEN_FUZZ_ITERATIONS:-}" -e QWEN_FUZZ_SEED="${QWEN_FUZZ_SEED:-}" \
-        -e QWEN_FUZZ_FINDINGS="${QWEN_FUZZ_FINDINGS:-}" \
         "$image" bash -euo pipefail -c '
 ./gradlew --no-daemon --no-build-cache --console=plain -Pprebuilt=true -Pandroid.builder.sdkDownload=false \
     :app:testDebugUnitTest --tests "ai.airi.qwenmobile.*FuzzTest" || status=$?
@@ -436,11 +406,10 @@ exit ${status:-0}
 # The ASan runtime of NDK r29 traps in each new thread on the phone: bionic resets
 # the PAC key through prctl, and the prctl interceptor then fails its own AUTIASP.
 # Each Android ASan run uses the runtime of compiler-rt 22.1.8 that
-# tests/sanitizers/build-asan-android-runtime.sh builds (task #176), first in
-# LD_LIBRARY_PATH.
+# tests/sanitizers/build-asan-android-runtime.sh builds, first in LD_LIBRARY_PATH.
 ASAN_RT22="$REPO/build/fuzz/asan-android-runtime/libclang_rt.asan-aarch64-android.so"
 
-# Stop when the fixed ASan runtime is missing, or when its sha256 is not the one of its build.
+# Stop when that ASan runtime is missing, or when its sha256 is not the one of its build.
 check_asan_rt22() {
     [[ -f "$ASAN_RT22" && -f "$ASAN_RT22.sha256" ]] \
         || die "no $ASAN_RT22: run tests/sanitizers/build-asan-android-runtime.sh"
@@ -501,7 +470,7 @@ fi
     cp "$b"/{fuzz_jni_api,fuzz_jni_threads,fuzz_caches,fuzz_spec_policy,app_fuzz_driver} "$stage/bin/"
     cp "$dsp" "$stage/lib/"
     if [[ $san == asan ]]; then
-        # The fixed runtime goes in its own directory, which is first in LD_LIBRARY_PATH.
+        # That runtime goes in its own directory, which is first in LD_LIBRARY_PATH.
         check_asan_rt22
         mkdir -p "$stage/asan-rt"
         cp "$ASAN_RT22" "$stage/asan-rt/"
@@ -512,7 +481,7 @@ fi
         cp "$jnilibs"/*.so "$stage/lib/"
     fi
     cp "$MODELS"/tiny-qwen35-*.gguf "$stage/models/"
-    [[ -f "$UBSAN_SUPP" ]] || die "no $UBSAN_SUPP: the sanitizer-matrix agent writes it"
+    [[ -f "$UBSAN_SUPP" ]] || die "no $UBSAN_SUPP: the shared sanitizer files are missing"
     cp "$UBSAN_SUPP" "$stage/ubsan.supp"
     echo "run.sh: the phone files are in $stage ($(du -sh "$stage" | cut -f1))"
 }
@@ -527,7 +496,7 @@ phone_apk() {
     local jnilibs="$REPO/android/snapdragon/jniLibs/arm64-v8a" out="$OUT/phone-apk" lib name
     diff -q "$REPO/build/hashes-native.txt" <(sha256_table "$jnilibs"/*.so) > /dev/null \
         || die "$jnilibs does not match build/hashes-native.txt: the shipped libraries are not the last build"
-    # The new library links the llama.cpp libraries of build/native/llama: they must be the shipped ones.
+    # The library links the llama.cpp libraries of build/native/llama: they must be the shipped ones.
     for lib in "$REPO"/build/native/llama/bin/lib*.so; do
         name=${lib##*/}
         if [[ -f "$jnilibs/$name" ]] && ! cmp -s "$lib" "$jnilibs/$name"; then
@@ -616,7 +585,7 @@ phone_commands() {
     echo "$a shell chmod 755 $d/bin/fuzz_jni_api $d/bin/fuzz_jni_threads $d/bin/fuzz_caches $d/bin/fuzz_spec_policy $d/bin/app_fuzz_driver"
     echo "$a shell ls -la /data/local/tmp/qwen/models/"
     if [[ $san == asan ]]; then
-        one "0. The thread self-test of task #176. A code other than 0 stops the ASan runs: an environment failure, not a finding." \
+        one "0. The thread self-test of the ASan runtime. A code other than 0 stops the ASan runs: an environment failure, not a defect." \
             "cd $d && timeout -s KILL 100 env $envs bin/app_fuzz_driver --selftest-threads > logs/selftest.log 2>&1"
     fi
     one "1. The draft length policy, CPU only, 80 s." \

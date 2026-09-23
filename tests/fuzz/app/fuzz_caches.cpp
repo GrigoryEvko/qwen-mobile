@@ -8,13 +8,13 @@
  * - The byte counters are the sums over the entries, and the budgets hold.
  * - An entry that the store finds gives the bytes of its last put.
  * - best_prefix gives the longest prefix with at most limit items.
- * - A snapshot whose bytes did not read (a null read) is gone from the store
- *   (task #95 items 5 and 6), and a pointer from best_prefix stays valid for
- *   the bytes call and the drop, as prefill in llama_jni.cpp uses it.
+ * - A snapshot whose bytes did not read (a null read) is gone from the store,
+ *   and a pointer from best_prefix stays valid for the bytes call and the
+ *   drop, as prefill in llama_jni.cpp uses it.
  * - After a drain, each snapshot on disk has its file. A new store on the
  *   same directory (a restart of the app) finds each intact file again.
  * - The image cache gives data only for a request of the shape of the
- *   entry, and an entry of another shape goes (task #160).
+ *   entry, and an entry of another shape goes.
  *
  * The file compiles the headers with public members, thus the checks read
  * the entry lists. The layout of the classes does not change.
@@ -117,8 +117,8 @@ void check_states(const StateCache & s) {
     }
     // make_resident admits a snapshot by its state bytes, but the counter also
     // holds its items, and evict_ram never evicts the snapshot it keeps. Thus
-    // one resident snapshot can hold the store above the budget (finding
-    // state-ram-overhead). More than one cannot.
+    // one resident snapshot can hold the store above the budget. More than
+    // one cannot.
     if (s.ram_bytes_ > s.ram_budget_ && s.resident() > 1) {
         fail("state store: %zu bytes in RAM in %zu snapshots, over the budget of %zu", s.ram_bytes_, s.resident(),
              s.ram_budget_);
@@ -237,9 +237,9 @@ void run_states(FuzzedDataProvider & fdp, const std::string & dir) {
                     break;
                 }
                 const std::vector<MemItem> key = snap->items;
-                // FUZZ_CACHES_DRAIN=1 waits for the queued writes first: a finding that goes away with it
-                // is a read of a file whose write is still in the queue (finding state-pending-write).
-                // FUZZ_APP_SKIP_KNOWN=1 does the same, thus a long run explores past that finding.
+                // FUZZ_CACHES_DRAIN=1 or FUZZ_APP_SKIP_KNOWN=1 waits for the queued writes first. The store
+                // drops a snapshot whose file write is still in the queue, and the switch lets a long run
+                // go past that defect.
                 static const bool drain_first = getenv("FUZZ_CACHES_DRAIN") != nullptr ||
                                                 (getenv("FUZZ_APP_SKIP_KNOWN") != nullptr &&
                                                  strcmp(getenv("FUZZ_APP_SKIP_KNOWN"), "1") == 0);
@@ -387,7 +387,7 @@ void run_images(FuzzedDataProvider & fdp, const std::string & dir) {
                 const bool had = before != cache->index_.end();
                 const bool same = had && before->second->info.n_tokens == n_tokens && before->second->info.n_embd == n_embd;
                 const float * got = cache->get(id, n_tokens, n_embd);
-                // The caller reads n_tokens x n_embd floats from the pointer (finding image-cache-shape, task #160).
+                // The caller reads n_tokens x n_embd floats from the pointer.
                 if (got != nullptr && !same) {
                     fail("image cache: get(%s, %u, %u) gave the data of an entry of another shape", id.c_str(), n_tokens,
                          n_embd);

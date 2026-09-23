@@ -14,14 +14,14 @@
  * --size      The bytes of one program (the default is 1024).
  * --threads   Run the second thread of fuzz_jni_threads.
  * --replay    Run the files as programs, then stop.
- * --check-priority  Run the check of task #66 and stop with its result.
- * --scenario  Run one scenario of a finding (image-shape, image-twice,
+ * --check-priority  Run the check of the thread priorities and stop with its result.
+ * --scenario  Run one scenario of a defect class (image-shape, image-twice,
  *             jni-pending, spec-disable, spec-parity, sampler-nan, priority)
  *             and stop.
  * --speed     Measure the time of one generateNext of the tiny model, REPS
  *             answers without and REPS with speculation, and stop.
  * --selftest-threads  Start one thread, join it, and stop: the first step of
- *             a phone ASan run (task #176). A runtime that traps in a new
+ *             a phone ASan run. A runtime that traps in a new
  *             thread stops the process here.
  *
  * The environment variables of app_harness.h select the models and the device.
