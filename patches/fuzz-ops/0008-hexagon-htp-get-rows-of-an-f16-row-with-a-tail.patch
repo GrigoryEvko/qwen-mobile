@@ -1,0 +1,77 @@
+hexagon: htp: get_rows of an f16 row with a tail
+Fold-into: upstream/hexagon-htp
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+The f16 path of GET_ROWS converts a row with hvx_dequantize_row_f16_f32, which
+converts only the whole blocks of 32 elements. When ne00 % 32 != 0, the last
+ne00 % 32 values of each row stay as the old contents of the scratch pad, and
+the DMA writes them to the output. The op fuzzer found values up to 3e38 in
+such rows. The path also converted ne00 elements for each chunk of a row, not
+the chunk length. The app graphs do not reach this condition: their only f16
+GET_ROWS has ne00 = 2048.
+
+This patch converts cur_elems elements, the tail with one more vector and a
+store of its bytes. The v79 simulator shows the conversion correct for the
+lengths 1 to 2080, with no write after the row.
+
+The patch also adds GET_ROWS cases to test-backend-ops: f16 rows of 33, 58, 80
+and 293 elements, and f16 and q8_0 rows of 2080 and 4096 elements with few
+rows, which a backend can divide into chunks.
+
+diff --git a/ggml/src/ggml-hexagon/htp/get-rows-ops.c b/ggml/src/ggml-hexagon/htp/get-rows-ops.c
+index 4501285..97bc349 100644
+--- a/ggml/src/ggml-hexagon/htp/get-rows-ops.c
++++ b/ggml/src/ggml-hexagon/htp/get-rows-ops.c
+@@ -195,6 +195,19 @@ static void get_rows_thread_##TYPE_NAME##_##IDX_TYPE(unsigned int nth, unsigned
+     dma_queue_flush(dma_queue);                                                                                        \
+ }
+ 
++// The f16 rows of a chunk: hvx_dequantize_row_f16_f32 converts the whole blocks of 32 elements only,
++// thus the last n % 32 elements take one more vector and a store of their bytes. The load of that
++// vector reads past the row inside the scratch pad, which the layout rounds up to 256 bytes.
++static inline void get_rows_f16_to_f32(float * restrict dst, const uint8_t * restrict src, uint32_t n) {
++    const uint32_t nb = n / 32;
++    const uint32_t nt = n % 32;
++    hvx_dequantize_row_f16_f32(dst, src, (int) (nb * 32));
++    if (nt) {
++        const HVX_Vector v = *(const HVX_UVector *) (src + nb * 32 * sizeof(__fp16));
++        hvx_vec_store_u(dst + nb * 32, nt * sizeof(float), Q6_V_lo_W(hvx_vec_f16_to_f32(v)));
++    }
++}
++
+ #define F32_BYTES(n)  ((n) * sizeof(float))
+ #define F16_BYTES(n)  ((n) * sizeof(__fp16))
+ #define Q8_0_BYTES(n) (((n) / 32) * sizeof(block_q8_0))
+@@ -202,8 +215,8 @@ static void get_rows_thread_##TYPE_NAME##_##IDX_TYPE(unsigned int nth, unsigned
+ GET_ROWS_THREAD_DT_FN(f32,  F32_BYTES,  int32_t, { if (cur_elems > 0) hvx_copy_f32_uu((uint8_t *)dst_spad, (const uint8_t *)src_spad, cur_elems); })
+ GET_ROWS_THREAD_DT_FN(f32,  F32_BYTES,  int64_t, { if (cur_elems > 0) hvx_copy_f32_uu((uint8_t *)dst_spad, (const uint8_t *)src_spad, cur_elems); })
+ 
+-GET_ROWS_THREAD_DT_FN(f16,  F16_BYTES,  int32_t, { hvx_dequantize_row_f16_f32((float *)dst_spad, src_spad, ne00); })
+-GET_ROWS_THREAD_DT_FN(f16,  F16_BYTES,  int64_t, { hvx_dequantize_row_f16_f32((float *)dst_spad, src_spad, ne00); })
++GET_ROWS_THREAD_DT_FN(f16,  F16_BYTES,  int32_t, { if (cur_elems > 0) get_rows_f16_to_f32((float *)dst_spad, (const uint8_t *)src_spad, cur_elems); })
++GET_ROWS_THREAD_DT_FN(f16,  F16_BYTES,  int64_t, { if (cur_elems > 0) get_rows_f16_to_f32((float *)dst_spad, (const uint8_t *)src_spad, cur_elems); })
+ 
+ GET_ROWS_THREAD_DT_FN(q8_0, Q8_0_BYTES, int32_t, { hvx_dequantize_row_q8_0_f32((float *)dst_spad, src_spad, ne00); })
+ GET_ROWS_THREAD_DT_FN(q8_0, Q8_0_BYTES, int64_t, { hvx_dequantize_row_q8_0_f32((float *)dst_spad, src_spad, ne00); })
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index aa000f3..13ae4ad 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9380,6 +9380,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     }
+ 
+     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
++    // f16 rows whose length is not a multiple of 32 (a vector tail), and long f16 and q8_0 rows that
++    // a backend can divide into chunks
++    for (int n : {33, 58, 80, 293}) {
++        test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16, n, 40, 12, 1, 1, false));
++        test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16, n, 40, 12, 2, 1, false));
++    }
++    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
++        test_cases.emplace_back(new test_get_rows(type, 2080, 16, 1, 1, 1, false));
++        test_cases.emplace_back(new test_get_rows(type, 4096, 16, 2, 1, 1, false));
++    }
+     for (ggml_type type : all_types) {
+         for (int b : {1, 7}) {
+             for (bool v : {false, true}) {
