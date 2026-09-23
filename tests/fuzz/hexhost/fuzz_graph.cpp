@@ -21,6 +21,7 @@
 // x86 run the switches and the hardware of such a phone run, and
 // HEXHOST_OPFUSION=N sets the fusion switch.
 
+#include "dsp_model.h"
 #include "fake_dsp.h"
 #include "fuzz_death.h"
 #include "graphgen.h"
@@ -33,13 +34,68 @@
 
 #include <fuzzer/FuzzedDataProvider.h>
 
+#include <cinttypes>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 #ifndef HEXHOST_ASYNC_DSP
 #define HEXHOST_ASYNC_DSP 0
 #endif
+
+namespace {
+
+// Gives the names of the tensors of a world whose bytes hold the address: the caches and the
+// owners of the bytes of each graph node. O(caches + nodes).
+std::string names_at(const graphgen::world & w, uint64_t addr) {
+    std::string s;
+    auto        add = [&](const ggml_tensor * t) {
+        const uint64_t a = (uint64_t) (uintptr_t) t->data;
+        if (t->data && addr >= a && addr < a + ggml_nbytes(t)) {
+            s += s.empty() ? "" : ",";
+            s += t->name[0] ? t->name : "?";
+        }
+    };
+    for (const ggml_tensor * c : w.caches) {
+        add(c);
+    }
+    for (const auto & g : w.graphs) {
+        for (const ggml_tensor * n : g.order) {
+            if (!n->view_src) {
+                add(n);
+            }
+        }
+    }
+    return s.empty() ? "-" : s;
+}
+
+// HEXHOST_DUMP_OPS=1: prints each op of the recorded batches with the byte range and the owner
+// names of each input and output. O(ops * (caches + nodes)).
+void dump_batches(const graphgen::world & w, uint32_t step, const std::vector<fakedsp::batch_record> & batches) {
+    for (size_t b = 0; b < batches.size(); b++) {
+        for (size_t i = 0; i < batches[b].ops.size(); i++) {
+            const auto & op = batches[b].ops[i];
+            printf("step %u batch %zu op %zu %s\n", step, b, i, fakedsp::opcode_name(op.opcode));
+            auto one = [&](const char * kind, int k, const fakedsp::tensor_ref & t) {
+                if (t.present) {
+                    printf("    %s%d [0x%" PRIx64 ", 0x%" PRIx64 ") %u bytes flags 0x%x %s\n", kind, k, t.addr,
+                           t.addr + fakedsp::tensor_extent(t), t.size, t.flags, names_at(w, t.addr).c_str());
+                }
+            };
+            for (int k = 0; k < 10; k++) {
+                one("src", k, op.src[k]);
+            }
+            for (int k = 0; k < 4; k++) {
+                one("dst", k, op.dst[k]);
+            }
+        }
+    }
+    fflush(stdout);
+}
+
+} // namespace
 
 extern "C" int LLVMFuzzerInitialize(int * argc, char *** argv) {
     (void) argc;
@@ -110,7 +166,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
                 fakedsp::count("batch replays verified", verified);
             }
             fakedsp::count("steps");
-            chk.run_device(fakedsp::take_batches());
+            std::vector<fakedsp::batch_record> batches = fakedsp::take_batches();
+            if (getenv("HEXHOST_DUMP_OPS")) {
+                dump_batches(w, step, batches);
+            }
+            chk.run_device(batches);
             chk.run_reference(g);
             if (!valid) {
                 // A slot index that is not a row of the table has no defined result: the graph
