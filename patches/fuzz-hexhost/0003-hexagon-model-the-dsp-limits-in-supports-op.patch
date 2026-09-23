@@ -3,16 +3,13 @@ Fold-into: upstream/hexagon-host
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 
-Findings dsp-vtcm-binary, dsp-vtcm-glu, dsp-vtcm-softmax, dsp-vtcm-concat,
-dsp-vtcm-rows, dsp-vtcm-gdn, dsp-unary-block0, dsp-hmx-align and
-dsp-cpy-layout of fuzz-hexhost, task #159. For each of these ops the host
-accepted an op in supports_op that the DSP kernel then refuses, or does
-incorrectly. Thus the op does not go to the CPU. On the 8 MB VTCM of the v79
-the shapes of Qwen3.5 are in the limits. Task #62 ships one APK for chips
-with a smaller VTCM, and there these limits apply.
+supports_op of the host accepted ops that the DSP kernel then refuses, or
+does incorrectly. Such an op does not go to the CPU. On the 8 MB VTCM of the
+v79 the shapes of Qwen3.5 are in the limits. On a chip with a smaller VTCM
+these limits apply, and the app ships one APK for all chips.
 
-The host now models each check of the DSP. The comments give the file and
-the lines of the kernel:
+This patch models each check of the DSP in the host. The comments give the
+file and the lines of the kernel:
 
 - The binary ops: each thread holds two rows of src0 and of dst in VTCM (and
   of src1 for the same shape), and a broadcast row of src1 stays in VTCM
@@ -32,50 +29,14 @@ the lines of the kernel:
 - CPY: the layout test of the DSP. There an element stride that is not the
   type size, or rows that overlap, count as transposed.
 
-For three items the kernel did not refuse the op. This patch adds a check
-that returns HTP_STATUS_VTCM_TOO_SMALL:
+For three kernels the DSP did not refuse the op. This patch adds a check that
+returns HTP_STATUS_VTCM_TOO_SMALL:
 
 - get-rows-ops.c and set-rows-ops.c wrote their VTCM layout with no check of
-  the reservation (dsp-vtcm-rows).
+  the reservation.
 - gated-delta-net-ops.c had an assert only, and an assert is empty in the
-  release library (dsp-vtcm-gdn).
-- unary-ops.c returned OK with no output for BLOCK 0 (dsp-unary-block0).
-
-Evidence (2026-09-23):
-- The nine regression inputs of these items in tests/fuzz/hexhost/regress/
-  kparams give the finding before this patch (the model of the DSP kernels
-  in the fake DSP of fuzz-hexhost) in the test runs of the campaign, debug
-  and release. With the five patches of fuzz-hexhost they give no finding in
-  the asan build, debug and release.
-- The kparams fuzzer with the conditions of tasks #155 and #159 on ran 6
-  times for 100 s with the patches: no finding.
-- The supports_op decision of each op of the Qwen3.5 graphs is the same
-  before and after, with the values of the v79 (x86, the real-graph tool of
-  fuzz-hexhost with the fake DSP). The dumps of the 2B decode (112
-  decisions), the 2B prefill (147), the 4B decode (118) and the 4B prefill
-  (155) have no difference, and each op stays on HTP0. The count of each op
-  kind of each graph is the same.
-- The DSP libraries for v73, v75, v79 and v81 build with this patch. The
-  kernel lab (tools/htp-lab) has no target that runs these checks. Task #123
-  holds the missing lab targets.
-- The phone check of the five patches of fuzz-hexhost together (OnePlus 13,
-  the 2B Q8_0 on HTP0, thermal status 0, cpu7 cap 4.32 GHz, battery 27.6 to
-  27.7 °C, MemAvailable 8.9 to 9.5 GB):
-  - test-backend-ops on HTP0: GATED_DELTA_NET and SSM_CONV (101 cases),
-    CONCAT CPY GET_ROWS SET_ROWS (267 cases), the binary ops with GLU and
-    SOFT_MAX (385 cases), NORM RMS_NORM SCALE (127 cases). Each group passes
-    before and after.
-  - llama-bench tg32 -r 3 after one warmup at 23.76 t/s: before 23.56 ±
-    0.10, after 23.59 ± 0.27, before 23.63 ± 0.13, after 23.57 ± 0.11 t/s.
-  - llama-speculative-simple with the MTP draft of depth 4, temperature 0,
-    64 tokens: before 23.589 and 23.685 t/s, after 24.076 and 24.029 t/s.
-    Each run accepts 44 drafts (52.381 %), and the four runs give the same
-    text.
-
-Measurement: the host instructions for each decode token of the 4B Q8_0
-graph (x86, the real-graph tool with the fake DSP, perf stat, with
-GGML_HEXAGON_BATCHCACHE=0): 3,709,475 before this patch and 3,730,072 after
-(+0.56 %). The tg32 of the phone check does not change.
+  release library.
+- unary-ops.c returned OK with no output for BLOCK 0.
 
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 index 265d5c1..5aa5dc1 100644

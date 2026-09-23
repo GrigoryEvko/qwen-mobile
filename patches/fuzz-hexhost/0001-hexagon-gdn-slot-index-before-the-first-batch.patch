@@ -3,11 +3,10 @@ Fold-into: patches/hexagon-fusion/0004-hexagon-htp-gdn-slot-index-from-host-and-
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 
-Finding gdn-slot-stale of fuzz-hexhost, task #126. The fused recurrent ops
-GDN_CONV_STEP, GDN_CONV_CHUNK and GDN_STATE_STEP get the row of the state
-table from the s_copy input. The host read s_copy in enqueue_op, when it put
-the op into a batch. At that time the value can be incorrect in two
-conditions:
+The fused recurrent ops GDN_CONV_STEP, GDN_CONV_CHUNK and GDN_STATE_STEP get
+the row of the state table from the s_copy input. The host read s_copy in
+enqueue_op, when it put the op into a batch. At that time the value can be
+incorrect in two conditions:
 
 - ggml-alloc gives the bytes of s_copy to a different tensor after the last
   reader of s_copy in the node order. An op of an earlier batch of the same
@@ -24,50 +23,6 @@ the first op of the graph goes to the DSP (latch_gdn_slots), and enqueue_op
 uses that value. The matcher does not fuse a chain whose s_copy is not an
 input of the graph. A replay of the batch cache reads s_copy at its start,
 before an op of the graph goes to the DSP.
-
-Evidence (2026-09-23):
-- The regression inputs tests/fuzz/hexhost/regress/graph/gdn-slot-stale-
-  computed.bin and gdn-slot-stale-reuse.bin give the finding before this
-  patch in the none, asan and ubsan builds, debug and release. With the
-  five patches of fuzz-hexhost they give no finding in the asan build, debug
-  and release.
-- The graph fuzzer with the condition on ran for 10 minutes with this patch
-  (14852 executions): no finding.
-- With the five patches of fuzz-hexhost, the corpora of the campaign (549
-  graph, 2468 kparams, 1745 dirty, 609 repack and 695 envparse inputs) give no
-  finding in the asan build, debug and release. The open findings of tasks
-  #157 and #158 stay off in that run.
-- The phone (OnePlus 13, HTP0 v79): one graph input of the fuzz corpus gives
-  "the s_copy index is not a row of the state table (index 1057826292,
-  1 slots)" with the libraries before this patch, and then "GGML ABORT
-  dspqueue_read failed: 0x0000002e". With the libraries of the five patches
-  the same input gives no abort.
-- The fused ops of the Qwen3.5 graphs are the same before and after (x86,
-  the real-graph tool of fuzz-hexhost with the fake DSP): 2B decode 18
-  GDN_CONV_STEP and 18 GDN_STATE_STEP, 2B prefill 18 GDN_CONV_CHUNK, 4B
-  decode 24 and 24, 4B prefill 24.
-- The phone check of the five patches of fuzz-hexhost together (OnePlus 13,
-  the 2B Q8_0 on HTP0, thermal status 0, cpu7 cap 4.32 GHz, battery 27.6 to
-  27.7 °C, MemAvailable 8.9 to 9.5 GB):
-  - test-backend-ops on HTP0 in five op groups (GATED_DELTA_NET and
-    SSM_CONV, MUL_MAT_ID, CONCAT CPY GET_ROWS SET_ROWS, the binary ops with
-    GLU and SOFT_MAX, NORM RMS_NORM SCALE): each group passes before and
-    after.
-  - llama-bench tg32 -r 3 after one warmup at 23.76 t/s: before 23.56 ±
-    0.10, after 23.59 ± 0.27, before 23.63 ± 0.13, after 23.57 ± 0.11 t/s.
-  - llama-speculative-simple with the MTP draft of depth 4, temperature 0,
-    64 tokens: before 23.589 and 23.685 t/s, after 24.076 and 24.029 t/s.
-    Each run accepts 44 drafts (52.381 %), and the four runs give the same
-    text.
-  - The graph driver of fuzz-hexhost (HTP0 against the CPU of the phone, 40
-    random graph inputs): 17 inputs differ before, and 15 after, all in the
-    17. Task #179 holds these differences.
-
-Measurement: the host instructions for each decode token of the 4B Q8_0
-graph (x86, the real-graph tool with the fake DSP, perf stat): 3,691,856
-before and 3,711,938 after (+0.54 %) with GGML_HEXAGON_BATCHCACHE=0, and
-3,689,973 before and 3,715,434 after (+0.69 %) with the batch cache. The
-tg32 of the phone check does not change.
 
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 index 6d0797f..7586c16 100644

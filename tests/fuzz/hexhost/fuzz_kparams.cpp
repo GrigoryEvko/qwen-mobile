@@ -220,12 +220,8 @@ std::vector<ggml_tensor *> build(builder & b, int scenario) {
             const int64_t   n      = pick(fdp, N_DIMS, sizeof(N_DIMS) / 8, 32, 20000);
             const int64_t   n_exp  = fdp.ConsumeIntegralInRange<int64_t>(1, 64);
             const int64_t   n_used = fdp.ConsumeIntegralInRange<int64_t>(1, n_exp < 8 ? n_exp : 8);
-            int64_t         tok    = pick(fdp, M_DIMS, sizeof(M_DIMS) / 8, 1, 512);
-            // The known finding mm-id-div-zero: fewer tokens than experts gives ne12 / ne02 = 0 and
-            // a division by zero in init_fastdiv_values (ggml-hexagon.cpp:5122, SIGFPE on x86).
-            if (tok < n_exp && fakedsp::is_ignored("mm-id-div-zero")) {
-                tok = n_exp;
-            }
+            // Fewer tokens than experts gives ne12 / ne02 = 0 in the matmul params of the host
+            const int64_t   tok    = pick(fdp, M_DIMS, sizeof(M_DIMS) / 8, 1, 512);
             ggml_tensor *   w      = b.leaf(wt, k, n, n_exp, 1, true);
             ggml_tensor *   x      = b.leaf(GGML_TYPE_F32, k, fdp.ConsumeBool() ? n_used : 1, tok);
             ggml_tensor *   ids    = b.leaf(GGML_TYPE_I32, n_used, tok);

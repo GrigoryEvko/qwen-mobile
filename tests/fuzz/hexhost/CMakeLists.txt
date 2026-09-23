@@ -73,16 +73,16 @@ if (FUZZ_SANITIZER STREQUAL "asan")
     set(SAN_FLAGS -fsanitize=address -fno-optimize-sibling-calls)
     add_compile_definitions(HEXHOST_ASYNC_DSP=0)
 elseif (FUZZ_SANITIZER STREQUAL "ubsan")
-    # No check recovers: the finding of pointer-overflow (task #125) has its fix in
-    # patches/fuzz-ops/0001, thus each UBSan report stops the run. harness.cpp gives the shared
-    # file tests/sanitizers/ubsan.supp to the runtime for a check that a later task makes recover.
+    # No check recovers, thus each UBSan report stops the run. harness.cpp gives the shared file
+    # tests/sanitizers/ubsan.supp to the runtime: an entry there has an effect only for a check
+    # that tests/sanitizers/ubsan.cmake makes recover.
     set(SAN_FLAGS -fsanitize=undefined -fno-sanitize-recover=undefined)
     set(HEXHOST_UBSAN_SUPP "${CMAKE_CURRENT_SOURCE_DIR}/../../sanitizers/ubsan.supp")
     get_filename_component(HEXHOST_UBSAN_SUPP "${HEXHOST_UBSAN_SUPP}" ABSOLUTE)
     add_compile_definitions(HEXHOST_ASYNC_DSP=0 HEXHOST_UBSAN_SUPP="${HEXHOST_UBSAN_SUPP}")
     if (NOT EXISTS "${HEXHOST_UBSAN_SUPP}")
-        message(WARNING "hexhost: ${HEXHOST_UBSAN_SUPP} does not exist. Each run stops at the known "
-                        "report of ggml.c:7447 (task #125) until the file exists.")
+        message(WARNING "hexhost: ${HEXHOST_UBSAN_SUPP} does not exist. The UBSan runtime then gets no "
+                        "suppression file.")
     endif()
 elseif (FUZZ_SANITIZER STREQUAL "tsan")
     set(SAN_FLAGS -fsanitize=thread)

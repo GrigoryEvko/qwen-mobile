@@ -23,8 +23,8 @@ template <typename P> inline bool rare(P & fdp, int n) {
 void init();
 
 // Tells the log filter that each slot index of the graph that runs is valid. Then the log line
-// of the host "the unfused ops run" is a finding (gdn-slot-stale): the host read an index
-// that the harness did not write.
+// of the host "the unfused ops run" is a violation of the check gdn-slot-stale: the host read an
+// index that the harness did not write.
 void expect_valid_slots(bool on);
 
 // The jump buffer of the active guard, or nullptr. A ggml abort while a guard

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The fuzz campaign of the host part of the Hexagon backend (hexhost).
+# The fuzz targets of the host part of the Hexagon backend (hexhost).
 # Run it with no argument to see the usage text.
 set -euo pipefail
 
@@ -25,14 +25,15 @@ PHONE_RANDOM=${PHONE_RANDOM:-60}
 DSP_LIB=${DSP_LIB:-$REPO/build/native/llama/ggml/src/ggml-hexagon/libggml-htp-v79.so}
 SHIPPED_LIBS="$REPO/android/snapdragon/jniLibs/arm64-v8a"
 SHIPPED_HASHES="$REPO/build/hashes-native.txt"
-# The Android ASan runtime of compiler-rt 22 (tests/sanitizers/build-asan-android-runtime.sh, task
-# #176). The runtime of the NDK stops each new thread with SIGILL on the SM8750.
+# The Android ASan runtime of compiler-rt 22 (tests/sanitizers/build-asan-android-runtime.sh). The
+# runtime of the NDK stops each new thread with SIGILL on the SM8750.
 ASAN_RT_DIR=${ASAN_RT_DIR:-$REPO/build/fuzz/asan-android-runtime}
 ASAN_RT=libclang_rt.asan-aarch64-android.so
 
-# The ids of the known findings (fake_dsp.cpp: violation). In the fuzz mode the harness keeps these
-# conditions off (HEXHOST_IGNORE), thus the fuzzers look for new defects. The test mode does not
-# set them, thus each regression input of an open finding fails.
+# The names of the checks (fake_dsp.cpp: violation) that detect a defect of the backend with no
+# fix in the patch series. In the fuzz mode the harness keeps these conditions off (HEXHOST_IGNORE),
+# thus the fuzzers look for other defects. The test mode does not set them, thus each regression
+# input of such a defect fails.
 KNOWN_IDS="env-profile-empty,env-exception,env-devices-range,repack-nonfinite-scale,env-int-overflow"
 
 # The host switches of the phone runs: a name and the GGML_HEXAGON_* variables of each run
@@ -78,7 +79,7 @@ Options:
   --jobs N            The targets that run at the same time (default $JOBS)
 
 Environment:
-  FUZZ_KNOWN=0        Also fuzz the conditions of the known findings (default 1: keep them off)
+  FUZZ_KNOWN=0        Also fuzz the conditions of the checks of KNOWN_IDS (default 1: keep them off)
   BUILD_JOBS          The parallel build jobs (default $BUILD_JOBS)
   HEXHOST_LLAMA_DIR   The llama.cpp tree (default: the submodule third_party/llama.cpp with the
                       patch series applied)
@@ -108,7 +109,7 @@ build_x86() {
     local prof=$1 cfg=$2 dir
     dir=$(x86_dir "$prof" "$cfg")
     if [[ $cfg == ubsan && ! -f $UBSAN_SUPP ]]; then
-        die "the shared file $UBSAN_SUPP does not exist. The ubsan runs stop at the known report of ggml.c:7447 (task #125) without it."
+        die "the shared file $UBSAN_SUPP does not exist. The UBSan runtime of the ubsan runs reads it."
     fi
     mkdir -p "$dir"
     CC=clang CXX=clang++ cmake -S "$HERE" -B "$dir" -G Ninja -DCMAKE_BUILD_TYPE=None \
@@ -120,7 +121,7 @@ build_x86() {
 }
 
 # Print the environment of a run: the shared sanitizer options (tests/sanitizers/env.sh) and, for
-# the fuzz mode ($2 = 1), the switches of the known findings.
+# the fuzz mode ($2 = 1), the checks of KNOWN_IDS in HEXHOST_IGNORE.
 run_env() {
     local cfg=$1 fuzz=$2 v
     (
@@ -192,7 +193,7 @@ fuzz_one() {
     echo "$AREA-$prof-$cfg $t: $(( SECONDS - start )) s, $starts starts, $execs executions, corpus $(fd -t f . "$out/corpus" | wc -l), crash files ${#arts[@]}"
 }
 
-# Run one target one time on each seed and each regression input, with no known finding kept off.
+# Run one target one time on each seed and each regression input, with no check kept off.
 test_one() {
     local prof=$1 cfg=$2 t=$3 dir
     dir=$(x86_dir "$prof" "$cfg")
@@ -300,7 +301,7 @@ if [[ -n \$rt ]]; then
     cp -f \$(find \$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt -name \$rt | head -n 1) $rel/runtime/
 fi
 " > "$dir.build.log" 2>&1 || die "the phone build failed. Read $dir.build.log."
-    # The ASan runtime comes from the shared build (task #176), not from the NDK
+    # The ASan runtime comes from the shared build, not from the NDK
     [[ $cfg == asan ]] && cp -f "$ASAN_RT_DIR/$ASAN_RT" "$dir/runtime/"
 
     rm -rf "$stage"
@@ -367,7 +368,7 @@ phone_commands() {
         echo "adb -s $PHONE push ${stage#"$REPO"/}/. $d/"
         echo "adb -s $PHONE shell 'chmod 755 $d/bin/hexhost_phone'"
         if [[ $cfg == asan ]]; then
-            # Task #176: a failure of the thread start is a failure of the environment, not a finding
+            # A failure of the thread start is a failure of the environment, not a defect of the backend
             echo "# If this line does not give \"thread self-test ok\", stop: record an environment failure."
             echo "adb -s $PHONE shell 'cd $d && timeout -s KILL 30 env LD_LIBRARY_PATH=$d/lib $san ./bin/hexhost_phone --selftest-threads'"
         fi

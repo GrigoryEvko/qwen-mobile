@@ -3,40 +3,16 @@ Fold-into: upstream/hexagon-host
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 
-Tasks #175 and #178 of fuzz-ops: the tiled HVX matmul writes past its
-output. The tiled kernels of htp/matmul-ops.c get the count of rows to store
-for each tile of 32 weight rows from ne01 of the weight (src_w->ne[1] in the
-two MUL_MAT_ID forms). For a repacked weight the host sends ne[1] rounded up
-to a multiple of 32. When the real row count is not a multiple of 32, the
-last tile stores up to 31 values past the end of each row of dst.
+The tiled kernels of htp/matmul-ops.c took the count of rows to store for
+each tile of 32 weight rows from ne01 of the weight (src_w->ne[1] in the two
+MUL_MAT_ID forms). For a repacked weight the host sends ne[1] rounded up to
+a multiple of 32. When the real row count is not a multiple of 32, the last
+tile stored up to 31 values past the end of each row of dst, thus the kernel
+wrote past its output.
 
-This patch gets the count of rows to store from ne[0] of dst in the five
-tiled kernels. The weights of the Qwen3.5 models on the phone have row
-counts that are multiples of 32, thus their results do not change. The same
-change is in the diagnosis of fuzz-ops
-(build/fuzz/ops/fixes/htp-tiled-store-rows-from-dst.patch).
-
-Evidence (2026-09-23):
-- The DSP libraries for v73, v75, v79 and v81 build with this patch. The
-  kernel lab (tools/htp-lab) calls the tiled dot kernels with the count of
-  rows as an argument (lab/target_q8.c). No lab target runs the loops of
-  matmul-ops.c that this patch changes. Task #123 holds the missing lab
-  targets.
-- The phone check of the five patches of fuzz-hexhost together (OnePlus 13,
-  the 2B Q8_0 on HTP0, thermal status 0, cpu7 cap 4.32 GHz, battery 27.6 to
-  27.7 °C, MemAvailable 8.9 to 9.5 GB):
-  - test-backend-ops on HTP0, the MUL_MAT_ID cases (390 cases): pass before
-    and after. The four other op groups also pass before and after.
-  - llama-bench tg32 -r 3 after one warmup at 23.76 t/s: before 23.56 ±
-    0.10, after 23.59 ± 0.27, before 23.63 ± 0.13, after 23.57 ± 0.11 t/s.
-  - llama-speculative-simple with the MTP draft of depth 4, temperature 0,
-    64 tokens: before 23.589 and 23.685 t/s, after 24.076 and 24.029 t/s.
-    Each run accepts 44 drafts (52.381 %), and the four runs give the same
-    text. Thus the DSP library of this patch runs the real generation, and
-    the output does not change.
-
-Measurement: the patch changes the value that each tile loop reads, not the
-count of operations. The tg32 of the phone check does not change.
+This patch takes the count of rows to store from ne[0] of dst in the five
+tiled kernels. The weights of the Qwen3.5 models have row counts that are
+multiples of 32, thus their results do not change.
 
 diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
 index f7f2cd0..47f93ca 100644

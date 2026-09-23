@@ -75,9 +75,8 @@ void pick_params(FuzzedDataProvider & fdp, model_params & mp) {
         lp.extra_rows     = harness::rare(fdp, 8);
         lp.reader         = harness::rare(fdp, 6) ? fdp.ConsumeIntegralInRange<int>(0, 5) : -1;
         lp.out_flag       = harness::rare(fdp, 10) ? fdp.ConsumeIntegralInRange<int>(0, 3) : -1;
-        // A computed index is one form of the known finding gdn-slot-stale (the host reads the
-        // index before the DSP computes it). HEXHOST_IGNORE=gdn-slot-stale keeps it off.
-        lp.computed_idx   = harness::rare(fdp, 10) && !fakedsp::is_ignored("gdn-slot-stale");
+        // A computed index: the host must not read it before the DSP computes it
+        lp.computed_idx   = harness::rare(fdp, 10);
         lp.slot_mode      = harness::rare(fdp, 8) ? fdp.ConsumeIntegralInRange<int>(1, 2) : 0;
         lp.idx_offset     = harness::rare(fdp, 8) ? 1 : 0;
         lp.swiglu         = fdp.ConsumeBool();
@@ -324,11 +323,6 @@ struct gbuild {
             if (!s_copy) {
                 // three elements: an offset of one and two rows at most
                 s_copy = input(GGML_TYPE_I32, 3, 1, INPUT_SLOT, (int32_t) rows);
-                // The other form of gdn-slot-stale: ggml-alloc gives the s_copy bytes to a later
-                // tensor before the fused op reads them. An output flag keeps the bytes.
-                if (fakedsp::is_ignored("gdn-slot-stale")) {
-                    ggml_set_output(s_copy);
-                }
             }
             main_idx  = ggml_view_1d(ctx, s_copy, 1, lp.idx_offset * s_copy->nb[0]);
             extra_idx = ggml_view_1d(ctx, s_copy, std::min<int64_t>(n_rs - 1, s_copy->ne[0] - 1 - lp.idx_offset),

@@ -1,4 +1,4 @@
-// hexhost_phone: the phone driver of the hexhost fuzz campaign.
+// hexhost_phone: the phone driver of the hexhost fuzz targets.
 //
 // The driver reads graph inputs of the x86 target fuzz_graph (the same bytes give the same
 // Qwen3.5-shaped graphs, refer to graphgen.h) and runs each input two times: on the real NPU
@@ -17,7 +17,7 @@
 // input). --detail prints each tensor that differs, with the model params of the input.
 // --nodes gives each node its own bytes (no ggml-alloc reuse), compares each node, and prints
 // the root nodes of the first step that has a difference. --selftest-threads starts one thread
-// and stops: the first step of a phone ASan run (task #176).
+// and stops: the first step of a phone ASan run.
 //
 // Output: one line for each input ("ok", "skip", "mismatch" or "error") and a summary line.
 // The exit code is 1 when an input gives a mismatch or an error, else 0.
@@ -435,9 +435,9 @@ bool read_file(const std::string & path, std::vector<uint8_t> & out) {
 
 } // namespace
 
-// Starts one thread and waits for it. The first step of each phone ASan run (task #176): the ASan
-// runtime of the NDK stops each new thread with SIGILL on the SM8750, thus a failure here is a
-// failure of the environment, not a finding. Gives the exit code.
+// Starts one thread and waits for it. The first step of each phone ASan run: the ASan runtime of
+// the NDK stops each new thread with SIGILL on the SM8750, thus a failure here is a failure of the
+// environment, not a defect of the backend. Gives the exit code.
 int selftest_threads() {
     std::atomic<bool> ran { false };
     std::thread       t([&] { ran = true; });

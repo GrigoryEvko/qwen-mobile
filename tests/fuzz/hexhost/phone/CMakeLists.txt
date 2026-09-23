@@ -1,4 +1,4 @@
-# The phone driver of the hexhost campaign (hexhost_phone) and the ggml libraries that it loads,
+# The phone driver of the hexhost fuzz targets (hexhost_phone) and the ggml libraries that it loads,
 # for arm64 Android. tests/fuzz/hexhost/run.sh phone-build runs this project in the Snapdragon
 # container with the NDK toolchain file. One build directory for each pair:
 # build/fuzz/hexhost-android-<profile>-<sanitizer>.
@@ -55,8 +55,7 @@ elseif (FUZZ_SANITIZER STREQUAL "hwasan")
     endif()
     set(SAN_FLAGS -fsanitize=hwaddress)
 elseif (FUZZ_SANITIZER STREQUAL "ubsan")
-    # No check recovers: the finding of pointer-overflow (task #125) has its fix in
-    # patches/fuzz-ops/0001, thus each UBSan report stops the run.
+    # No check recovers, thus each UBSan report stops the run.
     set(SAN_FLAGS -fsanitize=undefined -fno-sanitize-recover=undefined)
 elseif (FUZZ_SANITIZER STREQUAL "none")
     set(SAN_FLAGS "")

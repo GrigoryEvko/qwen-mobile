@@ -38,10 +38,10 @@ void clamp_half(uint8_t * p, uint32_t max_exp) {
     memcpy(p, &h, 2);
 }
 
-// The known finding repack-nonfinite-scale: the forward repack of Q4_K (d * sc, sc <= 63) and of
-// Q6_K (d * scale, |scale| <= 128) writes Inf into the FP16 scales of the tile when d is too large,
-// and the read back converts NaN to an integer (ggml-hexagon.cpp:1675, 1850). This function makes
-// d and dmin of each block small, thus the products stay finite and the harness goes past the finding.
+// The forward repack of Q4_K (d * sc, sc <= 63) and of Q6_K (d * scale, |scale| <= 128) writes Inf
+// into the FP16 scales of the tile when d is too large, and the read back converts NaN to an
+// integer (ggml-hexagon.cpp:1675, 1850). This function makes d and dmin of each block small, thus
+// the products stay finite and the harness goes past that defect (the check repack-nonfinite-scale).
 void clamp_scales(ggml_type t, std::vector<uint8_t> & in) {
     const size_t bs = ggml_type_size(t);
     for (size_t b = 0; b + bs <= in.size(); b += bs) {

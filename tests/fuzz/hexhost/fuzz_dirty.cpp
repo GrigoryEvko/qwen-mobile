@@ -11,8 +11,8 @@
 //     (else the DMA of the op reads stale DDR),
 //   - each such byte is inside a range of the tracker (else no later flush covers it),
 //   - after a fence no such byte remains.
-// The harness also counts the bytes that the tracker flushes, the cost that
-// task #88 reports for the fused state op, which declares the whole output dirty.
+// The harness also counts the bytes that the tracker flushes: the fused state op
+// declares its whole output dirty, and each such byte costs a flush.
 
 #include <fuzzer/FuzzedDataProvider.h>
 

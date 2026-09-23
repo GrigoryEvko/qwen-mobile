@@ -1,6 +1,6 @@
 // The model of the DSP side of the Hexagon backend for the hexhost fuzz harness.
-// Refer to dsp_model.h. Each check names the file and the line of the snapshot
-// of 2026-09-23 (build/fuzz/hexhost/llama.cpp-snapshot) that it models.
+// Refer to dsp_model.h. Each check names the file and the line of the DSP source
+// that it models.
 
 #include "dsp_model.h"
 

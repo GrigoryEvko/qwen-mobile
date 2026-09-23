@@ -5,8 +5,8 @@
 // around each op: the block size check, the buffer and tensor preparation, and
 // the op loop. model_op() gives the status that the op function of the DSP
 // returns for the descriptors and the kernel params that the host sent, without
-// the arithmetic. The model follows the DSP sources of the snapshot of
-// 2026-09-23; a comment names the source lines of each check.
+// the arithmetic. A comment names the source lines of each check in the DSP
+// sources that the model follows.
 #pragma once
 
 #include "fake_dsp.h"

@@ -3,58 +3,23 @@ Fold-into: patches/hexagon-fusion/0001-hexagon-htp-fused-matvec-add-read-src2-fr
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 
-Findings dsp-mm-add-shape and dsp-mm-add-src2 of fuzz-hexhost, task #155.
 try_fuse_mul_mat_add fused a MUL_MAT and the ADD after it when one input of
 the ADD had the data address of the product. Two conditions give an
 incorrect fused op:
 
-- dsp-mm-add-shape: the ADD reads the product through a view with fewer
-  rows or columns at the same address. The fused kernel writes the full
-  product into the smaller output of the ADD, thus it writes past that
-  output.
-- dsp-mm-add-src2: the other input of the ADD (src2 of the fused op) has a
-  broadcast in dimension 0, or a dimension that ggml_add repeats. The fused
-  kernels read full rows of src2 and broadcast only a dimension of size 1,
-  thus they read past src2.
+- The ADD reads the product through a view with fewer rows or columns at
+  the same address. The fused kernel writes the full product into the
+  smaller output of the ADD, thus it writes past that output.
+- The other input of the ADD (src2 of the fused op) has a broadcast in
+  dimension 0, or a dimension that ggml_add repeats. The fused kernels read
+  full rows of src2 and broadcast only a dimension of size 1, thus they read
+  past src2.
 
 This patch fuses the two ops only when the ADD reads the whole product (the
 same address, type, shape and strides), the output of the ADD has the shape
 of the product, and src2 has full rows and, in each other dimension, a size
 of 1 or the size of the product. The matcher is upstream code. The src2 read
 of the fused kernels comes from hexagon-fusion/0001.
-
-Evidence (2026-09-23):
-- The regression inputs tests/fuzz/hexhost/regress/kparams/dsp-mm-add-
-  shape.bin and dsp-mm-add-src2.bin give the finding before this patch (the
-  model of the DSP kernels in the fake DSP of fuzz-hexhost) in the none,
-  asan and ubsan builds, debug and release. With the five patches of
-  fuzz-hexhost they give no finding in the asan build, debug and release.
-- The kparams fuzzer with the conditions of tasks #155 and #159 on ran 6
-  times for 100 s with the patches: no finding.
-- The fused ops of the Qwen3.5 graphs are the same before and after (x86,
-  the real-graph tool of fuzz-hexhost with the fake DSP). The count of each
-  op kind of each graph is the same:
-    2B decode   66 MUL_MAT_ADD, 30 MUL_MAT_NX, 73 RMS_NORM_MUL
-    2B prefill  48 MUL_MAT_ADD, 30 MUL_MAT_NX, 73 RMS_NORM_MUL
-    4B decode   88 MUL_MAT_ADD, 40 MUL_MAT_NX, 96 RMS_NORM_MUL
-    4B prefill  88 MUL_MAT_ADD, 40 MUL_MAT_NX, 96 RMS_NORM_MUL
-- The phone check of the five patches of fuzz-hexhost together (OnePlus 13,
-  the 2B Q8_0 on HTP0, thermal status 0, cpu7 cap 4.32 GHz, battery 27.6 to
-  27.7 °C, MemAvailable 8.9 to 9.5 GB):
-  - test-backend-ops on HTP0 in five op groups (GATED_DELTA_NET and
-    SSM_CONV, MUL_MAT_ID, CONCAT CPY GET_ROWS SET_ROWS, the binary ops with
-    GLU and SOFT_MAX, NORM RMS_NORM SCALE): each group passes before and
-    after.
-  - llama-bench tg32 -r 3 after one warmup at 23.76 t/s: before 23.56 ±
-    0.10, after 23.59 ± 0.27, before 23.63 ± 0.13, after 23.57 ± 0.11 t/s.
-  - llama-speculative-simple with the MTP draft of depth 4, temperature 0,
-    64 tokens: before 23.589 and 23.685 t/s, after 24.076 and 24.029 t/s.
-    Each run accepts 44 drafts (52.381 %), and the four runs give the same
-    text.
-
-Measurement: the host instructions for each decode token of the 4B Q8_0
-graph (x86, the real-graph tool with the fake DSP, perf stat, with
-GGML_HEXAGON_BATCHCACHE=0): 3,711,938 before this patch and 3,709,475 after.
 
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 index 7586c16..265d5c1 100644
