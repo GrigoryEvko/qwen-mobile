@@ -173,3 +173,4 @@ hexagon-hmx-i8/0002-hexagon-describe-the-conversion-word-of-the-int32-read.patch
 # time, thus a Q8_0 cache decodes faster than an F16 cache.
 memory/0003-hexagon-convert-q8_0-kv-rows-into-the-hmx-tiles-two-blocks-at-a-time.patch
 fuzz-ops/0014-ggml-cpu-the-rope-cache-reads-no-freq-factor-past-src2.patch
+fuzz-hexhost/0008-hexagon-fuse-mul-mat-and-add-only-for-the-one-reader-of-the-product.patch

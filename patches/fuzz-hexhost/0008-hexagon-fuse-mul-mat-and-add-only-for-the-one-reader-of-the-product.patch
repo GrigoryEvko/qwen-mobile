@@ -1,0 +1,71 @@
+hexagon: fuse MUL_MAT and ADD only when the ADD is the one reader of the product
+Fold-into: upstream/hexagon-host
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+graph_compute tags a MUL_MAT as fusable with the ADD after it when the product
+has one use (ggml_node_has_n_uses). A view of the product counts as that one
+use. When the ADD reads the product through the view and a second node reads
+the same view, the fused MUL_MAT_ADD writes only the output of the ADD, and
+the second node reads bytes of the product that no op wrote.
+
+This patch follows the chain of views from the product to its first compute
+reader. It tags the product only when each view of the chain has one use and
+is not a graph output. The tag runs when a graph is new to the graph cache,
+not for each token.
+
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 53d0f4a..bcd146d 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -474,6 +474,41 @@ static inline bool ggml_hexagon_tensor_is_fuseable(const struct ggml_tensor * t)
+     return (extra->flags & GGML_HEXAGON_TENSOR_FUSEABLE) != 0;
+ }
+ 
++// True when one node of the graph reads the bytes of the product at node i, directly or through a
++// chain of views, and the product is not an output. The fused MUL_MAT_ADD writes only the output
++// of the ADD, thus a second reader of the product (for example through the view that the ADD
++// reads) would read bytes that no op wrote. ggml_node_has_n_uses counts only the direct uses, and
++// a view is one use. O(nodes) for each view of the chain.
++static bool ggml_hexagon_product_has_one_reader(const struct ggml_cgraph * graph, int i) {
++    if (!ggml_node_has_n_uses(graph, i, 1)) {
++        return false;
++    }
++    const struct ggml_tensor * t = graph->nodes[i];
++    for (int idx = i;;) {
++        int user = -1;
++        for (int j = idx + 1; j < graph->n_nodes && user < 0; j++) {
++            for (int s = 0; s < GGML_MAX_SRC; s++) {
++                if (graph->nodes[j]->src[s] == t) {
++                    user = j;
++                    break;
++                }
++            }
++        }
++        if (user < 0) {
++            return false;   // the one use is in a different split
++        }
++        const struct ggml_tensor * u = graph->nodes[user];
++        if (!ggml_op_is_empty(u->op)) {
++            return true;    // the one use computes: it is the only reader
++        }
++        if (ggml_node_get_use_count(graph, user) != 1 || (u->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++            return false;   // a view with more than one reader, or an output
++        }
++        t   = u;
++        idx = user;
++    }
++}
++
+ static inline bool ggml_hexagon_tensors_overlap(const struct ggml_tensor * a, const struct ggml_tensor * b) {
+     const uintptr_t a0 = (uintptr_t) a->data;
+     const uintptr_t b0 = (uintptr_t) b->data;
+@@ -6680,7 +6715,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+                 extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
+             } else if (graph->nodes[i]->op == GGML_OP_MUL_MAT || graph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
+                 if ((i + 1 < graph->n_nodes && graph->nodes[i + 1]->op == GGML_OP_ADD && ggml_can_fuse(graph, i, { graph->nodes[i]->op, GGML_OP_ADD })) ||
+-                    ggml_node_has_n_uses(graph, i, 1)) {
++                    ggml_hexagon_product_has_one_reader(graph, i)) {
+                     extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
+                 }
+             }
