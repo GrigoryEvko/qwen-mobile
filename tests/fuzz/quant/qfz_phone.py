@@ -265,7 +265,7 @@ def write_seeds() -> list[Path]:
     - seeds/reader: two small toy exports (the gguf-py reader, the atheris
       reader target, the loader check)
     - seeds/pack: raw inputs of the atheris packer target
-    - regress/reader: the minimal files of QR1 and QR2
+    - regress/reader: the minimal files of QR1, QR2 and QR4
     - regress/ggml: the minimal files of the five reports of the ggml loader
       in the metadata mode (the loader check)
     - regress/ggml-full: the minimal file of the abort of the ggml loader in
@@ -306,6 +306,8 @@ def write_seeds() -> list[Path]:
         bad_reader / "qr1-long-scalar-array.seed": header(0, [("a", struct.pack("<IIQ", 9, 0, 4_000_000))]),
         bad_reader / "qr2-offset-wrap.seed": padded(header(1, []) + tensor_info("t", [4], 0, 2**64 - 64),
                                                     np.arange(4, dtype=np.float32).tobytes()),
+        # QR4: a Q4_0 tensor with no dimension. The atheris reader target found it.
+        bad_reader / "qr4-zero-dim-block-type.seed": padded(header(1, []) + tensor_info("t", [], 2, 0), bytes(32)),
         # gguf.cpp:576: the KV type 512 goes into enum gguf_type before the range check.
         ggml / "kv-type-enum.seed": header(0, [("a", struct.pack("<I", 512))]),
         # gguf.cpp:585: the array element type 512 goes into enum gguf_type before the range check.

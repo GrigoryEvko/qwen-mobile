@@ -111,3 +111,6 @@ hexagon-q8-ref/0001-hexagon-quantize-the-activations-as-the-cpu-reference.patch
 
 # fuzz-ops: the fixes of the op fuzzer. The header of each patch gives its task.
 fuzz-ops/0001-ggml-graph-size-with-integers.patch
+
+# fuzz-quant: the fixes of the quant fuzzer. The header of each patch gives its task.
+fuzz-quant/0001-gguf-py-check-the-byte-ranges-and-the-shapes-of-the-reader.patch

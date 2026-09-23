@@ -1,0 +1,91 @@
+gguf-py: check the byte ranges and the shapes of the reader
+Fold-into: upstream/gguf-py
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+GGUFReader did not compare its reads with the size of the file. The fuzz
+campaign of the quantization pipeline (task #171) found four defects:
+
+- QR1: an array with a large item count and no data made the reader loop
+  over the count. A file of 49 bytes with the count 4000000 took 18 s and
+  4.7 GB of memory.
+- QR2: the offset of a tensor was a uint64 sum. The offset 2^64 - 64
+  wrapped to the start of the file, and the tensor data was the header,
+  with only a RuntimeWarning. A tensor of 0 bytes after the end of the file
+  also passed.
+- QR3: a truncated file gave IndexError "index 0 is out of bounds" with no
+  offset and no size.
+- QR4: a tensor of a block type with no dimension gave IndexError "tuple
+  index out of range" in quant_shape_to_byte_shape.
+
+This patch adds four checks. Each check raises ValueError:
+
+- _get refuses a read past the end of the file.
+- An array refuses an item count that the remaining bytes cannot hold (one
+  byte for each item, or the size of its scalar type).
+- A tensor refuses a data range past the end of the file. The offset is a
+  sum of Python integers, which does not wrap.
+- A tensor with no dimension has one element, as in ggml. Thus a block type
+  gets the error of a row that is not a multiple of the block size.
+
+The reader gives the same fields and tensors for the 30 GGUF files of
+weights/ and the 9 files of the fuzz phone set (a digest of each field and
+of the name, type, shape, offset and size of each tensor). The regression
+tests are in tests/fuzz/quant/regress/test_qfz_regressions.py.
+
+diff --git a/gguf-py/gguf/gguf_reader.py b/gguf-py/gguf/gguf_reader.py
+--- a/gguf-py/gguf/gguf_reader.py
++++ b/gguf-py/gguf/gguf_reader.py
+@@ -207,8 +207,12 @@
+         self, offset: int, dtype: npt.DTypeLike, count: int = 1, override_order: None | Literal['I', 'S', '<'] = None,
+     ) -> npt.NDArray[Any]:
+         count = int(count)
++        offset = int(offset)
+         itemsize = int(np.empty([], dtype = dtype).itemsize)
+         end_offs = offset + itemsize * count
++        if offset < 0 or end_offs > self.data.nbytes:
++            raise ValueError(f'Cannot read {count} x {itemsize} bytes at offset {offset}: the file has '
++                             f'{self.data.nbytes} bytes')
+         arr = self.data[offset:end_offs].view(dtype=dtype)[:count]
+         return arr.view(arr.dtype.newbyteorder(self.byte_order if override_order is None else override_order))
+ 
+@@ -256,6 +260,16 @@
+             if int(alen[0]) > GGUF_MAX_ARRAY_ELEMENTS:
+                 raise ValueError(f'Array length {int(alen[0])} exceeds maximum {GGUF_MAX_ARRAY_ELEMENTS}')
+             offs += int(alen.nbytes)
++            # Each item has a minimum of one byte, thus an array with more items than the remaining bytes is not
++            # correct. A scalar array uses the size of its scalar type.
++            try:
++                sub_np = self.gguf_scalar_to_np.get(GGUFValueType(int(raw_itype[0])))
++            except ValueError:
++                sub_np = None
++            min_size = np.dtype(sub_np).itemsize if sub_np is not None else 1
++            if int(alen[0]) * min_size > self.data.nbytes - offs:
++                raise ValueError(f'The array has {int(alen[0])} items of {min_size} bytes, but only '
++                                 f'{self.data.nbytes - offs} bytes remain in the file')
+             aparts: list[npt.NDArray[Any]] = [raw_itype, alen]
+             data_idxs: list[int] = []
+             # FIXME: Handle multi-dimensional arrays properly instead of flattening
+@@ -350,7 +364,11 @@
+             np_dims = tuple(reversed(dims.tolist()))
+             block_size, type_size = GGML_QUANT_SIZES[ggml_type]
+             n_bytes = n_elems * type_size // block_size
+-            data_offs = int(start_offs + offset_tensor[0])
++            # The sum of start_offs and a np.uint64 value wraps in uint64. The sum of two Python integers does not wrap.
++            data_offs = int(start_offs) + int(offset_tensor[0])
++            if data_offs + n_bytes > self.data.nbytes:
++                raise ValueError(f'The tensor {tensor_name} has {n_bytes} bytes at offset {data_offs}, but the file '
++                                 f'has {self.data.nbytes} bytes')
+             item_type: npt.DTypeLike
+             if ggml_type == GGMLQuantizationType.F16:
+                 item_count = n_elems
+@@ -376,7 +394,8 @@
+             else:
+                 item_count = n_bytes
+                 item_type = np.uint8
+-                np_dims = quant_shape_to_byte_shape(np_dims, ggml_type)
++                # A tensor with no dimension holds one element, as ggml gives ne = 1 to each missing dimension.
++                np_dims = quant_shape_to_byte_shape(np_dims or (1,), ggml_type)
+             tensors.append(ReaderTensor(
+                 name = tensor_name,
+                 tensor_type = ggml_type,

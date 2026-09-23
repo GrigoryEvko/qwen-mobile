@@ -257,14 +257,13 @@ def test_qf11_export_does_not_grow_sys_path(monkeypatch: pytest.MonkeyPatch) -> 
     assert len(sys.path) == before, f"sys.path grew by {len(sys.path) - before} entries in 10 calls"
 
 
-# --- QR1, QR2, QR3: the gguf-py reader ---------------------------------------------------------------
+# --- QR1, QR2, QR3 (task #171): the gguf-py reader ---------------------------------------------------
 
-@xfail_open("QR1", "a 49-byte file with a scalar array count of 300 000 loops, then gives no error")
 def test_qr1_reader_refuses_a_scalar_array_longer_than_the_file(tmp_path: Path) -> None:
-    """gguf_reader.py:206-213, 252-270: a short read gives an empty array, the loop goes on per element.
+    """The reader refuses a scalar array count that the rest of the file cannot hold, in less than 0.5 s.
 
-    With 4 000 000 elements the reader takes 18 s and 4.7 GB. The limit of
-    GGUF_MAX_ARRAY_ELEMENTS (2^30) permits about 1.2 TB. It must raise at once.
+    Without the check the reader looped over the count: 4 000 000 items took
+    18 s and 4.7 GB, and GGUF_MAX_ARRAY_ELEMENTS (2^30) permits about 1.2 TB.
     """
     path = tmp_path / "qr1.gguf"
     path.write_bytes(header(0, [("a", struct.pack("<IIQ", 9, 0, 300_000))]))
@@ -274,9 +273,8 @@ def test_qr1_reader_refuses_a_scalar_array_longer_than_the_file(tmp_path: Path) 
     assert time.monotonic() - t0 < 0.5
 
 
-@xfail_open("QR2", "a tensor offset of 2^64 - 64 wraps, and the tensor reads the header")
 def test_qr2_reader_refuses_an_offset_that_wraps(tmp_path: Path) -> None:
-    """gguf_reader.py:353: start + offset in uint64 wraps to 0 with a RuntimeWarning only. It must raise."""
+    """The reader refuses the tensor offset 2^64 - 64, which wrapped in uint64 to the start of the file."""
     raw = header(1, []) + tensor_info("t", [4], 0, 2**64 - 64)
     raw += b"\0" * ((-len(raw)) % 32) + np.arange(4, dtype=np.float32).tobytes()
     path = tmp_path / "qr2.gguf"
@@ -287,9 +285,8 @@ def test_qr2_reader_refuses_an_offset_that_wraps(tmp_path: Path) -> None:
             gguf.GGUFReader(str(path))
 
 
-@xfail_open("QR2", "a tensor of 0 bytes at an offset past the end of the file passes")
 def test_qr2_reader_refuses_a_tensor_past_the_end(tmp_path: Path) -> None:
-    """gguf_reader.py:353-389: no range check, thus a 0-byte tensor at offset 64 of an 80-byte file passes."""
+    """The reader refuses a tensor of 0 bytes at the offset 64 of the data section of an 80-byte file."""
     raw = header(1, []) + tensor_info("t", [0], 0, 64)
     raw += b"\0" * ((-len(raw)) % 32) + bytes(16)
     path = tmp_path / "qr2-past-end.gguf"
@@ -298,10 +295,24 @@ def test_qr2_reader_refuses_a_tensor_past_the_end(tmp_path: Path) -> None:
         gguf.GGUFReader(str(path))
 
 
-@xfail_open("QR3", "a truncated file gives IndexError with no offset and no field name")
 def test_qr3_reader_gives_a_clear_error_for_a_truncated_file(tmp_path: Path) -> None:
-    """gguf_reader.py:311-315: the KV type read at the end of the file is empty, then raw_kv_type[0] raises."""
+    """The reader gives ValueError for a file that stops before the type of its first KV field."""
     path = tmp_path / "qr3.gguf"
     path.write_bytes(header(0, [("a", b"")]))
+    with pytest.raises(ValueError):
+        gguf.GGUFReader(str(path))
+
+
+def test_qr4_reader_gives_a_clear_error_for_a_block_tensor_with_no_dimension(tmp_path: Path) -> None:
+    """The reader gives ValueError for a Q4_0 tensor with no dimension (one element, not a full block).
+
+    Without the check, quants.quant_shape_to_byte_shape read the last
+    dimension of an empty shape and raised IndexError. The atheris reader
+    target found it. regress/reader/qr4-zero-dim-block-type.seed holds this file.
+    """
+    raw = header(1, []) + tensor_info("t", [], 2, 0)
+    raw += b"\0" * ((-len(raw)) % 32) + bytes(32)
+    path = tmp_path / "qr4.gguf"
+    path.write_bytes(raw)
     with pytest.raises(ValueError):
         gguf.GGUFReader(str(path))

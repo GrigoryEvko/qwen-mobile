@@ -1,17 +1,15 @@
 """The isolated worker of the gguf-py reader fuzzer, and the pool that drives it.
 
-A malformed file can make the reader loop for minutes or eat all the
-memory (finding QR1). Thus the reader runs in a separate process that
-imports numpy and gguf only, with an address-space limit and an alarm per
-file. The pool starts a new worker after a timeout or a memory error.
+A defect of the reader can make it loop for minutes or use all the memory
+(finding QR1 did). Thus the reader runs in a separate process that imports
+numpy and gguf only, with an address-space limit and an alarm per file.
+The pool starts a new worker after a timeout or a memory error.
 
 The worker reads one JSON request per line on stdin and writes one JSON
-result per line on stdout. A request holds the path and the reader
-("plain" for gguf-py as it is, "fixed" for gguf-py with the short-read
-check of the proposed fix of QR1). A result holds the status ("ok",
-"error", "timeout", "memory"), the exception type and message, and for
-"ok" the data section start, the file size, and the offset, the byte count
-and the raw offset of each tensor.
+result per line on stdout. A request holds the path. A result holds the
+status ("ok", "error", "timeout", "memory"), the exception type and
+message, and for "ok" the data section start, the file size, and the
+offset, the byte count and the raw offset of each tensor.
 
     python tests/fuzz/quant/qfz_reader_worker.py     # the worker loop, for the pool only
 """
@@ -40,30 +38,11 @@ def _on_alarm(signum: int, frame: object) -> None:
     raise _Timeout()
 
 
-def _fixed_reader(gguf: Any) -> type:
-    """Give a GGUFReader subclass whose _get raises ValueError on a short read (the proposed fix of QR1)."""
-    import numpy as np
-
-    class FixedReader(gguf.GGUFReader):
-        """GGUFReader with a check that each read is complete."""
-
-        def _get(self, offset: int, dtype: Any, count: int = 1, override_order: Any = None) -> Any:
-            count = int(count)
-            itemsize = int(np.empty([], dtype=dtype).itemsize)
-            if offset < 0 or offset + itemsize * count > self.data.nbytes:
-                raise ValueError(f"a read of {count} x {itemsize} bytes at offset {offset} is beyond the end of "
-                                 f"the file ({self.data.nbytes} bytes)")
-            return super()._get(offset, dtype, count, override_order)
-
-    return FixedReader
-
-
-def _read(gguf: Any, readers: dict[str, type], request: dict[str, str]) -> dict[str, Any]:
+def _read(gguf: Any, request: dict[str, str]) -> dict[str, Any]:
     """Run one request and give its result."""
-    reader_type = readers[request.get("reader", "plain")]
     signal.alarm(TIME_LIMIT)
     try:
-        r = reader_type(request["path"])
+        r = gguf.GGUFReader(request["path"])
         tensors = [{"name": t.name, "offset": int(t.data_offset), "nbytes": int(t.n_bytes),
                     "raw_offset": int(t.field.parts[5][0]), "type": t.tensor_type.name} for t in r.tensors]
         return {"status": "ok", "data_offset": int(r.data_offset), "size": int(r.data.nbytes), "tensors": tensors}
@@ -89,9 +68,8 @@ def serve() -> None:
     signal.signal(signal.SIGALRM, _on_alarm)
     import gguf
 
-    readers = {"plain": gguf.GGUFReader, "fixed": _fixed_reader(gguf)}
     for line in sys.stdin:
-        result = _read(gguf, readers, json.loads(line))
+        result = _read(gguf, json.loads(line))
         sys.stdout.write(json.dumps(result) + "\n")
         sys.stdout.flush()
 
@@ -117,12 +95,11 @@ class ReaderPool:
         return subprocess.Popen([sys.executable, str(Path(__file__).resolve())], stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, text=True, env=env)
 
-    def read(self, path: Path, reader: str = "plain") -> dict[str, Any]:
+    def read(self, path: Path) -> dict[str, Any]:
         """Read one file in the worker and give the result.
 
         Args:
             path: The GGUF file
-            reader: "plain" or "fixed"
 
         Returns:
             The result of the worker, or {"status": "crash"} when the worker died
@@ -131,7 +108,7 @@ class ReaderPool:
             self._proc = self._start()
         assert self._proc.stdin is not None and self._proc.stdout is not None
         try:
-            self._proc.stdin.write(json.dumps({"path": str(path), "reader": reader}) + "\n")
+            self._proc.stdin.write(json.dumps({"path": str(path)}) + "\n")
             self._proc.stdin.flush()
             line = self._proc.stdout.readline()
         except BrokenPipeError:

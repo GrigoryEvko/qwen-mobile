@@ -20,9 +20,6 @@ report as a finding of the target loader-check (rule R8), and the test
 fails at once only with QFZ_GGML_STRICT=1, thus the fuzzer goes on to the
 properties of gguf-py. A file that gguf-py reads and ggml refuses is only
 counted, because gguf-py checks less by design.
-
-The open findings QR1, QR2 and QR3 are recognized and passed, unless
-QFZ_KNOWN holds them. Refer to qfz_common.
 """
 
 from __future__ import annotations
@@ -30,7 +27,6 @@ from __future__ import annotations
 import logging
 import os
 from collections import Counter
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -39,7 +35,7 @@ from hypothesis import example, given
 from hypothesis import strategies as st
 
 from qfz_checks import check_available, ggml_loader_status, record_ggml_report
-from qfz_common import LLAMA_DIR, REGRESS_DIR, SEED_DIR, known_open, san_dir, scratch
+from qfz_common import LLAMA_DIR, REGRESS_DIR, SEED_DIR, san_dir, scratch
 from qfz_hyp import counted, fuzz_settings
 from qfz_rawgguf import INTERESTING_U32, INTERESTING_U64, IntField, put_int, walk
 from qfz_reader_worker import ReaderPool
@@ -67,7 +63,7 @@ def seeds() -> Seeds:
     """Give the seed files: toy exports of the pipeline in three types, tied and untied, then the committed seeds.
 
     The committed seeds are tests/fuzz/quant/seeds/reader (two toy exports)
-    and tests/fuzz/quant/regress/reader (the minimal files of QR1 and QR2),
+    and tests/fuzz/quant/regress/reader (the minimal files of QR1, QR2 and QR4),
     thus the mode "test" replays them.
     """
     out = Seeds()
@@ -143,36 +139,21 @@ def apply(data: bytes, ops: list[tuple]) -> bytes:
     return bytes(out)
 
 
-def _classify(result: dict, pool: ReaderPool, path: Path) -> str | None:
-    """Give None for an accepted outcome, or the reason of a failure. A known open finding is accepted."""
+def _classify(result: dict) -> str | None:
+    """Give None for an accepted outcome, or the reason of a failure."""
     status = result["status"]
     if status in ("timeout", "memory", "crash"):
-        # A crash of the worker can be a MemoryError out of the try block, thus it goes through the same check.
-        fixed = pool.read(path, reader="fixed")
-        if known_open("QR1") and fixed["status"] in ("ok", "error"):
-            STATS["known QR1"] += 1
-            return None
-        return f"the reader gave '{status}', and the reader with the short-read check gave {fixed}"
+        return f"the reader gave '{status}'"
     if status == "error":
         if result["type"] in ALLOWED:
             STATS[f"error {result['type']}"] += 1
             return None
-        if result["type"] == "IndexError" and known_open("QR3"):
-            STATS["known QR3"] += 1
-            return None
         return f"the reader raised {result['type']}: {result['message']}"
     STATS["ok"] += 1
     for t in result["tensors"]:
-        inside = result["data_offset"] <= t["offset"] and t["offset"] + t["nbytes"] <= result["size"]
-        if inside:
-            continue
-        # QR2: no range check of the tensor data. A wrapped offset aliases the header, and a tensor of 0 bytes
-        # passes with any offset. A tensor with bytes past the end fails in numpy with a ValueError.
-        if known_open("QR2") and (result["data_offset"] + t["raw_offset"] >= 2**64 or t["nbytes"] == 0):
-            STATS["known QR2"] += 1
-            continue
-        return f"the reader accepts tensor {t['name']} at {t['offset']} + {t['nbytes']}, out of the data section " \
-               f"{result['data_offset']} .. {result['size']}"
+        if not (result["data_offset"] <= t["offset"] and t["offset"] + t["nbytes"] <= result["size"]):
+            return f"the reader accepts tensor {t['name']} at {t['offset']} + {t['nbytes']}, out of the data " \
+                   f"section {result['data_offset']} .. {result['size']}"
     return None
 
 
@@ -197,7 +178,7 @@ def test_reader_survives_corrupted_pipeline_files(seeds: list[bytes], pool: Read
         path.write_bytes(data)
         if not data:
             return
-        reason = _classify(pool.read(path), pool, path)
+        reason = _classify(pool.read(path))
         assert reason is None, f"{reason} (mutations {ops} of seed {seed}, {len(data)} bytes)"
         if check_available():
             status, summary = ggml_loader_status(path)

@@ -76,9 +76,6 @@ KNOWN_FINDINGS = {
     "QF9": "the scale search compares float32 scales but stores their F16 rounding, which can lose to the plain scale",
     "QF10": "the export filter --only applies to Q4_0 and Q8_0, thus an IQ4_NL tensor out of the match stays IQ4_NL",
     "QF11": "each export() call puts llama_dir/gguf-py at the front of sys.path again, thus sys.path only grows",
-    "QR1": "the gguf-py reader loops over a scalar array that is longer than the file",
-    "QR2": "the gguf-py reader does not check the data range of a tensor: a large offset wraps, a 0-byte tensor passes",
-    "QR3": "the gguf-py reader gives an IndexError with no context for a truncated file",
     "QT1": "llama-perplexity does not flush its log at the exit, thus a run with the status 0 can lose its statistics",
 }
 
