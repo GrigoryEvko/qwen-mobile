@@ -65,8 +65,9 @@
 #   LTO-PART No file of an area or of tests/sanitizers and no build cache has
 #        --lto-partitions or -flto-partitions: the parallel code generation
 #        of full LTO in lld and clang 22.1.8 can drop the dynamic initializer
-#        of a C++17 inline variable (a minimal program shows it), and the
-#        shipped build has one partition.
+#        of a C++17 inline variable, and the shipped build has one
+#        partition. tests/sanitizers/repro/lto-partitions/run.sh shows the
+#        defect, and the rule does not check that directory.
 #   LLAMA-COPY (only with --copies-only) A matrix build of an area
 #        (build/fuzz/<area>[-android]-<profile>-<config>) that takes
 #        llama.cpp or ggml from a copy under build/, not from the submodule,
@@ -691,7 +692,8 @@ check_lto_partitions() {
         [[ "$file" == */check-rules.sh ]] && continue
         [[ "$text" =~ ^[[:space:]]*(#|//) ]] && continue
         violation LTO-PART "$(area_of "$file")" "$file:$num" "an LTO partition option: full LTO with more than one partition can drop the dynamic initializer of an inline variable; use one partition, as the shipped build"
-    done < <(rg -n --no-heading -e '-lto-partitions' "${dirs[@]}" -g '!corpus/**' -g '!regress/**' -g '!seeds/**' 2> /dev/null || true)
+    done < <(rg -n --no-heading -e '-lto-partitions' "${dirs[@]}" -g '!corpus/**' -g '!regress/**' -g '!seeds/**' \
+                -g '!**/tests/sanitizers/repro/lto-partitions/**' 2> /dev/null || true)
     [[ $CHECK_BUILDS -eq 1 && -d "$BUILD_FUZZ" ]] || return 0
     while IFS=: read -r file num text; do
         violation LTO-PART "$(area_of "$file")" "$file:$num" "a build with an LTO partition option: configure it again with one partition"
