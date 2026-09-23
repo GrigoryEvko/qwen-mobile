@@ -129,6 +129,15 @@ tests/sanitizers/<config>.cmake and tests/sanitizers/env.sh. Suppressions: only 
 tests/sanitizers/<config>.supp. The area has no entry there: the fixes of its UBSan reports (the
 null pointer of ggml_graph_nbytes, the casts of the type traits) are patches/fuzz-ops/0001 and 0002.
 
+Special cases: a case is special (refer to src/case.h) when an input holds Inf, NaN, a subnormal
+or a huge value, or when a conversion of the op makes an input infinite. The known properties of
+the CPU backend below are not defects, and their cases are special:
+  - A matmul activation past the f16 range (an F16 weight) or past 127 x 65520 (the Q8_0 scale of
+    a Q8_0 or Q4_0 weight) gives inf or NaN, and which one depends on the order of the operations.
+  - FLASH_ATTN_EXT with an F16 V (P3): the one-row path of the CPU adds the V rows in an f16
+    accumulator, which overflows past 65504. The tiled path adds them in f32.
+  - ROPE with a freq factor that makes an angle past 2^64: sin and cos are not defined by the inputs.
+
 Environment (defaults in parentheses):
   FUZZ_BUDGET, FUZZ_JOBS  the defaults of --budget-seconds and --jobs (600, 4)
   BUILD_JOBS     the parallel build jobs (8)

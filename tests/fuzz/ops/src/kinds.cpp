@@ -1138,7 +1138,9 @@ const char * TXT_FLASH_ATTN =
     "Reason: an error ds in each logit moves the softmax weights by a relative 2 ds, and the output "
     "is a convex sum of the V rows. The oracle converts Q to f16 (Q8_0 for a Q8_0 K) and, for an F16 V, "
     "keeps its running V sum in f16 (VKQ16 in ops.cpp), which rounds at each of the n_kv steps: that "
-    "error of the oracle itself is part of the strict bound.";
+    "error of the oracle itself is part of the strict bound. Known property (P3, not changed): the "
+    "f16 V sum of the one-row path overflows when sum_j p_j |v_j| goes past 65504, and the tiled path "
+    "(f32) does not. Thus a case with n_kv max|V| >= 32760 and an F16 V is special.";
 
 // ---------------------------------------------------------------------------------------------
 // SOFT_MAX
