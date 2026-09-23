@@ -63,9 +63,9 @@
 #                   the test mode relaxes none.
 #
 # The llama.cpp tree is a private snapshot in build/fuzz/app/llama-snap: the
-# commit that HEAD pins with the patch series of HEAD. An edit in the submodule
-# or a patch that is not committed does not change a fuzz build. A commit of a
-# patch changes the snapshot at the next run.
+# commit that HEAD pins with the patch series of HEAD, from
+# tests/sanitizers/llama-copy.sh. An edit in the submodule or a patch that is
+# not committed does not change a fuzz build. Each run refreshes the snapshot.
 
 set -euo pipefail
 
@@ -115,38 +115,11 @@ die() {
     exit 1
 }
 
-# Make the private llama.cpp tree $SNAP: the commit of the submodule that HEAD pins,
-# with the patch series of HEAD (patches/series). When HEAD pins another commit or
-# holds other patches, the next run makes the tree again. Each file then gets the
-# time of that run, thus ninja compiles each build directory again. O(size of the tree).
+# Make or refresh the private llama.cpp tree $SNAP with the shared helper: the commit
+# that HEAD pins with the patch series of HEAD. A file with new contents gets the
+# time of the copy, thus ninja compiles only its objects again. About 10 s.
 snapshot() {
-    local commit patches stamp tmp p now
-    commit=$(git -C "$REPO" rev-parse HEAD:third_party/llama.cpp)
-    patches=$(git -C "$REPO" rev-parse HEAD:patches)
-    stamp="$commit $patches"
-    if [[ -f "$SNAP/CMakeLists.txt" && "$(cat "$SNAP/.stamp" 2> /dev/null)" == "$stamp" ]]; then
-        return
-    fi
-    echo "run.sh: make $SNAP from llama.cpp $commit and the patch series of HEAD"
-    tmp="$SNAP.new"
-    rm -rf "$tmp"
-    mkdir -p "$tmp/src" "$tmp/patches"
-    git -C "$REPO/third_party/llama.cpp" archive "$commit" | tar -x -C "$tmp/src"
-    git -C "$REPO" archive "$patches" | tar -x -C "$tmp/patches"
-    while IFS= read -r p; do
-        [[ -z "$p" || "$p" == \#* ]] && continue
-        # The ceiling stops the search of git for a repository at $tmp: the build
-        # directory is in the work tree of the project, and git apply must patch
-        # the files of the snapshot, not the files of the project.
-        (cd "$tmp/src" && GIT_CEILING_DIRECTORIES="$tmp" git apply --whitespace=nowarn "$tmp/patches/$p") \
-            || die "the patch patches/$p of HEAD does not apply to llama.cpp $commit"
-    done < "$tmp/patches/series"
-    now=$(date +%s)
-    find "$tmp/src" -exec touch -h -d "@$now" {} +
-    echo "$stamp" > "$tmp/src/.stamp"
-    rm -rf "$SNAP"
-    mv "$tmp/src" "$SNAP"
-    rm -rf "$tmp"
+    "$REPO/tests/sanitizers/llama-copy.sh" "$SNAP" || die "the copy of the patched llama.cpp tree into $SNAP failed"
 }
 
 # Write the tiny models, one time.
