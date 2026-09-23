@@ -1,0 +1,96 @@
+tests: free the contexts of the recurrent rollback test on each return path
+Fold-into: fuzz-core/0003-tests-state-the-rollback-depth-rule-in-the-recurrent-state-test.patch
+
+The defects. The ctest entries of test-recurrent-state-rollback show each one in an ASan build.
+
+- A failed check of test_rollback leaks its contexts.
+
+  test_rollback frees ctx_src, ctx_dst and ctx_dirty only at its end. Each failed check returns
+  before that, thus LeakSanitizer reports the contexts on top of the failure, and the report hides
+  the failure. test_multi_seq_split_replay leaks the context that it created when the other one
+  fails to initialize.
+
+  The change: llama_context_ptr owners free the three contexts of test_rollback on each return
+  path. The owners release them before the multi-sequence part, as the explicit frees did. The
+  init failure of the multi-sequence part calls its cleanup.
+
+  The test: ctest test-recurrent-state-rollback and its model entries in an ASan build.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    tests/test-recurrent-state-rollback.cpp
+--- a/tests/test-recurrent-state-rollback.cpp
++++ b/tests/test-recurrent-state-rollback.cpp
+@@ -116,16 +116,18 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
+ 
+     llama_context * ctx_roll = make_ctx_multi();
+     llama_context * ctx_ref  = make_ctx_multi();
+-    if (ctx_roll == nullptr || ctx_ref == nullptr) {
+-        fprintf(stderr, "%s : failed to init multi-seq contexts\n", __func__);
+-        return false;
+-    }
+ 
+     const auto cleanup = [&]() {
+         llama_free(ctx_roll);
+         llama_free(ctx_ref);
+     };
+ 
++    if (ctx_roll == nullptr || ctx_ref == nullptr) {
++        fprintf(stderr, "%s : failed to init multi-seq contexts\n", __func__);
++        cleanup();
++        return false;
++    }
++
+     if (llama_n_rs_seq(ctx_roll) < n_rollback) {
+         fprintf(stderr, "%s : skipping because n_rs_seq is too small\n", __func__);
+         cleanup();
+@@ -279,6 +281,9 @@ static int test_rollback(const common_params & params, llama_model * model, uint
+ 
+     llama_context * ctx_src = make_ctx(params, model, fill);
+     llama_context * ctx_dst = make_ctx(params, model, fill);
++    // the owners free the contexts on each return path, thus a failed check leaks no context
++    llama_context_ptr own_src(ctx_src);
++    llama_context_ptr own_dst(ctx_dst);
+     if (ctx_src == nullptr || ctx_dst == nullptr) {
+         fprintf(stderr, "%s : failed to init contexts\n", __func__);
+         return 1;
+@@ -286,8 +291,6 @@ static int test_rollback(const common_params & params, llama_model * model, uint
+ 
+     if (llama_n_rs_seq(ctx_src) == 0) {
+         fprintf(stderr, "%s : skipping because n_rs_seq is disabled\n", __func__);
+-        llama_free(ctx_src);
+-        llama_free(ctx_dst);
+         return 0;
+     }
+ 
+@@ -301,8 +304,6 @@ static int test_rollback(const common_params & params, llama_model * model, uint
+     constexpr uint32_t n_rollback = 3;
+     if (n_rs_seq < n_rollback) {
+         fprintf(stderr, "%s : skipping because n_rs_seq is too small\n", __func__);
+-        llama_free(ctx_src);
+-        llama_free(ctx_dst);
+         return 0;
+     }
+     if (tokens.empty()) {
+@@ -397,6 +398,7 @@ static int test_rollback(const common_params & params, llama_model * model, uint
+     // groups 1..n_rs_seq hold a different prompt's history, and rs_idx[0] is
+     // non-zero at load time. The restore must wipe that state and still match.
+     llama_context * ctx_dirty = make_ctx(params, model, fill);
++    llama_context_ptr own_dirty(ctx_dirty);
+     if (ctx_dirty == nullptr) {
+         fprintf(stderr, "%s : failed to init dirty ctx\n", __func__);
+         return 1;
+@@ -443,9 +445,9 @@ static int test_rollback(const common_params & params, llama_model * model, uint
+     }
+ 
+     fprintf(stderr, "%s : recurrent rollback checkpoint restored successfully\n", __func__);
+-    llama_free(ctx_src);
+-    llama_free(ctx_dst);
+-    llama_free(ctx_dirty);
++    own_src.reset();
++    own_dst.reset();
++    own_dirty.reset();
+ 
+     if (!test_multi_seq_split_replay(params, model, n_vocab, fill)) {
+         return 1;
