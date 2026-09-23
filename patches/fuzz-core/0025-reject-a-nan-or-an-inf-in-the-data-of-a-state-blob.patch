@@ -1,0 +1,78 @@
+Reject a NaN or an Inf in the data of a state blob
+Fold-into: upstream/llama-context
+
+The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
+
+- A NaN in the data of a state blob gives NaN logits to the other sequences of the KV stream.
+
+  llama_state_seq_set_data and llama_state_set_data copy the K, V and recurrent rows of a blob
+  into the memory, and do not examine the values. A damaged blob that loads can thus put a NaN
+  into the state of a sequence. A decode of that sequence then writes NaN K and V rows into its
+  cells. The memory keeps these rows after a remove of the sequence, until a clear with data.
+
+  The attention without flash attention reads each cell of its window: the cells of the other
+  sequences and the free cells, with the weight 0 from the mask. But NaN + -inf and 0 * NaN are
+  NaN. Thus each other sequence of the stream gets NaN logits, and each new sequence after the
+  remove too. The flash attention of the CPU skips a masked cell, thus it does not show the defect.
+
+  The change: the host reader and the file reader of a state blob examine the bytes of each tensor
+  with ggml_validate_row_data before they write them. A NaN or an Inf (for a quantized type, in a
+  block scale) rejects the load, as a damaged size does: the load returns 0 and removes the
+  sequence. The device reader copies the rows of a state that the same context wrote, and it has
+  no host bytes to examine. A blob with finite values loads as before, and a decode does not
+  change. The check is O(size) at each load, and ggml_validate_row_data writes one line to stderr
+  when it finds a value.
+
+  The limit: a decode that overflows in one sequence can also write NaN rows, and this change does
+  not cover that path. check_known_limit() in tests/fuzz/core/fuzz_recurrent.cpp tests the limit
+  at the start of each run.
+
+  The reproducers: tests/fuzz/core/regress/fuzz_recurrent--state-nan-kv-window (a new sequence
+  after a remove) and tests/fuzz/core/regress/fuzz_recurrent--state-nan-kv-other-seq (a second
+  sequence that stays).
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    src/llama-context.cpp
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 7117b32..fb851b1 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2826,6 +2826,19 @@ private:
+     std::vector<write_info> winfos;
+ };
+ 
++// Reject the bytes of a state blob for a tensor of the memory when they hold a NaN or an Inf (for a
++// quantized type, in a block scale). The memory keeps the rows of a cell after a remove of its
++// sequence, and the attention without flash attention reads each cell of its window. A masked cell
++// gets the weight 0 there, but 0 * NaN and NaN + -inf are NaN. Thus one non-finite value of a damaged
++// blob gives NaN logits to the other sequences of the stream, and to each later sequence, until a
++// clear with data. A decode that overflows can also write a NaN: this check does not cover that
++// path. O(size), at a load only.
++static void llama_state_check_tensor_data(const ggml_tensor * tensor, const void * data, size_t size) {
++    if (!ggml_validate_row_data(tensor->type, data, size)) {
++        throw std::runtime_error(format("the state data of %s holds a NaN or an Inf value, or a size that is not a whole number of blocks", tensor->name));
++    }
++}
++
+ class llama_io_read_host : public llama_io_read_i {
+ public:
+     llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
+@@ -2852,6 +2865,8 @@ public:
+             throw std::runtime_error("unexpectedly reached end of buffer");
+         }
+ 
++        llama_state_check_tensor_data(tensor, ptr, size);
++
+         // save for later during destruction
+         rinfos.push_back({tensor, ptr, size, offset});
+ 
+@@ -2915,6 +2930,7 @@ public:
+     void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+         temp_buffer.resize(size);
+         read(temp_buffer.data(), size);
++        llama_state_check_tensor_data(tensor, temp_buffer.data(), size);
+         ggml_backend_tensor_set(tensor, temp_buffer.data(), offset, size);
+     }
+ 

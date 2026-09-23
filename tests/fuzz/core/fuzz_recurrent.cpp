@@ -41,6 +41,25 @@
 // A sequence becomes "tainted" after an operation that has a result that the
 // shadow cannot predict (a corrupted blob that loads, a middle range remove).
 // The oracle ignores a tainted sequence until the next clear.
+//
+// The known limit (check_known_limit() in LLVMFuzzerInitialize is its test):
+// the memory keeps the K and V rows of a cell after a remove of its sequence,
+// and the attention without flash attention reads each cell of its window,
+// also the cells of the other sequences. A masked cell gets the weight 0
+// there, but 0 * NaN is NaN. The flash attention of the CPU skips a masked
+// cell. The loader rejects a blob with a NaN or an Inf
+// (patches/fuzz-core/0025), thus a blob cannot bring one in. A decode that
+// overflows can still write one: then the other sequences of its KV stream,
+// and each later sequence in it, get NaN logits without flash attention,
+// until a clear with data. Thus a P2 failure with NaN logits, after a decode
+// in which a tainted sequence with finite data gave NaN logits (FUZZ_TRACE=1
+// writes that line), is this limit and not a new defect.
+//
+// Switches for a replay:
+//   FUZZ_TRACE=1                one line for each operation
+//   FUZZ_RECURRENT_CALIBRATE=1  write each difference of P2, and never fail P2
+//   FUZZ_NONFINITE=N            for each decode of the context under test, write the first N graph
+//                               nodes with a NaN or an Inf, and the count in each of their sources
 
 #include "fuzz_common.h"
 
@@ -79,6 +98,102 @@ int32_t       g_n_vocab = 0;
 float         g_tol   = 2e-4f;
 bool          g_trace = false;
 bool          g_calibrate = false;  // FUZZ_RECURRENT_CALIBRATE=1: print each difference, never fail P2
+long          g_nonfinite = 0;      // FUZZ_NONFINITE=N: write the first N nodes with a NaN or an Inf
+
+/** The state of the FUZZ_NONFINITE watch for one decode of the context under test. */
+struct NonFiniteWatch {
+    int  decode = 0;  // the number of the decode in this input, from 1
+    int  node   = 0;  // the nodes that the watch examined in this decode
+    long found  = 0;  // the nodes of this decode with a NaN or an Inf, up to g_nonfinite
+};
+NonFiniteWatch g_watch;
+
+/**
+ * The count of the NaN and Inf values of an F32, F16 or BF16 tensor, or -1 for a different type or
+ * a tensor with no data. A view can have gaps between its rows, thus the function reads the full
+ * span and then each element through the strides. *first gets the flat index of the first
+ * non-finite value. O(ggml_nelements(t)).
+ */
+int64_t count_nonfinite(const ggml_tensor * t, int64_t * first) {
+    *first = -1;
+    if ((t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16) ||
+        t->data == nullptr || t->buffer == nullptr || ggml_nelements(t) == 0) {
+        return -1;
+    }
+    std::vector<uint8_t> bytes(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, bytes.data(), 0, bytes.size());
+    int64_t count = 0, flat = 0;
+    for (int64_t i3 = 0; i3 < t->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < t->ne[2]; ++i2) {
+            for (int64_t i1 = 0; i1 < t->ne[1]; ++i1) {
+                const uint8_t * row = bytes.data() + i1 * t->nb[1] + i2 * t->nb[2] + i3 * t->nb[3];
+                for (int64_t i0 = 0; i0 < t->ne[0]; ++i0, ++flat) {
+                    const uint8_t * p = row + i0 * t->nb[0];
+                    float v;
+                    if (t->type == GGML_TYPE_F32) {
+                        memcpy(&v, p, sizeof(v));
+                    } else if (t->type == GGML_TYPE_F16) {
+                        ggml_fp16_t h;
+                        memcpy(&h, p, sizeof(h));
+                        v = ggml_fp16_to_fp32(h);
+                    } else {
+                        ggml_bf16_t h;
+                        memcpy(&h, p, sizeof(h));
+                        v = ggml_bf16_to_fp32(h);
+                    }
+                    if (!std::isfinite(v)) {
+                        if (count == 0) {
+                            *first = flat;
+                        }
+                        ++count;
+                    }
+                }
+            }
+        }
+    }
+    return count;
+}
+
+/**
+ * The eval callback of FUZZ_NONFINITE=N. It examines each node of the graph after the backend
+ * computes it. For each of the first N nodes with a NaN or an Inf, it writes the node and the count
+ * of each source. After N such nodes it examines no more nodes in this decode. It never stops the
+ * computation, thus the program of the input does not change. The scheduler computes each examined
+ * node alone, thus a fusion of the backend does not occur with the switch on. The count of a
+ * source is the count after the node ran: an in-place node writes its source.
+ */
+bool nonfinite_cb(ggml_tensor * t, bool ask, void * /*user_data*/) {
+    if (ask) {
+        return g_watch.found < g_nonfinite;
+    }
+    ++g_watch.node;
+    // A view computes nothing. The reshape of a full cache, and a write into a cache (SET_ROWS,
+    // CPY), are views of all the rows of the cache, also the rows that the graph does not read. The
+    // first node that computes from a NaN shows it, with its sources.
+    if (ggml_is_empty(t) || t->op == GGML_OP_NONE || t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE ||
+        t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_SET_ROWS || t->op == GGML_OP_CPY) {
+        return true;
+    }
+    int64_t first = -1;
+    const int64_t n = count_nonfinite(t, &first);
+    if (n <= 0) {
+        return true;
+    }
+    ++g_watch.found;
+    fprintf(stderr, "nonfinite: decode %d, node %d: %s '%s' %s [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64
+                    "] has %" PRId64 " NaN or Inf of %" PRId64 " (the first at %" PRId64 ")\n",
+            g_watch.decode, g_watch.node, ggml_op_desc(t), t->name, ggml_type_name(t->type), t->ne[0], t->ne[1], t->ne[2],
+            t->ne[3], n, ggml_nelements(t), first);
+    for (int k = 0; k < GGML_MAX_SRC && t->src[k] != nullptr; ++k) {
+        const ggml_tensor * s = t->src[k];
+        const int64_t       m = count_nonfinite(s, &first);
+        fprintf(stderr, "nonfinite:   src %d: %s '%s' %s [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]: %" PRId64
+                        " NaN or Inf%s\n",
+                k, ggml_op_desc(s), s->name, ggml_type_name(s->type), s->ne[0], s->ne[1], s->ne[2], s->ne[3], m,
+                m < 0 ? " (not examined)" : "");
+    }
+    return true;
+}
 
 /** The shadow of one sequence: its tokens, and whether the oracle can predict it. */
 struct Shadow {
@@ -86,6 +201,26 @@ struct Shadow {
     bool tainted = false;
     bool pending = false;  // a rollback is done and the next decode has not run yet
 };
+
+/** True when each of the n values is a NaN or an Inf. O(n). */
+bool all_nonfinite(const float * v, int n) {
+    for (int i = 0; i < n; ++i) {
+        if (std::isfinite(v[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/** True when each of the n values is finite. O(n). */
+bool all_finite(const float * v, int n) {
+    for (int i = 0; i < n; ++i) {
+        if (!std::isfinite(v[i])) {
+            return false;
+        }
+    }
+    return true;
+}
 
 /** Write one line of the operation trace when FUZZ_TRACE=1. */
 void trace(const char * fmt, ...) {
@@ -211,6 +346,10 @@ llama_context * make_ctx(const CtxParams & p) {
     // which is the size of the effect of a wrong state in the tiny model
     cp.type_k          = GGML_TYPE_F32;
     cp.type_v          = GGML_TYPE_F32;
+    if (g_nonfinite > 0) {
+        cp.cb_eval           = nonfinite_cb;
+        cp.cb_eval_user_data = nullptr;
+    }
     llama_context * ctx = llama_init_from_model(g_model, cp);
     setenv("LLAMA_EMBD_LOOKUP_HOST", "0", 1);
     return ctx;
@@ -266,6 +405,7 @@ void run(FuzzedDataProvider & fdp) {
     trace("ctx: n_seq_max %u n_rs_seq %u n_ubatch %u unified %d flash %d threads %d embd_host %d",
           p.n_seq_max, p.n_rs_seq, p.n_ubatch, p.unified, p.flash, p.threads, p.embd_host);
 
+    g_watch = NonFiniteWatch{};
     // the reference contexts with the flash attention setting of this context (auto is on for the CPU)
     g_ref = g_ref_sets[p.flash == 0 ? 0 : 1];
     llama_context * ctx = make_ctx(p);
@@ -340,6 +480,9 @@ void run(FuzzedDataProvider & fdp) {
                 b.logits[last_idx[k]] = 1;
             }
             b.n_tokens = total;
+            g_watch.decode++;
+            g_watch.node  = 0;
+            g_watch.found = 0;
             const int rc = llama_decode(ctx, b);
             trace("decode %zu seqs, %d tokens: rc %d", seqs.size(), total, rc);
             if (rc != 0) {
@@ -352,12 +495,15 @@ void run(FuzzedDataProvider & fdp) {
                     Shadow & s = sh[seqs[k]];
                     s.hist.insert(s.hist.end(), added[k].begin(), added[k].end());
                     s.pending = false;
+                    const float * l = llama_get_logits_ith(ctx, last_idx[k]);
+                    if (l == nullptr) {
+                        fuzz::fail("llama_get_logits_ith(%d) gives null after a decode that requested it", last_idx[k]);
+                    }
                     if (!s.tainted) {
-                        const float * l = llama_get_logits_ith(ctx, last_idx[k]);
-                        if (l == nullptr) {
-                            fuzz::fail("llama_get_logits_ith(%d) gives null after a decode that requested it", last_idx[k]);
-                        }
                         check_logits(l, s, seqs[k], "decode");
+                    } else if (!all_finite(l, g_n_vocab)) {
+                        // a later P2 failure with NaN logits can be the known limit (the header)
+                        trace("  seq %d (tainted) gives NaN or Inf logits", seqs[k]);
                     }
                 }
             }
@@ -493,6 +639,107 @@ bool silent(float /*progress*/, void * /*user_data*/) {
     return true;
 }
 
+/** The state of the probe of the known limit: while it is armed, each F32 Vcur node gets NaN values. */
+struct LimitProbe {
+    bool armed = false;
+    int  hits  = 0;
+};
+LimitProbe g_probe;
+
+/** The eval callback of the probe. It writes NaN into the V rows of the decode, as an overflow does. */
+bool probe_cb(ggml_tensor * t, bool ask, void * /*user_data*/) {
+    const bool vcur = g_probe.armed && strncmp(t->name, "Vcur-", 5) == 0 && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t);
+    if (ask) {
+        return vcur;
+    }
+    if (vcur) {
+        const std::vector<float> nan((size_t) ggml_nelements(t), NAN);
+        ggml_backend_tensor_set(t, nan.data(), 0, ggml_nbytes(t));
+        ++g_probe.hits;
+    }
+    return true;
+}
+
+/** Decode the tokens of one sequence from position 0 in ctx, and give the logits of the last token. */
+std::vector<float> probe_decode(llama_context * ctx, int seq, const std::vector<llama_token> & toks) {
+    llama_batch b = llama_batch_init((int32_t) toks.size(), 0, 1);
+    for (size_t i = 0; i < toks.size(); ++i) {
+        b.token[i]     = toks[i];
+        b.pos[i]       = (llama_pos) i;
+        b.n_seq_id[i]  = 1;
+        b.seq_id[i][0] = seq;
+        b.logits[i]    = i + 1 == toks.size();
+    }
+    b.n_tokens = (int32_t) toks.size();
+    const int rc = llama_decode(ctx, b);
+    llama_batch_free(b);
+    if (rc != 0) {
+        fuzz::fail("the probe of the known limit fails to decode seq %d (code %d)", seq, rc);
+    }
+    const float * l = llama_get_logits_ith(ctx, -1);
+    return std::vector<float>(l, l + g_n_vocab);
+}
+
+/**
+ * The test of the known limit (the header). A context of two sequences decodes seq 0 with NaN
+ * values in its V rows (as a decode that overflows), removes seq 0, and decodes seq 1 in the cells
+ * that seq 0 held. One cell of seq 0 stays free with its NaN row in the window. The flash attention
+ * of the CPU skips the masked cells: seq 1 must match the reference. The attention without flash
+ * attention reads them: each logit of seq 1 must be NaN or Inf. When this second result changes,
+ * the limit is gone: correct the header. CPU only.
+ */
+void check_known_limit() {
+    const std::vector<llama_token> h0 = { 11, 48, 85 };
+    const std::vector<llama_token> h1 = { 122, 159 };
+    for (int f = 0; f < 2; ++f) {
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx           = kCtx;
+        cp.n_batch         = kBatch;
+        cp.n_ubatch        = kBatch;
+        cp.n_seq_max       = 2;
+        cp.kv_unified      = true;
+        cp.n_threads       = 1;
+        cp.n_threads_batch = 1;
+        cp.no_perf         = true;
+        cp.type_k          = GGML_TYPE_F32;
+        cp.type_v          = GGML_TYPE_F32;
+        cp.flash_attn_type = f == 0 ? LLAMA_FLASH_ATTN_TYPE_DISABLED : LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        cp.cb_eval         = probe_cb;
+        llama_context * ctx = llama_init_from_model(g_model, cp);
+        if (ctx == nullptr) {
+            fuzz::fail("cannot create the context of the known-limit probe (flash attention %s)", f == 0 ? "off" : "on");
+        }
+        g_probe = LimitProbe{ true, 0 };
+        probe_decode(ctx, 0, h0);
+        g_probe.armed = false;
+        if (g_probe.hits == 0) {
+            fuzz::fail("the known-limit probe finds no contiguous F32 node Vcur-<layer> for its NaN values");
+        }
+        llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1);
+        const std::vector<float> got = probe_decode(ctx, 1, h1);
+        llama_free(ctx);
+
+        const std::vector<float> & ref = reference_logits(g_ref_sets[f][0], h1);
+        float max_ref = 0.0f, max_diff = 0.0f;
+        for (int i = 0; i < g_n_vocab; ++i) {
+            max_ref  = std::max(max_ref, std::fabs(ref[i]));
+            max_diff = std::max(max_diff, std::fabs(got[i] - ref[i]));  // std::max drops a NaN difference
+        }
+        const float limit = g_tol * (1.0f + max_ref);
+        if (f == 1) {
+            if (!all_finite(got.data(), g_n_vocab) || (!(max_diff <= limit) && !g_calibrate)) {
+                fuzz::fail("the flash attention of the CPU passes the NaN rows of a removed sequence to a new sequence "
+                           "(max diff %g, limit %g): the oracle depends on the skip of the masked cells", max_diff, limit);
+            }
+        } else if (!all_nonfinite(got.data(), g_n_vocab)) {
+            fuzz::fail("the known limit does not occur: without flash attention, the NaN rows of a removed sequence do "
+                       "not reach a new sequence. Correct the known limit in the header of fuzz_recurrent.cpp.");
+        }
+    }
+    fprintf(stderr, "fuzz_recurrent: known limit: without flash attention, the NaN rows of a removed sequence reach a new "
+                    "sequence. The flash attention of the CPU skips them.\n");
+}
+
 }  // namespace
 
 extern "C" int LLVMFuzzerInitialize(int * /*argc*/, char *** /*argv*/) {
@@ -500,6 +747,7 @@ extern "C" int LLVMFuzzerInitialize(int * /*argc*/, char *** /*argv*/) {
     llama_backend_init();
     g_trace     = fuzz::env_long("FUZZ_TRACE", 0) != 0;
     g_calibrate = fuzz::env_long("FUZZ_RECURRENT_CALIBRATE", 0) != 0;
+    g_nonfinite = fuzz::env_long("FUZZ_NONFINITE", 0);
     const char * tol = getenv("FUZZ_RECURRENT_TOL");
     if (tol != nullptr) {
         g_tol = strtof(tol, nullptr);
@@ -570,6 +818,11 @@ extern "C" int LLVMFuzzerInitialize(int * /*argc*/, char *** /*argv*/) {
             fuzz::fail("the model is not sensitive enough to its history for the oracle (%g < 10 x %g). Make the weights larger.",
                        max_diff, limit);
         }
+    }
+
+    // the flash attention of a different device can read the masked cells, thus the probe is for the CPU
+    if (dev_name == nullptr) {
+        check_known_limit();
     }
     return 0;
 }
