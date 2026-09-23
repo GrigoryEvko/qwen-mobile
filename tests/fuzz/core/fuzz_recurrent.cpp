@@ -2,7 +2,8 @@
 // recurrent rollback slots (n_rs_seq) of our patches, and the sequence state blobs.
 //
 // The harness loads the tiny random qwen35 model (make_tiny_model writes
-// data/tiny-qwen35-f32.gguf, and FUZZ_MODEL gives a different file) one time. For
+// data/tiny-qwen35-f32.gguf, and FUZZ_MODEL gives a different file) one time, on
+// the CPU (FUZZ_DEVICE names a different device, HTP0 for example). For
 // each input it creates a context with parameters from the input (n_seq_max
 // 1 to 4, n_rs_seq 0 to 5, n_ubatch, kv_unified, flash attention, threads,
 // LLAMA_EMBD_LOOKUP_HOST on or off), then runs a program of operations from
@@ -511,6 +512,18 @@ extern "C" int LLVMFuzzerInitialize(int * /*argc*/, char *** /*argv*/) {
     const std::string path = env != nullptr ? std::string(env) : fuzz::data_file("tiny-qwen35-f32.gguf");
     llama_model_params mp = llama_model_default_params();
     mp.progress_callback = silent;
+    // The CPU only, unless FUZZ_DEVICE names a device (HTP0 for example): a phone build registers the
+    // Hexagon backend, and the default parameters give it all the layers.
+    static ggml_backend_dev_t devs[2] = { nullptr, nullptr };
+    const char * dev_name = getenv("FUZZ_DEVICE");
+    devs[0] = dev_name != nullptr ? ggml_backend_dev_by_name(dev_name) : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (devs[0] == nullptr) {
+        fuzz::fail("no device %s", dev_name != nullptr ? dev_name : "of the type CPU");
+    }
+    mp.devices = devs;
+    if (dev_name == nullptr) {
+        mp.n_gpu_layers = 0;
+    }
     g_model = llama_model_load_from_file(path.c_str(), mp);
     if (g_model == nullptr) {
         fuzz::fail("cannot load the model %s", path.c_str());
