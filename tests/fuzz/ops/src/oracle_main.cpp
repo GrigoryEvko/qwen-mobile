@@ -644,7 +644,7 @@ void print_leaf_summary(const leaf & l) {
         return;
     }
     const std::vector<float> v = raw_to_f32(type, l.bytes.data(), n);
-    int64_t n_nan = 0, n_inf = 0, n_sub = 0, n_zero = 0, i_max = -1;
+    int64_t n_nan = 0, n_inf = 0, n_sub = 0, n_zero = 0, n_neg = 0, n_pos = 0, i_max = -1;
     float   amin = 0.0f, amax = 0.0f;
     bool    any = false;
     for (int64_t i = 0; i < n; i++) {
@@ -653,6 +653,8 @@ void print_leaf_summary(const leaf & l) {
         if (std::isfinite(f) && (i_max < 0 || a > amax)) {
             i_max = i;
         }
+        n_neg += f < 0.0f ? 1 : 0;
+        n_pos += f > 0.0f ? 1 : 0;
         if (std::isnan(f)) {
             n_nan++;
         } else if (std::isinf(f)) {
@@ -667,9 +669,10 @@ void print_leaf_summary(const leaf & l) {
         }
     }
     const int64_t ne0 = l.t->ne[0], ne1 = l.t->ne[1], ne2 = l.t->ne[2];
-    std::printf("    values: nan %lld inf %lld subnormal %lld zero %lld |finite nonzero| in [%.3g, %.3g], "
-                "the largest at [%lld,%lld,%lld,%lld]\n",
-                (long long) n_nan, (long long) n_inf, (long long) n_sub, (long long) n_zero, amin, amax,
+    std::printf("    values: nan %lld inf %lld subnormal %lld zero %lld negative %lld positive %lld |finite nonzero| "
+                "in [%.3g, %.3g], the largest at [%lld,%lld,%lld,%lld]\n",
+                (long long) n_nan, (long long) n_inf, (long long) n_sub, (long long) n_zero, (long long) n_neg,
+                (long long) n_pos, amin, amax,
                 (long long) (i_max % ne0), (long long) (i_max / ne0 % ne1), (long long) (i_max / (ne0 * ne1) % ne2),
                 (long long) (i_max / (ne0 * ne1 * ne2)));
     if (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q8_0) {
