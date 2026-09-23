@@ -1,0 +1,143 @@
+jinja: compute the integer +, -, * and % in int64_t, with errors for a zero divisor and an overflow
+Fold-into: upstream/common
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+The binary operators of two integers computed in double and cast the result
+back with static_cast<int64_t>. For "{{ 1 % 0 }}", fmod gives NaN, and the
+cast of NaN is undefined: UBSan reports a float-cast-overflow at
+common/jinja/runtime.cpp in test-jinja ("arithmetic edge cases"), in debug
+and release. For "{{ 999999999999999999 * 999999999999999999 }}", the
+product is outside int64_t, and that cast is also undefined. The double path
+also loses the exact value of an integer past 2^53.
+
+The change: two integers use int64_t arithmetic. A zero divisor of % throws
+"Integer modulo by zero" (Jinja raises ZeroDivisionError). A result outside
+int64_t throws "Integer overflow" (Python gives a larger integer, which
+int64_t cannot hold). INT64_MIN % -1 gives 0. The sign of % stays the sign of
+the dividend, as the fmod of the float path. The float operators do not
+change.
+
+test-jinja gets the case "integer arithmetic past 2^53", which also runs
+against Python Jinja2 in test-jinja -py, and the case "integer errors".
+test-jinja and test-jinja -py pass with no report in none and ubsan, debug
+and release.
+
+diff --git a/common/jinja/runtime.cpp b/common/jinja/runtime.cpp
+index 252ab55..b66bf97 100644
+--- a/common/jinja/runtime.cpp
++++ b/common/jinja/runtime.cpp
+@@ -7,6 +7,7 @@
+ #include <vector>
+ #include <memory>
+ #include <cmath>
++#include <cstdint>
+ 
+ #define FILENAME "jinja-runtime"
+ 
+@@ -109,6 +110,35 @@ value object_literal::execute_impl(context & ctx) {
+     return obj;
+ }
+ 
++// The +, - or * (op) of two integers. The double path loses the exact value past 2^53, and the cast
++// of a result outside int64_t back to an integer is undefined. Python gives a larger integer, which
++// int64_t cannot hold, thus a result outside int64_t is an error.
++static int64_t int_arith(char op, int64_t a, int64_t b) {
++    bool overflow = false;
++    if (op == '+') {
++        overflow = (b > 0 && a > INT64_MAX - b) || (b < 0 && a < INT64_MIN - b);
++    } else if (op == '-') {
++        overflow = (b < 0 && a > INT64_MAX + b) || (b > 0 && a < INT64_MIN + b);
++    } else if (a != 0 && b != 0) {
++        overflow = a > 0 ? (b > 0 ? a > INT64_MAX / b : b < INT64_MIN / a)
++                         : (b > 0 ? a < INT64_MIN / b : b < INT64_MAX / a);
++    }
++    if (overflow) {
++        throw std::runtime_error("Integer overflow: " + std::to_string(a) + " " + op + " " + std::to_string(b) +
++                                 " is outside the 64-bit integer range");
++    }
++    return op == '+' ? a + b : op == '-' ? a - b : a * b;
++}
++
++// The % of two integers, with the sign of the dividend, as the fmod of the float path. Jinja raises
++// ZeroDivisionError for a zero divisor. INT64_MIN % -1 is undefined in C++, and its value is 0.
++static int64_t int_mod(int64_t a, int64_t b) {
++    if (b == 0) {
++        throw std::runtime_error("Integer modulo by zero");
++    }
++    return b == -1 ? 0 : a % b;
++}
++
+ value binary_expression::execute_impl(context & ctx) {
+     value left_val = left->execute(ctx);
+ 
+@@ -194,7 +224,7 @@ value binary_expression::execute_impl(context & ctx) {
+             if (is_float) {
+                 return mk_val<value_float>(res);
+             } else {
+-                return mk_val<value_int>(static_cast<int64_t>(res));
++                return mk_val<value_int>(int_arith(op.value[0], left_val->as_int(), right_val->as_int()));
+             }
+         } else if (op.value == "/") {
+             JJ_DEBUG("Division operation: %f / %f", a, b);
+@@ -206,7 +236,7 @@ value binary_expression::execute_impl(context & ctx) {
+             if (is_float) {
+                 return mk_val<value_float>(rem);
+             } else {
+-                return mk_val<value_int>(static_cast<int64_t>(rem));
++                return mk_val<value_int>(int_mod(left_val->as_int(), right_val->as_int()));
+             }
+         } else if (op.value == "<") {
+             JJ_DEBUG("Comparison operation: %f < %f is %d", a, b, a < b);
+diff --git a/tests/test-jinja.cpp b/tests/test-jinja.cpp
+index 00de91d..fe3ab8a 100644
+--- a/tests/test-jinja.cpp
++++ b/tests/test-jinja.cpp
+@@ -494,6 +494,13 @@ static void test_expressions(testing & t) {
+         "20"
+     );
+ 
++    // 2^53 + 1 has no exact double, thus the integer operators must not compute in double.
++    test_template(t, "integer arithmetic past 2^53",
++        "{{ 9007199254740993 + 0 }} {{ 9007199254740993 - 1 }} {{ 3 * 3002399751580331 }} {{ 9007199254740993 % 10 }}",
++        json::object(),
++        "9007199254740993 9007199254740992 9007199254740993 3"
++    );
++
+     test_template(t, "string concat ~",
+         "{{ 'hello' ~ ' ' ~ 'world' }}",
+         json::object(),
+@@ -2499,6 +2506,33 @@ static void test_fuzzing(testing & t) {
+         }
+     });
+ 
++    t.test("integer errors", [&](testing & t) {
++        // Jinja raises ZeroDivisionError for a zero divisor, and an integer outside int64_t
++        // has no representation here: each template must give an error, not a value.
++        const std::vector<std::string> error_tests = {
++            "{{ 1 % 0 }}",
++            "{{ 9223372036854775807 + 1 }}",
++            "{{ -9223372036854775807 - 2 }}",
++            "{{ 3037000500 * 3037000500 }}",
++        };
++        for (const auto & tmpl : error_tests) {
++            bool threw = false;
++            try {
++                jinja::lexer lexer;
++                auto lexer_res = lexer.tokenize(tmpl);
++                jinja::program ast = jinja::parse_from_tokens(lexer_res);
++                jinja::context ctx(tmpl);
++                jinja::global_from_json(ctx, json::object(), true);
++                jinja::runtime runtime(ctx);
++                const jinja::value results = runtime.execute(ast);
++                runtime.gather_string_parts(results);
++            } catch (const std::exception &) {
++                threw = true;
++            }
++            t.assert_true("error: " + tmpl, threw);
++        }
++    });
++
+     t.test("deeply nested structures", [&](testing & t) {
+         // Deeply nested loops
+         for (int depth = 1; depth <= 10; ++depth) {
