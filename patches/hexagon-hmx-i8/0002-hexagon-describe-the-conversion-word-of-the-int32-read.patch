@@ -1,0 +1,74 @@
+hexagon: describe the conversion word of the int32 accumulator read
+Fold-into: hexagon-hmx-i8/0001-hexagon-hmx-int8-macros.patch
+
+The comment of the int8 section of hmx-utils.h told that HMX_I32_READ_SCALES
+holds four f16 scales (2^9, 2^1, 2^-7 and 2^-15). A probe of each field of
+the word in the simulator, and the same probe streams on the v79 silicon,
+show a different format. Each value is a conversion word. Bits 0..9 are a
+mantissa m, bits 10..14 are an exponent e, and the scale is
+(1 + m / 1024) * 2^(e - 24). Bit 15 is the sign, bits 16..18 select an
+activation function, and bits 19..30 are a u8 bias with 4 fraction bits.
+The four words have e = 24, 16, 8 and 0, thus they read byte 0, 1, 2 and 3
+of the accumulator. The constants are correct, and only the comment changes.
+
+The comment also gives these facts from the same probe:
+- The u16 stores (acc:2x1 and acc:2x2) write the maximum of two rows or of
+  2x2 elements, thus no store gives the full int32 value.
+- mxclracc and a store without :retain clear the accumulator. After
+  mxswapacc, they clear the two accumulators.
+
+The header of 0001 gives approximately 711 processor cycles for one int32
+read. That number includes the call overhead of the vendor library. On the
+v79 silicon, one four-plane read of a 64 by 32 tile in an inline asm chain
+costs 55 to 60 processor cycles.
+
+The patch changes comments only. Two builds of libggml-htp-v79.so from the
+pinned commit plus the series, without and with this patch, give the same
+bytes (sha256 1bb393c868c36736c11991835019833b1eac14fc67f69bdee73d288c76ebfb10).
+diff --git a/ggml/src/ggml-hexagon/htp/hmx-utils.h b/ggml/src/ggml-hexagon/htp/hmx-utils.h
+index ca7b198..44c8bc9 100644
+--- a/ggml/src/ggml-hexagon/htp/hmx-utils.h
++++ b/ggml/src/ggml-hexagon/htp/hmx-utils.h
+@@ -233,11 +233,25 @@ static inline void hmx_interleave_cols_to_tiles(__fp16 * restrict tiles_out,
+ // order of two suffixes without a new probe: ":deep:cm" assembles and ":cm:deep" does
+ // not.
+ //
+-// The int32 accumulator has no f16 and no f32 store. It leaves only as u8 or as u16.
+-// Thus a caller that wants the full int32 value reads it as four u8 byte planes:
+-// four stores of ":after:retain:cm.ub", each with its own scale in the bias register,
+-// with ":retain" holding the accumulator alive across the first three. The four
+-// scales come from the conversion table that HMX_I32_READ_SCALES gives.
++// The int32 accumulator has no f16 store and no f32 store. A u8 store writes one byte of
++// each element. The u16 stores ("acc:2x1" and "acc:2x2") write the maximum of two rows or
++// of 2x2 elements, thus no store gives the full value. The int32 sum has no saturation,
++// thus it is correct modulo 2^32.
++//
++// Thus a caller that wants the full int32 value reads it as four u8 byte planes: four
++// stores of ":after:retain:cm.ub", each with its own conversion word in the bias register.
++// The ":retain" suffix keeps the accumulator for the next store, thus the first three
++// stores have it and the last store does not. "mxclracc" and a store without ":retain"
++// clear the accumulator. After "mxswapacc", they clear the two accumulators.
++//
++// The conversion word of one column is 32 bits, and "bias = mxmem" loads 32 of them:
++//   bits 0..9    m, bits 10..14 e: the scale is (1 + m / 1024) * 2^(e - 24)
++//   bit 15       the sign of the scale
++//   bits 16..18  an activation function (0 is none)
++//   bits 19..30  a u8 bias with 4 fraction bits
++// With m = 0, no sign, no activation and no bias, a u8 store without ":sat" writes
++// floor(acc * 2^(e - 24)) modulo 256. Thus the words with e = 24, 16, 8 and 0 give
++// byte 0, 1, 2 and 3 of acc. HMX_I32_READ_SCALES holds these four words.
+ //
+ // The consequence for a quantized matmul: the scale of the weight must be constant
+ // over the whole k dimension of one accumulation, because the accumulation cannot
+@@ -297,9 +311,8 @@ static inline void hmx_interleave_cols_to_tiles(__fp16 * restrict tiles_out,
+ #define HMX_STORE_PLANE_LAST_I32(out, range) \
+     "mxmem(" out ", " range "):after:cm.ub = acc\n"
+ 
+-// The four scales of the conversion table that read the four byte planes of the int32
+-// accumulator, as f16 bit patterns in the low half of each word. They are 2^9, 2^1,
+-// 2^-7 and 2^-15, thus each plane is 8 bits lower than the one before it.
++// The four conversion words that read byte 0, 1, 2 and 3 of the int32 accumulator. Their
++// e fields are 24, 16, 8 and 0, thus their scales are 1, 2^-8, 2^-16 and 2^-24.
+ #define HMX_I32_READ_SCALES { 0x00006000u, 0x00004000u, 0x00002000u, 0x00000000u }
+ 
+ // Size in bytes of the HMX configuration region that the int32 read needs. The region

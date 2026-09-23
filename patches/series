@@ -165,3 +165,6 @@ fuzz-ops/0010-opencl-soft-max-of-a-fully-masked-row-gives-0.patch
 fuzz-ops/0011-opencl-row-broadcast-of-a-src1-row-that-repeats-along-dim-0.patch
 fuzz-ops/0012-hexagon-htp-the-src1-rows-of-the-scalar-and-same-shape-binary-paths.patch
 fuzz-ops/0013-ggml-the-f32-to-f16-conversion-gives-inf-past-the-f16-range-with-fast-math.patch
+
+# hexagon-hmx-i8: the comment of the int32 read gives the format of the conversion word.
+hexagon-hmx-i8/0002-hexagon-describe-the-conversion-word-of-the-int32-read.patch
