@@ -135,6 +135,7 @@ fuzz-core/0004-check-the-metadata-of-the-model-loader.patch
 fuzz-core/0005-refuse-a-defective-vocabulary.patch
 fuzz-core/0006-refuse-a-malformed-template.patch
 fuzz-core/0007-check-the-input-of-the-gguf-reader.patch
+fuzz-core/0008-give-the-samplers-a-defined-result-for-special-logits.patch
 
 # The fixes of the defects that the sanitizer matrix of tests/run-suite.sh finds in the tests of llama.cpp.
 # The header of each patch describes its defect and the change.

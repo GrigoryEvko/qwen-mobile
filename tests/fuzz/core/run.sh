@@ -102,16 +102,12 @@ declare -A SWITCH=(
     [kv-keep-streams]=FUZZ_RECURRENT_KNOWN_KV_KEEP
     [recurrent-shared-rollback]=FUZZ_RECURRENT_KNOWN_SHARED_ROLLBACK
     [copy-into-used-sequence]=FUZZ_RECURRENT_CLEAR_BEFORE_COPY
-    [dist-inf]=FUZZ_SAMPLER_KNOWN_DIST_INF
-    [sampler-bucket-cast]=FUZZ_SAMPLER_KNOWN_BUCKET_CAST
     [tsan-topset-counters]=FUZZ_TOPSET_KNOWN_COUNTERS
 )
 
 # The report of each known finding, as an extended regular expression on the run log. A
 # regression input "reproduces" its finding when its log matches this expression.
 declare -A EXPECT=(
-    [dist-inf]="P4: candidate [0-9]+ has the logit \+Inf|Assertion .found. failed"
-    [sampler-bucket-cast]='P3: the top set|llama-sampler\.cpp:[0-9]+:[0-9]+: runtime error: .*outside the range'
     [embd-host-mrope]='llama_batch_allocr::ubatch_add|P2: after decode'
     [kv-keep-streams]='P2: after'
     [recurrent-shared-rollback]='cannot write shared recurrent state|P2: after'
