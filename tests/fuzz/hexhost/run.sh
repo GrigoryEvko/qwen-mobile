@@ -360,7 +360,8 @@ fi
 rm -rf $rel/runtime && mkdir -p $rel/runtime
 case $cfg in
     hwasan) rt=libclang_rt.hwasan-aarch64-android.so ;;
-    ubsan) rt=libclang_rt.ubsan_standalone-aarch64-android.so ;;
+    # The ubsan build links its runtime statically (-static-libsan, refer to the vptr text in
+    # phone/CMakeLists.txt), thus the stage has no UBSan library.
     *) rt= ;;
 esac
 if [[ -n \$rt ]]; then

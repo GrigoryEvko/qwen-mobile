@@ -57,6 +57,15 @@ elseif (FUZZ_SANITIZER STREQUAL "hwasan")
 elseif (FUZZ_SANITIZER STREQUAL "ubsan")
     # No check recovers, thus each UBSan report stops the run.
     set(SAN_FLAGS -fsanitize=undefined -fno-sanitize-recover=undefined)
+    if (ANDROID)
+        # The shared UBSan runtime of the NDK has its own copy of the libc++abi type_info
+        # classes, and the executable has the copy of the static NDK libc++. The vptr check
+        # does a dynamic_cast to the copy of the runtime, which fails for the type_info
+        # objects of the executable, thus it gave a false report at the start
+        # ("dynamic-type-mismatch" in sstream). The static runtime uses the one copy of the
+        # executable, and it exports its handlers to the ggml libraries.
+        set(SAN_LINK_FLAGS -static-libsan)
+    endif()
 elseif (FUZZ_SANITIZER STREQUAL "none")
     set(SAN_FLAGS "")
 else()
@@ -64,11 +73,17 @@ else()
 endif()
 
 add_compile_options(${PROFILE_FLAGS} ${SAN_FLAGS})
-add_link_options(${PROFILE_LINK_FLAGS} ${SAN_FLAGS})
+add_link_options(${PROFILE_LINK_FLAGS} ${SAN_FLAGS} ${SAN_LINK_FLAGS})
 message(STATUS "hexhost_phone: profile ${FUZZ_PROFILE}, sanitizer ${FUZZ_SANITIZER}: ${PROFILE_FLAGS} ${SAN_FLAGS}")
 
-# ggml as the app builds it (the preset arm64-android-snapdragon), without OpenCL
-set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
+# ggml as the app builds it (the preset arm64-android-snapdragon), without OpenCL. The ubsan
+# build for the phone links ggml statically: the NDK links a shared library with --no-undefined,
+# and the static UBSan runtime of the executable cannot give its handlers to such a library.
+if (ANDROID AND FUZZ_SANITIZER STREQUAL "ubsan")
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+else()
+    set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
+endif()
 set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
 set(GGML_LLAMAFILE OFF CACHE BOOL "" FORCE)
 set(GGML_OPENCL OFF CACHE BOOL "" FORCE)
