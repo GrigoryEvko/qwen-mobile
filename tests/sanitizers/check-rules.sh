@@ -45,8 +45,12 @@
 #        uses -O1, no -flto and no -DNDEBUG. The lab release build of the DSP
 #        code uses each code generation flag of the shipped DSP library.
 #   R13  Each entry of tests/sanitizers/ubsan.supp has a reproducer in
-#        tests/sanitizers/repro/, and the last run of
-#        tests/sanitizers/supp-repro.sh passed in the two profiles.
+#        tests/sanitizers/repro/. With the build directories (not
+#        --no-builds): the last run of tests/sanitizers/supp-repro.sh passed
+#        for the entry in the two profiles.
+#   T176 No area takes the Android ASan runtime from an NDK, and each copy of
+#        that runtime under build/fuzz has the sha256 of
+#        tests/sanitizers/build-asan-android-runtime.sh.
 #   L8   No suppression comment names a task of tests/sanitizers/closed-tasks.txt.
 #   L9   Each libFuzzer command of the scripts of an area has -artifact_prefix,
 #        each fuzz run has an outer "timeout -s KILL", and the root of the
@@ -465,6 +469,9 @@ check_repro() {
         if ! rg -q -F -e "REPRO-ENTRY: $entry" "$SAN_DIR/repro/" 2> /dev/null; then
             violation R13 sanitizers "tests/sanitizers/ubsan.supp" "the entry '$entry' has no reproducer (a file in tests/sanitizers/repro/ with the line 'REPRO-ENTRY: $entry')"
         fi
+        # The results come from the suite (supp-repro.sh). --no-builds (the
+        # check before the suite, and a clean CI checkout) has none yet.
+        [[ $CHECK_BUILDS -eq 1 ]] || continue
         for profile in debug release; do
             res="$BUILD_FUZZ/matrix-supp-repro-$profile/results.jsonl"
             if [[ ! -f "$res" ]]; then
@@ -577,6 +584,43 @@ check_death_callback() {
     done
 }
 
+# Task #176: each Android ASan run uses the runtime of
+# tests/sanitizers/build-asan-android-runtime.sh (compiler-rt 22.1.8), not
+# the runtime of the NDK r29, whose prctl interceptor traps (FEAT_FPAC).
+#   - No script or CMake file of an area copies the ASan runtime of an NDK.
+#   - With the build directories: each copy of
+#     libclang_rt.asan-aarch64-android.so under build/fuzz has the sha256 of
+#     build/fuzz/asan-android-runtime/libclang_rt.asan-aarch64-android.so.sha256.
+# The order of LD_LIBRARY_PATH on the phone is not a static fact of a file,
+# thus the phone commands of each area give it, and this script does not
+# check it.
+check_android_asan_runtime() {
+    local area file num text rt="libclang_rt.asan-aarch64-android.so"
+    local ref_file="$BUILD_FUZZ/asan-android-runtime/$rt.sha256" ref copy sum
+    for area in $AREAS; do
+        while IFS= read -r file; do
+            while IFS=: read -r num text; do
+                [[ "$text" =~ ^[[:space:]]*(#|//) ]] && continue
+                if [[ "$text" == *android-ndk* || "$text" == *toolchains/llvm/prebuilt* || "$text" == *'$ANDROID_NDK'* || "$text" == *'${ANDROID_NDK'* ]]; then
+                    violation T176 "$area" "$file:$num" "this line takes $rt from an NDK: use build/fuzz/asan-android-runtime/$rt (tests/sanitizers/build-asan-android-runtime.sh, task #176)"
+                fi
+            done < <(rg -n -F -e "$rt" "$file" || true)
+        done < <(find "$FUZZ_DIR/$area" \( -name '*.sh' -o -name CMakeLists.txt -o -name '*.cmake' \) -type f 2> /dev/null | sort)
+    done
+    [[ $CHECK_BUILDS -eq 1 && -f "$ref_file" ]] || return 0
+    ref="$(cut -d' ' -f1 "$ref_file")"
+    while IFS= read -r copy; do
+        # Only the copies in the build or phone directory of an Android ASan
+        # configuration are the runtimes of runs. A tool or source tree of
+        # an area is not.
+        [[ "${copy#"$BUILD_FUZZ"/}" =~ (^|/)([a-z]+-android-(debug|release)-asan|[a-z]+-(debug|release)-asan|phone-(debug|release)-asan)(/|$) ]] || continue
+        sum="$(sha256sum "$copy" | cut -d' ' -f1)"
+        [[ "$sum" == "$ref" ]] \
+            || violation T176 "$(area_of "$copy")" "$copy" "this ASan runtime has sha256 ${sum:0:16}, not ${ref:0:16} of tests/sanitizers/build-asan-android-runtime.sh (task #176)"
+    done < <(find "$BUILD_FUZZ" -name "$rt" -type f \
+                -not -path "$BUILD_FUZZ/asan-android-runtime/*" 2> /dev/null | sort)
+}
+
 # The suppressions of a closed task: a suppression entry must not name a task
 # of tests/sanitizers/closed-tasks.txt (rule L8: the fix removes its entries).
 check_closed_tasks() {
@@ -627,6 +671,7 @@ main() {
     check_libfuzzer_commands
     check_death_callback
     check_closed_tasks
+    check_android_asan_runtime
     check_parity_sources
     check_repro
     if [[ $CHECK_BUILDS -eq 1 && -d "$BUILD_FUZZ" ]]; then
