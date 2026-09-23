@@ -75,6 +75,15 @@ int check_priority(const Options & opt);
  */
 int run_scenario(const Options & opt, const std::string & name);
 
+/**
+ * The speed of the answer path on the host, for the fixes of the decode and
+ * sample path: the tiny model (F32, one thread) answers one message with up
+ * to 64 tokens, reps times without and reps times with speculation. Prints
+ * the median, the minimum and the maximum of the time of one generateNext
+ * for each mode. Returns 0. O(reps x 64) generateNext calls.
+ */
+int speed_check(const Options & opt, int reps);
+
 /** The counters of all programs of this process, for the summary line of the driver. Two threads write them. */
 struct Counters {
     std::atomic<uint64_t> programs{0};

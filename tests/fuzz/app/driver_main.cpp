@@ -4,7 +4,8 @@
  * programs of random bytes from a seeded generator, or the programs of files.
  *
  *   app_fuzz_driver [--seconds S] [--iters N] [--seed X] [--size B] [--threads] [--cross-free]
- *                   [--replay FILE...] [--check-priority] [--scenario NAME]
+ *                   [--replay FILE...] [--check-priority] [--scenario NAME] [--speed REPS]
+ *                   [--selftest-threads]
  *
  * --seconds   Stop after S seconds (the default is 60).
  * --iters     Stop after N programs (the default has no limit).
@@ -16,6 +17,11 @@
  * --check-priority  Run the check of task #66 and stop with its result.
  * --scenario  Run one scenario of a finding (image-shape, image-twice,
  *             jni-pending, spec-disable, sampler-nan, priority) and stop.
+ * --speed     Measure the time of one generateNext of the tiny model, REPS
+ *             answers without and REPS with speculation, and stop.
+ * --selftest-threads  Start one thread, join it, and stop: the first step of
+ *             a phone ASan run (task #176). A runtime that traps in a new
+ *             thread stops the process here.
  *
  * The environment variables of app_harness.h select the models and the device.
  * With FUZZ_APP_LAST_PROGRAM=<file>, the driver writes each program to the
@@ -23,6 +29,7 @@
  */
 #include "app_harness.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -31,6 +38,7 @@
 #include <iterator>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -39,7 +47,8 @@ namespace {
 int usage() {
     fprintf(stderr,
             "usage: app_fuzz_driver [--seconds S] [--iters N] [--seed X] [--size B] [--threads] [--cross-free]\n"
-            "                       [--replay FILE...] [--check-priority] [--scenario NAME]\n");
+            "                       [--replay FILE...] [--check-priority] [--scenario NAME] [--speed REPS]\n"
+            "                       [--selftest-threads]\n");
     return 2;
 }
 
@@ -61,6 +70,8 @@ int main(int argc, char ** argv) {
     std::vector<const char *> replay;
     bool check_priority = false;
     std::string scenario;
+    int speed_reps = 0;
+    bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> const char * { return i + 1 < argc ? argv[++i] : nullptr; };
@@ -90,6 +101,12 @@ int main(int argc, char ** argv) {
             const char * v = next();
             if (v == nullptr) return usage();
             scenario = v;
+        } else if (a == "--selftest-threads") {
+            selftest = true;
+        } else if (a == "--speed") {
+            const char * v = next();
+            if (v == nullptr || atoi(v) <= 0) return usage();
+            speed_reps = atoi(v);
         } else if (a == "--replay") {
             while (i + 1 < argc && argv[i + 1][0] != '-') {
                 replay.push_back(argv[++i]);
@@ -98,12 +115,23 @@ int main(int argc, char ** argv) {
             return usage();
         }
     }
+    if (selftest) {
+        // No backend loads: the test is only the start of one thread under the sanitizer runtime.
+        std::atomic<bool> ran{false};
+        std::thread t([&ran] { ran = true; });
+        t.join();
+        fprintf(stderr, "selftest: one thread %s\n", ran ? "started and joined" : "did not run");
+        return ran ? 0 : 1;
+    }
     harness::init_once(opt);
     if (check_priority) {
         return harness::check_priority(opt);
     }
     if (!scenario.empty()) {
         return harness::run_scenario(opt, scenario);
+    }
+    if (speed_reps > 0) {
+        return harness::speed_check(opt, speed_reps);
     }
     if (!replay.empty()) {
         for (const char * path : replay) {

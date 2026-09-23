@@ -8,6 +8,7 @@
 #   tests/fuzz/app/run.sh jvm
 #   tests/fuzz/app/run.sh phone-build <none|asan|hwasan|ubsan> [--profile debug|release]
 #   tests/fuzz/app/run.sh phone-commands <none|asan|hwasan|ubsan> [--profile debug|release]
+#   tests/fuzz/app/run.sh phone-apk
 #
 # The modes:
 #   test            Build build/fuzz/app-<profile>-<sanitizer> and run each
@@ -28,10 +29,15 @@
 #                   build/fuzz/app-android-<profile>-<sanitizer>, and stage the
 #                   files for the phone into build/fuzz/app/phone-<profile>-<sanitizer>.
 #                   An ASan build uses the ASan runtime of compiler-rt 22.1.8
-#                   from build/fuzz/ops/phone/asan-rt22 (the runtime of NDK r29
-#                   traps in each new thread on the phone).
+#                   from build/fuzz/asan-android-runtime (task #176: the runtime
+#                   of NDK r29 traps in each new thread on the phone).
 #   phone-commands  Print the adb commands that push and run a phone build.
 #                   This script never runs adb.
+#   phone-apk       Build libqwenmobile.so from the working tree against
+#                   build/native/llama, and an APK with the shipped libraries
+#                   and that library, into build/fuzz/app/phone-apk. The unit
+#                   tests of the app run in the same Gradle call. jniLibs,
+#                   build/native and build/apk do not change.
 #
 # The profiles: debug (-O1 -g, no NDEBUG, no LTO) and release (the flags that
 # ship: -O3 -DNDEBUG, and -flto with the floating-point flags of the preset
@@ -429,16 +435,17 @@ exit ${status:-0}
 
 # The ASan runtime of NDK r29 traps in each new thread on the phone: bionic resets
 # the PAC key through prctl, and the prctl interceptor then fails its own AUTIASP.
-# The runtime of compiler-rt 22.1.8 has the upstream fix. fuzz-ops builds it, and
-# each Android ASan run uses it, first in LD_LIBRARY_PATH.
-ASAN_RT22="$REPO/build/fuzz/ops/phone/asan-rt22/libclang_rt.asan-aarch64-android.so"
-ASAN_RT22_SHA256=546f2a868184b0a818f7704d1c42990526db878858f38eacf4f1bc75fa93ede1
+# Each Android ASan run uses the runtime of compiler-rt 22.1.8 that
+# tests/sanitizers/build-asan-android-runtime.sh builds (task #176), first in
+# LD_LIBRARY_PATH.
+ASAN_RT22="$REPO/build/fuzz/asan-android-runtime/libclang_rt.asan-aarch64-android.so"
 
-# Stop when the fixed ASan runtime is missing or has a different hash.
+# Stop when the fixed ASan runtime is missing, or when its sha256 is not the one of its build.
 check_asan_rt22() {
-    [[ -f "$ASAN_RT22" ]] || die "no $ASAN_RT22: fuzz-ops builds the fixed ASan runtime (compiler-rt 22.1.8)"
-    [[ $(sha256sum "$ASAN_RT22" | cut -d' ' -f1) == "$ASAN_RT22_SHA256" ]] \
-        || die "$ASAN_RT22 does not have the sha256 $ASAN_RT22_SHA256"
+    [[ -f "$ASAN_RT22" && -f "$ASAN_RT22.sha256" ]] \
+        || die "no $ASAN_RT22: run tests/sanitizers/build-asan-android-runtime.sh"
+    [[ $(sha256sum "$ASAN_RT22" | cut -d' ' -f1) == "$(cut -d' ' -f1 "$ASAN_RT22.sha256")" ]] \
+        || die "$ASAN_RT22 does not have the sha256 of $ASAN_RT22.sha256"
 }
 
 # The runtime library of the sanitizer $1 on the phone, or nothing.
@@ -483,8 +490,9 @@ cmake -S tests/fuzz/app -B build/fuzz/app-android-$PROFILE-$SAN -G Ninja \
     -DHEXAGON_SDK_ROOT="$HEXAGON_SDK_ROOT" -DHEXAGON_TOOLS_ROOT="$HEXAGON_TOOLS_ROOT" -DPREBUILT_LIB_DIR=android_aarch64
 nice -n 10 cmake --build build/fuzz/app-android-$PROFILE-$SAN -j"$JOBS" \
     --target fuzz_jni_api fuzz_jni_threads fuzz_caches fuzz_spec_policy app_fuzz_driver
-if [ -n "$RUNTIME" ]; then
-    cp "$(find "$ANDROID_NDK_ROOT" -name "$RUNTIME" | head -1)" build/fuzz/app-android-$PROFILE-$SAN/
+# The ASan build takes the runtime of build/fuzz/asan-android-runtime, not the one of the NDK.
+if [ -n "$RUNTIME" ] && [ "$SAN" != asan ]; then
+    cp -f "$(find "$ANDROID_NDK_ROOT" -name "$RUNTIME" | head -1)" build/fuzz/app-android-$PROFILE-$SAN/
 fi
 ' > "$OUT/logs/phone-build-$name.log" 2>&1 || die "the phone build failed, see $OUT/logs/phone-build-$name.log"
     local stage="$OUT/phone-$name" b="$REPO/build/fuzz/app-android-$name"
@@ -507,6 +515,70 @@ fi
     [[ -f "$UBSAN_SUPP" ]] || die "no $UBSAN_SUPP: the sanitizer-matrix agent writes it"
     cp "$UBSAN_SUPP" "$stage/ubsan.supp"
     echo "run.sh: the phone files are in $stage ($(du -sh "$stage" | cut -f1))"
+}
+
+# Build libqwenmobile.so from the working tree against build/native/llama, and an
+# APK with the shipped libraries of jniLibs and that one library, into
+# build/fuzz/app/phone-apk. The unit tests of the app run in the same Gradle
+# call. The shared outputs (jniLibs, build/native, build/apk) do not change.
+phone_apk() {
+    # shellcheck source=../../../scripts/lib.sh
+    source "$REPO/scripts/lib.sh"
+    local jnilibs="$REPO/android/snapdragon/jniLibs/arm64-v8a" out="$OUT/phone-apk" lib name
+    diff -q "$REPO/build/hashes-native.txt" <(sha256_table "$jnilibs"/*.so) > /dev/null \
+        || die "$jnilibs does not match build/hashes-native.txt: the shipped libraries are not the last build"
+    # The new library links the llama.cpp libraries of build/native/llama: they must be the shipped ones.
+    for lib in "$REPO"/build/native/llama/bin/lib*.so; do
+        name=${lib##*/}
+        if [[ -f "$jnilibs/$name" ]] && ! cmp -s "$lib" "$jnilibs/$name"; then
+            die "build/native/llama/bin/$name is not the shipped $name: build the native libraries first"
+        fi
+    done
+    rm -rf "$out"
+    mkdir -p "$out/logs" "$out/src"
+    # The command runs in the container, thus its variables expand there.
+    # shellcheck disable=SC2016
+    container_run -e JOBS="$BUILD_JOBS" "$SNAPDRAGON_IMAGE" bash -euo pipefail -c '
+flags="-ffile-prefix-map=/workspace=. -fdebug-prefix-map=/workspace=. -Werror=date-time"
+cmake -S android/snapdragon -B build/fuzz/app/phone-apk/jni -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-34 \
+    -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
+    -DLLAMA_CPP_DIR=/workspace/third_party/llama.cpp -DLLAMA_BUILD_DIR=/workspace/build/native/llama \
+    -DCMAKE_C_FLAGS="$flags" -DCMAKE_CXX_FLAGS="$flags"
+nice -n 10 cmake --build build/fuzz/app/phone-apk/jni -j"$JOBS"
+' > "$out/logs/jni.log" 2>&1 || die "the build of libqwenmobile.so failed, see $out/logs/jni.log"
+    (
+        cd "$REPO"
+        while IFS= read -r -d '' file; do
+            [[ -e "$file" ]] || continue
+            cp --parents -- "$file" "$out/src/"
+        done < <(git ls-files -z --cached --others --exclude-standard -- android)
+    )
+    mkdir -p "$out/src/android/snapdragon"
+    cp -r "$REPO/android/snapdragon/jniLibs" "$out/src/android/snapdragon/jniLibs"
+    cp "$out/jni/libqwenmobile.so" "$out/src/android/snapdragon/jniLibs/arm64-v8a/libqwenmobile.so"
+    printf 'sdk.dir=/opt/android-sdk\nllama.dir=/workspace/third_party/llama.cpp\n' > "$out/src/android/local.properties"
+    mkdir -p "$REPO/build/cache/home/.android" "$REPO/build/cache/gradle"
+    if [[ -f "$HOME/.android/debug.keystore" ]]; then
+        cp "$HOME/.android/debug.keystore" "$REPO/build/cache/home/.android/debug.keystore"
+    fi
+    local image
+    image=$(ensure_apk_image)
+    # shellcheck disable=SC2016
+    container_run \
+        -v "$out/src/android:/workspace/android" -w /workspace/android \
+        -e GRADLE_USER_HOME=/workspace/build/cache/gradle \
+        -e ANDROID_USER_HOME=/workspace/build/cache/home/.android \
+        -e VERSION_CODE="$(version_code)" \
+        "$image" bash -euo pipefail -c '
+./gradlew --no-daemon --no-build-cache --console=plain -Pprebuilt=true -Pandroid.builder.sdkDownload=false \
+    -PversionCode="$VERSION_CODE" :app:testDebugUnitTest :app:assembleRelease
+cp app/build/outputs/apk/release/app-release.apk /workspace/build/fuzz/app/phone-apk/
+cp -r app/build/test-results/testDebugUnitTest /workspace/build/fuzz/app/phone-apk/test-results
+' > "$out/logs/apk.log" 2>&1 || die "the APK build or a unit test failed, see $out/logs/apk.log"
+    rm -rf "$out/src"
+    sha256_table "$out/app-release.apk" "$out/jni/libqwenmobile.so" | tee "$out/hashes.txt"
+    echo "run.sh: the APK is $out/app-release.apk; android/scripts/install.sh $out/app-release.apk installs it"
 }
 
 phone_commands() {
@@ -539,10 +611,14 @@ phone_commands() {
     echo "$a shell mkdir -p $d/work $d/logs"
     echo "$a push $push $d/"
     if [[ $san == asan ]]; then
-        echo "$a shell sha256sum $d/asan-rt/libclang_rt.asan-aarch64-android.so  # must be $ASAN_RT22_SHA256"
+        echo "$a shell sha256sum $d/asan-rt/libclang_rt.asan-aarch64-android.so  # must be $(cut -d' ' -f1 "$ASAN_RT22.sha256")"
     fi
     echo "$a shell chmod 755 $d/bin/fuzz_jni_api $d/bin/fuzz_jni_threads $d/bin/fuzz_caches $d/bin/fuzz_spec_policy $d/bin/app_fuzz_driver"
     echo "$a shell ls -la /data/local/tmp/qwen/models/"
+    if [[ $san == asan ]]; then
+        one "0. The thread self-test of task #176. A code other than 0 stops the ASan runs: an environment failure, not a finding." \
+            "cd $d && timeout -s KILL 100 env $envs bin/app_fuzz_driver --selftest-threads > logs/selftest.log 2>&1"
+    fi
     one "1. The draft length policy, CPU only, 80 s." \
         "cd $d && timeout -s KILL 100 env $envs bin/fuzz_spec_policy -max_total_time=80 -rss_limit_mb=2048 -artifact_prefix=logs/ > logs/spec_policy.log 2>&1"
     one "2. The caches, CPU only, 80 s." \
@@ -551,18 +627,23 @@ phone_commands() {
         "cd $d && timeout -s KILL 100 env $envs bin/app_fuzz_driver --seconds 80 --seed 1000 > logs/driver-cpu-tiny.log 2>&1"
     one "4. The JNI API with the tiny model, most loads on HTP0." \
         "cd $d && timeout -s KILL 100 env $envs FUZZ_APP_DEVICE=HTP0 bin/app_fuzz_driver --seconds 80 --seed 2000 > logs/driver-htp0-tiny.log 2>&1"
-    one "5. Short programs with the real 2B Q8_0 model on HTP0." \
+    # A run that loads a real model gets the mark of the runner: it needs 9 GB of MemAvailable.
+    echo "# REAL-MODEL"
+    one "5. Short programs with the real 2B Q8_0 model on HTP0: one load of it, n_ctx 1024." \
         "cd $d && timeout -s KILL 100 env $envs FUZZ_APP_DEVICE=HTP0 $real bin/app_fuzz_driver --seconds 80 --seed 3000 > logs/driver-htp0-real.log 2>&1"
-    one "6. Short programs with the real 2B Q8_0 model on the CPU." \
+    echo "# REAL-MODEL"
+    one "6. Short programs with the real 2B Q8_0 model on the CPU: one load of it, n_ctx 1024." \
         "cd $d && timeout -s KILL 100 env $envs $real bin/app_fuzz_driver --seconds 80 --seed 4000 > logs/driver-cpu-real.log 2>&1"
     one "7. Stop requests and frees from a second thread, tiny model on HTP0." \
         "cd $d && timeout -s KILL 100 env $envs FUZZ_APP_DEVICE=HTP0 bin/app_fuzz_driver --threads --cross-free --seconds 80 --seed 5000 > logs/driver-threads-htp0.log 2>&1"
     one "8. libFuzzer on the JNI API, tiny model, most loads on HTP0." \
         "cd $d && timeout -s KILL 100 env $envs FUZZ_APP_DEVICE=HTP0 FUZZ_APP_MAX_OPS=24 bin/fuzz_jni_api -max_total_time=80 -rss_limit_mb=3072 -max_len=1024 -artifact_prefix=logs/ > logs/fuzz_jni_api-htp0.log 2>&1"
-    local sc
-    for sc in image-shape spec-disable sampler-nan priority; do
-        one "9. The scenario $sc (its log ends with its report, or with a line that has \"no\")." \
-            "cd $d && timeout -s KILL 60 env $envs FAKEJNI_RELAX= bin/app_fuzz_driver --scenario $sc > logs/scenario-$sc.log 2>&1"
+    local sc dev
+    for dev in cpu HTP0; do
+        for sc in image-shape spec-disable sampler-nan jni-pending priority; do
+            one "9. The scenario $sc on $dev (its log ends with its report, or with a line that has \"no\")." \
+                "cd $d && timeout -s KILL 100 env $envs FAKEJNI_RELAX= FUZZ_APP_DEVICE=${dev/cpu/} bin/app_fuzz_driver --scenario $sc > logs/scenario-$sc-$dev.log 2>&1"
+        done
     done
     echo "$a pull $d/logs $OUT/phone-logs-$PROFILE-$san"
 }
@@ -614,6 +695,7 @@ case $mode in
         done
         ;;
     jvm) jvm ;;
+    phone-apk) phone_apk ;;
     phone-build | phone-commands)
         san=${1:?"$mode needs a sanitizer: none, asan, hwasan or ubsan"}
         shift

@@ -583,9 +583,6 @@ LoadSpec gen_load(Program & p) {
         case 7: case 8: s.model = opt.real_model.empty() ? f32 : opt.real_model; break;
         default: s.model = f32; break;
     }
-    if (real_only) {
-        s.model = opt.real_model;
-    }
     const bool real = !opt.real_model.empty() && s.model == opt.real_model;
     switch (fdp.ConsumeIntegralInRange<int>(0, 15)) {
         case 0: case 1: s.mmproj = ""; break;
@@ -621,6 +618,25 @@ LoadSpec gen_load(Program & p) {
         case 0: s.cache = ""; break;
         case 1: s.cache = p.cache_b; break;
         default: s.cache = p.cache_a; break;
+    }
+    if (real_only) {
+        // The rule of the phone for a real model: the Hexagon backend copies the
+        // weights into rpcmem, which the kernel cannot reclaim. Thus the process
+        // loads the real model one time, with the shortest context of the engine,
+        // no prefill model, and a projector only when FUZZ_APP_REAL_MMPROJ names
+        // one. The later loads of the process take the tiny model.
+        static std::atomic<int> real_loads{0};
+        if (real_loads.fetch_add(1) == 0) {
+            s.model   = opt.real_model;
+            s.mmproj  = opt.real_mmproj;
+            s.device  = s.device == "NoSuchDevice" ? opt.device : s.device;
+            s.prefill = "";
+            s.vision  = s.vision == "NoSuchDevice" ? std::string() : s.vision;
+            s.n_ctx   = 1024;
+        } else {
+            s.model  = f32;
+            s.mmproj = mmp;
+        }
     }
     return s;
 }
@@ -1357,6 +1373,8 @@ int run_scenario(const Options & opt, const std::string & name) {
     s.n_ctx = 1024;
     s.threads = 2;
     s.image_max_tokens = 256;
+    // FUZZ_APP_DEVICE=HTP0 runs the scenario on the NPU of the phone.
+    s.device = opt.device;
     int result = 0;
     auto user = [](const char16_t * text, int image) { return Msg{"user", text, image}; };
     if (name == "image-shape") {
@@ -1585,6 +1603,58 @@ int run_program(const Options & opt, const uint8_t * data, size_t size) {
         api_free(le.handle);
     }
     g_counters.faults = fakejni::injected_faults(fakejni::env());
+    g_prog = nullptr;
+    cache_io::remove_tree(p.dir);
+    fakejni::reset();
+    return 0;
+}
+
+int speed_check(const Options & opt, int reps) {
+    init_once(opt);
+    Program p;
+    p.opt = &opt;
+    p.dir = opt.work_dir + "/speed-" + std::to_string(getpid());
+    cache_io::make_dirs(p.dir);
+    g_prog = &p;
+    LoadSpec s;
+    s.model   = opt.model_dir + "/tiny-qwen35-f32.gguf";
+    s.n_ctx   = 1024;
+    s.threads = 1;
+    const std::vector<Msg> chat = {Msg{"user", u"Hello, how are you? Tell me about the cat.", -1}};
+    for (const bool speculative : {false, true}) {
+        s.speculative = speculative;
+        const jlong h = api_load(s);
+        if (h == 0) {
+            fail("speed: the tiny model did not load");
+        }
+        std::vector<double> us_per_call;
+        size_t tokens = 0;
+        for (int r = 0; r < reps; ++r) {
+            // Greedy sampling: each repetition gives the same answer.
+            if (api_chat_start(p, h, chat, false, 0.0f, 0.8f, false, false) < 0) {
+                fail("speed: chatStart failed");
+            }
+            std::vector<int8_t> piece;
+            int n = 0;
+            const auto t0 = std::chrono::steady_clock::now();
+            while (n < 64 && api_generate_next(h, piece) == 1) {
+                ++n;
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            if (n > 0) {
+                us_per_call.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count() / n);
+                tokens = (size_t) n;
+            }
+        }
+        api_free(h);
+        if (us_per_call.empty()) {
+            fail("speed: no answer gave a token");
+        }
+        std::sort(us_per_call.begin(), us_per_call.end());
+        fprintf(stderr, "speed %s: %zu tokens, %zu runs, one generateNext median %.1f us, min %.1f us, max %.1f us\n",
+                speculative ? "speculative" : "plain", tokens, us_per_call.size(), us_per_call[us_per_call.size() / 2],
+                us_per_call.front(), us_per_call.back());
+    }
     g_prog = nullptr;
     cache_io::remove_tree(p.dir);
     fakejni::reset();
