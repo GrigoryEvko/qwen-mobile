@@ -16,6 +16,7 @@ readonly SNAP="$REPO_ROOT/build/fuzz/ops-src"
 readonly SRC="$SNAP/ggml"
 readonly MISC="$REPO_ROOT/build/fuzz/ops"          # the oracle, fixes, phone stage, temporary files
 readonly B_ORACLE="$MISC/oracle"
+readonly B_ORACLE_X86="$REPO_ROOT/build/oracle-x86"   # the naive llama.cpp build, read by other areas
 readonly SHARED_SAN="$REPO_ROOT/tests/sanitizers"
 readonly SHIPPED_LIBS="$REPO_ROOT/android/snapdragon/jniLibs/arm64-v8a"
 readonly SYMBOLIZER="$MISC/tools/llvm-symbolizer-android-arm64"   # run.sh symbolizer builds it
@@ -97,6 +98,9 @@ Other modes:
                            match. It needs llvm-tblgen on the host and an NDK (NDK_HOST).
   asan-runtime             Build the ASan runtime of the phone (compiler-rt 22.1.8) with
                            tests/sanitizers/build-asan-android-runtime.sh, and check it.
+  oracle-x86               Build the naive x86 oracle of the full llama.cpp tree in build/oracle-x86:
+                           gcc, Release, no SIMD option, -ffp-contract=off -fno-fast-math. Other
+                           areas read its llama-perplexity (the KL bases).
   phone-libs               With FUZZ_OPS_SRC and FUZZ_OPS_TAG: build the app libraries and llama-bench
                            for arm64 Android from the llama.cpp tree above FUZZ_OPS_SRC, with the
                            recipe of scripts/build-native.sh, into build/fuzz/ops/phone/libs-TAG.
@@ -178,6 +182,37 @@ build_oracle() {
     fi
     nice -n 10 cmake --build "$B_ORACLE" -j"$BUILD_JOBS" --target ops_oracle > "$B_ORACLE/build.log" 2>&1 \
         || die "the build of the oracle failed, refer to $B_ORACLE/build.log"
+}
+
+# Build the naive x86 oracle of the full llama.cpp tree in build/oracle-x86 (llama-perplexity and the
+# other tools): gcc, Release (-O3 -DNDEBUG), GGML_NATIVE and each x86 SIMD option off,
+# -ffp-contract=off -fno-fast-math. OpenMP and llamafile stay on (the llama.cpp defaults). Thus the
+# CPU backend uses its scalar paths, for example quantize_row_q8_0_ref and the scalar Q8_0 dot. The
+# source is the submodule with the series. BUILD-INFO records the commit and the hash of its diff,
+# because another session can change the tree.
+build_oracle_x86() {
+    local -a opts=(-DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
+        -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF
+        "-DCMAKE_C_FLAGS=-ffp-contract=off -fno-fast-math" "-DCMAKE_CXX_FLAGS=-ffp-contract=off -fno-fast-math")
+    local opt
+    for opt in GGML_NATIVE GGML_AVX GGML_AVX2 GGML_AVX512 GGML_AVX512_VBMI GGML_AVX512_VNNI GGML_AVX512_BF16 \
+               GGML_AVX_VNNI GGML_FMA GGML_F16C GGML_SSE42 GGML_BMI2 GGML_AMX_TILE GGML_AMX_INT8 GGML_AMX_BF16; do
+        opts+=("-D$opt=OFF")
+    done
+    mkdir -p "$B_ORACLE_X86"
+    CC=gcc CXX=g++ nice -n 10 cmake -S "$LLAMA_SUBMODULE" -B "$B_ORACLE_X86" -G Ninja "${opts[@]}" \
+        > "$B_ORACLE_X86/cmake.log" 2>&1 \
+        || die "the configure of the x86 oracle failed, refer to $B_ORACLE_X86/cmake.log"
+    nice -n 10 cmake --build "$B_ORACLE_X86" -j"$BUILD_JOBS" > "$B_ORACLE_X86/build.log" 2>&1 \
+        || die "the build of the x86 oracle failed, refer to $B_ORACLE_X86/build.log"
+    {
+        echo "date: $(date -Iseconds)"
+        echo "llama.cpp commit: $(git -C "$LLAMA_SUBMODULE" rev-parse HEAD)"
+        echo "sha256 of the diff of the tree: $(git -C "$LLAMA_SUBMODULE" diff HEAD | sha256sum | cut -d' ' -f1)"
+        echo "compiler: $(gcc --version | head -n 1)"
+        echo "options: ${opts[*]}"
+    } > "$B_ORACLE_X86/BUILD-INFO"
+    echo "fuzz-ops: the x86 oracle is in $B_ORACLE_X86/bin (refer to $B_ORACLE_X86/BUILD-INFO)"
 }
 
 # Configure (once) and build the host fuzzer of one profile and one configuration. The flags come
@@ -984,6 +1019,7 @@ main() {
         snapshot)       take_snapshot ;;
         symbolizer)     build_symbolizer ;;
         asan-runtime)   build_asan_runtime ;;
+        oracle-x86)     build_oracle_x86 ;;
         phone-libs)     phone_libs ;;
         phone-check-commands) phone_check_commands ;;
         bounds)         build_oracle; "$B_ORACLE/ops_oracle" bounds ;;
