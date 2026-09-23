@@ -1929,7 +1929,12 @@ static jlong load_impl(JNIEnv * env, jstring jpath, jstring jmmproj,
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = gpu_layers;
     mp.load_mtp     = want_spec;
+    // The token embedding is a row lookup on the CPU. With the lazy mode it stays in a file
+    // mapping, thus its pages are reclaimable and not anonymous memory: 515 MiB for the 2B and
+    // 644 MiB for the 4B Q8_0 file. A model that runs only on the CPU holds a copy of the
+    // embedding as its output, thus the lazy mode saves nothing there and the preset mode stays.
     if (!device.empty()) {
+        mp.lazy_mode = LLAMA_LAZY_MODE_ON;
         ggml_backend_dev_t dev = ggml_backend_dev_by_name(device.c_str());
         if (dev == nullptr) {
             throw_java(env, "The device is not available: " + device);
@@ -1992,6 +1997,7 @@ static jlong load_impl(JNIEnv * env, jstring jpath, jstring jmmproj,
         llama_model_params mp_pf = llama_model_default_params();
         mp_pf.n_gpu_layers = 999;
         mp_pf.devices      = devices_pf.data();
+        mp_pf.lazy_mode    = LLAMA_LAZY_MODE_ON;
         e->model_pf = llama_model_load_from_file(path.c_str(), mp_pf);
         llama_context_params cp_pf = cp;
         cp_pf.n_seq_max = 1;
