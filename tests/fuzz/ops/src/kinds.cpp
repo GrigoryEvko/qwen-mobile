@@ -14,6 +14,7 @@
 #include "case.h"
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -1427,6 +1428,30 @@ const char * TXT_SOFT_MAX =
 // ---------------------------------------------------------------------------------------------
 // RMS_NORM, L2_NORM
 
+// Return true if a row of X (rows of n values) gives a norm divisor below FLT_MIN: the mean square
+// plus eps for RMS_NORM, max(norm, eps) for L2_NORM, in the f32 steps of the CPU (the squares in f32,
+// their sum in double). Only eps = 0 can give such a row. Its scale is then inf or near the f32
+// limit, and the result is inf or NaN by the order of the operations and by the reciprocal square
+// root of each backend: the x86 CPU with fast math makes 1/sqrt with vrsqrtss and one Newton step,
+// which gives NaN for 0 and -inf for a subnormal. The time is O(elements).
+bool norm_scale_overflows(const std::vector<double> & X, int64_t n, float eps, bool l2) {
+    if (eps >= FLT_MIN || n <= 0) {
+        return false;
+    }
+    for (size_t r = 0; r + (size_t) n <= X.size(); r += (size_t) n) {
+        double sum = 0.0;
+        for (size_t i = r; i < r + (size_t) n; i++) {
+            const float x = (float) X[i];
+            sum += (double) (x * x);
+        }
+        const float div = l2 ? std::max(std::sqrt((float) sum), eps) : (float) (sum / (double) n) + eps;
+        if (!(div >= FLT_MIN)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool build_norm(builder & b, bool l2) {
     reader &      rd    = b.rd;
     const bool    model = rd.chance(100);
@@ -1446,6 +1471,9 @@ bool build_norm(builder & b, bool l2) {
         x = ggml_view_3d(b.ctx, full, n, rows, ne2, full->nb[1], full->nb[2], rd.chance(128) ? 0 : (size_t) n * 4);
     } else {
         x = b.f32(n, rows, ne2, 1, b.vs(-3.0f, 3.0f));
+    }
+    if (norm_scale_overflows(logical_values(b.c, x), n, eps, l2)) {
+        b.c.special = true;
     }
     ggml_tensor * y = l2 ? ggml_l2_norm(b.ctx, x, eps) : ggml_rms_norm(b.ctx, x, eps);
     const bool    fuse = !l2 && rd.chance(128);
@@ -1473,12 +1501,49 @@ void bound_norm(const built_case & c, size_t o, const std::vector<float> & ref, 
         ba.strict[i]   = (n + 10.0) * EPS32 * a;
         ba.loose[i]    = ba.strict[i] + 4.0 * EPS16 * a;
     }
+    if (y->op != GGML_OP_MUL) {
+        return;
+    }
+    // RMS_NORM + MUL: y = x scale w. The reference multiplies (x scale) w, and a backend with fast
+    // math can multiply the three factors in another order (the x86 CPU backend does (x w) scale).
+    // When two factors give a product below FLT_MIN, that product rounds to a multiple of 2^-149,
+    // with an absolute error up to 2^-150, and the third factor multiplies the error. Thus each
+    // element also gets the absolute floor 2^-150 max(|x|, scale, |w|). The floor is 7e-46 times the
+    // largest factor, thus a result in the normal range keeps its relative bound.
+    const ggml_tensor * rn = y->src[0]->op == GGML_OP_RMS_NORM ? y->src[0] : y->src[1];
+    const ggml_tensor * w  = rn == y->src[0] ? y->src[1] : y->src[0];
+    const std::vector<double> X = logical_values(c, rn->src[0]);
+    const std::vector<double> W = logical_values(c, w);
+    if (X.size() != ref.size() || W.empty()) {
+        return;
+    }
+    float eps;
+    std::memcpy(&eps, rn->op_params, sizeof(float));
+    const size_t ne0 = (size_t) y->ne[0];
+    for (size_t r = 0; r < ref.size() / ne0; r++) {
+        double sum = 0.0;
+        for (size_t i = 0; i < ne0; i++) {
+            sum += X[r * ne0 + i] * X[r * ne0 + i];
+        }
+        const double scale = 1.0 / std::sqrt(sum / (double) ne0 + (double) eps);
+        for (size_t i = 0; i < ne0; i++) {
+            const double f = std::ldexp(1.0, -150) *
+                             std::max({ std::fabs(X[r * ne0 + i]), scale, std::fabs(W[i % W.size()]) });
+            ba.strict[r * ne0 + i] += f;
+            ba.loose[r * ne0 + i] += f;
+        }
+    }
 }
 
 const char * TXT_NORM =
     "strict = (n+10) u |y|, loose = strict + 4 u16 |y|. Reason: the sum of n squares in f32 in any "
     "order has a relative error of gamma(n), the square root halves it, and the scale, the product "
-    "and the fused weight add a few roundings.";
+    "and the fused weight add a few roundings. RMS_NORM + MUL adds the absolute floor "
+    "2^-150 max(|x|, scale, |w|) to each element: a backend with fast math can multiply x scale w in "
+    "another order, and a product of two factors below FLT_MIN rounds to a multiple of 2^-149. A case "
+    "with eps = 0 and a row whose divisor (the mean square, or the norm for L2_NORM) is below FLT_MIN "
+    "is special: its scale is inf, and the result is inf or NaN by the reciprocal square root of the "
+    "backend (the x86 CPU with fast math gives NaN for 1/sqrt(0) with vrsqrtss and a Newton step).";
 
 // ---------------------------------------------------------------------------------------------
 // Elementwise ops

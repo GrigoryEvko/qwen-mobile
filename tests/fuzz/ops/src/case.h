@@ -54,7 +54,8 @@ struct built_case {
     int                  n_threads  = 1;
     bool                 cpu_repack = false; // weights go into the extra buffer type of the CPU backend
     // The inputs hold Inf, NaN, subnormal or huge values, or a value that a conversion of the op
-    // (to f16 or Q8_0) makes infinite, or a rope factor that makes an angle past 2^64.
+    // (to f16 or Q8_0) makes infinite, or a rope factor that makes an angle past 2^64, or a norm row
+    // with eps = 0 whose divisor is below FLT_MIN (an infinite scale).
     bool                 special    = false;
     std::string          desc;               // the shapes and types, readable
     std::string          path;               // the path class of the backends, for the error table
