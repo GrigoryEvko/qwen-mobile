@@ -749,12 +749,17 @@ bool ensure_vision(Engine & e, std::string & error) {
 
 /**
  * The encoder output of an image chunk: from the cache by the hash of the
- * image file, or from one run of the vision encoder. The pointer is valid
- * until the next call. Returns nullptr with the error text set.
+ * image file and the shape of the chunk, or from one run of the vision
+ * encoder. mtmd_helper_decode_image_chunk reads n_tokens x n_embd floats
+ * from the pointer, thus an entry of another shape is not a hit (the cache
+ * drops it). The pointer is valid until the next call. Returns nullptr
+ * with the error text set.
  */
 const float * image_embd(Engine & e, const mtmd_input_chunk * chunk, std::string & error) {
-    const std::string id = mtmd_input_chunk_get_id(chunk);
-    if (const float * hit = e.images->get(id)) {
+    const std::string id       = mtmd_input_chunk_get_id(chunk);
+    const uint32_t    n_tokens = (uint32_t) mtmd_input_chunk_get_n_tokens(chunk);
+    const uint32_t    n_embd   = (uint32_t) llama_model_n_embd_inp(e.model);
+    if (const float * hit = e.images->get(id, n_tokens, n_embd)) {
         e.turn.images_cached += 1;
         return hit;
     }
@@ -777,15 +782,15 @@ const float * image_embd(Engine & e, const mtmd_input_chunk * chunk, std::string
     }
     e.turn.images_encoded += 1;
     ImageInfo info = known->second;
-    info.n_tokens  = (uint32_t) mtmd_input_chunk_get_n_tokens(chunk);
-    info.n_embd    = (uint32_t) llama_model_n_embd_inp(e.model);
+    info.n_tokens  = n_tokens;
+    info.n_embd    = n_embd;
     const float * out = mtmd_get_output_embd(e.mctx);
     e.images->put(id, info, out);
     LOGI("image %s encoded in %.0f ms, %u tokens, %.1f MB, cache %zu images %.0f MB in RAM, %.0f MB on disk",
          id.substr(0, 12).c_str(), (now_us() - t0) / 1000.0, info.n_tokens, info.n_floats() * 4 / 1048576.0,
          e.images->count(), e.images->ram_bytes() / 1048576.0, e.images->disk_bytes() / 1048576.0);
     // The output buffer of the encoder stays valid until the next encode, thus it serves when the cache did not keep the copy.
-    const float * kept = e.images->get(id);
+    const float * kept = e.images->get(id, n_tokens, n_embd);
     return kept != nullptr ? kept : out;
 }
 
@@ -1338,76 +1343,117 @@ bool tokenize_prompt(JNIEnv * env, jclass native_class, Engine & e, const std::s
     if (!ensure_vision(e, error)) {
         return false;
     }
+    const uint32_t n_embd = (uint32_t) llama_model_n_embd_inp(e.model);
     // A known image gives a placeholder bitmap with its dimensions and its
     // id: the same chunk as its decode gives, without the decode of the file
     // and its preprocessing. The id is the SHA-256 of the file bytes. The
     // dimensions of a new image are the target of the preprocessor, thus
-    // the placeholder of a later turn gives the same target.
-    mtmd::bitmaps bitmaps;
-    e.turn_images.clear();
-    e.turn.images_total = (int) images.size();
-    for (jbyteArray image : images) {
-        const jsize len = env->GetArrayLength(image);
-        jbyte * bytes = env->GetByteArrayElements(image, nullptr);
-        if (bytes == nullptr) {
-            error = "The image bytes are not readable";
+    // the placeholder of a later turn gives the same target. The same bytes
+    // two times in one prompt decode one time and give two copies of one
+    // bitmap, thus the chunks of one id have one shape.
+    //
+    // A cache entry whose shape is not the shape of its chunk (a file of an
+    // earlier build, or a damaged file) goes, and the second pass decodes
+    // the bytes of its image. The first pass drops each such entry, thus
+    // the second pass finds none.
+    for (int pass = 0; pass < 2; ++pass) {
+        items.clear();
+        chunk_of.clear();
+        chunks.ptr.reset();
+        mtmd::bitmaps bitmaps;
+        // The entries of the images that tokenize as placeholders, by id.
+        std::unordered_map<std::string, ImageInfo> known;
+        // The bitmaps that this pass decoded, by id. bitmaps owns them.
+        std::unordered_map<std::string, const mtmd_bitmap *> decoded;
+        e.turn_images.clear();
+        e.turn.images_total = (int) images.size();
+        e.turn.images_known = 0;
+        for (jbyteArray image : images) {
+            const jsize len = env->GetArrayLength(image);
+            jbyte * bytes = env->GetByteArrayElements(image, nullptr);
+            if (bytes == nullptr) {
+                error = "The image bytes are not readable";
+                return false;
+            }
+            const std::string id = cache_io::sha256_hex(bytes, (size_t) len);
+            env->ReleaseByteArrayElements(image, bytes, JNI_ABORT);
+            ImageInfo info;
+            mtmd_bitmap * bitmap = nullptr;
+            const auto seen = decoded.find(id);
+            if (seen != decoded.end()) {
+                bitmap = mtmd_bitmap_init(mtmd_bitmap_get_nx(seen->second), mtmd_bitmap_get_ny(seen->second),
+                                          mtmd_bitmap_get_data(seen->second));
+            } else if (e.images->info(id, info)) {
+                bitmap = mtmd_bitmap_init(info.nx, info.ny, nullptr);
+                known[id] = info;
+                e.turn.images_known += 1;
+            } else {
+                bitmap = decode_image(env, native_class, e, image, error);
+                if (bitmap == nullptr) {
+                    return false;
+                }
+                info.nx = mtmd_bitmap_get_nx(bitmap);
+                info.ny = mtmd_bitmap_get_ny(bitmap);
+                e.turn_images[id] = info;
+                decoded[id] = bitmap;
+            }
+            mtmd_bitmap_set_id(bitmap, id.c_str());
+            bitmaps.entries.emplace_back(bitmap);
+        }
+
+        chunks.ptr.reset(mtmd_input_chunks_init());
+        mtmd_input_text text;
+        text.text          = prompt.c_str();
+        text.text_len      = prompt.size();
+        text.add_special   = true;
+        text.parse_special = true;
+        const std::vector<const mtmd_bitmap *> ptrs = bitmaps.c_ptr();
+        const int32_t tk = mtmd_tokenize(e.mctx, chunks.ptr.get(), &text, ptrs.data(), ptrs.size());
+        if (tk != 0) {
+            error = tk == 1 ? "The number of images differs from the number of markers in the prompt"
+                            : "The image preprocessing failed";
             return false;
         }
-        const std::string id = cache_io::sha256_hex(bytes, (size_t) len);
-        env->ReleaseByteArrayElements(image, bytes, JNI_ABORT);
-        ImageInfo info;
-        mtmd_bitmap * bitmap = nullptr;
-        if (e.images->info(id, info)) {
-            bitmap = mtmd_bitmap_init(info.nx, info.ny, nullptr);
-            e.turn.images_known += 1;
-        } else {
-            bitmap = decode_image(env, native_class, e, image, error);
-            if (bitmap == nullptr) {
-                return false;
-            }
-            info.nx = mtmd_bitmap_get_nx(bitmap);
-            info.ny = mtmd_bitmap_get_ny(bitmap);
-            e.turn_images[id] = info;
-        }
-        mtmd_bitmap_set_id(bitmap, id.c_str());
-        bitmaps.entries.emplace_back(bitmap);
-    }
-
-    chunks.ptr.reset(mtmd_input_chunks_init());
-    mtmd_input_text text;
-    text.text          = prompt.c_str();
-    text.text_len      = prompt.size();
-    text.add_special   = true;
-    text.parse_special = true;
-    const std::vector<const mtmd_bitmap *> ptrs = bitmaps.c_ptr();
-    const int32_t tk = mtmd_tokenize(e.mctx, chunks.ptr.get(), &text, ptrs.data(), ptrs.size());
-    if (tk != 0) {
-        error = tk == 1 ? "The number of images differs from the number of markers in the prompt"
-                        : "The image preprocessing failed";
-        return false;
-    }
-    for (size_t c = 0; c < chunks.size(); ++c) {
-        const mtmd_input_chunk * chunk = chunks[c];
-        switch (mtmd_input_chunk_get_type(chunk)) {
-            case MTMD_INPUT_CHUNK_TYPE_TEXT: {
-                size_t n = 0;
-                const llama_token * tokens = mtmd_input_chunk_get_tokens_text(chunk, &n);
-                for (size_t i = 0; i < n; ++i) {
-                    items.push_back(MemItem{tokens[i], {}});
-                    chunk_of.push_back(nullptr);
+        bool stale = false;
+        for (size_t c = 0; c < chunks.size(); ++c) {
+            const mtmd_input_chunk * chunk = chunks[c];
+            switch (mtmd_input_chunk_get_type(chunk)) {
+                case MTMD_INPUT_CHUNK_TYPE_TEXT: {
+                    size_t n = 0;
+                    const llama_token * tokens = mtmd_input_chunk_get_tokens_text(chunk, &n);
+                    for (size_t i = 0; i < n; ++i) {
+                        items.push_back(MemItem{tokens[i], {}});
+                        chunk_of.push_back(nullptr);
+                    }
+                    break;
                 }
-                break;
+                case MTMD_INPUT_CHUNK_TYPE_IMAGE: {
+                    const std::string id = mtmd_input_chunk_get_id(chunk);
+                    const auto k = known.find(id);
+                    const uint32_t n_tokens = (uint32_t) mtmd_input_chunk_get_n_tokens(chunk);
+                    if (k != known.end() && (k->second.n_tokens != n_tokens || k->second.n_embd != n_embd)) {
+                        LOGE("image %s: the cache holds %u tokens x %u, the prompt needs %u x %u, "
+                             "the entry goes and the image decodes again",
+                             id.substr(0, 12).c_str(), k->second.n_tokens, k->second.n_embd, n_tokens, n_embd);
+                        e.images->drop(id);
+                        known.erase(k);
+                        stale = true;
+                    }
+                    items.push_back(MemItem{LLAMA_TOKEN_NULL, id});
+                    chunk_of.push_back(chunk);
+                    break;
+                }
+                default:
+                    error = "The prompt holds a media type that this engine does not decode";
+                    return false;
             }
-            case MTMD_INPUT_CHUNK_TYPE_IMAGE:
-                items.push_back(MemItem{LLAMA_TOKEN_NULL, mtmd_input_chunk_get_id(chunk)});
-                chunk_of.push_back(chunk);
-                break;
-            default:
-                error = "The prompt holds a media type that this engine does not decode";
-                return false;
+        }
+        if (!stale) {
+            return true;
         }
     }
-    return true;
+    error = "The cache of encoded images did not agree with the prompt. Send the message again.";
+    return false;
 }
 
 /**

@@ -25,6 +25,8 @@ constexpr const char * kSuffix  = ".embd";
 /** The limits of one encoder output: the token budget of an image and the width of the model. */
 constexpr uint32_t kMaxTokens   = 1u << 16;
 constexpr uint32_t kMaxEmbd     = 1u << 16;
+/** The limit of each side of a bitmap, the same as the limit of the decode in llama_jni.cpp. */
+constexpr uint32_t kMaxSide     = 1u << 16;
 
 /** The header of an entry as bytes. */
 std::vector<uint8_t> encode_head(const ImageInfo & info) {
@@ -53,6 +55,12 @@ bool read_head(const std::string & path, ImageInfo & info) {
     // file of two huge dimensions passes the check and every later read of it
     // throws on the allocation of the vector.
     if (fields[3] == 0 || fields[3] > kMaxTokens || fields[4] == 0 || fields[4] > kMaxEmbd) {
+        return false;
+    }
+    // The engine tokenizes a placeholder bitmap of these dimensions, and the
+    // preprocessor casts each side to int: zero or a side above the limit of
+    // a decoded image is a damaged file.
+    if (fields[1] == 0 || fields[1] > kMaxSide || fields[2] == 0 || fields[2] > kMaxSide) {
         return false;
     }
     info.nx       = fields[1];
@@ -150,12 +158,18 @@ bool ImageCache::write_file(const Entry & entry) const {
                                                           {entry.data.data(), entry.data.size() * sizeof(float)}});
 }
 
-const float * ImageCache::get(const std::string & id) {
+const float * ImageCache::get(const std::string & id, uint32_t n_tokens, uint32_t n_embd) {
     const auto found = index_.find(id);
     if (found == index_.end()) {
         return nullptr;
     }
     auto it = found->second;
+    if (it->info.n_tokens != n_tokens || it->info.n_embd != n_embd) {
+        // A file of an earlier build, a damaged file, or the same bytes at
+        // another size: the caller would read past the floats or read wrong ones.
+        erase(it, true);
+        return nullptr;
+    }
     if (it->data.empty()) {
         if (!it->on_disk || !read_file(*it)) {
             erase(it, true);
@@ -174,8 +188,10 @@ const float * ImageCache::get(const std::string & id) {
 }
 
 void ImageCache::put(const std::string & id, const ImageInfo & info, const float * data) {
+    // The limits of read_head: an entry that its own file cannot give back does not enter.
     if (!cache_io::is_hex(id) || info.n_floats() == 0 || data == nullptr ||
-        info.n_tokens > kMaxTokens || info.n_embd > kMaxEmbd) {
+        info.n_tokens > kMaxTokens || info.n_embd > kMaxEmbd ||
+        info.nx == 0 || info.nx > kMaxSide || info.ny == 0 || info.ny > kMaxSide) {
         return;
     }
     // An entry that does not fit in RAM cannot be given to a caller, because
@@ -186,7 +202,8 @@ void ImageCache::put(const std::string & id, const ImageInfo & info, const float
     }
     auto found = index_.find(id);
     if (found != index_.end()) {
-        if (found->second->info.n_floats() != info.n_floats()) {
+        // The same key is the same id and the same shape (refer to get).
+        if (found->second->info.n_tokens != info.n_tokens || found->second->info.n_embd != info.n_embd) {
             erase(found->second, true);
         } else {
             entries_.splice(entries_.begin(), entries_, found->second);
@@ -274,6 +291,13 @@ void ImageCache::erase(List::iterator it, bool remove_file) {
     }
     index_.erase(it->id);
     entries_.erase(it);
+}
+
+void ImageCache::drop(const std::string & id) {
+    const auto found = index_.find(id);
+    if (found != index_.end()) {
+        erase(found->second, true);
+    }
 }
 
 void ImageCache::clear(bool disk_too) {

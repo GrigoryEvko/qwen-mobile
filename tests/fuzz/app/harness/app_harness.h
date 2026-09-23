@@ -40,8 +40,8 @@ struct Options {
     bool trace = false;
     /**
      * Do not reach the findings that a scenario reproduces already, thus a
-     * long run explores past them: no planted image files, one decoded size
-     * for the same image bytes, and no fault of the draft follow.
+     * long run explores past them: no NaN temperature or top-p (task #164),
+     * and no fault of the draft follow (task #162).
      */
     bool skip_known = false;
 };

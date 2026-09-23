@@ -2,7 +2,8 @@
  * The cache of encoded images. An entry is the output of the vision
  * encoder for one image (n_tokens x n_embd floats) with the dimensions of
  * the bitmap, keyed by the SHA-256 of the image file bytes, which is also
- * the id that mtmd gives the bitmap. The most recently used entries stay
+ * the id that mtmd gives the bitmap, and by the shape of the output. One id
+ * has one entry: an entry of another shape goes. The most recently used entries stay
  * in RAM inside a byte budget, and every entry stays on disk inside a
  * second budget.
  *
@@ -53,14 +54,20 @@ public:
 
     /**
      * The encoder output of an image, from RAM or read from its file into
-     * RAM. The pointer stays valid until the next call that changes the
-     * cache. Returns null for an unknown id, or when the file is not
-     * readable, and then the entry is gone.
+     * RAM. The shape is part of the key: the caller gives the n_tokens and
+     * n_embd of its image chunk, because it reads that number of floats
+     * from the pointer. The pointer stays valid until the next call that
+     * changes the cache. Returns null for an unknown id, for an entry of
+     * another shape, or when the file is not readable. In the last two
+     * conditions, the entry and its file are gone.
      */
-    const float * get(const std::string & id);
+    const float * get(const std::string & id, uint32_t n_tokens, uint32_t n_embd);
 
     /** Keep the encoder output of an image. The data is copied. An output larger than the RAM budget is not kept. */
     void put(const std::string & id, const ImageInfo & info, const float * data);
+
+    /** Remove the entry of the id from RAM and its file from the disk. An unknown id does nothing. */
+    void drop(const std::string & id);
 
     /** Remove every entry from RAM, and with disk_too also every file. */
     void clear(bool disk_too);

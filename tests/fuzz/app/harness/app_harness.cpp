@@ -455,17 +455,11 @@ jobject java_decode_image(JNIEnv * env, va_list args) {
     if (max_tokens < kImageTokensMin || max_tokens > kImageTokensMax) {
         fail("decodeImage: the token limit %d is out of the range of the engine", max_tokens);
     }
+    // The tape can give two sizes for the same bytes, as a decode that fails one time and not the next.
     Program * p = g_prog;
-    uint8_t mode = p != nullptr ? tape_next(*p) : 0;
-    int w = 1 + (p != nullptr ? tape_next(*p) : 31) % 96;
-    int h = 1 + (p != nullptr ? tape_next(*p) : 31) % 96;
-    if (p != nullptr && p->opt->skip_known) {
-        // The decoder of the app is a function of the bytes: the same image gives the same size in each call.
-        const uint64_t hv = cache_io::fnv1a64(img->bytes.data(), img->bytes.size());
-        mode = (uint8_t) (hv % 10);
-        w = 1 + (int) ((hv >> 8) % 96);
-        h = 1 + (int) ((hv >> 16) % 96);
-    }
+    const uint8_t mode = p != nullptr ? tape_next(*p) : 0;
+    const int     w    = 1 + (p != nullptr ? tape_next(*p) : 31) % 96;
+    const int     h    = 1 + (p != nullptr ? tape_next(*p) : 31) % 96;
     std::vector<uint8_t> px;
     switch (mode % 10) {
         case 0: case 1: case 2: case 3: {
@@ -961,7 +955,7 @@ void corrupt_cache(Program & p) {
         }
         case 4: {
             // The encoder output of an image with a new shape of the same size: n_tokens and n_embd trade a factor.
-            if (!p.opt->skip_known && bytes.size() >= 32 && memcmp(bytes.data(), "QMIE", 4) == 0) {
+            if (bytes.size() >= 32 && memcmp(bytes.data(), "QMIE", 4) == 0) {
                 uint32_t nt = 0, ne = 0;
                 memcpy(&nt, bytes.data() + 16, 4);
                 memcpy(&ne, bytes.data() + 20, 4);
@@ -1574,9 +1568,7 @@ int run_program(const Options & opt, const uint8_t * data, size_t size) {
         } else if (op == 27) {
             corrupt_cache(p);
         } else if (op == 28) {
-            if (!opt.skip_known) {
-                plant_image(p);
-            }
+            plant_image(p);
         } else if (op == 29) {
             for (LiveEngine & le : p.live) {
                 le.dirty = true;

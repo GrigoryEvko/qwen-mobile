@@ -13,6 +13,8 @@
  *   the bytes call and the drop, as prefill in llama_jni.cpp uses it.
  * - After a drain, each snapshot on disk has its file. A new store on the
  *   same directory (a restart of the app) finds each intact file again.
+ * - The image cache gives data only for a request of the shape of the
+ *   entry, and an entry of another shape goes (task #160).
  *
  * The file compiles the headers with public members, thus the checks read
  * the entry lists. The layout of the classes does not change.
@@ -352,7 +354,7 @@ void run_images(FuzzedDataProvider & fdp, const std::string & dir) {
     int ops = 0;
     while (fdp.remaining_bytes() > 0 && ops++ < 64) {
         const std::string id = ids[fdp.ConsumeIntegralInRange<size_t>(0, 5)];
-        switch (fdp.ConsumeIntegralInRange<int>(0, 6)) {
+        switch (fdp.ConsumeIntegralInRange<int>(0, 7)) {
             case 0: case 1: {
                 ImageInfo info;
                 info.nx = fdp.ConsumeIntegral<uint16_t>();
@@ -364,16 +366,39 @@ void run_images(FuzzedDataProvider & fdp, const std::string & dir) {
                     data[i] = (float) (i * 3 + info.nx);
                 }
                 cache->put(id, info, data.empty() ? nullptr : data.data());
-                // The cache refuses an output larger than its RAM budget and keeps the entry
-                // it has for the id, also when that entry has another shape.
-                if (!data.empty() && cache_io::is_hex(id) && info.n_floats() * sizeof(float) <= ram_budget) {
+                // The cache refuses an output larger than its RAM budget, and a bitmap side of
+                // zero, and then keeps the entry it has for the id, also of another shape.
+                if (!data.empty() && cache_io::is_hex(id) && info.n_floats() * sizeof(float) <= ram_budget &&
+                    info.nx != 0 && info.ny != 0) {
                     model[id] = {info, data};
                 }
                 break;
             }
             case 2: {
-                const float * got = cache->get(id);
+                // The shape of the request: the shape of the last put, or a shape from the input.
                 auto m = model.find(id);
+                uint32_t n_tokens = fdp.ConsumeIntegralInRange<uint32_t>(0, 40);
+                uint32_t n_embd   = fdp.ConsumeIntegralInRange<uint32_t>(0, 40);
+                if (m != model.end() && fdp.ConsumeBool()) {
+                    n_tokens = m->second.first.n_tokens;
+                    n_embd   = m->second.first.n_embd;
+                }
+                const auto before = cache->index_.find(id);
+                const bool had = before != cache->index_.end();
+                const bool same = had && before->second->info.n_tokens == n_tokens && before->second->info.n_embd == n_embd;
+                const float * got = cache->get(id, n_tokens, n_embd);
+                // The caller reads n_tokens x n_embd floats from the pointer (finding image-cache-shape, task #160).
+                if (got != nullptr && !same) {
+                    fail("image cache: get(%s, %u, %u) gave the data of an entry of another shape", id.c_str(), n_tokens,
+                         n_embd);
+                }
+                if (had && !same) {
+                    if (cache->index_.count(id) != 0) {
+                        fail("image cache: an entry of another shape than the request stays after get");
+                    }
+                    model.erase(id);
+                    m = model.end();
+                }
                 if (got != nullptr && m != model.end() && !damaged) {
                     // A put of a known id with the same shape keeps the first data, thus compare the shape only.
                     ImageInfo info;
@@ -381,6 +406,16 @@ void run_images(FuzzedDataProvider & fdp, const std::string & dir) {
                         fail("image cache: get gave data for %s but info does not agree", id.c_str());
                     }
                 }
+                break;
+            }
+            case 6: {
+                cache->drop(id);
+                cache_io::FileStat st;
+                if (cache->index_.count(id) != 0 ||
+                    (!cache->dir_.empty() && cache_io::stat_file(cache->path_of(id), st))) {
+                    fail("image cache: a dropped entry %s stays in the index or on disk", id.c_str());
+                }
+                model.erase(id);
                 break;
             }
             case 3: {
