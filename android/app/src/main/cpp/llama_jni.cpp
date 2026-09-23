@@ -1927,6 +1927,17 @@ static jlong load_impl(JNIEnv * env, jstring jpath, jstring jmmproj,
     cp.n_threads       = e->n_threads;
     cp.n_threads_batch = e->n_threads;
     cp.no_perf         = false;
+    // The most logits rows that one decode asks for: the verify batch of a
+    // speculative step, the last token and its draft. The prompt batches ask
+    // for one row, an image batch for none. The context reserves its compute
+    // buffer for this many rows: with the default (n_batch rows) the logits
+    // tensor alone is 1024 x the vocabulary x 4 bytes, 970 MiB, and on the
+    // NPU that memory is committed at the load. llama_decode does not accept
+    // a batch that asks for more rows, thus each decode of this file keeps
+    // the limit. llama-server sets the same limit
+    // (common_speculative_get_output_limits).
+    cp.n_outputs_max         = (uint32_t) kSpecDraftMax + 1;
+    cp.n_outputs_max_per_seq = (uint32_t) kSpecDraftMax + 1;
     // The recurrent layers keep one state snapshot for each drafted position
     // of a verified batch, thus a rejected draft rolls back without a copy of
     // the state. The architecture must support the rollback, and

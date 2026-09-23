@@ -25,14 +25,17 @@ object MemoryBudget {
 
     /**
      * The bytes of the recurrent state snapshots that a draft needs. The
-     * context keeps one snapshot for each drafted position (3), next to the
-     * state itself. One recurrent layer of the 4B model holds a state of
-     * 128 x 128 x 32 values and a convolution state of 8192 x 3 values in
-     * F32, which is 2.1 MB, and the model has 24 recurrent layers: 151 MB
-     * for the three snapshots. The 2B model needs 54 MB, thus this value is
-     * the ceiling of the two models.
+     * context keeps one snapshot for each drafted position (kDraftMax = 4 in
+     * spec_policy.h, the n_rs_seq of the context), next to the state itself.
+     * One recurrent layer of the 4B model holds a state of 128 x 128 x 32
+     * values and a convolution state of 8192 x 3 values in F32, which is
+     * 2.094 MiB, and the model has 24 recurrent layers: 50.25 MiB for one
+     * snapshot and 201 MiB for the four. The 2B model needs 4 x 19.27 MiB =
+     * 77 MiB, thus this value is the ceiling of the two models. llama.cpp
+     * logs the total with the state itself: "RS buffer size = 251.25 MiB"
+     * for the 4B.
      */
-    const val DRAFT_STATE_BYTES = 160L shl 20
+    const val DRAFT_STATE_BYTES = 201L shl 20
 
     /**
      * The bytes of the weights that the backend holds in memory. The hybrid
