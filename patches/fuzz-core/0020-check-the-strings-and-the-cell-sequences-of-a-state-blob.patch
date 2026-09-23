@@ -1,0 +1,72 @@
+Check the strings and the cell sequences of a state blob before their use
+Fold-into: upstream/llama-context
+
+The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
+
+- A damaged state blob sizes one allocation of up to 4 GiB.
+
+  llama_io_read_i::read_string reads a 32-bit size from the blob and allocates a buffer of that
+  size before it reads the string. A full state blob of 115 bytes with a damaged size of the
+  architecture name thus allocates 4 GiB, and then fails at the end of the input.
+
+  The change: read_string reads the string in chunks of 4 KiB, thus a damaged size fails at the
+  end of the input after an allocation of at most the size of the input.
+
+  The reproducer: tests/fuzz/core/regress/fuzz_recurrent--state-string-size.
+
+- A damaged full KV state gives one cell a sequence two times, or a sequence of a different stream.
+
+  The whole-cache path of llama_kv_cache::state_read_meta adds each sequence id of a cell with
+  seq_add, which asserts that the cell does not hold the sequence (a debug build stops), and which
+  counts the position two times in a release build. A sequence id of a different stream (with
+  kv_unified = false) gives a stream cells that its sequence map does not know.
+
+  The change: The read refuses a cell that gives a sequence two times or a sequence of a
+  different stream, as it refuses a sequence id out of range.
+
+  The reproducer: tests/fuzz/core/regress/fuzz_recurrent--state-cell-seq-twice.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    src/llama-io.cpp
+    src/llama-kv-cache.cpp
+--- a/src/llama-io.cpp
++++ b/src/llama-io.cpp
+@@ -13,8 +13,14 @@ void llama_io_read_i::read_string(std::string & str) {
+     uint32_t str_size;
+     read(&str_size, sizeof(str_size));
+ 
+-    std::vector<char> buf(str_size);
+-    read(buf.data(), str_size);
+-
+-    str.assign(buf.data(), str_size);
++    // Read in chunks: a size from a damaged state blob then fails at the end of the input, and it
++    // does not size one allocation of up to 4 GiB first. O(str_size).
++    str.clear();
++    char chunk[4096];
++    for (uint32_t left = str_size; left > 0; ) {
++        const uint32_t n = left < (uint32_t) sizeof(chunk) ? left : (uint32_t) sizeof(chunk);
++        read(chunk, n);
++        str.append(chunk, n);
++        left -= n;
++    }
+ }
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -2496,6 +2496,15 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
+                     return false;
+                 }
+ 
++                // A cell holds each sequence one time, and a sequence has its cells in its own stream
++                // only. A damaged blob can give a sequence two times, or a sequence of a different
++                // stream: seq_add would then count the position two times (an assert in a debug
++                // build), or a stream would hold cells that its sequence map does not know.
++                if (cells.seq_has(i, seq_id) || seq_to_stream[seq_id] != strm) {
++                    LLAMA_LOG_ERROR("%s: cell %u gives the seq_id %d two times or in the wrong stream\n", __func__, i, seq_id);
++                    return false;
++                }
++
+                 cells.seq_add(i, seq_id);
+             }
+         }

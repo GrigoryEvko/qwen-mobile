@@ -147,6 +147,7 @@ fuzz-core/0016-give-the-softmax-a-defined-result-for-special-logits.patch
 fuzz-core/0017-refuse-the-rollback-of-a-shared-recurrent-cell.patch
 fuzz-core/0018-apply-the-pending-memory-update-before-a-state-write-or-read.patch
 fuzz-core/0019-give-an-error-for-a-text-that-a-vocabulary-cannot-tokenize.patch
+fuzz-core/0020-check-the-strings-and-the-cell-sequences-of-a-state-blob.patch
 
 # The fixes of the defects that the sanitizer matrix of tests/run-suite.sh finds in the tests of llama.cpp.
 # The header of each patch describes its defect and the change.
