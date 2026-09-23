@@ -17,7 +17,9 @@
 // mode), thus a host read of reused bytes gets the value of a later tensor.
 //
 // The phone driver (phone/driver.cpp) reads the same input bytes and runs the
-// same graphs on HTP0 and on the CPU backend.
+// same graphs on HTP0 and on the CPU backend. HEXHOST_PHONE_OPTIONS=1 gives the
+// x86 run the switches and the hardware of such a phone run, and
+// HEXHOST_OPFUSION=N sets the fusion switch.
 
 #include "fake_dsp.h"
 #include "fuzz_death.h"
@@ -54,6 +56,22 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
     fakedsp::config  cfg;
     hexhost::options o;
     graphgen::decode_session(fdp, HEXHOST_ASYNC_DSP != 0, cfg, o);
+    // HEXHOST_PHONE_OPTIONS: the switches and the hardware of a phone driver run with no
+    // GGML_HEXAGON_* variable (the defaults on the v79), in place of the values of the input. The
+    // input bytes that decode_session reads do not change, thus the graph stays the same.
+    if (getenv("HEXHOST_PHONE_OPTIONS")) {
+        const size_t vmem = o.vmem;
+        o                 = hexhost::options();
+        o.vmem            = vmem;
+        cfg.n_threads     = 6;
+        cfg.n_hmx         = 1;
+        cfg.vtcm_size     = 8u << 20;
+        cfg.touch         = true;
+    }
+    // HEXHOST_OPFUSION: the fusion switch (GGML_HEXAGON_OPFUSION) in place of the value of the input
+    if (const char * f = getenv("HEXHOST_OPFUSION")) {
+        o.opfusion = atoi(f);
+    }
     if (const char * f = getenv("HEXHOST_TOUCH_FILL")) {
         cfg.fill = (uint8_t) strtoul(f, nullptr, 0);
     }
