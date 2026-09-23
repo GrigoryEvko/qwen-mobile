@@ -35,6 +35,11 @@
 #include <tuple>
 #include <unistd.h>
 
+#if defined(__x86_64__) || defined(__i386__)
+#include <pmmintrin.h>
+#include <xmmintrin.h>
+#endif
+
 namespace {
 
 using namespace fo;
@@ -144,6 +149,15 @@ int parse_verdict(const std::string & v) {
 extern "C" int LLVMFuzzerInitialize(int * argc, char *** argv) {
     (void) argc;
     (void) argv;
+#if defined(__x86_64__) || defined(__i386__)
+    // A link with -ffp-model=fast adds crtfastmath.o, whose constructor sets FTZ and DAZ in MXCSR.
+    // Then the decode of this process turns subnormal values into 0, the oracle process (no fast
+    // math) keeps them, and the input hashes differ. The app on arm64 Android keeps subnormals, thus
+    // clear the two bits before the first case. The threads of the CPU backend copy MXCSR from this
+    // thread when they start.
+    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_OFF);
+    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_OFF);
+#endif
     S = new state();
     const char * oracle = std::getenv("FUZZ_OPS_ORACLE");
     if (!oracle) {

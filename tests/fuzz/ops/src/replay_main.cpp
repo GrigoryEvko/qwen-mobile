@@ -48,6 +48,11 @@
 #include <utility>
 #include <vector>
 
+#if defined(__x86_64__) || defined(__i386__)
+#include <pmmintrin.h>
+#include <xmmintrin.h>
+#endif
+
 namespace {
 
 using namespace fo;
@@ -341,6 +346,13 @@ int replay_main(int argc, char ** argv) {
 
 // "--trace" as the first argument runs the driver under the ptrace tracer of crashdiag.cpp.
 int main(int argc, char ** argv) {
+#if defined(__x86_64__) || defined(__i386__)
+    // A link with -ffp-model=fast sets FTZ and DAZ at the start (crtfastmath.o), thus the decode
+    // would turn subnormal values into 0 where the oracle keeps them. Clear the two bits, as
+    // fuzz_main.cpp does. On arm64 Android the process keeps subnormals.
+    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_OFF);
+    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_OFF);
+#endif
     if (argc >= 2 && std::strcmp(argv[1], "--trace") == 0) {
         argv[1] = argv[0];
         return run_traced(argc - 1, argv + 1, replay_main);
