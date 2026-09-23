@@ -187,8 +187,30 @@ def dequantize_pack(z, device: torch.device, rows: torch.Tensor | None = None,
     return w
 
 
+def _check_pack(idx: torch.Tensor, d: torch.Tensor, lo: int, hi: int) -> None:
+    """Raise ValueError when the levels are out of lo … hi, or the scales do not fit the levels or are not finite."""
+    rows, cols = idx.shape
+    if cols % BLOCK:
+        raise ValueError(f"the levels have {cols} columns, which is not a multiple of {BLOCK}")
+    if tuple(d.shape) != (rows, cols // BLOCK):
+        raise ValueError(f"the scales have the shape {tuple(d.shape)}, the levels [{rows}, {cols}] need "
+                         f"[{rows}, {cols // BLOCK}]")
+    if idx.numel():
+        least, most = (int(x) for x in torch.aminmax(idx))
+        if least < lo or most > hi:
+            raise ValueError(f"a level is out of {lo} … {hi}: the range of the levels is {least} … {most}")
+    bad = ~torch.isfinite(d.to(torch.float32))
+    if bad.any():
+        raise ValueError(f"{int(bad.sum())} block scales are not finite")
+
+
 def pack_nibbles(idx: torch.Tensor, d: torch.Tensor) -> np.ndarray:
-    """Pack indices 0 … 15 to the ggml byte layout: uint8 [rows, nblocks · 18]."""
+    """Pack indices 0 … 15 to the ggml byte layout: uint8 [rows, nblocks · 18].
+
+    Raises ValueError for an index out of 0 … 15, for scales that do not
+    fit the indices, and for a scale that is not finite.
+    """
+    _check_pack(idx, d, 0, 15)
     rows, cols = idx.shape
     nb = cols // BLOCK
     qb = idx.reshape(rows, nb, BLOCK).to(torch.uint8).cpu().numpy()
@@ -228,7 +250,12 @@ def q8_0_dequantize(q: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
 
 
 def pack_q8_0(q: torch.Tensor, d: torch.Tensor) -> np.ndarray:
-    """Pack to the ggml byte layout: uint8 [rows, nblocks · 34]."""
+    """Pack to the ggml byte layout: uint8 [rows, nblocks · 34].
+
+    Raises ValueError for a level out of -127 … 127, for scales that do not
+    fit the levels, and for a scale that is not finite.
+    """
+    _check_pack(q, d, -127, 127)
     rows, cols = q.shape
     nb = cols // BLOCK
     qb = q.reshape(rows, nb, BLOCK).cpu().numpy().view(np.uint8)

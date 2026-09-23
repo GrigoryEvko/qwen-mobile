@@ -100,22 +100,20 @@ def test_qf2_block_error_of_a_tiny_block_with_a_zero() -> None:
     assert got == pytest.approx(float(w.pow(2).sum()), rel=1e-6)
 
 
-# --- QF3: pack validation ------------------------------------------------------------------------
+# --- QF3 (task #167): pack validation ----------------------------------------------------------------
 
-@xfail_open("QF3", "pack_nibbles packs an index of 17 into the neighbor nibble")
 def test_qf3_pack_nibbles_refuses_an_index_out_of_range() -> None:
-    """quant/grid.py:165-167: index 17 gives the byte 0x11, thus two wrong nibbles and no error."""
+    """pack_nibbles refuses the index 17, which gave the byte 0x11: two wrong nibbles and no error."""
     idx = torch.full((1, 32), 17, dtype=torch.int16)
     with pytest.raises(ValueError):
         pack_nibbles(idx, torch.ones(1, 1, dtype=torch.float16))
 
 
-@xfail_open("QF3", "the export writes a pack whose shape is not the shape of the source tensor")
 def test_qf3_export_refuses_a_pack_of_another_shape(tmp_path: Path) -> None:
-    """quant/export.py:339-349: a pack [96, 32] of output.weight [48, 64] becomes a tensor of another shape.
+    """The export refuses a pack [96, 32] for output.weight [48, 64].
 
-    The element count is the same, thus pack_nibbles does not see it, and
-    the file holds output.weight with the shape of the pack.
+    The element count is the same, thus pack_nibbles cannot see it. Without
+    the check the file held output.weight with the shape of the pack.
     """
     src = _plain_source(tmp_path / "src.gguf")
     packs = tmp_path / "packs"

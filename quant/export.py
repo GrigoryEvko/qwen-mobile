@@ -344,6 +344,9 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
             if "kind" in z and str(z["kind"]) != kind:
                 raise ValueError(f"{name}: the solved blocks are {z['kind']}, the plan says {kind}")
             d = torch.from_numpy(z["d"].view(np.float16))
+            if tuple(idx.shape) != tuple(shape):
+                raise ValueError(f"{name}: the pack {pack} has the shape {tuple(idx.shape)}, the source tensor "
+                                 f"{tuple(shape)}")
             if layout is not None:
                 idx, d = layout.pack(name, idx, d)
             writer.add_tensor(name, pack_nibbles(idx, d), raw_dtype=getattr(gguf.GGMLQuantizationType, GGUF_4BIT[kind]))
