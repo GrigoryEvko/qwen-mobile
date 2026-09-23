@@ -1,0 +1,132 @@
+Write zeros to a used recurrent state row before a new sequence starts in it
+Fold-into: upstream/memory
+
+The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
+
+- A new sequence starts from NaN when its recurrent cell held a NaN.
+
+  The graph gives a new sequence its first state from row rs_z, which it clears with a scale by 0
+  (build_rs). A NaN or an Inf in that row stays NaN, because NaN * 0 and Inf * 0 are NaN. A state
+  blob can load with success and hold NaN values (the load cannot see them), and a decode that
+  overflows writes NaN. A remove of the sequence and llama_memory_clear(mem, false) keep the data
+  of the cell. Thus each later sequence that starts in that cell gives NaN logits, until a clear
+  with data.
+
+  The change: The recurrent memory records for each cell whether the first group of its row holds
+  zeros: true after the allocation, a clear with data, or a zero write, and false after a decode or
+  a load of the cell. When a ubatch starts a new sequence (rs_z >= 0) in a row that is not zero,
+  the memory context writes zeros to that row on the host (one ggml_backend_tensor_set for each
+  state tensor of each layer, from a zero row that it keeps), before the graph runs. The graph and
+  its ops do not change. A steady decode has no rs_z, and a new chat after a clear with data, a
+  restore of a state and the MTP draft context (a plain KV cache) write nothing.
+
+  The reproducer: tests/fuzz/core/regress/fuzz_recurrent--state-nan-reuse.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    src/llama-memory-recurrent.cpp
+    src/llama-memory-recurrent.h
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -39,6 +39,7 @@ llama_memory_recurrent::llama_memory_recurrent(
+ 
+     cells.clear();
+     cells.resize(mem_size);
++    cell_zero.assign(mem_size, true); // the buffers are cleared below
+ 
+     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
+     struct ggml_backend_buft_comparator {
+@@ -155,6 +156,7 @@ void llama_memory_recurrent::clear(bool data) {
+         for (auto & [_, buf] : ctxs_bufs) {
+             ggml_backend_buffer_clear(buf.get(), 0);
+         }
++        std::fill(cell_zero.begin(), cell_zero.end(), true);
+     }
+ 
+     std::fill(rs_idx.begin(), rs_idx.end(), 0);
+@@ -452,6 +454,30 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
+     return result;
+ }
+ 
++void llama_memory_recurrent::zero_new_state() {
++    if (rs_z >= 0 && !cell_zero[rs_z]) {
++        // one tensor_set of zeros for each state tensor of each layer: the first group of row rs_z
++        for (const auto * v : { &r_l, &s_l, &p_l }) {
++            for (ggml_tensor * t : *v) {
++                if (t == nullptr) {
++                    continue;
++                }
++                const size_t row = t->nb[1];
++                if (zero_row.size() < row) {
++                    zero_row.assign(row, 0);
++                }
++                ggml_backend_tensor_set(t, zero_row.data(), (size_t) rs_z * row, row);
++            }
++        }
++        cell_zero[rs_z] = true;
++    }
++
++    // the graph of this ubatch writes the rows of the cells from head to head + n
++    for (uint32_t i = head; i < head + n && i < size; ++i) {
++        cell_zero[i] = false;
++    }
++}
++
+ void llama_memory_recurrent::set_rs_depth(const llama_ubatch & ubatch) {
+     if (n_rs_seq == 0) {
+         return;
+@@ -929,6 +955,13 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
+ 
+     res = res && state_read_meta(io, cell_count, seq_id);
+ 
++    // the load writes the rows of the cells from head on, also when it fails in the middle
++    if (res) {
++        for (uint32_t i = head; i < head + cell_count && i < size; ++i) {
++            cell_zero[i] = false;
++        }
++    }
++
+     try {
+         res = res && state_read_data(io, cell_count);
+     } catch (...) {
+@@ -1350,6 +1383,7 @@ bool llama_memory_recurrent_context::apply() {
+     }
+ 
+     mem->find_slot(ubatches[i_next]);
++    mem->zero_new_state();
+     mem->set_rs_depth(ubatches[i_next]);
+ 
+     return true;
+--- a/src/llama-memory-recurrent.h
++++ b/src/llama-memory-recurrent.h
+@@ -97,6 +97,14 @@ public:
+     // first zero-ed state
+     int32_t rs_z = -1;
+ 
++    // Give a new sequence of the ubatch that the graph runs a zero state. The graph clears row
++    // rs_z with a scale by 0, and a NaN or an Inf in that row (from a loaded state blob or a decode
++    // that overflowed, which a remove of the sequence or clear(false) keeps) stays NaN. Thus the
++    // host writes zeros to the first group of row rs_z when a decode or a load wrote that row after
++    // its last zero. Then it records the rows that the graph writes. The memory context calls this
++    // one time for each ubatch, after find_slot. A steady decode has no rs_z, thus it writes nothing.
++    void zero_new_state();
++
+     // TODO: optimize for recurrent state needs
+     struct mem_cell {
+         llama_pos pos  = -1;
+@@ -136,6 +144,14 @@ private:
+     // ggml contexts for the KV cache along with the allocated backend buffers:
+     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+ 
++    // For each cell: true when the first group of its row holds zeros (after the allocation, a
++    // clear with data, or a zero write of zero_new_state). A decode or a load of the cell sets it
++    // to false.
++    std::vector<bool> cell_zero;
++
++    // the zeros of one tensor_set in zero_new_state, one row of the widest state tensor
++    std::vector<uint8_t> zero_row;
++
+     size_t total_size() const;
+ 
+     size_t size_r_bytes() const;
