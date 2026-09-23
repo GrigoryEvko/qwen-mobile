@@ -37,6 +37,14 @@
 //       paths (it has a different place in the two arrays), and near ties at a
 //       cut can go the other way. The same holds for two logits of the same sign
 //       above 1e30 in magnitude, which a temperature below 1 turns into Inf.
+//       More generally, a division can merge two different logits into one
+//       value (a rounding, a very large temperature that makes each logit 0 or
+//       -0): the full path then selects the lower id of the tie, and the top set
+//       of the logits before the division can hold only the other token. Thus a
+//       difference also counts as a near tie when the chain divides and, after
+//       the chain, the full path gives the two tokens the same logit. Both paths
+//       obey the order of the samplers (logit descending, then id ascending) on
+//       the values that they see.
 //   P4  The dist sampler alone, on 2 to 8 candidates from the input: when
 //       exactly one candidate has the logit +Inf and no logit is NaN, dist
 //       selects that candidate, as greedy does.
@@ -270,6 +278,16 @@ void check_topset(const std::vector<llama_token_data> & top, size_t n_top, const
     }
 }
 
+/** The logit of token id in an applied array, or NaN when the array does not hold the token. O(a.size). */
+float logit_of(const llama_token_data_array & a, llama_token id) {
+    for (size_t j = 0; j < a.size; ++j) {
+        if (a.data[j].id == id) {
+            return a.data[j].logit;
+        }
+    }
+    return NAN;
+}
+
 /** The selected token of an applied array, or LLAMA_TOKEN_NULL when the chain selected nothing. */
 llama_token selected(const llama_token_data_array & a) {
     return (a.selected >= 0 && (size_t) a.selected < a.size) ? a.data[a.selected].id : LLAMA_TOKEN_NULL;
@@ -367,11 +385,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
             id_chain = selected(part_p);
             // the input logits of the two tokens are at most 4 ulp apart and the chain divides (P3)
             // A temperature below 1 also turns two finite logits of the same sign above about 1e30 in
-            // magnitude into the same Inf, thus a tie at the float limit.
+            // magnitude into the same Inf, thus a tie at the float limit. And the division can merge
+            // two different logits into one value on the full path (== also joins 0 and -0).
             const bool near_tie = g_div && id_chain != id_full && id_chain >= 0 && id_full >= 0 &&
                                   (within_ulp(logits[id_chain], logits[id_full], 4) ||
                                    (std::fabs(logits[id_chain]) >= 1e30f && std::fabs(logits[id_full]) >= 1e30f &&
-                                    std::signbit(logits[id_chain]) == std::signbit(logits[id_full])));
+                                    std::signbit(logits[id_chain]) == std::signbit(logits[id_full])) ||
+                                   logit_of(full_p, id_chain) == logit_of(full_p, id_full));
             if (id_chain != id_full) {
                 if (strict && !near_tie) {
                     // the first candidates of the two arrays after the chain, for the report
