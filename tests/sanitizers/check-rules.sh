@@ -186,6 +186,29 @@ check_reasons() {
     done
 }
 
+# R5 and L8: each check in a -fsanitize-recover= list has at least one entry
+# of that check in tests/sanitizers/ubsan.supp. A recover flag without an
+# entry lets the reports of that check continue with no reason (for example
+# after the fix of its task removed the entry).
+check_recover_entries() {
+    local file num text list check types
+    types="$( { rg -v -e '^\s*#' -e '^\s*$' "$SAN_DIR/ubsan.supp" || true; } | { rg -o -r '$1' '^([a-z-]+):' || true; } | sort -u | tr '\n' ' ')"
+    for file in "$@"; do
+        [[ -f "$file" ]] || continue
+        while IFS=: read -r num text; do
+            [[ "$text" =~ ^[[:space:]]*(#|//) ]] && continue
+            while IFS= read -r list; do
+                list="${list#-fsanitize-recover=}"
+                [[ "$list" == *'$'* ]] && continue
+                for check in ${list//,/ }; do
+                    [[ " $types " == *" $check "* ]] \
+                        || violation R5 "$(area_of "$file")" "$file:$num" "-fsanitize-recover=$check has no entry of that check in tests/sanitizers/ubsan.supp: remove the check from the recover list (L8)"
+                done
+            done < <(rg -o -e '-fsanitize-recover=[A-Za-z0-9_,-]+' <<< "$text" || true)
+        done < <(rg -n -e '-fsanitize-recover=' "$file" || true)
+    done
+}
+
 # Print the lines FIRST thru LAST of a file.
 line_range() {
     local file="$1" first="$2" last="$3" n=0 line
@@ -598,6 +621,7 @@ main() {
 
     check_sources_r1 "${sources[@]}"
     check_reasons "${sources[@]}"
+    check_recover_entries "${sources[@]}"
     check_suppressions
     check_run_sh
     check_libfuzzer_commands
