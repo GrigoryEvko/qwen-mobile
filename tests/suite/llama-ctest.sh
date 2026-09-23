@@ -30,6 +30,10 @@
 #      pools. The tests with the label "model" get LLAMACPP_TEST_MODELFILE of
 #      the tiny model. Without it, they skip and give a false pass. Each
 #      test that reads LLAMA_ARG_THREADS gets 8 threads (SUITE_TEST_THREADS).
+#      In the tsan configuration, test-opt runs with the preload library
+#      tests/suite/nprocs-shim.c: it sees 16 processors (SUITE_NPROCS) and
+#      starts 8 threads. The log of the step and the log of test-opt give
+#      the count.
 #   5. The local-model step runs the tests that need the model download of
 #      upstream (test-thread-safety, test-state-restore-fragmented) and each
 #      sub-test of test-backend-sampler, with the tiny model.
@@ -66,6 +70,9 @@ readonly TEST_THREADS="${SUITE_TEST_THREADS:-8}"
 # hardware_concurrency() / 2) or measure the thread pool (test-barrier). They
 # run one at a time after the parallel step.
 readonly SERIAL_REGEX='^(test-opt|test-barrier)$'
+# The processor count that test-opt sees in the tsan configuration, through
+# tests/suite/nprocs-shim.c.
+readonly SHIM_NPROCS="${SUITE_NPROCS:-16}"
 CONFIG=""
 PROFILE=""
 PHASE="all"
@@ -255,6 +262,19 @@ run_ctest() {
     return $rc
 }
 
+# Build the preload library tests/suite/nprocs-shim.c into $BUILD, with no
+# sanitizer, and make sure that it changes the processor count of a process.
+# Output: the path of the library.
+build_nprocs_shim() {
+    local lib="$BUILD/nprocs-shim.so" seen
+    clang -O2 -fPIC -shared -o "$lib" "$SUITE_REPO_ROOT/tests/suite/nprocs-shim.c" \
+        || suite_die "$PROFILE-$CONFIG: the build of tests/suite/nprocs-shim.c failed."
+    seen="$(LD_PRELOAD="$lib" SUITE_NPROCS="$SHIM_NPROCS" getconf _NPROCESSORS_ONLN)"
+    [[ "$seen" == "$SHIM_NPROCS" ]] \
+        || suite_die "$PROFILE-$CONFIG: with nprocs-shim.so, getconf gives $seen processors, not $SHIM_NPROCS."
+    echo "$lib"
+}
+
 # Print the names of the sub-tests of test-backend-sampler, from the table
 # BACKEND_TESTS of its source. A new upstream sub-test thus runs with no
 # change here.
@@ -348,8 +368,27 @@ run_tests() {
         -E "$exclude_regex|^test-generate-models\$|$SERIAL_REGEX" -FS generate-models -j "$TEST_JOBS" || failed=1
 
     suite_log "$PROFILE-$CONFIG: ctest step 3, the tests that start their own thread pools, one at a time."
-    LLAMACPP_TEST_MODELFILE="$TINY_MODEL" run_ctest serial \
-        -R "$SERIAL_REGEX" -E "$exclude_regex" -FS generate-models -j 1 || failed=1
+    if [[ "$CONFIG" == tsan && " ${exclude_names[*]} " != *" test-opt "* ]]; then
+        # test-opt starts hardware_concurrency() / 2 threads. Under TSan on a
+        # server with hundreds of hardware threads, it runs for more than one
+        # hour, thus it sees SHIM_NPROCS processors here.
+        local shim note
+        # run_tests runs on the left side of ||, thus set -e does not stop
+        # it, and each failure needs its own check.
+        shim="$(build_nprocs_shim)" || exit 2
+        note="suite: test-opt ran with LD_PRELOAD=$shim and SUITE_NPROCS=$SHIM_NPROCS: it saw $SHIM_NPROCS processors and started $((SHIM_NPROCS / 2)) threads."
+        suite_log "$PROFILE-$CONFIG: ${note#suite: }"
+        LLAMACPP_TEST_MODELFILE="$TINY_MODEL" LD_PRELOAD="$shim" SUITE_NPROCS="$SHIM_NPROCS" run_ctest serial-opt \
+            -R '^test-opt$' -FS generate-models -j 1 || failed=1
+        echo "$note" >> "$OUT/logs/test-opt.log"
+        if [[ " ${exclude_names[*]} " != *" test-barrier "* ]]; then
+            LLAMACPP_TEST_MODELFILE="$TINY_MODEL" run_ctest serial \
+                -R '^test-barrier$' -FS generate-models -j 1 || failed=1
+        fi
+    else
+        LLAMACPP_TEST_MODELFILE="$TINY_MODEL" run_ctest serial \
+            -R "$SERIAL_REGEX" -E "$exclude_regex" -FS generate-models -j 1 || failed=1
+    fi
 
     suite_log "$PROFILE-$CONFIG: the local-model step."
     run_local_model_tests || failed=1
