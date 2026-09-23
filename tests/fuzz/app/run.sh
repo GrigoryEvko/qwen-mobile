@@ -155,14 +155,40 @@ runtime_options() {
     esac
 }
 
+# Print the directory of the jni.h of the host build, or nothing when CMakeLists.txt finds
+# one itself (an NDK on the host). A host without an NDK takes the jni.h of the NDK of the
+# Snapdragon container, which is the header of the phone, one time into $OUT/jni-include.
+host_jni_include() {
+    local ndk
+    for ndk in "${ANDROID_NDK_ROOT:-/nonexistent}" "$HOME"/Android/Sdk/ndk/*; do
+        if compgen -G "$ndk/toolchains/llvm/prebuilt/*/sysroot/usr/include/jni.h" > /dev/null; then
+            return
+        fi
+    done
+    if [[ ! -f "$OUT/jni-include/jni.h" ]]; then
+        # shellcheck source=../../../scripts/lib.sh
+        source "$REPO/scripts/lib.sh"
+        mkdir -p "$OUT/jni-include"
+        # The command runs in the container, thus its variable expands there.
+        # shellcheck disable=SC2016
+        container_run "$SNAPDRAGON_IMAGE" bash -c \
+            'cat "$ANDROID_NDK_ROOT"/toolchains/llvm/prebuilt/*/sysroot/usr/include/jni.h' \
+            > "$OUT/jni-include/jni.h.tmp" && [[ -s "$OUT/jni-include/jni.h.tmp" ]] \
+            || die "no jni.h: no NDK on the host, and the Snapdragon container did not give one"
+        mv "$OUT/jni-include/jni.h.tmp" "$OUT/jni-include/jni.h"
+    fi
+    echo "$OUT/jni-include"
+}
+
 # Configure and build the host fuzzers with the sanitizer $1 into build/fuzz/app-$1. The flags
 # come from the shared initial cache tests/sanitizers/$1.cmake when it exists.
 build_host() {
-    local san=$1 dir
+    local san=$1 dir jni
     dir=$(bdir "$1")
     local -a init=()
     snapshot
     models
+    jni=$(host_jni_include)
     # The shared initial caches give the flags: the profile
     # first, then the sanitizer. Without them tests/fuzz/app/CMakeLists.txt
     # gives the same flags itself.
@@ -176,7 +202,7 @@ build_host() {
     mkdir -p "$dir/logs"
     cmake -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DFUZZ_SANITIZER="$san" -DFUZZ_PROFILE="$PROFILE" \
         "${init[@]}" -S "$HERE" -B "$dir" -G Ninja \
-        -DLLAMA_CPP_DIR="$SNAP" -DFUZZ_APP_MODEL_DIR="$MODELS" > "$dir/logs/configure.log" 2>&1 \
+        -DLLAMA_CPP_DIR="$SNAP" -DFUZZ_APP_MODEL_DIR="$MODELS" -DFUZZ_JNI_INCLUDE="$jni" > "$dir/logs/configure.log" 2>&1 \
         || die "the configuration of $dir failed, see $dir/logs/configure.log"
     if ((${#init[@]} > 0)); then
         : > "$dir/.initial-cache"
