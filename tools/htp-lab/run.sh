@@ -48,6 +48,11 @@
 #   PROPOSALS  The proposal patches to apply, as space-separated names of tools/htp-lab/proposals.
 #              Default: every patch of that directory. "none" applies no patch, thus the "_after"
 #              programs measure the kernels of the checkout.
+#   PROFILE    The code generation flags (task #123 item 3). Empty (the default): the lab flags.
+#              "release": the flags of the shipped DSP library (CMakeLists.txt gives the source).
+#              "debug": the release flags with live asserts (no -DNDEBUG=1). A profile builds in
+#              out/build-<ARCH>-<PROFILE>, thus the lab flags and the two profiles do not mix.
+#   EXTRA_CFLAGS More compile flags, after the flags of the profile.
 #
 # Output (tools/htp-lab/out/, not in git):
 #   build/                       The CMake build directory (Ninja)
@@ -96,6 +101,12 @@ case "${ARCH}" in
     v73|v75|v79|v81) ;;
     *) echo "error: ARCH=${ARCH} is not one of v73, v75, v79, v81" >&2; exit 1 ;;
 esac
+PROFILE="${PROFILE:-}"
+case "${PROFILE}" in
+    ""|release|debug) ;;
+    *) echo "error: PROFILE=${PROFILE} is not empty, release or debug" >&2; exit 1 ;;
+esac
+EXTRA_CFLAGS="${EXTRA_CFLAGS:-}"
 SUBMODULE_DIR="${REPO_DIR}/third_party/llama.cpp"
 HTP_REL="ggml/src/ggml-hexagon/htp"
 
@@ -141,7 +152,7 @@ LAB_TREE="$(tree_id)"
 LAB_PROPOSALS="$(proposal_ids)"
 
 usage() {
-    sed -n '2,78p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,83p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 in_container() {
@@ -150,6 +161,7 @@ in_container() {
         -v "${REPO_DIR}:/repo" -v "${LLAMA_DIR}:/llama" -w /repo \
         -e "SIM_ARGS=${SIM_ARGS}" -e "LAB_TREE=${LAB_TREE}" -e "LAB_PROPOSALS=${LAB_PROPOSALS}" \
         -e "OUT_REL=${OUT_REL}" -e "PROPOSALS=${PROPOSALS}" -e "LAB_TARGETS=${LAB_TARGETS}" -e "ARCH=${ARCH}" \
+        -e "PROFILE=${PROFILE}" -e "EXTRA_CFLAGS=${EXTRA_CFLAGS}" \
         "${IMAGE}" bash -c "$1"
 }
 
@@ -165,6 +177,8 @@ export LD_LIBRARY_PATH=/tmp/shim
 OUT="/repo/${OUT_REL}"
 # v79 keeps the build directory of the lab before the ARCH switch
 if [ "${ARCH}" = "v79" ]; then BUILD_DIR="$OUT/build"; else BUILD_DIR="$OUT/build-${ARCH}"; fi
+# A profile has its own build directory, thus its flags never mix with the lab flags
+if [ -n "${PROFILE:-}" ]; then BUILD_DIR="$OUT/build-${ARCH}-${PROFILE}"; fi
 EOF
 
 # Builds all programs. The proposal patches are applied to a copy of the kernel directory.
@@ -190,7 +204,8 @@ for p in $list; do
 done
 cmake -G Ninja -S /repo/tools/htp-lab -B "$BUILD_DIR" \
     -DCMAKE_TOOLCHAIN_FILE=/repo/tools/htp-lab/toolchain.cmake -DHEXAGON_ARCH="${ARCH}" \
-    -DLLAMA_DIR=/llama -DHTP_PROPOSED_DIR="$PROPOSED" -DLAB_TARGETS="${LAB_TARGETS:-}" > "$OUT/cmake-${ARCH}.log"
+    -DLLAMA_DIR=/llama -DHTP_PROPOSED_DIR="$PROPOSED" -DLAB_TARGETS="${LAB_TARGETS:-}" \
+    -DLAB_PROFILE="${PROFILE:-}" -DLAB_EXTRA_C_FLAGS="${EXTRA_CFLAGS:-}" > "$OUT/cmake-${ARCH}${PROFILE:+-$PROFILE}.log"
 # -k 0 keeps going after a failure, thus a target that another agent is editing cannot stop yours.
 ninja -k 0 -C "$BUILD_DIR" || echo "lab: NOTE: at least one target did not build. The others did."
 EOF
