@@ -63,8 +63,9 @@
 #                   the test mode relaxes none.
 #
 # The llama.cpp tree is a private snapshot in build/fuzz/app/llama-snap: the
-# first run copies it from the submodule, thus a later edit of the submodule
-# does not change a fuzz build. Remove the snapshot to take a new one.
+# commit that HEAD pins with the patch series of HEAD. An edit in the submodule
+# or a patch that is not committed does not change a fuzz build. A commit of a
+# patch changes the snapshot at the next run.
 
 set -euo pipefail
 
@@ -114,14 +115,38 @@ die() {
     exit 1
 }
 
-# Copy the submodule into the private snapshot, one time.
+# Make the private llama.cpp tree $SNAP: the commit of the submodule that HEAD pins,
+# with the patch series of HEAD (patches/series). When HEAD pins another commit or
+# holds other patches, the next run makes the tree again. Each file then gets the
+# time of that run, thus ninja compiles each build directory again. O(size of the tree).
 snapshot() {
-    if [[ -f "$SNAP/CMakeLists.txt" ]]; then
+    local commit patches stamp tmp p now
+    commit=$(git -C "$REPO" rev-parse HEAD:third_party/llama.cpp)
+    patches=$(git -C "$REPO" rev-parse HEAD:patches)
+    stamp="$commit $patches"
+    if [[ -f "$SNAP/CMakeLists.txt" && "$(cat "$SNAP/.stamp" 2> /dev/null)" == "$stamp" ]]; then
         return
     fi
-    echo "run.sh: copy third_party/llama.cpp into $SNAP"
-    mkdir -p "$SNAP"
-    rsync -a --exclude=.git --exclude='build*/' "$REPO/third_party/llama.cpp/" "$SNAP/"
+    echo "run.sh: make $SNAP from llama.cpp $commit and the patch series of HEAD"
+    tmp="$SNAP.new"
+    rm -rf "$tmp"
+    mkdir -p "$tmp/src" "$tmp/patches"
+    git -C "$REPO/third_party/llama.cpp" archive "$commit" | tar -x -C "$tmp/src"
+    git -C "$REPO" archive "$patches" | tar -x -C "$tmp/patches"
+    while IFS= read -r p; do
+        [[ -z "$p" || "$p" == \#* ]] && continue
+        # The ceiling stops the search of git for a repository at $tmp: the build
+        # directory is in the work tree of the project, and git apply must patch
+        # the files of the snapshot, not the files of the project.
+        (cd "$tmp/src" && GIT_CEILING_DIRECTORIES="$tmp" git apply --whitespace=nowarn "$tmp/patches/$p") \
+            || die "the patch patches/$p of HEAD does not apply to llama.cpp $commit"
+    done < "$tmp/patches/series"
+    now=$(date +%s)
+    find "$tmp/src" -exec touch -h -d "@$now" {} +
+    echo "$stamp" > "$tmp/src/.stamp"
+    rm -rf "$SNAP"
+    mv "$tmp/src" "$SNAP"
+    rm -rf "$tmp"
 }
 
 # Write the tiny models, one time.
@@ -188,7 +213,7 @@ host_jni_include() {
 # Configure and build the host fuzzers with the sanitizer $1 into build/fuzz/app-$1. The flags
 # come from the shared initial cache tests/sanitizers/$1.cmake when it exists.
 build_host() {
-    local san=$1 dir jni
+    local san=$1 dir jni sums=""
     dir=$(bdir "$1")
     local -a init=()
     snapshot
@@ -199,8 +224,11 @@ build_host() {
     # gives the same flags itself.
     if [[ -f "$REPO/tests/sanitizers/profile-$PROFILE.cmake" && -f "$REPO/tests/sanitizers/$san.cmake" ]]; then
         init=(-C "$REPO/tests/sanitizers/profile-$PROFILE.cmake" -C "$REPO/tests/sanitizers/$san.cmake")
-        # A build directory of an earlier configuration keeps its flags in its cache: it goes.
-        if [[ -f "$dir/CMakeCache.txt" && ! -f "$dir/.initial-cache" ]]; then
+        sums=$(sha256sum "$REPO/tests/sanitizers/profile-$PROFILE.cmake" "$REPO/tests/sanitizers/common.cmake" \
+            "$REPO/tests/sanitizers/$san.cmake" | cut -d' ' -f1)
+        # A build directory keeps the values of its first initial caches in its cache (a set
+        # without FORCE does not replace them). Thus a directory of other initial caches goes.
+        if [[ -f "$dir/CMakeCache.txt" && "$(cat "$dir/.initial-cache" 2> /dev/null)" != "$sums" ]]; then
             rm -rf "$dir"
         fi
     fi
@@ -210,7 +238,7 @@ build_host() {
         -DLLAMA_CPP_DIR="$SNAP" -DFUZZ_APP_MODEL_DIR="$MODELS" -DFUZZ_JNI_INCLUDE="$jni" > "$dir/logs/configure.log" 2>&1 \
         || die "the configuration of $dir failed, see $dir/logs/configure.log"
     if ((${#init[@]} > 0)); then
-        : > "$dir/.initial-cache"
+        echo "$sums" > "$dir/.initial-cache"
     fi
     nice -n 10 cmake --build "$dir" -j"$BUILD_JOBS" \
         --target fuzz_jni_api fuzz_jni_threads fuzz_caches fuzz_spec_policy app_fuzz_driver > "$dir/logs/build.log" 2>&1 \
