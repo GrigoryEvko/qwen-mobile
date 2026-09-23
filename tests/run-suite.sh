@@ -37,6 +37,10 @@
 #   lab          tests/suite/lab-checks.sh: the kernel-lab simulator checks
 #                of the DSP code (the "none" configuration only).
 #   supp-repro   tests/sanitizers/supp-repro.sh: rule R13 (ubsan only).
+#   tsan-selftest  tests/sanitizers/tsan-death-selftest.sh: the first step of
+#                each tsan configuration, in the test and the fuzz suite. A
+#                failure is an environment failure: no other tsan step of
+#                that profile runs.
 #   areas        tests/fuzz/<area>/run.sh <test|fuzz> <config> --profile <p>.
 # The test suite runs rules, llama, app-host, probe-host, lab, supp-repro and
 # the areas in test mode. The fuzz suite runs the areas in fuzz mode.
@@ -76,6 +80,7 @@ NO_CONTAINER=0
 BUILD_MSAN=0
 RUN_ID=""
 STEP_RECORDS=""
+LAST_STEP_STATUS=""
 
 # Write the header comment of this file as the usage text.
 print_usage() {
@@ -98,6 +103,7 @@ app-host    test   all five           no         <1        <1 each
 probe-host  test   all five           yes        <2        <1 each (in the Snapdragon image)
 lab         test   none only          yes        <2        about 6 for the four Hexagon versions
 supp-repro  test   ubsan only         no         2         1 (debug), 3 (release)
+tsan-selftest both tsan only         no         <1        <1 (first step of each tsan configuration)
 areas       test   all five           per area   per area  per area (refer to tests/fuzz/<area>/run.sh --help)
 areas       fuzz   all five           per area   per area  build + budget x ceil(targets / jobs)
 The container is the Hexagon SDK image (podman). Without it, use --no-container.
@@ -180,6 +186,7 @@ run_step() {
         *) status=fail ;;
     esac
     suite_log "[$suite] $step $profile-$config: $status (exit $rc, $secs s)."
+    LAST_STEP_STATUS="$status"
     jq -nc --arg suite "$suite" --arg step "$step" --arg profile "$profile" --arg san "$config" \
         --arg status "$status" --argjson rc "$rc" --argjson seconds "$secs" --arg log "$log" \
         '{kind: "step", suite: $suite, step: $step, profile: $profile, sanitizer: $san,
@@ -351,6 +358,18 @@ main() {
     for suite in $SUITES; do
         for p in $PROFILES; do
             for c in $CONFIGS; do
+                # The TSan death callback must work before any tsan step: a
+                # deadlock there turns each TSan report into a hung job.
+                if [[ "$c" == tsan ]]; then
+                    run_step "$suite" tsan-selftest "$p" "$c" $((10 * 60)) \
+                        "$SUITE_REPO_ROOT/build/fuzz/matrix-tsan-selftest-$p/results.jsonl" \
+                        "$SUITE_REPO_ROOT/tests/sanitizers/tsan-death-selftest.sh" --profile "$p"
+                    if [[ "$LAST_STEP_STATUS" != pass ]]; then
+                        skip_step "$suite" "tsan-steps" "$p" "$c" \
+                            "environment failure: the TSan death callback self-test did not pass, thus no tsan step runs in the $p profile"
+                        continue
+                    fi
+                fi
                 if [[ "$suite" == test ]]; then
                     test_steps "$p" "$c"
                 elif want_step areas; then
