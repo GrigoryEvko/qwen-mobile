@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """Compare the raw logits dumps of hexhost_logits_hash (HEXHOST_LOGITS_DUMP) with a reference dump.
 
-Usage: logitsdiff.py N_VOCAB REF.bin RUN.bin [RUN.bin ...]
+Usage: logitsdiff.py [--rows START:END] N_VOCAB REF.bin RUN.bin [RUN.bin ...]
 
 For each run and each row: the maximum absolute difference of the logits, the KL divergence
 KL(ref || run) of the softmax, and whether the argmax is the same. The tool prints the first row
 that differs, the maximum and the mean KL over the rows, and the count of rows with another argmax.
-O(rows * n_vocab).
+--rows keeps the rows START to END - 1. In a decode dump, a row is comparable only while the two
+runs chose the same tokens before it. O(rows * n_vocab).
 """
 
 import sys
 
 import numpy as np
+
+ROWS = slice(None)
 
 
 def rows(path: str, n_vocab: int) -> np.ndarray:
@@ -19,7 +22,7 @@ def rows(path: str, n_vocab: int) -> np.ndarray:
     a = np.fromfile(path, dtype=np.float32)
     if a.size % n_vocab:
         raise SystemExit(f"{path}: {a.size} floats is not a multiple of {n_vocab}")
-    return a.reshape(-1, n_vocab).astype(np.float64)
+    return a.reshape(-1, n_vocab)[ROWS].astype(np.float64)
 
 
 def log_softmax(x: np.ndarray) -> np.ndarray:
@@ -30,11 +33,19 @@ def log_softmax(x: np.ndarray) -> np.ndarray:
 
 def main() -> int:
     """Print one block for each run."""
-    n_vocab = int(sys.argv[1])
-    ref = rows(sys.argv[2], n_vocab)
+    global ROWS
+    args = sys.argv[1:]
+    if len(args) >= 2 and args[0] == "--rows":
+        start, end = args[1].split(":")
+        ROWS = slice(int(start), int(end))
+        args = args[2:]
+    if len(args) < 3:
+        raise SystemExit(__doc__)
+    n_vocab = int(args[0])
+    ref = rows(args[1], n_vocab)
     lp_ref = log_softmax(ref)
     p_ref = np.exp(lp_ref)
-    for path in sys.argv[3:]:
+    for path in args[2:]:
         x = rows(path, n_vocab)
         if x.shape != ref.shape:
             print(f"{path}: {x.shape[0]} rows, the reference has {ref.shape[0]}")

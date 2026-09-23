@@ -13,6 +13,9 @@
 // when every logit has the same bits. HEXHOST_LOGITS_DUMP=FILE also writes the raw logits of each
 // llama_decode of the target to FILE (float32, one row after the other). tools/logitsdiff.py
 // compares two dumps: the first row that differs, the maximum difference and the KL divergence.
+// HEXHOST_LOGITS_DUMP_LAST=1 writes only the last row of each llama_decode. HEXHOST_PROMPT_LEN=P
+// gives the decode and mtp modes a prompt of P tokens (16 when it is not set), thus the steps run
+// at the positions P and up.
 //
 // The build for the phone, in the Snapdragon container, against a phone build of llama.cpp in
 // LLAMA_BUILD (its bin directory holds libllama-common.so, libllama.so, libggml.so and
@@ -27,6 +30,7 @@
 #include "llama.h"
 #include "speculative.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
@@ -72,7 +76,8 @@ llama_token argmax(const float * row, int32_t n_vocab) {
 }
 
 uint64_t g_all  = 1469598103934665603ull;
-FILE *   g_dump = nullptr;  // HEXHOST_LOGITS_DUMP: the raw logits of each llama_decode
+FILE *   g_dump      = nullptr;  // HEXHOST_LOGITS_DUMP: the raw logits of each llama_decode
+bool     g_dump_last = false;    // HEXHOST_LOGITS_DUMP_LAST: only the last row of each llama_decode
 
 // Prints the hash of the logits of the last llama_decode (n rows), adds it to the total, and
 // gives the greedy token of the last row. With HEXHOST_LOGITS_DUMP the rows also go to that file
@@ -80,7 +85,9 @@ FILE *   g_dump = nullptr;  // HEXHOST_LOGITS_DUMP: the raw logits of each llama
 llama_token report(llama_context * ctx, const char * what, int step, int32_t n, int32_t n_vocab) {
     const float *  logits = llama_get_logits(ctx);
     const uint64_t h      = fnv1a(logits, (size_t) n * n_vocab * sizeof(float));
-    if (g_dump) {
+    if (g_dump && g_dump_last) {
+        fwrite(logits + (size_t) (n - 1) * n_vocab, sizeof(float), (size_t) n_vocab, g_dump);
+    } else if (g_dump) {
         fwrite(logits, sizeof(float), (size_t) n * n_vocab, g_dump);
     }
     const llama_token t   = argmax(logits + (size_t) (n - 1) * n_vocab, n_vocab);
@@ -110,6 +117,13 @@ int main(int argc, char ** argv) {
             return 2;
         }
     }
+    g_dump_last = getenv("HEXHOST_LOGITS_DUMP_LAST") != nullptr;
+    const char * plen    = getenv("HEXHOST_PROMPT_LEN");
+    const int    n_first = plen ? atoi(plen) : 16;  // the prompt of the decode and mtp modes
+    if (n_first < 1) {
+        fprintf(stderr, "hexhost_logits_hash: HEXHOST_PROMPT_LEN must be a positive count\n");
+        return 2;
+    }
     llama_backend_init();
     ggml_backend_dev_t dev = ggml_backend_dev_by_name(argv[2]);
     if (!dev) {
@@ -126,9 +140,11 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "hexhost_logits_hash: cannot load %s\n", model_path.c_str());
         return 1;
     }
+    // The prompt and the steps (up to 5 tokens each in the mtp mode) fit the context
+    const int n_prompt_max  = mode == "prefill" ? n : n_first;
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx                = 1024;
-    cp.n_batch              = 1024;
+    cp.n_ctx                = (uint32_t) std::max(1024, n_prompt_max + 5 * n + 64);
+    cp.n_batch              = (uint32_t) std::max(1024, n_prompt_max);
     cp.n_ubatch             = 1024;
     cp.n_seq_max            = 1;
     cp.kv_unified           = true;
@@ -140,7 +156,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
     const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
-    const int     n_prompt = mode == "prefill" ? n : 16;
+    const int     n_prompt = n_prompt_max;
     std::vector<llama_token> prompt(n_prompt);
     for (int i = 0; i < n_prompt; i++) {
         prompt[i] = (llama_token) ((1000 + 7 * i) % n_vocab);
