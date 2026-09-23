@@ -17,11 +17,9 @@ The properties of the written file:
 - A small sample of the files runs in llama-perplexity of the build without
   a sanitizer (TOY_BIN), and the logits are finite.
 
-The expected type of a filtered IQ4_NL tensor follows the known defect
-only-filter-skips-iq4-nl while it is in qfz_common.KNOWN_DEFECTS. The
-regression tests hold the export of a source with an empty array and of a
-plan with an unknown type name, which need a source from raw bytes or a
-type name out of the supported set.
+The regression tests hold the export of a source with an empty array and
+of a plan with an unknown type name, which need a source from raw bytes or
+a type name out of the supported set.
 """
 
 from __future__ import annotations
@@ -39,7 +37,7 @@ from hypothesis import strategies as st
 
 import gguf
 from qfz_checks import check_available, ggml_loader_check, kl_statistics, read_tensors, run_perplexity
-from qfz_common import LLAMA_DIR, known_open, san_dir, scratch
+from qfz_common import LLAMA_DIR, san_dir, scratch
 from qfz_hyp import counted, fuzz_settings
 from qfz_toy import PROFILES, SMALL, Geometry, make_text, output_rot_for, write_source
 from quant.export import FILE_TYPES, GGUF_4BIT, LinearAttentionLayout, export, mtp_map
@@ -138,14 +136,10 @@ def expected_kind(plan: Plan, name: str, only: str | None, invert: bool) -> str:
     """Give the type that the export must write for a tensor, before the source type of a kept tensor.
 
     The docstring of export() says that the filter keeps every tensor out
-    of the match in F16. The code applies the filter to Q4_0 and Q8_0 only,
-    thus an IQ4_NL tensor out of the match stays IQ4_NL: the known defect
-    only-filter-skips-iq4-nl. The expectation follows the code while that
-    defect is in KNOWN_DEFECTS.
+    of the match in F16, thus each quantized type out of the match is "keep".
     """
     kind = plan.type_of(name)
-    filtered = ("Q4_0", "Q8_0") if known_open("only-filter-skips-iq4-nl") else ("Q4_0", "IQ4_NL", "Q8_0")
-    if only is not None and kind in filtered and (re.search(only, name) is None) != invert:
+    if only is not None and kind in ("Q4_0", "IQ4_NL", "CB4", "Q8_0") and (re.search(only, name) is None) != invert:
         kind = "keep"
     return kind
 

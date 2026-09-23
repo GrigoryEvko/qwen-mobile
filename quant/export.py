@@ -43,6 +43,8 @@ GGUF_4BIT = {"Q4_0": "Q4_0", "IQ4_NL": "IQ4_NL"}
 FILE_TYPES = {"Q4_0": "MOSTLY_Q4_0", "IQ4_NL": "MOSTLY_IQ4_NL", "Q8_0": "MOSTLY_Q8_0"}
 # The type names that a plan field can hold. CB4 has no GGUF type, and the export refuses it per tensor.
 PLAN_TYPES = set(GGUF_4BIT) | {"Q8_0", "F16", "CB4"}
+# The quantized plan types. The filter ``only`` keeps each such tensor out of its match in F16.
+QUANTIZED_TYPES = PLAN_TYPES - {"F16"}
 PLAN_TYPE_FIELDS = ("bulk", "head", "embedding", "kv_proj", "gdn_gate", "ssm_out", "ffn_down", "edge_type", "mtp")
 
 
@@ -350,7 +352,7 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
         promote_this = promoter is not None and kind in GGUF_4BIT and promoter.search(name) is not None
         if promote_this:
             kind = promote_type
-        if selector is not None and kind in ("Q4_0", "Q8_0") and (selector.search(name) is None) != invert:
+        if selector is not None and kind in QUANTIZED_TYPES and (selector.search(name) is None) != invert:
             kind = "keep"
         shape = [int(x) for x in reversed(t.shape)]
         pack = packs / f"{name}.npz"

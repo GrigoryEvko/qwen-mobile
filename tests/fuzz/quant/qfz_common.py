@@ -65,10 +65,7 @@ CHECK_BIN = san_dir() / "bin" / "qfz-gguf-check"
 LLAMA_BIN = san_dir() / "llama" / "bin"
 
 # The known defects of the code under test. The regression tests give the file and the minimal example of each.
-KNOWN_DEFECTS = {
-    "only-filter-skips-iq4-nl":
-        "the export filter --only applies to Q4_0 and Q8_0, thus an IQ4_NL tensor out of the match stays IQ4_NL",
-}
+KNOWN_DEFECTS: dict[str, str] = {}
 
 # The largest finite F16 value, and the smallest positive subnormal F16 value.
 F16_MAX = 65504.0

@@ -206,9 +206,8 @@ def test_export_refuses_a_map_that_overflows_f16(tmp_path: Path) -> None:
     assert np.isfinite(values).all(), f"the export wrote {int((~np.isfinite(values)).sum())} inf values in F16"
 
 
-@xfail_open("only-filter-skips-iq4-nl", "the filter keeps IQ4_NL tensors out of the match in IQ4_NL")
 def test_only_keeps_every_other_tensor_in_f16(tmp_path: Path) -> None:
-    """quant/export.py (the --only filter): the docstring promises F16 for each tensor out of the match."""
+    """The filter --only keeps each quantized tensor out of its match in F16, an IQ4_NL tensor too."""
     src = _plain_source(tmp_path / "src.gguf")
     out = tmp_path / "out.gguf"
     export(src, out, tmp_path / "no-packs", Plan(n_layers=0, head="IQ4_NL", embedding="IQ4_NL"), LLAMA_DIR, CPU,
