@@ -33,7 +33,8 @@
 #   data            Write build/fuzz/core/data: the vocab-only GGUF of the 2B
 #                   model, its chat template, and the tiny random qwen35
 #                   models (f32 and q8_0). The other modes need these files.
-#   phone-build     Copy the submodule tree into build/fuzz/core-android-src, and
+#   phone-build     Copy the llama.cpp tree (the submodule, or FUZZ_LLAMA_DIR) into
+#                   build/fuzz/core-android-src (with the suffix -<tag>), and
 #                   build the device targets for arm64 Android with one profile
 #                   and one sanitizer, plus the DSP library of v79 (no sanitizer:
 #                   the DSP code has none), in the container of scripts/build-native.sh.
@@ -59,11 +60,13 @@
 #                       in the fuzz mode. 0 turns them off.
 #   FUZZ_MODEL_SRC      The Qwen3.5 GGUF of the data mode (default
 #                       weights/gguf/Qwen3.5-2B-Q8_0.gguf).
-#   FUZZ_LLAMA_DIR      A private llama.cpp tree for the test and fuzz modes (the
-#                       test of a fix before it lands). The default is the submodule.
+#   FUZZ_LLAMA_DIR      A private llama.cpp tree for the test, fuzz and phone modes
+#                       (the test of a fix before it lands). The default is the submodule.
 #   FUZZ_TREE_TAG       The name of that tree. The build directory gets it as a
-#                       suffix: build/fuzz/core-<profile>-<config>-<tag>. It is
-#                       necessary with FUZZ_LLAMA_DIR.
+#                       suffix: build/fuzz/core-<profile>-<config>-<tag>, and
+#                       build/fuzz/core-android-<profile>-<config>-<tag> for the
+#                       phone. The phone directory of phone-commands gets it too.
+#                       It is necessary with FUZZ_LLAMA_DIR.
 #   ADB_SERIAL          The phone of phone-commands (default 192.168.14.130:5555).
 #
 # Each fuzz run uses nice 10, -rss_limit_mb=4096 and -timeout=30. libFuzzer stops
@@ -178,6 +181,11 @@ signature() {
 # The build directory of the profile $1 and the configuration $2 (with the suffix of a private tree).
 tree_dir() {
     echo "$REPO/build/fuzz/core-$1-$2${TREE_TAG:+-$TREE_TAG}"
+}
+
+# The phone build directory of the profile $1 and the configuration $2, relative to the repository.
+phone_rel() {
+    echo "build/fuzz/core-android-$1-$2${TREE_TAG:+-$TREE_TAG}"
 }
 
 # Configure and build the host tree of the profile $1 and the configuration $2 with the targets $3.
@@ -429,11 +437,14 @@ phone_build() {
     check_san "$san" phone
     # shellcheck source=../../../scripts/lib.sh
     source "$REPO/scripts/lib.sh"
-    local src="$REPO/build/fuzz/core-android-src"
-    local rel="build/fuzz/core-android-$profile-$san"
-    mkdir -p "$src" "$REPO/$rel/out"
-    # A private copy of the submodule: the main session edits the HTP sources.
-    rsync -a --delete --exclude .git --exclude '/build*/' "$REPO/third_party/llama.cpp/" "$src/llama.cpp/"
+    local src_rel="build/fuzz/core-android-src${TREE_TAG:+-$TREE_TAG}"
+    local copy="$REPO/$src_rel"
+    local rel
+    rel=$(phone_rel "$profile" "$san")
+    mkdir -p "$copy" "$REPO/$rel/out"
+    # A private copy of the llama.cpp tree (the submodule, or FUZZ_LLAMA_DIR): the main session edits
+    # the HTP sources of the submodule.
+    rsync -a --delete --exclude .git --exclude '/build*/' "${LLAMA_DIR:-$REPO/third_party/llama.cpp}/" "$copy/llama.cpp/"
     local runtime
     runtime=$(phone_runtime "$san")
     container_run "$SNAPDRAGON_IMAGE" bash -euo pipefail -c "
@@ -441,7 +452,7 @@ phone_build() {
             -DCMAKE_TOOLCHAIN_FILE=\$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-34 \
             -DCMAKE_C_FLAGS='$SHIPPED_MARCH' -DCMAKE_CXX_FLAGS='$SHIPPED_MARCH' \
-            -DFUZZ_LLAMA_DIR=/workspace/build/fuzz/core-android-src/llama.cpp \
+            -DFUZZ_LLAMA_DIR=/workspace/$src_rel/llama.cpp \
             -DFUZZ_PROFILE=$profile -DFUZZ_SANITIZER=$san -DFUZZ_HEXAGON=ON \
             -DFUZZ_TARGETS='${PHONE_TARGETS// /;}' \
             -DHEXAGON_SDK_ROOT=\$HEXAGON_SDK_ROOT -DHEXAGON_TOOLS_ROOT=\$HEXAGON_TOOLS_ROOT \
@@ -493,9 +504,11 @@ phone_commands() {
     check_profile "$profile"
     check_san "$san" phone
     local a="adb -s $ADB_SERIAL"
-    local out="$REPO/build/fuzz/core-android-$profile-$san/out"
-    local logs="$REPO/build/fuzz/core-android-$profile-$san/phone-logs"
-    local pd="$PHONE_BASE/$profile-$san"
+    local rel
+    rel=$(phone_rel "$profile" "$san")
+    local out="$REPO/$rel/out"
+    local logs="$REPO/$rel/phone-logs"
+    local pd="$PHONE_BASE/$profile-$san${TREE_TAG:+-$TREE_TAG}"
     local runtime
     runtime=$(phone_runtime "$san")
     # the options of the one sanitizer of this build, as tests/sanitizers/env.sh gives them on the host
