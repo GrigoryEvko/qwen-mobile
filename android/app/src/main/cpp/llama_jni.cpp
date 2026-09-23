@@ -372,6 +372,28 @@ std::set<int32_t> list_tids() {
     return tids;
 }
 
+/**
+ * The name (comm) of a thread of this process, or an empty string when the
+ * thread is gone. A thread that pthread_create makes starts with the name of
+ * the thread that made it, and ggml does not name its workers.
+ */
+std::string thread_name(int32_t tid) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/self/task/%d/comm", (int) tid);
+    FILE * f = fopen(path, "re");
+    if (f == nullptr) {
+        return {};
+    }
+    char buf[32] = {};
+    const bool ok = fgets(buf, sizeof(buf), f) != nullptr;
+    fclose(f);
+    std::string name = ok ? buf : "";
+    while (!name.empty() && name.back() == '\n') {
+        name.pop_back();
+    }
+    return name;
+}
+
 /** The id of a special token, or LLAMA_TOKEN_NULL when the text is not one token. */
 llama_token single_token(const llama_vocab * vocab, const char * text) {
     const std::vector<llama_token> ids = common_tokenize(vocab, text, false, true);
@@ -1958,9 +1980,13 @@ static jlong load_impl(JNIEnv * env, jstring jpath, jstring jmmproj,
     if (e->ctx_pf != nullptr) {
         llama_attach_threadpool(e->ctx_pf, e->tp, e->tp);
     }
+    // A thread of the app can start between the two listings, for example a
+    // thread of a Kotlin dispatcher. It has its own name, and the workers of
+    // the pool have the name of this thread, thus the name selects them.
+    const std::string own_name = thread_name(gettid());
     std::vector<int32_t> tids;
     for (int32_t tid : list_tids()) {
-        if (before.count(tid) == 0) {
+        if (before.count(tid) == 0 && thread_name(tid) == own_name) {
             tids.push_back(tid);
             lower_priority(tid);
         }
