@@ -136,24 +136,28 @@ const int32_t ZERO_PARAMS[16] = {0};
 
 // ---- memory
 
+// The last block stays valid while no rpcmem allocation or release occurs. O(size) for the first
+// read of an allocation, O(log allocations) for a read in a different block, else O(1).
 val memory::get(uint64_t addr) {
-    if (!(last_vec && addr >= last_base && addr < last_base + last_size)) {
+    const uint64_t gen = fakedsp::alloc_generation();
+    if (!(last_vec && gen == last_gen && addr >= last_base && addr < last_base + last_size)) {
         uint64_t base = 0, size = 0;
         int      fd   = -1;
         if (!fakedsp::lookup_alloc(addr, &base, &size, &fd)) {
             fakedsp::violation("sym-address", "the symbolic check reads address 0x%" PRIx64 " outside every rpcmem allocation", addr);
             return init_of(addr);
         }
-        auto it = blocks.find(base);
+        auto it = blocks.find(fd);
         if (it == blocks.end()) {
             std::vector<val> v(size);
             for (uint64_t i = 0; i < size; i++) {
                 v[i] = init_of(base + i);
             }
-            it = blocks.emplace(base, std::move(v)).first;
+            it = blocks.emplace(fd, std::move(v)).first;
         }
         last_base = base;
         last_size = size;
+        last_gen  = gen;
         last_vec  = &it->second;
     }
     return (*last_vec)[addr - last_base];

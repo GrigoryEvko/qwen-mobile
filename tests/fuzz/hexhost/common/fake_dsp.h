@@ -94,6 +94,10 @@ bool is_ignored(const char * id);
 // Looks up the rpcmem allocation that holds addr. Gives false when no allocation holds it.
 bool lookup_alloc(uint64_t addr, uint64_t * base, uint64_t * size, int * fd);
 
+// Gives a number that changes at each rpcmem allocation and at each rpcmem release. The result of a
+// lookup_alloc stays correct while this number stays the same.
+uint64_t alloc_generation();
+
 // Gives the number of live rpcmem allocations (a leak check of the session release).
 size_t live_allocs();
 

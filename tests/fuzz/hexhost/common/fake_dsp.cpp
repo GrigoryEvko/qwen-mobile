@@ -78,6 +78,7 @@ config                                              g_cfg;
 std::map<uint64_t, alloc_info>                      g_allocs;      // base address -> allocation
 std::unordered_map<int, uint64_t>                   g_fd_base;     // fd -> base address
 int                                                 g_next_fd = 100;
+std::atomic<uint64_t>                               g_alloc_gen{0}; // + 1 at each allocation and release
 std::unordered_map<uint64_t, std::unique_ptr<queue_info>>  g_queues;   // queue id -> queue
 std::unordered_map<uint64_t, std::unique_ptr<handle_info>> g_handles;  // handle id -> session
 uint64_t                                            g_next_id = 1;
@@ -243,6 +244,10 @@ bool lookup_alloc(uint64_t addr, uint64_t * base, uint64_t * size, int * fd) {
     return true;
 }
 
+uint64_t alloc_generation() {
+    return g_alloc_gen.load(std::memory_order_acquire);
+}
+
 size_t live_allocs() {
     std::lock_guard<std::mutex> lock(g_mu);
     return g_allocs.size();
@@ -316,6 +321,7 @@ void * rpcmem_alloc2(int heapid, uint32_t flags, size_t size) {
     info.size = size;
     g_allocs[(uint64_t) (uintptr_t) p] = info;
     g_fd_base[info.fd]                 = (uint64_t) (uintptr_t) p;
+    g_alloc_gen.fetch_add(1, std::memory_order_release);
     return p;
 }
 
@@ -335,6 +341,7 @@ void rpcmem_free(void * po) {
         }
         g_fd_base.erase(it->second.fd);
         g_allocs.erase(it);
+        g_alloc_gen.fetch_add(1, std::memory_order_release);
     }
     free(po);
 }

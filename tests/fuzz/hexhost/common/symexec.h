@@ -37,12 +37,15 @@ namespace symexec {
 using val = uint64_t;
 
 // The memory of one execution: a symbolic value for each byte of each rpcmem
-// allocation. A byte that no write touched has the value init(address).
+// allocation. A byte that no write touched has the value init(address). The key
+// of a block is the fd of its allocation, because a new allocation can get the
+// base address of a released one with a different size.
 struct memory {
-    std::unordered_map<uint64_t, std::vector<val>> blocks;   // allocation base -> byte values
-    uint64_t                                       last_base = 0;
-    uint64_t                                       last_size = 0;
-    std::vector<val> *                             last_vec  = nullptr;
+    std::unordered_map<int, std::vector<val>> blocks;         // allocation fd -> byte values
+    uint64_t                                  last_base = 0;
+    uint64_t                                  last_size = 0;
+    uint64_t                                  last_gen  = 0;  // fakedsp::alloc_generation of the last lookup
+    std::vector<val> *                        last_vec  = nullptr;
 
     val  get(uint64_t addr);
     void set(uint64_t addr, size_t n, val v);
