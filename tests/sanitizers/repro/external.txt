@@ -1,0 +1,11 @@
+# The reproducers of the ubsan.supp entries that need the code of a fuzz area
+# (rule R13). tests/sanitizers/supp-repro.sh builds the target of the area
+# with the ubsan flags of tests/sanitizers/ubsan.cmake and replays the input.
+# Format of one line:
+#   REPRO-ENTRY: <entry> AREA: <area> TARGET: <target> INPUT: <path of the input>
+#
+# x86 note for integer-divide-by-zero: after UBSan reports (or suppresses) an
+# integer division by zero, the division itself runs, and x86 traps with
+# SIGFPE. Thus the match criterion is the report line, not the exit status.
+# On arm64 (the phone) a division by zero gives 0, and the run continues.
+REPRO-ENTRY: integer-divide-by-zero:^init_fastdiv_values( AREA: hexhost TARGET: kparams INPUT: tests/fuzz/hexhost/regress/kparams/mm-id-div-zero.bin
