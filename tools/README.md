@@ -83,6 +83,21 @@ Its one hole is HMX: the timing model never retires an HMX instruction, thus the
 matrix engine has no simulated cycle story. HMX numbers have to come from the
 device counters instead.
 
+## hmx-bench/ — HMX programs on the phone
+
+`build-i8.sh` builds three DSP programs for `run_main_on_hexagon` with no vendor
+library: `i8hello.so`, `i8read.so` (the cost of the int32 read of the int8 path)
+and `i8probe.so`. The header of the script tells how to make the skel library and
+how to run a program. `build.sh` builds `hmx_rate.so`, which links the HexKL
+library, thus that program is for local use only.
+
+**A DSP program in the unsigned protection domain writes no log line without a
+`.farf` mask file.** Put a file `<program>.farf` with the content `0x1f` next to
+each program, and a file `run_main_on_hexagon.farf` next to the runner, in the
+directory of `ADSP_LIBRARY_PATH`. Without them, logcat shows no line from
+`printf` or from `FARF`. Logcat can also drop lines when many come at once, thus
+`i8read.so --out <path>` also writes its results to a file.
+
 ## trace/ — the timeline
 
 `htp_trace.py` turns a DSP profile log into a Chrome trace for Perfetto, with a
