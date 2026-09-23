@@ -1,0 +1,273 @@
+hexagon: convert Q8_0 K and V rows into the HMX tiles two blocks at a time
+Fold-into: upstream/ggml-hexagon
+
+The defect
+
+With a Q8_0 KV cache, the HMX flash attention dequantized each K and V row of a KV block in
+VTCM with hvx_dequantize_row_q8_0_f16 before the tile interleave. That function converts one
+32-value block per iteration: a scalar load of the scale from VTCM, a splat, an F16-to-F32
+pair, two unpacks, an int-to-float conversion, a qf32 multiply and a conversion back to F16,
+on a quarter of the vector width. At decode the HMX has almost no work, thus this HVX pass was
+the whole op: on the phone the Q8_0 op cost 5.6 times the F16 op for each KV row (127 against
+23 ns per row of K and V of one head, 2B, depth 4096 and 16384), and the tg of the 2B at depth
+32768 fell from 18.6 (F16 KV) to 10.7 tokens per second. The PMU counters of the op agree:
+11.2 million committed packets per op for Q8_0 against 1.0 million for F16, with the user DMA
+active in 12 % of the cycles for Q8_0 and in 87 % for F16.
+
+The change
+
+hvx_dequantize_pair_q8_0_f16 (hvx-quant.h) converts two Q8_0 blocks into one vector of 64 F16
+values from one unaligned load: a vrdelta takes the 64 quants into bytes 0..63, a vdelta copies
+the two scales into their 32 lanes each, then vunpack, the int16-to-F16 conversion, a qf32
+multiply and the qf32-to-F16 conversion. There is no scalar load. fa_q8_0_rows_to_tiles and
+fa_q8_0_cols_to_tiles (flash-attn-ops.c) write the result straight into the K and the V tiles,
+thus the rows need no F16 copy in VTCM. The pair loop has no branch and unrolls. A head
+dimension that is not a multiple of 64 keeps the old path.
+
+The values are those of the old path: a quant is exact in F16, the product of two F16 values is
+exact in qf32, and the same qf32-to-F16 conversion rounds it. The kernel lab
+(tools/htp-lab, target fadq) compares every K and V tile value for random KV blocks (1 to 64
+rows, odd tails included): 0 differences. Over all 256 quants and all 63488 finite F16 scales the
+only differences are signed zeros for a zero product with a negative or a zero scale, which no
+quantizer writes. The lab measures 66 cycles for a row of 256 values against 656 (v79, timing
+mode, the release flags).
+
+The result on the phone (HTP0, the 2B, tg32, all runs at the same CPU clock caps): with a Q8_0
+cache the decode gives 15.14, 16.28 and 17.12 tokens per second at the depths 4096, 16384 and
+32768, against 14.12, 14.75 and 12.83 with an F16 cache. The old library gave 8.99 at 16384.
+The KL of the 2B against the naive x86 oracle at 4096 and 16384 tokens is the same as with the
+old library in each row of the table, to six decimals. A greedy generation with the 2B and with
+the 4B gives the correct answer.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    ggml/src/ggml-hexagon/htp/flash-attn-ops.c
+    ggml/src/ggml-hexagon/htp/hvx-quant.h
+diff --git a/ggml/src/ggml-hexagon/htp/flash-attn-ops.c b/ggml/src/ggml-hexagon/htp/flash-attn-ops.c
+index a88e0de..5433394 100644
+--- a/ggml/src/ggml-hexagon/htp/flash-attn-ops.c
++++ b/ggml/src/ggml-hexagon/htp/flash-attn-ops.c
+@@ -585,6 +585,111 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
+     }
+ }
+ 
++// ============================================================================
++// Q8_0 K and V rows into the HMX tiles
++// ============================================================================
++
++// The Q8_0 rows [start_row, end_row) of a K block (rows of src_stride bytes in VTCM) into the
++// transposed K tiles: the tiles of hvx_dequantize_row_q8_0_f16 on each row followed by
++// hmx_interleave_rows_to_tiles, for k a multiple of 64. Each vector of 64 values comes from two
++// Q8_0 blocks, thus the rows need no F16 copy in VTCM. The pair loop has no branch (an odd last
++// row has its own loop) and unrolls, thus the chains of the two rows interleave in the packets.
++static inline void fa_q8_0_rows_to_tiles(__fp16 * restrict vtcm_dst,
++                                         const uint8_t * restrict src,
++                                         uint32_t n_cols,
++                                         uint32_t k,
++                                         size_t src_stride,
++                                         uint32_t start_row,
++                                         uint32_t end_row) {
++    assert(k % 64 == 0);
++
++    const uint32_t   n_k_tiles   = k / HMX_FP16_TILE_N_COLS;
++    const HVX_Vector v_scat_base = hvx_vmem(hmx_transpose_scatter_offsets);
++    const HVX_Vector v_scat_step = Q6_V_vsplat_R(4);
++    const size_t     pair_region = (size_t) (2 * HMX_FP16_TILE_SIZE - 1);
++    const size_t     dst_step    = 2 * (size_t) HMX_FP16_TILE_N_ELMS;
++    const uint32_t   n_pairs     = k / 64;
++    const size_t     pair_bytes  = 2 * sizeof(block_q8_0);
++
++    for (uint32_t r = start_row; r < end_row; r += 2) {
++        const uint32_t   ct             = r / HMX_FP16_TILE_N_ROWS;
++        const uint32_t   local_r        = r % HMX_FP16_TILE_N_ROWS;
++        const bool       next_row_valid = (r + 1) < end_row && (r + 1) < n_cols;
++        const HVX_Vector v_off0         = Q6_Vw_vadd_VwVw(v_scat_base, Q6_V_vsplat_R(local_r * 4));
++        const HVX_Vector v_off1         = Q6_Vw_vadd_VwVw(v_off0, v_scat_step);
++
++        __fp16 *        tile_base = vtcm_dst + (size_t) ct * n_k_tiles * HMX_FP16_TILE_N_ELMS;
++        const uint8_t * p0        = src + (size_t) r * src_stride;
++        const uint8_t * p1        = p0 + src_stride;
++
++        if (next_row_valid) {
++#pragma clang loop unroll_count(4)
++            for (uint32_t i = 0; i < n_pairs; ++i) {
++                const HVX_Vector v0 = hvx_dequantize_pair_q8_0_f16(p0 + i * pair_bytes);
++                const HVX_Vector v1 = hvx_dequantize_pair_q8_0_f16(p1 + i * pair_bytes);
++                Q6_vscatter_RMVwV((size_t) (tile_base + i * dst_step), pair_region, v_off0, v0);
++                Q6_vscatter_RMVwV((size_t) (tile_base + i * dst_step), pair_region, v_off1, v1);
++            }
++        } else {
++            const HVX_Vector vzero = Q6_V_vzero();
++            for (uint32_t i = 0; i < n_pairs; ++i) {
++                const HVX_Vector v0 = hvx_dequantize_pair_q8_0_f16(p0 + i * pair_bytes);
++                Q6_vscatter_RMVwV((size_t) (tile_base + i * dst_step), pair_region, v_off0, v0);
++                Q6_vscatter_RMVwV((size_t) (tile_base + i * dst_step), pair_region, v_off1, vzero);
++            }
++        }
++    }
++}
++
++// The Q8_0 rows [start_row, end_row) of a V block into the V tiles: the tiles of
++// hvx_dequantize_row_q8_0_f16 on each row followed by hmx_interleave_cols_to_tiles, for
++// head_dim a multiple of 64.
++static inline void fa_q8_0_cols_to_tiles(__fp16 * restrict tiles_out,
++                                         const uint8_t * restrict src,
++                                         uint32_t n_rows,
++                                         uint32_t head_dim,
++                                         size_t src_stride,
++                                         uint32_t n_row_tiles,
++                                         uint32_t start_row,
++                                         uint32_t end_row) {
++    assert(head_dim % 64 == 0);
++
++    const size_t   tile_stride_elms = (size_t) n_row_tiles * HMX_FP16_TILE_N_ELMS;
++    const size_t   tb_step          = 2 * tile_stride_elms;
++    const uint32_t n_pairs          = head_dim / 64;
++    const size_t   pair_bytes       = 2 * sizeof(block_q8_0);
++
++    for (uint32_t r = start_row; r < end_row; r += 2) {
++        const bool      next_row_valid = (r + 1) < end_row && (r + 1) < n_rows;
++        const uint8_t * p0             = src + (size_t) r * src_stride;
++        const uint8_t * p1             = p0 + src_stride;
++
++        const uint32_t r0      = r / HMX_FP16_TILE_N_ROWS;
++        const uint32_t r1_half = (r % HMX_FP16_TILE_N_ROWS) / 2;
++
++        __fp16 * tb0 = tiles_out + (size_t) r0 * HMX_FP16_TILE_N_ELMS;
++
++        if (next_row_valid) {
++#pragma clang loop unroll_count(4)
++            for (uint32_t i = 0; i < n_pairs; ++i) {
++                const HVX_Vector     v0 = hvx_dequantize_pair_q8_0_f16(p0 + i * pair_bytes);
++                const HVX_Vector     v1 = hvx_dequantize_pair_q8_0_f16(p1 + i * pair_bytes);
++                const HVX_VectorPair vp = Q6_W_vshuff_VVR(v1, v0, -2);
++                ((HVX_Vector *) (tb0 + i * tb_step))[r1_half]                    = Q6_V_lo_W(vp);
++                ((HVX_Vector *) (tb0 + i * tb_step + tile_stride_elms))[r1_half] = Q6_V_hi_W(vp);
++            }
++        } else {
++            const HVX_Vector vzero = Q6_V_vzero();
++            for (uint32_t i = 0; i < n_pairs; ++i) {
++                const HVX_Vector     v0 = hvx_dequantize_pair_q8_0_f16(p0 + i * pair_bytes);
++                const HVX_VectorPair vp = Q6_W_vshuff_VVR(vzero, v0, -2);
++                ((HVX_Vector *) (tb0 + i * tb_step))[r1_half]                    = Q6_V_lo_W(vp);
++                ((HVX_Vector *) (tb0 + i * tb_step + tile_stride_elms))[r1_half] = Q6_V_hi_W(vp);
++            }
++        }
++    }
++}
++
+ // ============================================================================
+ // HMX Phase args and thread logic
+ // ============================================================================
+@@ -614,14 +719,19 @@ static void fa_k_interleave_thread(unsigned int n, unsigned int i, void * data)
+ 
+     struct htp_thread_trace * tr = &factx->octx->ctx->trace[i];
+     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, (uint16_t) (args->kv_start + start));
+-    if (factx->k->type == HTP_TYPE_Q8_0) {
+-        for (uint32_t r = start; r < end; ++r) {
+-            __fp16 * row_k = (__fp16 *)((char *)args->curr_k + r * args->src_stride * sizeof(__fp16));
+-            hvx_dequantize_row_q8_0_f16(row_k, row_k, factx->DK);
++    if (factx->k->type == HTP_TYPE_Q8_0 && factx->DK % 64 == 0) {
++        fa_q8_0_rows_to_tiles(factx->vtcm_k_tiles[args->buf_idx], (const uint8_t *) args->curr_k, total_rows, factx->DK,
++                              args->src_stride * sizeof(__fp16), start, end);
++    } else {
++        if (factx->k->type == HTP_TYPE_Q8_0) {
++            for (uint32_t r = start; r < end; ++r) {
++                __fp16 * row_k = (__fp16 *)((char *)args->curr_k + r * args->src_stride * sizeof(__fp16));
++                hvx_dequantize_row_q8_0_f16(row_k, row_k, factx->DK);
++            }
+         }
++        hmx_interleave_rows_to_tiles(factx->vtcm_k_tiles[args->buf_idx], (const __fp16 *) args->curr_k, total_rows, factx->DK,
++                                 args->src_stride, start, end);
+     }
+-    hmx_interleave_rows_to_tiles(factx->vtcm_k_tiles[args->buf_idx], (const __fp16 *) args->curr_k, total_rows, factx->DK,
+-                             args->src_stride, start, end);
+     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, (uint16_t) (args->kv_start + start));
+ }
+ 
+@@ -668,14 +778,19 @@ static void fa_v_interleave_thread(unsigned int n, unsigned int i, void * data)
+ 
+     struct htp_thread_trace * tr = &factx->octx->ctx->trace[i];
+     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_V_PREP, (uint16_t) (args->kv_start + start));
+-    if (factx->v->type == HTP_TYPE_Q8_0) {
+-        for (uint32_t r = start; r < end; ++r) {
+-            __fp16 * row_v = (__fp16 *)((char *)args->v_src + r * args->src_stride * sizeof(__fp16));
+-            hvx_dequantize_row_q8_0_f16(row_v, row_v, factx->DV);
++    if (factx->v->type == HTP_TYPE_Q8_0 && factx->DV % 64 == 0) {
++        fa_q8_0_cols_to_tiles(v_tiles_dst, (const uint8_t *) args->v_src, total_rows, factx->DV,
++                              args->src_stride * sizeof(__fp16), (uint32_t) args->n_col_tiles, start, end);
++    } else {
++        if (factx->v->type == HTP_TYPE_Q8_0) {
++            for (uint32_t r = start; r < end; ++r) {
++                __fp16 * row_v = (__fp16 *)((char *)args->v_src + r * args->src_stride * sizeof(__fp16));
++                hvx_dequantize_row_q8_0_f16(row_v, row_v, factx->DV);
++            }
+         }
++        hmx_interleave_cols_to_tiles(v_tiles_dst, (const __fp16 *) args->v_src, total_rows, factx->DV,
++                                 args->src_stride, (uint32_t) args->n_col_tiles, start, end);
+     }
+-    hmx_interleave_cols_to_tiles(v_tiles_dst, (const __fp16 *) args->v_src, total_rows, factx->DV,
+-                             args->src_stride, (uint32_t) args->n_col_tiles, start, end);
+     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_V_PREP, (uint16_t) (args->kv_start + start));
+ }
+ 
+diff --git a/ggml/src/ggml-hexagon/htp/hvx-quant.h b/ggml/src/ggml-hexagon/htp/hvx-quant.h
+index 6b172cd..17ea0db 100644
+--- a/ggml/src/ggml-hexagon/htp/hvx-quant.h
++++ b/ggml/src/ggml-hexagon/htp/hvx-quant.h
+@@ -146,6 +146,54 @@ static inline void hvx_dequantize_row_q8_0_f16(__fp16 * restrict dst_ptr, const
+     }
+ }
+ 
++// The delta-network controls of hvx_dequantize_pair_q8_0_f16.
++//
++// vrdelta routes the 64 quants of two Q8_0 blocks (bytes 2..33 and 36..67 of the pair) into
++// bytes 0..63. The table is the route of that mapping through the network, stage by stage from
++// the output back to the input. The other network order of vdelta cannot route it.
++static const uint8_t hvx_q8_0_pair_quants_ctl[128] __attribute__((aligned(128))) = {
++    0x02, 0x02, 0x04, 0x04, 0x02, 0x02, 0x0a, 0x0a, 0x02, 0x02, 0x06, 0x06, 0x02, 0x02, 0x16, 0x16,
++    0x02, 0x02, 0x06, 0x06, 0x02, 0x02, 0x0e, 0x0e, 0x02, 0x02, 0x06, 0x06, 0x02, 0x02, 0x2e, 0x2e,
++    0x04, 0x04, 0x06, 0x06, 0x08, 0x08, 0x0c, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x14, 0x14, 0x1c, 0x1c,
++    0x04, 0x04, 0x04, 0x04, 0x0c, 0x0c, 0x0c, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x4c, 0x4c, 0x5c, 0x5c,
++    0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x08, 0x08, 0x08, 0x08,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x10, 0x10, 0x10,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x20, 0x20, 0x20,
++};
++
++// vdelta copies d0 (bytes 0..1) into the halfword lanes 0..31 and d1 (bytes 34..35) into the
++// lanes 32..63. Byte L of the control holds the partner choices of lane L: its own bits, with
++// bits 1 and 5 flipped in the upper half, where the source is byte 34 (0b0100010).
++static const uint8_t hvx_q8_0_pair_scales_ctl[128] __attribute__((aligned(128))) = {
++#define HVX_Q8_0_CTL8(k)                                                                      \
++    ((k) & 0x7E) ^ ((k) >= 64 ? 0x22 : 0), ((k + 1) & 0x7E) ^ ((k) >= 64 ? 0x22 : 0),         \
++        ((k + 2) & 0x7E) ^ ((k) >= 64 ? 0x22 : 0), ((k + 3) & 0x7E) ^ ((k) >= 64 ? 0x22 : 0), \
++        ((k + 4) & 0x7E) ^ ((k) >= 64 ? 0x22 : 0), ((k + 5) & 0x7E) ^ ((k) >= 64 ? 0x22 : 0), \
++        ((k + 6) & 0x7E) ^ ((k) >= 64 ? 0x22 : 0), ((k + 7) & 0x7E) ^ ((k) >= 64 ? 0x22 : 0)
++    HVX_Q8_0_CTL8(0),  HVX_Q8_0_CTL8(8),  HVX_Q8_0_CTL8(16),  HVX_Q8_0_CTL8(24),
++    HVX_Q8_0_CTL8(32), HVX_Q8_0_CTL8(40), HVX_Q8_0_CTL8(48),  HVX_Q8_0_CTL8(56),
++    HVX_Q8_0_CTL8(64), HVX_Q8_0_CTL8(72), HVX_Q8_0_CTL8(80),  HVX_Q8_0_CTL8(88),
++    HVX_Q8_0_CTL8(96), HVX_Q8_0_CTL8(104), HVX_Q8_0_CTL8(112), HVX_Q8_0_CTL8(120)
++#undef HVX_Q8_0_CTL8
++};
++
++// Two consecutive Q8_0 blocks (68 bytes at src: d0, 32 quants, d1, 32 quants) as 64 F16 values
++// in one vector, from one unaligned load and no scalar load (a scalar load from VTCM stalls).
++// The values are those of hvx_dequantize_row_q8_0_f16: a quant is exact in F16, the product of
++// two F16 values is exact in qf32, and the same qf32-to-F16 conversion rounds it. The one
++// exception is the sign of a zero product with a negative or a zero scale, which no quantizer
++// writes. The load reads 128 bytes from src, thus the caller keeps 60 readable bytes after the
++// pair (the VTCM row slot of a KV block has them). The kernel lab measures 66 cycles for a row of
++// 256 values against 656 for hvx_dequantize_row_q8_0_f16 (v79, timing mode).
++static inline HVX_Vector hvx_dequantize_pair_q8_0_f16(const uint8_t * restrict src) {
++    const HVX_Vector w = hvx_vmemu(src);
++    const HVX_Vector q = Q6_V_vrdelta_VV(w, hvx_vmem(hvx_q8_0_pair_quants_ctl));
++    const HVX_Vector h = Q6_Vhf_equals_Vh(Q6_V_lo_W(Q6_Wh_vunpack_Vb(q)));
++    const HVX_Vector d = Q6_V_vdelta_VV(w, hvx_vmem(hvx_q8_0_pair_scales_ctl));
++    return Q6_Vhf_equals_Wqf32(Q6_Wqf32_vmpy_VhfVhf(h, d));
++}
++
+ static inline void hvx_dequantize_row_f16_f32(float * restrict dst_ptr, const void * restrict src_ptr, int n) {
+     const int nb = n / 32;
+     const _Float16 * src = (const _Float16 *) src_ptr;
