@@ -1,0 +1,77 @@
+// The FastRPC interface of the DDR read probe. The host program ddrbw calls it, and the DSP library
+// libddrbw_skel.so implements it. Refer to build.sh for the build, to dsp/ddrbw_dsp.c for the
+// behavior on the DSP, and to ddrbw_common.h for the constants.
+
+#ifndef DDRBW_IDL
+#define DDRBW_IDL
+
+#include "AEEStdDef.idl"
+#include "remote.idl"
+
+// One read run. Each thread reads its own contiguous part of the first "region" bytes of the
+// buffer, chunk by chunk, and starts again at the start of the part at its end, until the time
+// "budget_us" is over.
+struct ddrbw_run {
+    int32  fd;         // the buffer, mapped with map()
+    uint32 region;     // the bytes of the buffer that the run reads, from offset 0
+    uint32 n_threads;  // 1 to the HVX context count
+    uint32 n_dma;      // threads 0 to n_dma - 1 read with the DMA engine, the others with HVX loads
+    uint32 chunk;      // the bytes of one chunk, a multiple of 128
+    uint32 row;        // DMA: the bytes of one row of a descriptor, 0 for one row of "chunk" bytes
+    uint32 dst_row;    // DMA: the VTCM pitch of one row, 0 for "row"
+    uint32 depth;      // DMA: the descriptors in flight for each thread
+    uint32 pf;         // HVX: the chunks that the l2fetch box holds ahead of the loads, 0 for no l2fetch
+    uint32 flags;      // DDRBW_FLAG_*
+    uint32 budget_us;  // the read time in microseconds
+};
+
+// The result of one thread of a read run.
+struct ddrbw_thread {
+    uint64 t_start;     // the qtimer count at the first chunk
+    uint64 t_end;       // the qtimer count after the last chunk
+    uint64 chunks;      // the chunks that the thread read
+    uint64 pcycles;     // the processor cycles of the read loop
+    uint32 part_start;  // the offset of the part of the thread
+    uint32 part_len;    // the bytes of the part
+    uint32 sum;         // the checksum: the 32-bit sum of the words that the thread added
+    uint32 kind;        // DDRBW_KIND_*
+};
+
+interface ddrbw : remote_handle64 {
+    // Send the power votes of the mask (DDRBW_VOTE_*) and hold the full VTCM. Call it one time,
+    // first. rc gets DDRBW_RC_COUNT return codes, facts gets DDRBW_FACT_COUNT values.
+    AEEResult setup(in uint32 votes, rout sequence<int32> rc, rout sequence<uint64> facts);
+
+    // Give the facts again, for example the clock after a run.
+    AEEResult query(rout sequence<uint64> facts);
+
+    // Map the buffer of an fd that the host mapped with FASTRPC_MAP_FD_DELAYED (HAP_mmap2), as
+    // htp/main.c maps a buffer of a batch. ticks gets the qtimer ticks of HAP_mmap2.
+    AEEResult map(in int32 fd, in uint32 size, rout uint64 ticks);
+
+    // Remove the mapping of an fd (HAP_munmap2). ticks gets the qtimer ticks of HAP_munmap2.
+    AEEResult unmap(in int32 fd, rout uint64 ticks);
+
+    // Do one read run. threads gets one result for each thread. t_go is the qtimer count at the
+    // start of all threads. status is DDRBW_OK or DDRBW_E_*.
+    AEEResult read(in ddrbw_run run, rout sequence<ddrbw_thread> threads, rout uint64 t_go, rout int32 status);
+
+    // Do nothing. The host measures the time of a FastRPC call with it.
+    AEEResult nop();
+
+    // Import a dspqueue of the host and start the thread that answers its packets (DDRBW_QMODE_*).
+    AEEResult queue_start(in uint64 queue_id, in uint32 mode);
+
+    // Stop the queue thread after the host sent DDRBW_QCMD_STOP, and close the queue. served gets
+    // the count of packets that the thread answered.
+    AEEResult queue_stop(rout uint32 served);
+
+    // The DSP half of the fence test on a buffer of map(). For each i from 1 to iters: wait until
+    // the host slot holds i, then write i to the DSP slot. It stops when a wait is longer than
+    // timeout_us. done gets the last i, t_first and t_last the qtimer counts of the first and the
+    // last answer.
+    AEEResult fence(in int32 fd, in uint32 iters, in uint32 timeout_us, rout uint32 done, rout uint64 t_first,
+                    rout uint64 t_last);
+};
+
+#endif
