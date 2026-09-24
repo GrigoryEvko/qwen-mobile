@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build the phone stage "fak": the flash attention of HTP0 (the tile-layout kernel, the chunk cost
-# model and the resident K and V) against the flash attention of HEAD, on one library set. The
-# switch GGML_HEXAGON_FA_OPT (patches/hexagon-fa) selects the form at run time.
+# Build the phone stage "fak": the flash attention of HTP0 (the chunk cost model, the tile-layout
+# kernel, the resident K and V and the decode spans) against the flash attention of HEAD, on one
+# library set. The switch GGML_HEXAGON_FA_OPT (patches/hexagon-fa) selects the parts at run time.
 #
 #   JOBS=24 tools/stages/fak/build.sh
 #
