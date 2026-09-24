@@ -2017,7 +2017,31 @@ static jlong load_impl(JNIEnv * env, jstring jpath, jstring jmmproj,
     if (want_spec) {
         cp.n_rs_seq = (uint32_t) kSpecDraftMax;
     }
+    // The NPU engine keeps K and V in Q8_0: the cache takes 53 % of the bytes of F16. The HMX flash
+    // attention reads the Q8_0 rows (patches/memory/0003), and the Hadamard rotation that llama.cpp
+    // applies to a quantized cache runs as a fast transform (patches/memory/0006). On the phone the
+    // attention of a 4B decode token is 0.2 ms slower than with F16 at depth 16, 0.3 ms faster at 4096
+    // and 6.5 ms faster at 16384, and the KL against the naive oracle equals that of F16. The rotation
+    // stays on (the preset).
+    // flash_attn_type stays AUTO: a quantized V needs flash attention, and AUTO probes the device of each
+    // attention layer (patches/memory/0002). When a layer cannot run it, the Q8_0 context does not
+    // initialize, and the engine uses F16. ENABLED would run the op of such a layer on the CPU with no
+    // message. The CPU and the GPU engines keep F16. The hybrid engine keeps F16 too: it copies these
+    // parameters to its NPU prefill context and moves the state into its GPU decode context. The MTP draft
+    // context keeps the preset of common_params (F16).
+    const bool kv_q8_0 = device.rfind("HTP", 0) == 0 && !hybrid;
+    if (kv_q8_0) {
+        cp.type_k = GGML_TYPE_Q8_0;
+        cp.type_v = GGML_TYPE_Q8_0;
+    }
     e->ctx = llama_init_from_model(e->model, cp);
+    if (e->ctx == nullptr && kv_q8_0) {
+        LOGE("the context with a Q8_0 KV cache did not initialize on %s, the engine uses an F16 KV cache",
+             device.c_str());
+        cp.type_k = GGML_TYPE_F16;
+        cp.type_v = GGML_TYPE_F16;
+        e->ctx    = llama_init_from_model(e->model, cp);
+    }
     if (e->ctx == nullptr) {
         throw_java(env, "The context did not initialize (n_ctx=" + std::to_string(n_ctx) + ")");
         return 0;
@@ -2097,9 +2121,9 @@ static jlong load_impl(JNIEnv * env, jstring jpath, jstring jmmproj,
     rebuild_sampler(*e, false, 0.7f, 0.8f);
     open_stores(*e, cache, path);
 
-    LOGI("model loaded: %s, device=%s, prefill=%s, gpu_layers=%d, threads=%d, n_ctx=%u, mmproj=%s, image tokens %d, draft %s",
+    LOGI("model loaded: %s, device=%s, prefill=%s, gpu_layers=%d, threads=%d, n_ctx=%u, kv=%s, mmproj=%s, image tokens %d, draft %s",
          path.c_str(), device.empty() ? "cpu" : device.c_str(), prefill.empty() ? "same" : prefill.c_str(),
-         gpu_layers, e->n_threads, llama_n_ctx(e->ctx), e->mmproj.empty() ? "none" : e->mmproj.c_str(),
+         gpu_layers, e->n_threads, llama_n_ctx(e->ctx), ggml_type_name(cp.type_k), e->mmproj.empty() ? "none" : e->mmproj.c_str(),
          e->image_max_tokens, e->spec != nullptr ? "on" : e->mtp_ready ? "off" : "absent");
     return engine_table().add(std::move(e));
 }
