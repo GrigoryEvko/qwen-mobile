@@ -101,26 +101,27 @@ class Model:
         return self.d_state * self.d_state * self.n_v_heads * 4
 
 
-# The 4B shapes are measured, not assumed. Every per-tensor byte count of a decode
-# token was read out of a device profile (tools/prof/store/20260919T213512Z-stalls-p1.log)
-# and divided by its layer count, which gives the parameter count of each matrix:
+# The shapes come from the metadata and the tensors of the GGUF files (weights/gguf/Qwen3.5-4B-Q8_0.gguf
+# and Qwen3.5-2B-Q8_0.gguf): qwen35.attention.head_count, head_count_kv, key_length,
+# ssm.state_size, ssm.group_count and ssm.time_step_rank. The tensors of the 4B:
 #   ffn_gate/up/down  2560 x 9216     thus n_ff is 9216 and not 9728
 #   attn_qkv          2560 x 8192     thus conv_dim 8192 = 2*key_dim + value_dim
 #   attn_gate         2560 x 4096     thus value_dim 4096 = d_state 128 x 32 heads
 #   ssm_out           4096 x 2560     thus key_dim 2048 = d_state 128 x 16 heads
-#   attn_q            2560 x 8192     the q projection is doubled, the attention is gated
-#   attn_k, attn_v    2560 x 1024     thus n_head_kv is 8 and not 2
+#   attn_q            2560 x 8192     16 heads of 256, doubled: the attention is gated
+#   attn_k, attn_v    2560 x 1024     4 KV heads of 256
 #   token_embd        2560 x 248320   the head, tied
-# The sum is 4468 MB against 4482 MB measured, and with the F16 multi-token-prediction
-# block of 241 MB it reaches 4710 MB against the 4.40 GiB file, thus the model is closed.
+# The byte counts of a 4B decode token agree with a device profile
+# (tools/prof/store/20260919T213512Z-stalls-p1.log): the sum is 4468 MB against 4482 MB
+# measured, and with the F16 multi-token-prediction block of 241 MB it gives 4710 MB against
+# the 4.40 GiB file. The 2B has 8 heads and 2 KV heads of 256, and 16 value heads.
 MODELS: dict[str, Model] = {
     "4b": Model("Qwen3.5-4B", n_embd=2560, n_ff=9216, n_layer=32, n_gdn=24,
-                vocab=248320, n_head_kv=8, head_dim=128, n_head=32,
+                vocab=248320, n_head_kv=4, head_dim=256, n_head=16,
                 d_state=128, n_v_heads=32, n_k_heads=16),
-    # The 2B is scaled from the 4B and is NOT measured. Treat its numbers as a hypothesis.
     "2b": Model("Qwen3.5-2B", n_embd=2048, n_ff=6144, n_layer=24, n_gdn=18,
-                vocab=248320, n_head_kv=8, head_dim=128, n_head=32,
-                d_state=128, n_v_heads=32, n_k_heads=16),
+                vocab=248320, n_head_kv=2, head_dim=256, n_head=8,
+                d_state=128, n_v_heads=16, n_k_heads=16),
 }
 
 
@@ -223,8 +224,9 @@ def target_budget(m: Model, p: Plan) -> Budget:
 def mtp_layer_bytes(m: Model, p: Plan) -> float:
     """The weight bytes of the multi-token-prediction block, without its head.
 
-    The block holds one decoder layer plus the ``eh_proj`` matrix, which maps the
-    concatenation of the hidden state and the embedding back to the hidden size.
+    The block holds one full-attention decoder layer plus the ``eh_proj`` matrix, which maps
+    the concatenation of the hidden state and the embedding back to the hidden size. Its
+    attention is gated as in the trunk: the q projection is twice the head width.
 
     Args:
         m: The model
@@ -236,8 +238,9 @@ def mtp_layer_bytes(m: Model, p: Plan) -> float:
     eh = 2 * m.n_embd * m.n_embd
     mlp = 3 * m.n_embd * m.n_ff
     kv = 2 * m.n_head_kv * m.head_dim * m.n_embd
-    qo = 2 * m.n_embd * m.n_embd
-    return _bytes_of(eh + mlp + kv + qo, p.mtp)
+    q = 2 * m.head_dim * m.n_head * m.n_embd
+    o = m.head_dim * m.n_head * m.n_embd
+    return _bytes_of(eh + mlp + kv + q + o, p.mtp)
 
 
 def draft_step_bytes(m: Model, p: Plan, draft_head_rows: int | None = None) -> tuple[float, float]:
