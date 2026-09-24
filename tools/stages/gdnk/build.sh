@@ -19,7 +19,9 @@
 #      GDNK_STAGE/android with the preset, the flags (with -flto) and the build number and commit of
 #      scripts/build-native.sh, and builds the libraries of the app (LLAMA_LIBS of scripts/lib.sh), the DSP
 #      library v79, llama-bench, llama-perplexity and test-backend-ops.
-#   3. The script copies the files of the stage into GDNK_STAGE/phone and writes SHA256SUMS.
+#   3. The script copies the files of the stage into GDNK_STAGE/phone and writes SHA256SUMS. It stops if a
+#      program or a library of the stage needs a llama, ggml or mtmd library (readelf, NEEDED) that is not
+#      in phone/lib.
 #
 # Time: about 15 minutes with JOBS=24 (the LTO links take most of it). Disk: about 2 GB.
 set -euo pipefail
@@ -94,6 +96,19 @@ for lib in $LLAMA_LIBS llama-bench-impl llama-perplexity-impl; do
 done
 cp -f "$bdir/ggml/src/ggml-hexagon/libggml-htp-v79.so" "$out/lib/"
 cp -f "$bdir/bin/llama-bench" "$bdir/bin/llama-perplexity" "$bdir/bin/test-backend-ops" "$out/bin/"
+# The phone gives the system libraries. Each llama, ggml or mtmd library that an ELF file needs must be in
+# lib/ (readelf, NEEDED), the same check as tools/stages/fuse-mm/build.sh.
+for elf in "$out"/bin/* "$out"/lib/*.so; do
+    [[ $(head -c 4 "$elf") == $'\x7fELF' ]] || continue
+    for need in $(readelf -d "$elf" | grep -o 'Shared library: \[[^]]*' | grep -o '\[.*'); do
+        need=${need#[}
+        case $need in
+            libllama* | libggml* | libmtmd*)
+                [[ -f $out/lib/$need ]] || die "$(basename "$elf") needs $need, which is not in $out/lib"
+                ;;
+        esac
+    done
+done
 cp -f tools/phone/gate.sh "$out/bin/"
 (cd "$out" && sha256sum bin/* lib/* > SHA256SUMS)
 cat "$out/SHA256SUMS"

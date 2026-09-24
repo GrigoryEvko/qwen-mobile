@@ -84,8 +84,20 @@ RUNS = (
     ("x16C", "C", 16, T_BOTH, False, "the scaled f16 tiles through f32 and the add of zero"),
 )
 LIMIT = 100
-STAGE_FILES = ("bin/gate.sh", "bin/test-backend-ops", "lib/libggml-base.so", "lib/libggml-cpu.so",
-               "lib/libggml-hexagon.so", "lib/libggml-htp-v79.so", "lib/libggml-opencl.so", "lib/libggml.so")
+
+
+def stage_files() -> list[str]:
+    """The files of the stage: each line of phone/SHA256SUMS that the build wrote. The build recipe checks
+    that phone/lib holds each llama, ggml and mtmd library that a program needs, thus the stage pushes
+    all of them. O(files)."""
+    sums = STAGE_DIR / "phone" / "SHA256SUMS"
+    if not sums.exists():
+        sys.exit(f"probe.py: {sums} does not exist. Build the stage first (GDNK_STAGE={LAPTOP_STAGE} "
+                 "tools/stages/gdnk/build.sh).")
+    files = [line.split()[1] for line in sums.read_text().splitlines() if line.strip()]
+    if "bin/test-backend-ops" not in files or not any(f.startswith("lib/") for f in files):
+        sys.exit(f"probe.py: {sums} has no test-backend-ops or no library")
+    return files
 
 HEADER = """\
 # Phone stage "gdnk2": the variants of the stage gdnk one by one, and the probes of the state path of version 2
@@ -117,9 +129,10 @@ def run_lines(name: str, variant: str, probe: int, args: str, logcat: bool, text
 
 
 def setup_lines() -> list[str]:
-    """The lines that copy the stage to the phone and check its files, with the .farf mask file."""
-    bins = " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in STAGE_FILES if f.startswith("bin/"))
-    libs = " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in STAGE_FILES if f.startswith("lib/"))
+    """The lines that copy each file of the stage to the phone and check it, with the .farf mask file."""
+    files = stage_files()
+    bins = " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in files if f.startswith("bin/"))
+    libs = " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in files if f.startswith("lib/"))
     return [
         f"mkdir -p {LAPTOP_STAGE} && rsync -a --delete {BOX}/phone/ {LAPTOP_STAGE}/phone/",
         f"(cd {LAPTOP_STAGE}/phone && sha256sum -c SHA256SUMS)",
@@ -127,8 +140,10 @@ def setup_lines() -> list[str]:
         f"{S.ADB} push {bins} {PHONE}/bin/",
         f"{S.ADB} push {libs} {PHONE}/lib/",
         f"{S.ADB} push {LAPTOP_STAGE}/phone/SHA256SUMS {PHONE}/",
-        f"{S.ADB} shell 'cd {PHONE} && sha256sum -c SHA256SUMS 2>/dev/null | grep -c OK; chmod 755 {PHONE}/bin/*; "
-        f"echo 0x1f > {PHONE}/lib/test-backend-ops.farf; echo 0x1f > {PHONE}/bin/test-backend-ops.farf'",
+        # each of the files must check, thus the count of OK lines must be the count of the files
+        f"{S.ADB} shell 'cd {PHONE} && sha256sum -c SHA256SUMS | grep -c OK; echo {len(files)} files; "
+        f"chmod 755 {PHONE}/bin/*; echo 0x1f > {PHONE}/lib/test-backend-ops.farf; "
+        f"echo 0x1f > {PHONE}/bin/test-backend-ops.farf'",
     ]
 
 
