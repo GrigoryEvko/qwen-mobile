@@ -229,8 +229,7 @@ HEADER = """\
 # The libraries: tools/stages/v81/build.sh (build/v81/{stage}): the patched llama.cpp tree of HEAD (with
 # hexagon-v81/0001, v81 uses the f32 to f16 conversion of v79) plus the patches of build/v81/patches: 0002 the
 # start-up self-test of the DSP (the host library), 0003 the stride of the transpose tile copy (cpy-ops.c of the
-# DSP library) with four CONT cases of test-backend-ops. dsp-base holds the DSP libraries of HEAD
-# (build/v81/dsp-compare.txt gives the hashes of the two sets).
+# DSP library) with four CONT cases of test-backend-ops.{base_text}
 #
 # The runs and the decision of each:
 {runs}
@@ -280,7 +279,9 @@ def write_commands(set_name: str, path: Path) -> None:
              "timing of the DSP library." if not kit else
              "The v81 silicon kit: a phone with the Hexagon v81 DSP (Snapdragon 8 Elite Gen 5, SM8850) of a device farm.")
     decisions = KIT_DECISIONS if kit else DECISIONS
-    text = HEADER.format(title=title, stage=t.stage,
+    base_text = "" if kit else ("\n# dsp-base holds the DSP libraries of HEAD (build/v81/dsp-compare.txt gives the "
+                                "hashes of the two sets).")
+    text = HEADER.format(title=title, stage=t.stage, base_text=base_text,
                          runs="\n".join(f"#   {k}: {v}" for k, v in decisions.items()),
                          charger="a charger permitted (ALLOW_CHARGER=1)" if kit else "no charger",
                          minutes=20 if kit else 18, n_runs=len(rs))
