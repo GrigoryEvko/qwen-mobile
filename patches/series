@@ -217,3 +217,7 @@ fuzz-core/0025-reject-a-nan-or-an-inf-in-the-data-of-a-state-blob.patch
 fuzz-hexhost/0018-hexagon-retry-a-dspqueue-read-or-write-that-a-signal-interrupts.patch
 fuzz-core/0026-check-the-data-of-a-state-blob-in-the-copy-of-the-host-reader.patch
 fuzz-ops/0018-hexagon-htp-keep-the-sign-of-zero-in-the-f16-conversion-of-v79-copy-to-f16-without-unroll.patch
+
+# memory: the host sends the Hadamard rotation of a quantized KV cache (a hinted MUL_MAT) as the DSP op FWHT, a fast
+# Walsh-Hadamard transform, for the decode shapes and for rows of 64 values.
+memory/0006-hexagon-run-the-kv-cache-rotation-as-a-fast-walsh-hadamard-transform.patch

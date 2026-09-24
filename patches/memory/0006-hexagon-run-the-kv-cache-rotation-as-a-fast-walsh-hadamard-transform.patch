@@ -1,0 +1,427 @@
+hexagon: run the KV cache rotation as a fast Walsh-Hadamard transform
+Fold-into: upstream/hexagon-htp
+
+The defect
+
+A quantized KV cache makes llama.cpp rotate Q, K and V with a Hadamard matrix
+(llama_mul_mat_hadamard), and the attention output back. Each rotation is a
+MUL_MAT with the hint GGML_HINT_SRC0_IS_HADAMARD. The CPU, CUDA, Metal, Vulkan
+and SYCL backends run a fast Walsh-Hadamard transform (FWHT) for such a
+MUL_MAT and do not read the matrix. HTP0 multiplied by the full matrix: on the
+phone the rotations of one decode token took 226 us (2B) and 382 us (4B).
+
+The change
+
+The host sends a hinted MUL_MAT as the DSP op HTP_OP_FWHT (htp/fwht-ops.c)
+when src1 and dst are F32 with packed rows of 64, 128 or 256 values. The op
+does not read src0. It multiplies each row by 1/sqrt(n), then it does the
+butterflies in the sequence of ggml_compute_forward_fwht_f32, thus with IEEE
+adds each value is the value of the CPU transform. A stage in one vector (1 to
+16 values) gets the partner of each lane with one vdelta and selects the sum
+or the difference with a lane mask. A stage across vectors adds and subtracts
+full vectors. Groups of 16 vectors (2 rows of 256, 4 rows of 128, 8 rows of 64)
+stay in the registers. With less than 256 rows the op uses one thread.
+
+Rows of 64 values always go to the op. Rows of 128 or 256 values go to the
+op to a maximum of 8192 values (32 rows of 256). The per-op profile of the
+phone gives the limit: for rows of 256 values the op takes 2 to 13 us from 2
+to 32 rows, against 8 to 19 us for the MUL_MAT, and from 64 rows the HMX
+MUL_MAT is faster (17.5 against 19 us at 64 rows, 452 against 594 us at 8192
+rows). For rows of 64 values the op is as fast or faster at each measured
+count (8 to 65536 rows). Thus a decode step runs each rotation as the op, and
+a prefill block runs the rotation of Q and K as the MUL_MAT. A different
+MUL_MAT stays HTP_OP_MUL_MAT.
+
+supports_op accepts each MUL_MAT that the op takes, with no VTCM check,
+because the op uses no VTCM. ggml_hexagon_rows_packed requires the strides
+that the op requires: ggml_is_contiguous permits any stride for a dimension
+of size 1, and the op refuses such a descriptor with HTP_STATUS_NO_SUPPORT.
+The op also refuses a dst with a different row count.
+
+test-backend-ops gets six MUL_MAT_HADAMARD cases: a pair of rows of 256 and
+one more row, 32 and 33 rows of 256 (the two sides of the limit), a group of
+4 rows of 128 and 3 more rows, a group of 8 rows of 64 and 5 more rows, and
+300 rows of 64 for more than one thread.
+
+The results
+
+The kernel lab (tools/htp-lab, target fwht, the release flags, one thread)
+gives 363 cycles for a row of 256 values and 87 for a row of 64 on v79
+(timing mode). On v79 and v81 each value is equal to the value of the CPU
+transform. On v73 and v75 the adds give qf32 values: 24800 of 35840 values
+differ from the CPU transform, and the largest error is 3.5e-7 of the largest
+value of a row, against 1.3e-7 for the f32 CPU transform (functional mode,
+the error against a float64 transform).
+
+On the phone (HTP0, a build of this op with no row limit, 2026-09-23 and
+2026-09-24), the rotations of one decode token take 104 us (2B) and 212 us
+(4B), against 226 and 382 us for the MUL_MAT. A greedy generation of the 2B
+and of the 4B with a Q8_0 K and V cache gives the correct answer. The KL of
+the 64 decode rows against the naive x86 oracle is 0.000807 for the 2B at
+4096 tokens (F16 cache 0.000745), 0.000931 at 16384 (0.001053), and for the
+4B 0.000545 at 4096 (0.000565) and 0.000667 at 16384 (0.000696).
+
+On the phone with this patch (HTP0, 2026-09-24, the library set of the
+series with this patch): test-backend-ops gives 15 of 15 MUL_MAT_HADAMARD
+cases against the CPU. A greedy generation of the 4B with a Q8_0 K and V
+cache and flash attention in AUTO mode gives the correct answer. The KL of
+the 4B at 4096 tokens against the naive x86 oracle is 0.000510 for all rows
+and 0.000542 for the 64 decode rows. The profile of the 4B (1024 prompt
+tokens, 8 decode tokens) has 288 rotations, 272 of them as HTP_OP_FWHT: each
+decode rotation, and V and the attention output of the prefill.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    ggml/src/ggml-hexagon/ggml-hexagon.cpp
+    ggml/src/ggml-hexagon/htp/CMakeLists.txt
+    ggml/src/ggml-hexagon/htp/fwht-ops.c
+    ggml/src/ggml-hexagon/htp/htp-ctx.h
+    ggml/src/ggml-hexagon/htp/htp-ops.h
+    ggml/src/ggml-hexagon/htp/main.c
+    tests/test-backend-ops.cpp
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 5627e25..0e179fe 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -179,6 +179,7 @@ static const char * htp_op_name(uint32_t opcode) {
+         case HTP_OP_SUB:              return "SUB";
+         case HTP_OP_DIV:              return "DIV";
+         case HTP_OP_MUL_MAT:          return "MUL_MAT";
++        case HTP_OP_FWHT:             return "FWHT";
+         case HTP_OP_MUL_MAT_ID:       return "MUL_MAT_ID";
+         case HTP_OP_MUL_MAT_NX:       return "MUL_MAT_NX";
+         case HTP_OP_MUL_MAT_ID_NX:    return "MUL_MAT_ID_NX";
+@@ -5651,10 +5652,56 @@ static bool ggml_hexagon_tensor_is_non_host(const struct ggml_hexagon_session *
+     GGML_UNUSED(sess);
+ }
+ 
++// Returns true when each row of t follows the row before it with no space: nb[0] is the size of one
++// value, and each stride is the stride of the dimension before it times its count. The DSP op
++// HTP_OP_FWHT requires this layout. ggml_is_contiguous permits any stride for a dimension of size 1.
++static bool ggml_hexagon_rows_packed(const struct ggml_tensor * t) {
++    return t->nb[0] == ggml_type_size(t->type) && t->nb[1] == t->nb[0] * t->ne[0] &&
++           t->nb[2] == t->nb[1] * t->ne[1] && t->nb[3] == t->nb[2] * t->ne[2];
++}
++
++// The largest count of values (rows times n) of a rotation with rows of 128 or 256 values that the DSP
++// runs as HTP_OP_FWHT. Rows of 64 values have no limit. Refer to ggml_hexagon_is_fwht.
++static constexpr int64_t GGML_HEXAGON_FWHT_MAX_VALUES = 8192;
++
++// Returns true for a MUL_MAT by the Hadamard matrix of llama.cpp (the hint GGML_HINT_SRC0_IS_HADAMARD)
++// that the DSP runs as a fast Walsh-Hadamard transform (HTP_OP_FWHT, htp/fwht-ops.c). The op does not
++// read src0. It takes F32 src1 and dst with packed rows of 64, 128 or 256 values.
++//
++// The limit of the row count comes from the phone (HTP0, the profile of the 2B and the 4B at the
++// depths 16 to 16384). For rows of 64 values the op is as fast as the MUL_MAT or faster at each
++// measured count (8 to 65536 rows). For rows of 256 values the op takes 2 to 13 us from 2 to 32 rows,
++// against 8 to 19 us for the MUL_MAT. From 64 rows the HMX MUL_MAT is faster: 17.5 against 19 us at
++// 64 rows, 452 against 594 us at 8192 rows. Thus the limit is 32 rows of 256 values (8192 values),
++// which holds each decode step (2 to 16 rows). Rows of 128 values get the same count of values. A
++// different MUL_MAT stays HTP_OP_MUL_MAT, which multiplies by the matrix.
++static bool ggml_hexagon_is_fwht(const struct ggml_tensor * t) {
++    if (t->op != GGML_OP_MUL_MAT || ggml_get_op_params_i32(t, 1) != GGML_HINT_SRC0_IS_HADAMARD) {
++        return false;
++    }
++    const struct ggml_tensor * src1 = t->src[1];
++    const int64_t              n    = src1->ne[0];
++    if (src1->type != GGML_TYPE_F32 || t->type != GGML_TYPE_F32 || t->ne[0] != n) {
++        return false;
++    }
++    if (!ggml_hexagon_rows_packed(src1) || !ggml_hexagon_rows_packed(t)) {
++        return false;
++    }
++    if (n == 64) {
++        return true;
++    }
++    return (n == 128 || n == 256) && ggml_nelements(src1) <= GGML_HEXAGON_FWHT_MAX_VALUES;
++}
++
+ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * sess, const struct ggml_tensor * dst) {
+     const struct ggml_tensor * src0 = dst->src[0];
+     const struct ggml_tensor * src1 = dst->src[1];
+ 
++    // HTP_OP_FWHT needs no VTCM and does not read src0
++    if (ggml_hexagon_is_fwht(dst)) {
++        return true;
++    }
++
+     if (dst->type != GGML_TYPE_F32) {
+         return false;
+     }
+@@ -6437,7 +6484,7 @@ static void ggml_backend_hexagon_free(ggml_backend_t backend) {
+ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
+     switch (t->op) {
+         case GGML_OP_FLASH_ATTN_EXT:  return HTP_OP_FLASH_ATTN_EXT;
+-        case GGML_OP_MUL_MAT:         return HTP_OP_MUL_MAT;
++        case GGML_OP_MUL_MAT:         return ggml_hexagon_is_fwht(t) ? HTP_OP_FWHT : HTP_OP_MUL_MAT;
+         case GGML_OP_MUL_MAT_ID:      return HTP_OP_MUL_MAT_ID;
+         case GGML_OP_MUL:             return HTP_OP_MUL;
+         case GGML_OP_ADD:             return HTP_OP_ADD;
+diff --git a/ggml/src/ggml-hexagon/htp/CMakeLists.txt b/ggml/src/ggml-hexagon/htp/CMakeLists.txt
+index 3382ca0..580eb9e 100644
+--- a/ggml/src/ggml-hexagon/htp/CMakeLists.txt
++++ b/ggml/src/ggml-hexagon/htp/CMakeLists.txt
+@@ -39,6 +39,7 @@ add_library(${HTP_LIB} SHARED
+     ssm-conv.c
+     cumsum-ops.c
+     fill-ops.c
++    fwht-ops.c
+     concat-ops.c
+     diag-ops.c
+     solve-tri-ops.c
+diff --git a/ggml/src/ggml-hexagon/htp/fwht-ops.c b/ggml/src/ggml-hexagon/htp/fwht-ops.c
+new file mode 100644
+index 0000000..e8e3581
+--- /dev/null
++++ b/ggml/src/ggml-hexagon/htp/fwht-ops.c
+@@ -0,0 +1,193 @@
++#pragma clang diagnostic ignored "-Wunused-function"
++
++#include <math.h>
++#include <string.h>
++
++#include "hex-common.h"
++
++#include "hvx-utils.h"
++
++#include "htp-ctx.h"
++#include "htp-ops.h"
++#include "htp-tensor.h"
++
++// The KV cache rotation of llama.cpp as a fast Walsh-Hadamard transform. llama.cpp rotates Q, K and V
++// with a MUL_MAT by a Hadamard matrix (llama_mul_mat_hadamard) and marks that MUL_MAT with the hint
++// GGML_HINT_SRC0_IS_HADAMARD. The host sends such a MUL_MAT as HTP_OP_FWHT. For each row of src1,
++// dst = H src1, with H the n x n Sylvester matrix times 1/sqrt(n). The op does not read src0.
++// The butterflies run in the sequence of the CPU backend (ggml_compute_forward_fwht_f32: the scale
++// first, then the stages of length 1, 2, 4 and more). O(rows * n * log2(n)).
++
++struct htp_fwht_context {
++    struct htp_ops_context * octx;
++    uint32_t                 n;
++    uint32_t                 row_start;
++    uint32_t                 nrows;
++    uint32_t                 nrows_per_thread;
++    HVX_Vector               scale;
++    HVX_Vector               lane_mask[5];  // lane i is all ones when bit s of i is set
++    HVX_Vector               swap_ctl[5];   // the vdelta control of the swap i <-> i XOR 2^s
++};
++
++// One stage of length 2^s (1 to 16 values) in one vector: a lane with bit s clear gets
++// v[i] + v[i + 2^s], a lane with bit s set gets v[i - 2^s] - v[i].
++static inline HVX_Vector fwht_stage(HVX_Vector v, HVX_Vector swap_ctl, HVX_VectorPred q) {
++    const HVX_Vector p   = Q6_V_vdelta_VV(v, swap_ctl);
++    const HVX_Vector sum = hvx_vec_add_f32_f32(v, p);
++    const HVX_Vector dif = hvx_vec_sub_f32_f32(p, v);
++    return Q6_V_vmux_QVV(q, dif, sum);
++}
++
++// Transforms G rows of NV vectors from src to dst in registers. NV and G are constants at each
++// call, thus the array t stays in vector registers.
++static inline __attribute__((always_inline)) void fwht_group(uint8_t * restrict dst, const uint8_t * restrict src,
++                                                             const uint32_t NV, const uint32_t G,
++                                                             const struct htp_fwht_context * fc) {
++    HVX_Vector t[16];
++#pragma clang loop unroll(full)
++    for (uint32_t j = 0; j < NV * G; ++j) {
++        t[j] = hvx_vec_mul_f32_f32(*(const HVX_UVector *) (src + 128 * j), fc->scale);
++    }
++#pragma clang loop unroll(full)
++    for (int s = 0; s < 5; ++s) {
++        const HVX_VectorPred q = Q6_Q_vand_VR(fc->lane_mask[s], 0xffffffff);
++#pragma clang loop unroll(full)
++        for (uint32_t j = 0; j < NV * G; ++j) {
++            t[j] = fwht_stage(t[j], fc->swap_ctl[s], q);
++        }
++    }
++#pragma clang loop unroll(full)
++    for (uint32_t k = 1; k < NV; k <<= 1) {
++#pragma clang loop unroll(full)
++        for (uint32_t r = 0; r < G; ++r) {
++#pragma clang loop unroll(full)
++            for (uint32_t j = 0; j < NV; j += 2 * k) {
++#pragma clang loop unroll(full)
++                for (uint32_t i = j; i < j + k; ++i) {
++                    const HVX_Vector a = t[r * NV + i];
++                    const HVX_Vector b = t[r * NV + i + k];
++                    t[r * NV + i]      = hvx_vec_add_f32_f32(a, b);
++                    t[r * NV + i + k]  = hvx_vec_sub_f32_f32(a, b);
++                }
++            }
++        }
++    }
++#pragma clang loop unroll(full)
++    for (uint32_t j = 0; j < NV * G; ++j) {
++        *(HVX_UVector *) (dst + 128 * j) = t[j];
++    }
++}
++
++// Transforms the rows [r0, r1) of n values each. Groups of 16 vectors (2 rows of 256, 4 rows of 128,
++// 8 rows of 64) go through the stages together.
++static void fwht_rows(uint8_t * dst, const uint8_t * src, uint32_t n, uint32_t r0, uint32_t r1,
++                      const struct htp_fwht_context * fc) {
++    const size_t row = (size_t) n * sizeof(float);
++    uint32_t     r   = r0;
++    if (n == 256) {
++        for (; r + 2 <= r1; r += 2) {
++            fwht_group(dst + r * row, src + r * row, 8, 2, fc);
++        }
++        for (; r < r1; ++r) {
++            fwht_group(dst + r * row, src + r * row, 8, 1, fc);
++        }
++    } else if (n == 128) {
++        for (; r + 4 <= r1; r += 4) {
++            fwht_group(dst + r * row, src + r * row, 4, 4, fc);
++        }
++        for (; r < r1; ++r) {
++            fwht_group(dst + r * row, src + r * row, 4, 1, fc);
++        }
++    } else {
++        for (; r + 8 <= r1; r += 8) {
++            fwht_group(dst + r * row, src + r * row, 2, 8, fc);
++        }
++        for (; r < r1; ++r) {
++            fwht_group(dst + r * row, src + r * row, 2, 1, fc);
++        }
++    }
++}
++
++static void fwht_thread(unsigned int nth, unsigned int ith, void * data) {
++    const struct htp_fwht_context * fc   = (const struct htp_fwht_context *) data;
++    struct htp_ops_context *        octx = fc->octx;
++    const uint32_t r0 = fc->row_start + fc->nrows_per_thread * ith;
++    const uint32_t r1 = MIN(r0 + fc->nrows_per_thread, fc->row_start + fc->nrows);
++    if (r0 >= r1) {
++        return;
++    }
++    fwht_rows((uint8_t *) octx->dst->data, (const uint8_t *) octx->src[1]->data, fc->n, r0, r1, fc);
++    (void) nth;
++}
++
++// True when the rows of t are packed: nb[0] is one float and each stride is the stride of the
++// dimension before it times its count.
++static bool fwht_rows_packed(const struct htp_tensor * t, uint32_t n) {
++    return t->nb[0] == sizeof(float) && t->nb[1] == n * sizeof(float) && t->nb[2] == t->nb[1] * t->ne[1] &&
++           t->nb[3] == t->nb[2] * t->ne[2];
++}
++
++int op_fwht(struct htp_ops_context * octx) {
++    const struct htp_tensor * src = octx->src[1];
++    const struct htp_tensor * dst = octx->dst;
++
++    // The host sends only an F32 MUL_MAT with packed rows of 64, 128 or 256 values as this op
++    // (ggml_hexagon_is_fwht). These checks refuse a different descriptor, because the op writes
++    // ne[1] * ne[2] * ne[3] rows of src1 into dst.
++    if (src->type != HTP_TYPE_F32 || dst->type != HTP_TYPE_F32) {
++        return HTP_STATUS_NO_SUPPORT;
++    }
++    const uint32_t n = src->ne[0];
++    if (n != 64 && n != 128 && n != 256) {
++        return HTP_STATUS_NO_SUPPORT;
++    }
++    if (dst->ne[0] != n || dst->ne[1] != src->ne[1] || dst->ne[2] != src->ne[2] || dst->ne[3] != src->ne[3] ||
++        !fwht_rows_packed(src, n) || !fwht_rows_packed(dst, n)) {
++        return HTP_STATUS_NO_SUPPORT;
++    }
++    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
++        return HTP_STATUS_OK;
++    }
++
++    const uint32_t nr        = src->ne[1] * src->ne[2] * src->ne[3];
++    uint32_t       row_start = 0;
++    uint32_t       nrows     = nr;
++    if (octx->ctx->mdev.count > 1) {
++        const struct htp_tensor_mdev_range range =
++            htp_tensor_mdev_partition(nr, 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
++        row_start = range.start;
++        nrows     = range.count;
++    }
++    if (nrows == 0) {
++        return HTP_STATUS_OK;
++    }
++
++    struct htp_fwht_context fc;
++    fc.octx      = octx;
++    fc.n         = n;
++    fc.row_start = row_start;
++    fc.nrows     = nrows;
++    fc.scale     = hvx_vec_splat_f32(1.0f / sqrtf((float) n));
++    for (int s = 0; s < 5; ++s) {
++        uint32_t m[32] __attribute__((aligned(128)));
++        uint8_t  c[128] __attribute__((aligned(128)));
++        for (int i = 0; i < 32; ++i) {
++            m[i] = (i & (1 << s)) ? 0xffffffffu : 0u;
++        }
++        memset(c, 4 << s, sizeof(c));
++        fc.lane_mask[s] = *(const HVX_Vector *) m;
++        fc.swap_ctl[s]  = *(const HVX_Vector *) c;
++    }
++
++    // A decode step has 2 to 64 rows: one thread and no work queue. A prefill block divides its
++    // rows between the threads.
++    const uint32_t n_threads = nrows >= 256 ? octx->n_threads : 1;
++    if (n_threads <= 1) {
++        fc.nrows_per_thread = nrows;
++        fwht_thread(1, 0, &fc);
++    } else {
++        fc.nrows_per_thread = (nrows + n_threads - 1) / n_threads;
++        work_queue_run(octx->ctx->work_queue, fwht_thread, &fc, n_threads);
++    }
++    return HTP_STATUS_OK;
++}
+diff --git a/ggml/src/ggml-hexagon/htp/htp-ctx.h b/ggml/src/ggml-hexagon/htp/htp-ctx.h
+index 2068d4e..49a2fdc 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-ctx.h
++++ b/ggml/src/ggml-hexagon/htp/htp-ctx.h
+@@ -170,6 +170,7 @@ int op_argsort(struct htp_ops_context * octx);
+ int op_ssm_conv(struct htp_ops_context * octx);
+ int op_cumsum(struct htp_ops_context * octx);
+ int op_fill(struct htp_ops_context * octx);
++int op_fwht(struct htp_ops_context * octx);
+ int op_concat(struct htp_ops_context * octx);
+ int op_diag(struct htp_ops_context * octx);
+ int op_solve_tri(struct htp_ops_context * octx);
+diff --git a/ggml/src/ggml-hexagon/htp/htp-ops.h b/ggml/src/ggml-hexagon/htp/htp-ops.h
+index f27fd12..9f6906a 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-ops.h
++++ b/ggml/src/ggml-hexagon/htp/htp-ops.h
+@@ -108,6 +108,7 @@ enum htp_op_code {
+     HTP_OP_GDN_CONV_STEP,   // fused GET_ROWS + CONCAT + SSM_CONV + SILU + CPY of the conv state (one token)
+     HTP_OP_GDN_STATE_STEP,  // fused GET_ROWS + GATED_DELTA_NET + CPY of the delta net state (one token)
+     HTP_OP_GDN_CONV_CHUNK,  // the same conv chain over a batch of tokens
++    HTP_OP_FWHT,            // a MUL_MAT by the Hadamard matrix of llama.cpp (GGML_HINT_SRC0_IS_HADAMARD)
+ 
+     HTP_OP_INVALID
+ };
+diff --git a/ggml/src/ggml-hexagon/htp/main.c b/ggml/src/ggml-hexagon/htp/main.c
+index 59c9d21..9d425a6 100644
+--- a/ggml/src/ggml-hexagon/htp/main.c
++++ b/ggml/src/ggml-hexagon/htp/main.c
+@@ -868,6 +868,9 @@ static int execute_op(struct htp_ops_context * octx) {
+         case HTP_OP_FILL:
+             return op_fill(octx);
+ 
++        case HTP_OP_FWHT:
++            return op_fwht(octx);
++
+         case HTP_OP_DIAG:
+             return op_diag(octx);
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index aecb335..2469ad4 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10181,6 +10181,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 256, 512, 256)); // many rows
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 32, 1, 32)); // too small (N<64)
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 1, 1024)); // too big (N>512)
++    // The row groups and the row limits of the Hexagon FWHT op (ggml-hexagon/htp/fwht-ops.c)
++    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 256, 3, 256));   // a pair of rows and one row
++    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 256, 32, 256));  // 8192 values
++    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 256, 33, 256));  // 8448 values
++    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 7, 128));   // a group of 4 rows and 3 rows
++    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 64, 13, 64));    // a group of 8 rows and 5 rows
++    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 64, 300, 64));   // rows for more than one thread
+ 
+ #if 0
+     // > 4GB A matrix. Too slow to be enabled by default.
