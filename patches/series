@@ -231,3 +231,4 @@ spec-mtp/0001-common-the-mtp-drafter-stops-at-the-draft-length-of-the-call.patch
 hexagon-host/0004-hexagon-htp-remove-only-the-mappings-that-a-batch-needs-to-free.patch
 hexagon-host/0005-hexagon-replay-the-packed-batches-of-a-graph-of-more-than-one-batch.patch
 hexagon-host/0006-hexagon-format-the-profile-line-of-an-op-when-the-host-packs-the-batch.patch
+hexagon-mm/0002-hexagon-select-the-hmx-2d-chunks-with-the-cost-of-the-kernel.patch

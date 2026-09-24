@@ -1,0 +1,565 @@
+hexagon: select the chunks of the HMX 2D matmul with the cost of the kernel
+
+Base: llama.cpp commit c6824a9 plus the patches before this one in patches/series.
+
+Files:
+    ggml/src/ggml-hexagon/htp/matmul-ops.h  the cost model of the kernel (htp_mm_hmx_solve_2d_cost), the chunks
+                                            of a request (htp_mm_hmx_fit_2d_chunks) and their constants
+    ggml/src/ggml-hexagon/ggml-hexagon.cpp  the switches GGML_HEXAGON_MM_SOLVER and GGML_HEXAGON_MM_CHUNKS
+    ggml/src/ggml-hexagon/htp-opnode.h      the op lines of an HMX matmul give its chunks
+
+The defect
+
+hmx_mm_2d_f32 and hmx_mm_nx_2d_f32 have two loops. The outer loop gets m_chunk token rows and converts
+their activation rows to f16 tiles one time. The inner loop moves each chunk of n_chunk weight rows
+through the DMA, the dequantization and the HMX. Thus the weights go through the DMA and the
+dequantization one time for each token chunk.
+
+htp_mm_hmx_solve_2d_params adds the cost of the activation conversion for each weight chunk. Thus it
+selects small token chunks, and the weights go through the DMA and the dequantization many times. At
+1024 tokens of the 4B:
+
+    ffn_down (k 9216, n 2560)               m_chunk 128, n_chunk 96, 8 passes
+    ssm_out, attn_output (k 4096, n 2560)   m_chunk 384, n_chunk 192, 3 passes
+    the shapes with k 2560                  2 passes
+
+The phone stage sweep (tools/stages/sweep) measured these ops at 1024 tokens (the DSP time of a fresh op,
+and the part of the op time in which the HMX operates):
+
+    ffn_down               4165 us  51 %  thread 0 waits for the dequantization (21.9 %) and the DMA (21.2 %)
+    ssm_out, attn_output   1598 us  78 %  thread 0 waits for the DMA (13.6 %)
+    attn_k, attn_v          537 us  57 %
+    ffn_gate, ffn_up       3069 us  92 %
+
+The change
+
+1. htp_mm_hmx_solve_2d_cost selects the chunks with the cost of the kernel, in ns:
+
+       passes x n x (the DMA time + the dequantization time of one weight row)
+       + passes x ceil(n / n_chunk) x HTP_MM_HMX_CHUNK_NS
+
+   The activation conversion is the same for each selection, thus it is not a term. For each n chunk,
+   the function uses the largest m chunk of the accurate layout (htp_mm_hmx_get_2d_vtcm_size). The
+   estimate of htp_mm_hmx_compute_chunks adds 6 tiles, thus for ffn_down at n_chunk 32 it gives m_chunk
+   320 and 4 passes. The layout of 352 rows is in the budget, and it gives 3 passes.
+
+2. When the old selection moves the weights through the DMA one time, htp_mm_hmx_solve_2d_cost returns
+   it: no selection has less passes, and the old selection has the widest n chunk. Thus an op changes its
+   chunks only when the old model gives it more than one pass. At 5 to 32 tokens (the verify batch of the
+   MTP draft) each op keeps its chunks. The function does not give more passes than the old model.
+
+3. The host uses the new function for the HMX 2D kernel of MUL_MAT, MUL_MAT_ADD and MUL_MAT_NX. MUL_MAT_ID
+   and the batched F16 kernel have other loops, thus they keep htp_mm_hmx_solve_2d_params. The DSP gets
+   m_chunk and n_chunk in the kernel params, thus the DSP code does not change: libggml-htp-v79.so of the
+   series with this patch has the bytes of the library without it.
+
+4. GGML_HEXAGON_MM_SOLVER=0 selects the old model, for an A/B run with one library set. The preset value
+   1 selects the new model. With the value 0 the backend writes the log line "ggml-hex: the HMX matmul
+   chunks come from the old cost model (GGML_HEXAGON_MM_SOLVER=0)".
+
+5. GGML_HEXAGON_MM_CHUNKS=mc,nc gives each HMX 2D matmul the chunks mc and nc when their layout is in the
+   VTCM budget. A value of 0 gets the largest value for the other value. When the layout is not in the
+   budget, the op keeps the chunks of the solver. The switch is for a series of chunk measurements.
+
+6. The profile lines and the verbose op lines of an HMX matmul give "mc M nc N" after the VTCM value. The
+   first word of the field stays the kernel path, thus the readers of tools/prof and tools/stages do not
+   change.
+
+The constants
+
+    HTP_MM_HMX_DMA_BYTES_PER_US       61000  the stage sweep measured 59 to 62 GB/s for the weight stream of
+                                             this kernel at 5 to 32 tokens, where the DMA sets its time
+    HTP_MM_HMX_DEQUANT_PER_THREAD_US  23000  the phase trace of the stage sweep gives 18900 (k 2560) and
+                                             28000 (k 9216) Q8_0 weights for each HVX thread and us
+    HTP_MM_HMX_CHUNK_NS                2000  the phase trace gives less than 0.2 us for each chunk outside
+                                             the phases of thread 0
+
+At 1024 tokens, one pass of ffn_down costs 632 us in this model. The selections of the 4B shapes at 5 to
+1024 tokens are the same for each chunk time from 0 to 5 us (tools/stages/mmsolve/plan.cpp sensitivity).
+
+The chunks of the 4B at 1024 tokens (computed, tools/stages/mmsolve/plan.cpp table):
+
+    shape                              old                      new
+    ffn_down 9216x2560                 128 x 96, 8 passes       352 x 32, 3 passes
+    ssm_out, attn_output 4096x2560     384 x 192, 3 passes      576 x 128, 2 passes
+    ffn_gate, ffn_up 2560x9216         576 x 288, 2 passes      1024 x 128, 1 pass
+    attn_qkv, attn_q 2560x8192         576 x 288, 2 passes      1024 x 128, 1 pass
+    attn_gate 2560x4096                576 x 288, 2 passes      1024 x 128, 1 pass
+    attn_k, attn_v 2560x1024           672 x 256, 2 passes      1024 x 128, 1 pass
+    MTP ffn_down F16 9216x2560         192 x 64, 6 passes       320 x 32, 4 passes
+    MTP eh_proj F16 5120x2560          288 x 128, 4 passes      544 x 64, 2 passes
+
+The output does not change. Each output tile is one accumulator chain over all of k for each selection
+of the chunks, and the conversions of the activation and of the output change each value independently.
+
+The tests on the host
+
+- tools/stages/mmsolve/plan.cpp check: each 4B shape (Q8_0 and the F16 MTP block) at each token count
+  from 5 to 1024 (15300 cases, 5440 with other chunks) and 20000 random shapes. Each layout is in the
+  budget, each chunk is a multiple of 32 in its range, the new model does not give more passes than the
+  old model, and each case with one old pass keeps the old chunks. 0 failed checks.
+- tests/fuzz/hexhost/run.sh test none --profile release kparams graph envparse on the tree with this
+  patch: 0 findings. The graphs mode runs the real graphs of the 2B and the 4B (decode, prefill 512, the
+  MTP draft and its verify batch, the image turn) against the checks of the DSP layout of each op.
+- tools/htp-lab target mmchunks (the functional simulator, the lab flags and the release flags): MUL_MAT,
+  MUL_MAT with src2 and MUL_MAT_NX of Q8_0 and F16 weights, 31 runs of 7 cases with the old chunks, the
+  new chunks and requests down to n_chunk 32. Each run gives the bytes of the run with the old chunks.
+
+The results on the phone (HTP0, the stage mmsolve of tools/stages/mmsolve, one library set, thermal
+status 0 before each timing run, off the charger)
+
+llama-bench, 4B Q8_0, the flags of the app (-b 1024 -ub 1024, flash attention, Q8_0 K and V), 3 rounds in
+alternated order. t/s as the median of the rounds, and the median of the ratios new / old of one round:
+
+    test            old      new      new / old   each round new / old
+    pp512 d0        890.5    920.8    +4.5 %      +4.5 %, +2.5 %, +6.2 %
+    pp1024 d0       842.0    875.7    +1.3 %      +1.3 %, +4.0 %, +1.3 %
+    pp512 d3072     741.4    769.3    +3.8 %      +1.6 %, +3.8 %, +4.5 %
+    pp1024 d3072    740.0    765.3    +2.4 %      +1.1 %, +3.4 %, +2.4 %
+    tg32 d0         10.38    10.43    +0.1 %
+
+test-backend-ops perf, one op at a time, the DSP time of the op copies 1 to 3 (fresh) and of the last 30 %
+(sustained), the median of 2 rounds:
+
+    shape at tokens              old chunks    new chunks    fresh old  fresh new   sustained old  new
+    ffn_down 9216x2560 at 1024   128 x 96      352 x 32      4227 us    3516 us     5186 us    4633 us
+    ffn_down 9216x2560 at 512    128 x 96      352 x 32      2068 us    1781 us     2847 us    2479 us
+    4096x2560 at 1024            384 x 192     576 x 128     1621 us    1610 us     2192 us    2123 us
+    4096x2560 at 512             288 x 224     512 x 128      834 us     790 us     1136 us    1039 us
+    ffn_gate, ffn_up at 1024     576 x 288     1024 x 128    3087 us    3053 us     4071 us    4136 us
+    attn_k, attn_v at 1024       672 x 256     1024 x 128     544 us     510 us      626 us     598 us
+    MTP ffn_down F16 at 1024     192 x 64      320 x 32      8217 us    6513 us     8977 us    7466 us
+    MTP eh_proj F16 at 1024      288 x 128     544 x 64      3337 us    2650 us     3962 us    3254 us
+    2560x9216 at 32              32 x 480      32 x 480       413 us     418 us      421 us     422 us
+
+The time of one chunk: 2560x9216 at 32 tokens (one pass, the DMA sets the time) with n chunks of 480, 128,
+64 and 32 gives 413, 456, 571 and 761 us for 20, 72, 144 and 288 chunks. Thus a chunk adds 1.3 to 1.6 us
+where the chunks are small, which is in the range 0 to 5 us that gives the same selections.
+
+The profile lines of the stage give the chunks of the plan table for each op of the old and the new model.
+test-backend-ops test mode passes the 29 MUL_MAT cases of the 4B shapes (5 to 1024 tokens) with the new
+model.
+
+mmcheck (tools/stages/mmsolve/mmcheck.cpp, the stage mmsolve-bx) gives a hash of the HTP0 output of 33
+cases: the 4B shapes at 5 to 1024 tokens as MUL_MAT, MUL_MAT_NX and MUL_MAT+ADD, with Q8_0 weights and
+with the F16 weights of the MTP block. The old model, the new model and the request 0,32 give the same
+hash in each case, and the new model with the fusion off gives the same hash too. Each case has 0 values
+that are not finite. The NMSE against the CPU backend of the phone is 1.4e-5 for Q8_0 and 3.6e-6 to
+6.4e-6 for F16.
+
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 0aeebf0..865df3e 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -151,6 +151,18 @@ static int opt_graphcache = 8;
+ // (HTP_OPBATCH_MMAP_LRU), 0 = the DSP removes each mapping that the batch does not use
+ static int opt_mmap_lru = 1;
+ 
++// GGML_HEXAGON_MM_SOLVER: 1 = the chunks of the HMX 2D matmul come from the cost of the kernel
++// (htp_mm_hmx_solve_2d_cost, the default), 0 = from the model that adds the cost of the activation conversion
++// for each weight chunk (htp_mm_hmx_solve_2d_params). Thus an A/B run of the two uses one library set.
++static int opt_mm_solver = 1;
++
++// GGML_HEXAGON_MM_CHUNKS=mc,nc: each HMX 2D matmul uses the m chunk mc and the n chunk nc when a layout of
++// them is in the VTCM budget (htp_mm_hmx_fit_2d_chunks). A value of 0 gets the largest value for the other
++// value. Other matmuls keep the chunks of the solver. The switch is for a series of chunk measurements. The
++// value -1 is no request.
++static int opt_mm_chunks_m = -1;
++static int opt_mm_chunks_n = -1;
++
+ static inline bool ggml_hexagon_is_fusion_enabled(int flag) {
+     if (opt_opfusion <= 0) return false;
+     if (opt_opfusion == 1) return true; // 1 enables all
+@@ -5138,6 +5150,44 @@ static bool ggml_hexagon_matmul_is_hmx_eligible(
+     return true;
+ }
+ 
++// The 2D solve of the HMX chunks. The HMX 2D kernel (not MUL_MAT_ID, not batched) gets the cost of the kernel
++// (htp_mm_hmx_solve_2d_cost) when GGML_HEXAGON_MM_SOLVER is 1, and then the request of GGML_HEXAGON_MM_CHUNKS
++// when a layout of it is in the budget. MUL_MAT_ID and the batched F16 kernel have different loops, thus
++// they keep htp_mm_hmx_solve_2d_params. Returns false when no layout is in the budget.
++static bool ggml_hexagon_solve_hmx_2d(int wtype, int k, int m_id_rows, int ne01_padded, int ne11_padded, int ne11,
++                                      int n_threads, bool pipeline, bool is_matmul_id, bool is_batched,
++                                      int aligned_tile_size, size_t vtcm_budget, size_t * m_chunk, size_t * n_chunk,
++                                      int * act_threads, size_t * vtcm_size) {
++    const bool kernel_2d = !is_matmul_id && !is_batched;
++    if (!kernel_2d || !opt_mm_solver) {
++        if (!htp_mm_hmx_solve_2d_params(wtype, k, m_id_rows, ne01_padded, ne11_padded, ne11, n_threads, pipeline,
++                                        is_matmul_id, aligned_tile_size, vtcm_budget, m_chunk, n_chunk, act_threads,
++                                        vtcm_size)) {
++            return false;
++        }
++    } else if (!htp_mm_hmx_solve_2d_cost(wtype, k, ne01_padded, ne11_padded, ne11, n_threads, pipeline,
++                                         aligned_tile_size, vtcm_budget, m_chunk, n_chunk, act_threads, vtcm_size)) {
++        return false;
++    }
++
++    if (kernel_2d && opt_mm_chunks_m >= 0) {
++        size_t mc = 0, nc = 0, size = 0;
++        int    threads = 0;
++        if (htp_mm_hmx_fit_2d_chunks(wtype, k, ne01_padded, ne11_padded, n_threads, pipeline, aligned_tile_size,
++                                     vtcm_budget, opt_mm_chunks_m, opt_mm_chunks_n, &mc, &nc, &threads, &size)) {
++            *m_chunk     = mc;
++            *n_chunk     = nc;
++            *act_threads = threads;
++            *vtcm_size   = size;
++        } else {
++            HEX_VERBOSE("ggml-hex: GGML_HEXAGON_MM_CHUNKS=%d,%d is not in the VTCM budget for k %d n %d m %d, the "
++                        "solver chunks mc %zu nc %zu stay\n", opt_mm_chunks_m, opt_mm_chunks_n, k, ne01_padded, ne11,
++                        *m_chunk, *n_chunk);
++        }
++    }
++    return true;
++}
++
+ static bool ggml_hexagon_precompute_hmx_mm_params(
+     const struct ggml_hexagon_session * sess,
+     const struct ggml_tensor * src0,
+@@ -5180,7 +5230,7 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
+     if (!use_grouped) {
+         // Fallback to simple 2D path (group_size = 1)
+         const int m_id_rows = (dst && is_matmul_id) ? (int) ((size_t) dst->ne[1] * dst->ne[2]) : 0;
+-        if (!htp_mm_hmx_solve_2d_params(wtype, ne00_padded, m_id_rows, ne01_padded, ne11_padded, ne11, n_threads, pipeline, is_matmul_id, aligned_tile_size, vtcm_budget, &m_chunk, &n_chunk, &act_threads_selected, &vtcm_size)) {
++        if (!ggml_hexagon_solve_hmx_2d(wtype, ne00_padded, m_id_rows, ne01_padded, ne11_padded, ne11, n_threads, pipeline, is_matmul_id, is_batched, aligned_tile_size, vtcm_budget, &m_chunk, &n_chunk, &act_threads_selected, &vtcm_size)) {
+             // The pipelined layout holds a second weight buffer, a second scratch pad and a
+             // second output tile, thus its cost for each column is twice that of the serial
+             // layout. A shape with a very large k can exceed the VTCM budget where the serial
+@@ -5189,7 +5239,7 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
+                 return false;
+             }
+             pipeline = false;
+-            if (!htp_mm_hmx_solve_2d_params(wtype, ne00_padded, m_id_rows, ne01_padded, ne11_padded, ne11, n_threads, pipeline, is_matmul_id, aligned_tile_size, vtcm_budget, &m_chunk, &n_chunk, &act_threads_selected, &vtcm_size)) {
++            if (!ggml_hexagon_solve_hmx_2d(wtype, ne00_padded, m_id_rows, ne01_padded, ne11_padded, ne11, n_threads, pipeline, is_matmul_id, is_batched, aligned_tile_size, vtcm_budget, &m_chunk, &n_chunk, &act_threads_selected, &vtcm_size)) {
+                 return false;
+             }
+         }
+@@ -8539,6 +8589,30 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+         GGML_LOG_INFO("ggml-hex: the KV cache rotation stays MUL_MAT (GGML_HEXAGON_FWHT=0)\n");
+     }
+ 
++    // The chunk switches of the HMX 2D matmul (refer to opt_mm_solver and opt_mm_chunks_m)
++    const char * str_mm_solver = getenv("GGML_HEXAGON_MM_SOLVER");
++    const char * str_mm_chunks = getenv("GGML_HEXAGON_MM_CHUNKS");
++    opt_mm_solver = str_mm_solver ? atoi(str_mm_solver) : opt_mm_solver;
++    if (!opt_mm_solver) {
++        GGML_LOG_INFO("ggml-hex: the HMX matmul chunks come from the old cost model (GGML_HEXAGON_MM_SOLVER=0)\n");
++    }
++    opt_mm_chunks_m = -1;
++    opt_mm_chunks_n = -1;
++    if (str_mm_chunks && str_mm_chunks[0] != '\0') {
++        char *     end = nullptr;
++        const long mc  = strtol(str_mm_chunks, &end, 10);
++        const long nc  = (end && *end == ',') ? strtol(end + 1, &end, 10) : -1;
++        if (end && *end == '\0' && mc >= 0 && nc >= 0 && mc <= INT32_MAX && nc <= INT32_MAX && (mc > 0 || nc > 0)) {
++            opt_mm_chunks_m = (int) mc;
++            opt_mm_chunks_n = (int) nc;
++            GGML_LOG_INFO("ggml-hex: each HMX 2D matmul uses the chunks mc %d nc %d when they are in the VTCM budget "
++                          "(GGML_HEXAGON_MM_CHUNKS)\n", opt_mm_chunks_m, opt_mm_chunks_n);
++        } else {
++            GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_MM_CHUNKS='%s' is not two values mc,nc of 0 or more that are not both "
++                          "0, thus the solver sets the chunks\n", str_mm_chunks);
++        }
++    }
++
+     // Parse device configuration
+     const char * str_devices  = getenv("GGML_HEXAGON_DEVICES");
+     if (!str_devices && str_ndev && str_ndev[0] != '\0') {
+diff --git a/ggml/src/ggml-hexagon/htp-opnode.h b/ggml/src/ggml-hexagon/htp-opnode.h
+index 2d918c3..0376bc1 100644
+--- a/ggml/src/ggml-hexagon/htp-opnode.h
++++ b/ggml/src/ggml-hexagon/htp-opnode.h
+@@ -334,7 +334,13 @@ struct htp_opformat {
+                        type == HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT) {
+                 path = "hvx-flat";
+             }
+-            snprintf(str, max_size, "%s vtcm %d", path, (int) kparams->vtcm_size);
++            if (type == HTP_MM_KERNEL_HMX_2D || type == HTP_MM_KERNEL_HMX_F16_BATCHED) {
++                // The chunks of the HMX kernel. The first word stays the path for the readers of the field.
++                snprintf(str, max_size, "%s vtcm %d mc %d nc %d", path, (int) kparams->vtcm_size,
++                         (int) kparams->m_chunk, (int) kparams->n_chunk);
++            } else {
++                snprintf(str, max_size, "%s vtcm %d", path, (int) kparams->vtcm_size);
++            }
+         } else if (node.opcode == HTP_OP_FLASH_ATTN_EXT) {
+             const auto * kparams = (const struct htp_fa_kernel_params *) node.kernel_params;
+             const char * path = "unknown";
+diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.h b/ggml/src/ggml-hexagon/htp/matmul-ops.h
+index 56b1de3..06e653c 100644
+--- a/ggml/src/ggml-hexagon/htp/matmul-ops.h
++++ b/ggml/src/ggml-hexagon/htp/matmul-ops.h
+@@ -49,6 +49,21 @@ extern "C" {
+ #define HTP_MM_HMX_COST_W_DEQUANT 3 // cost penalty for quantized weight loading/dequantization
+ #define HTP_MM_HMX_COST_A_CONVERT 2 // cost penalty for activation loading/conversion
+ 
++// --- The cost model of the chunks of the HMX 2D kernel (htp_mm_hmx_solve_2d_cost) ---
++// The rate of the weight DMA of the HMX 2D kernel, in bytes for each us. The DMA reads the tiles of a chunk
++// as one continuous range and writes them to the pitch aligned_tile_size in the VTCM. At 5 to 32 tokens the
++// DMA sets the time of the kernel, and the phone stage sweep measured 59 to 62 GB/s there.
++#define HTP_MM_HMX_DMA_BYTES_PER_US      61000
++// The weights that one HVX thread dequantizes to f16 tiles in one us. The phase trace of the phone stage
++// sweep gives 18900 at k 2560 and 28000 at k 9216 for Q8_0 weights.
++#define HTP_MM_HMX_DEQUANT_PER_THREAD_US 23000
++// The fixed time of one chunk in ns: two dispatches of the HVX threads, one DMA descriptor and one HMX job.
++// The phase trace of the phone stage sweep gives less than 0.2 us for each chunk outside the phases of thread
++// 0. A job for an HMX thread that waits on an empty queue also waits for a futex wake (HMX_QUEUE_POLL_COUNT is
++// 1 on v79). The selections of the 4B shapes at 5 to 1024 tokens are the same for each value from 0 to 5 us
++// (tools/stages/mmsolve/plan.cpp sensitivity).
++#define HTP_MM_HMX_CHUNK_NS              2000
++
+ // --- DMA Activation Transfer Configuration ---
+ #define HTP_MM_DMA_ACT_ROWS_PER_STEP 2
+ #define HTP_MM_DMA_ACT_MULTIPLIER    (2 * HTP_MM_DMA_ACT_ROWS_PER_STEP)
+@@ -820,6 +835,253 @@ static inline bool htp_mm_hmx_solve_2d_params(
+     return false;
+ }
+ 
++// --- The chunks of the HMX 2D kernel from the cost of the kernel ---
++//
++// hmx_mm_2d_f32 and hmx_mm_nx_2d_f32 (matmul-ops.c) have two loops. The outer loop gets m_chunk token rows
++// and converts their activation rows to f16 tiles one time. The inner loop gets each chunk of n_chunk weight
++// rows: the DMA moves it to the VTCM, the HVX threads dequantize it, the HMX multiplies it with the tiles of
++// the token rows, and the HVX threads store the output. Thus, for m token rows and n weight rows:
++//   - The weights go through the DMA and the dequantization one time for each token chunk. These are the
++//     passes, ceil(m / m_chunk).
++//   - Each activation row is converted one time, for each selection of the chunks.
++//   - Each pair of a token chunk and a weight chunk (a chunk) has a fixed time: two dispatches of the HVX
++//     threads, one DMA descriptor and one HMX job.
++// Each output tile is one accumulator chain over all of k for each selection of the chunks. Thus the chunks
++// do not change the output.
++//
++// htp_mm_hmx_solve_2d_params adds the cost of the activation conversion for each weight chunk, but the
++// kernel converts the activation one time for each token chunk. Thus that model selects small token chunks
++// and many passes: at 1024 tokens, k 9216 n 2560 gets m_chunk 128 and 8 passes.
++//
++// The cost of the kernel, in ns:
++//   passes x n x (the DMA time + the dequantization time of one weight row)
++//   + passes x ceil(n / n_chunk) x HTP_MM_HMX_CHUNK_NS
++// The activation conversion is the same for each selection, thus it is not a term.
++//
++// The host calls these functions. The sizes are in 64 bits there.
++
++static inline uint64_t htp_mm_mul_sat64(uint64_t a, uint64_t b) {
++    return (b != 0 && a > UINT64_MAX / b) ? UINT64_MAX : a * b;
++}
++
++static inline uint64_t htp_mm_add_sat64(uint64_t a, uint64_t b) {
++    return a > UINT64_MAX - b ? UINT64_MAX : a + b;
++}
++
++// The DMA time and the dequantization time of one weight row of the HMX 2D kernel, in ns. For a quantized
++// weight, the DMA moves k / 32 tiles of tile_size bytes for each 32 weight rows. For an F16 or F32 weight, it
++// moves the row.
++static inline uint64_t htp_mm_hmx_row_ns(int wtype, uint32_t k, int n_threads) {
++    const bool     is_quant = (wtype != HTP_TYPE_F16 && wtype != HTP_TYPE_F32);
++    const uint64_t bytes    = is_quant ? (uint64_t) (k / HTP_MM_HMX_TILE_N_COLS) * htp_mm_get_weight_tile_size(wtype) /
++                                             HTP_MM_HMX_TILE_N_ROWS
++                                       : (uint64_t) htp_mm_get_tiled_row_stride(wtype, k);
++    const uint64_t deq_rate = (uint64_t) HTP_MM_HMX_DEQUANT_PER_THREAD_US * (uint64_t) (n_threads > 0 ? n_threads : 1);
++    return (bytes * 1000 + HTP_MM_HMX_DMA_BYTES_PER_US - 1) / HTP_MM_HMX_DMA_BYTES_PER_US +
++           ((uint64_t) k * 1000 + deq_rate - 1) / deq_rate;
++}
++
++// The largest m chunk (a multiple of 32, at most m_pad) with an HMX 2D layout that is not larger than the
++// budget, for the n chunk nc. 0 when no m chunk gives such a layout. The bytes of the layout increase with the m
++// chunk, thus a binary search finds it in O(log(m_pad / 32)) layout builds.
++static inline size_t htp_mm_hmx_max_m_chunk(int wtype, uint32_t k, size_t nc, size_t m_pad, bool pipeline,
++                                            uint32_t act_threads, uint32_t aligned_tile_size, size_t budget) {
++    size_t lo = 0;
++    size_t hi = m_pad / HTP_MM_HMX_TILE_N_ROWS;
++    while (lo < hi) {
++        const size_t mid = lo + (hi - lo + 1) / 2;
++        const size_t mc  = mid * HTP_MM_HMX_TILE_N_ROWS;
++        if (htp_mm_hmx_get_2d_vtcm_size(wtype, k, mc, nc, pipeline, act_threads, aligned_tile_size) <= budget) {
++            lo = mid;
++        } else {
++            hi = mid - 1;
++        }
++    }
++    return lo * HTP_MM_HMX_TILE_N_ROWS;
++}
++
++// The largest n chunk (a multiple of 32, at most n_pad) for the m chunk mc, as htp_mm_hmx_max_m_chunk gives
++// the m chunk. O(log(n_pad / 32)) layout builds.
++static inline size_t htp_mm_hmx_max_n_chunk(int wtype, uint32_t k, size_t mc, size_t n_pad, bool pipeline,
++                                            uint32_t act_threads, uint32_t aligned_tile_size, size_t budget) {
++    size_t lo = 0;
++    size_t hi = n_pad / HTP_MM_HMX_TILE_N_COLS;
++    while (lo < hi) {
++        const size_t mid = lo + (hi - lo + 1) / 2;
++        const size_t nc  = mid * HTP_MM_HMX_TILE_N_COLS;
++        if (htp_mm_hmx_get_2d_vtcm_size(wtype, k, mc, nc, pipeline, act_threads, aligned_tile_size) <= budget) {
++            lo = mid;
++        } else {
++            hi = mid - 1;
++        }
++    }
++    return lo * HTP_MM_HMX_TILE_N_COLS;
++}
++
++// The chunks of the HMX 2D kernel of MUL_MAT, MUL_MAT_ADD and MUL_MAT_NX with the cost of the kernel (refer
++// to the comment before htp_mm_mul_sat64). MUL_MAT_ID and the batched F16 kernel have different loops, thus
++// they keep htp_mm_hmx_solve_2d_params.
++//
++// The function first gets the selection of htp_mm_hmx_solve_2d_params. When that selection moves the weights
++// through the DMA one time, the function returns it: no selection has less passes, and that selection has the
++// widest n chunk, thus the smallest number of chunks. If not, the function examines each n chunk (a multiple
++// of 32) with the largest m chunk of an accurate layout, for each count of activation threads of the old
++// solver. It keeps the smallest cost, then the larger area mc x nc, then the larger count of threads. It does
++// not give more passes than the old selection.
++//
++// ne11_padded is the token count m aligned up to 32. chunk_ns is the fixed time of one chunk
++// (HTP_MM_HMX_CHUNK_NS in htp_mm_hmx_solve_2d_cost, other values in a measurement of the model). Time:
++// O(threads x n_pad / 32 x log(m_pad / 32)) layout builds when the old selection has more than one pass. An n
++// chunk with one pass stops the loop over the n chunks, because a narrower n chunk only adds chunks.
++static inline bool htp_mm_hmx_solve_2d_cost_ns(int      wtype,
++                                               uint32_t k,
++                                               uint32_t ne01_padded,
++                                               uint32_t ne11_padded,
++                                               uint32_t m,
++                                               int      n_threads,
++                                               bool     pipeline,
++                                               uint32_t aligned_tile_size,
++                                               size_t   vtcm_budget,
++                                               uint64_t chunk_ns,
++                                               size_t * m_chunk_out,
++                                               size_t * n_chunk_out,
++                                               int *    act_threads_out,
++                                               size_t * vtcm_size_out) {
++    size_t old_mc = 0, old_nc = 0, old_vtcm = 0;
++    int    old_threads = 0;
++    if (!htp_mm_hmx_solve_2d_params(wtype, k, 0, ne01_padded, ne11_padded, m, n_threads, pipeline, false,
++                                    aligned_tile_size, vtcm_budget, &old_mc, &old_nc, &old_threads, &old_vtcm)) {
++        return false;
++    }
++    *m_chunk_out     = old_mc;
++    *n_chunk_out     = old_nc;
++    *act_threads_out = old_threads;
++    *vtcm_size_out   = old_vtcm;
++
++    const uint64_t old_passes = ((uint64_t) m + old_mc - 1) / old_mc;
++    if (old_passes <= 1) {
++        return true;
++    }
++
++    size_t per_n = 0, per_m = 0, per_mn = 0;
++    htp_mm_hmx_get_2d_chunk_costs(wtype, k, pipeline, aligned_tile_size, &per_n, &per_m, &per_mn);
++    if (per_n == 0) {
++        return true;
++    }
++    const size_t   nc_max = hex_align_down(hex_smin((size_t) ne01_padded, vtcm_budget / per_n), HTP_MM_HMX_TILE_N_COLS);
++    const uint64_t row_ns = htp_mm_hmx_row_ns(wtype, k, n_threads);
++
++    uint64_t best_cost = UINT64_MAX;
++    uint64_t best_area = 0;
++    size_t   best_mc = 0, best_nc = 0;
++    int      best_threads = 0;
++
++    for (int act_threads = n_threads; act_threads >= 1; act_threads = (act_threads == 1) ? 0 : act_threads / 2) {
++        for (size_t nc = nc_max; nc >= HTP_MM_HMX_TILE_N_COLS; nc -= HTP_MM_HMX_TILE_N_COLS) {
++            const size_t mc = htp_mm_hmx_max_m_chunk(wtype, k, nc, ne11_padded, pipeline, (uint32_t) act_threads,
++                                                     aligned_tile_size, vtcm_budget);
++            if (mc == 0) {
++                continue;
++            }
++            const uint64_t passes = ((uint64_t) m + mc - 1) / mc;
++            const uint64_t chunks = htp_mm_mul_sat64(passes, ((uint64_t) ne01_padded + nc - 1) / nc);
++            const uint64_t cost   = htp_mm_add_sat64(htp_mm_mul_sat64(htp_mm_mul_sat64(passes, ne01_padded), row_ns),
++                                                     htp_mm_mul_sat64(chunks, chunk_ns));
++            const uint64_t area   = (uint64_t) mc * nc;
++            if (cost < best_cost || (cost == best_cost && area > best_area)) {
++                best_cost    = cost;
++                best_area    = area;
++                best_mc      = mc;
++                best_nc      = nc;
++                best_threads = act_threads;
++            }
++            if (passes == 1) {
++                break;
++            }
++        }
++    }
++
++    if (best_mc == 0 || ((uint64_t) m + best_mc - 1) / best_mc > old_passes) {
++        return true;
++    }
++    *m_chunk_out     = best_mc;
++    *n_chunk_out     = best_nc;
++    *act_threads_out = best_threads;
++    *vtcm_size_out   = htp_mm_hmx_get_2d_vtcm_size(wtype, k, best_mc, best_nc, pipeline, (uint32_t) best_threads,
++                                                   aligned_tile_size);
++    return true;
++}
++
++// htp_mm_hmx_solve_2d_cost_ns with the chunk time HTP_MM_HMX_CHUNK_NS
++static inline bool htp_mm_hmx_solve_2d_cost(int      wtype,
++                                            uint32_t k,
++                                            uint32_t ne01_padded,
++                                            uint32_t ne11_padded,
++                                            uint32_t m,
++                                            int      n_threads,
++                                            bool     pipeline,
++                                            uint32_t aligned_tile_size,
++                                            size_t   vtcm_budget,
++                                            size_t * m_chunk_out,
++                                            size_t * n_chunk_out,
++                                            int *    act_threads_out,
++                                            size_t * vtcm_size_out) {
++    return htp_mm_hmx_solve_2d_cost_ns(wtype, k, ne01_padded, ne11_padded, m, n_threads, pipeline, aligned_tile_size,
++                                       vtcm_budget, HTP_MM_HMX_CHUNK_NS, m_chunk_out, n_chunk_out, act_threads_out,
++                                       vtcm_size_out);
++}
++
++// The chunks of a request (GGML_HEXAGON_MM_CHUNKS of the host) for the HMX 2D kernel. The function aligns each
++// value down to a multiple of 32 and limits it to ne11_padded or ne01_padded. A value of 0 gets the largest
++// value with a layout in the budget for the other value. For each count of activation threads of the old
++// solver, the function examines the layout of the request. It returns false when no such layout is in the
++// budget, and the caller then keeps the chunks of the solver.
++static inline bool htp_mm_hmx_fit_2d_chunks(int      wtype,
++                                            uint32_t k,
++                                            uint32_t ne01_padded,
++                                            uint32_t ne11_padded,
++                                            int      n_threads,
++                                            bool     pipeline,
++                                            uint32_t aligned_tile_size,
++                                            size_t   vtcm_budget,
++                                            size_t   mc_request,
++                                            size_t   nc_request,
++                                            size_t * m_chunk_out,
++                                            size_t * n_chunk_out,
++                                            int *    act_threads_out,
++                                            size_t * vtcm_size_out) {
++    const size_t mc_req = hex_smin(hex_align_down(mc_request, HTP_MM_HMX_TILE_N_ROWS), (size_t) ne11_padded);
++    const size_t nc_req = hex_smin(hex_align_down(nc_request, HTP_MM_HMX_TILE_N_COLS), (size_t) ne01_padded);
++    if (mc_req == 0 && nc_req == 0) {
++        return false;
++    }
++    for (int act_threads = n_threads; act_threads >= 1; act_threads = (act_threads == 1) ? 0 : act_threads / 2) {
++        size_t mc = mc_req;
++        size_t nc = nc_req;
++        if (nc == 0) {
++            nc = htp_mm_hmx_max_n_chunk(wtype, k, mc, ne01_padded, pipeline, (uint32_t) act_threads, aligned_tile_size,
++                                        vtcm_budget);
++        }
++        if (mc == 0 && nc != 0) {
++            mc = htp_mm_hmx_max_m_chunk(wtype, k, nc, ne11_padded, pipeline, (uint32_t) act_threads, aligned_tile_size,
++                                        vtcm_budget);
++        }
++        if (mc == 0 || nc == 0) {
++            continue;
++        }
++        const size_t size = htp_mm_hmx_get_2d_vtcm_size(wtype, k, mc, nc, pipeline, (uint32_t) act_threads,
++                                                        aligned_tile_size);
++        if (size <= vtcm_budget) {
++            *m_chunk_out     = mc;
++            *n_chunk_out     = nc;
++            *act_threads_out = act_threads;
++            *vtcm_size_out   = size;
++            return true;
++        }
++    }
++    return false;
++}
++
+ #ifdef __cplusplus
+ }
+ #endif
