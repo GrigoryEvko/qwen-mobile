@@ -240,3 +240,4 @@ hexagon-host/0008-hexagon-send-a-pointwise-unary-op-on-contiguous-tensors-with-l
 hexagon-v81/0001-hexagon-htp-v81-uses-the-f32-to-f16-conversion-of-v79.patch
 hexagon-gemv/0001-hexagon-htp-move-each-q8-0-column-tile-with-one-dma-row.patch
 hexagon-v81/0002-hexagon-a-start-up-self-test-of-the-dsp-before-the-backend-registers-a-device.patch
+hexagon-v81/0003-hexagon-htp-the-transpose-tile-copy-reads-the-source-rows-at-the-stride-of-a-row.patch
