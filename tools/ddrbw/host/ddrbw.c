@@ -48,7 +48,7 @@
 // two clocks at one time.
 //
 // Each result is one line on stdout that starts with "ddrbw: " and holds "key=value" fields.
-// build/bw/stage.py reads these lines. Each checksum that does not agree gives "check=FAIL".
+// tools/stages/bw/stage.py reads these lines. Each checksum that does not agree gives "check=FAIL".
 //
 // Exit codes: 0 success, 1 a usage error, 2 a FastRPC, memory or setup error, 4 a checksum or a run
 // status was not correct.
