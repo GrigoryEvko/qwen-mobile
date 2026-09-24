@@ -47,7 +47,8 @@ def find_repo() -> Path:
     for d in (here, *here.parents):
         if (d / "build").is_dir() and (d / "tools").is_dir():
             return d
-    return here
+    # A checkout with no tools/ (the laptop): the copy build/bw/stage.py gives the root two levels up.
+    return here.parent.parent if here.name == "bw" and here.parent.name == "build" else here
 
 
 REPO = find_repo()
