@@ -226,10 +226,10 @@ def output_lines(t: Target, kit: bool) -> list:
 HEADER = """\
 # {title}
 #
-# The libraries: tools/stages/v81/build.sh (build/v81/{stage}): the patched llama.cpp tree of HEAD (with
-# hexagon-v81/0001, v81 uses the f32 to f16 conversion of v79) plus the patches of build/v81/patches: 0002 the
-# start-up self-test of the DSP (the host library), 0003 the stride of the transpose tile copy (cpy-ops.c of the
-# DSP library) with four CONT cases of test-backend-ops.{base_text}
+# The libraries: tools/stages/v81/build.sh (build/v81/{stage}): the patched llama.cpp tree of HEAD plus the
+# patches of build/v81/patches (build/v81/{stage}/patches.sha256 lists them). The series has the patches of
+# patches/hexagon-v81: v81 uses the f32 to f16 conversion of v79, the start-up self-test of the DSP (the canary),
+# and the stride of the transpose tile copy.{base_text}
 #
 # The runs and the decision of each:
 {runs}
