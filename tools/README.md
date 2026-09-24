@@ -46,10 +46,24 @@ The set the backend ships by default holds no stall-attribution event, thus a
 run can say that an op is slow and never say why. Use `stalls` first. It is the
 Hexagon analogue of the Nsight Compute stall-reason breakdown.
 
-`pmu.py todo` lists the coprocessor events that the Snapdragon Profiler NPU
-plugin names but whose raw ids we have not confirmed. That family is the only
-HMX instrumentation on this part, because the simulator runs HMX functionally
-and never retires it in timing mode.
+The HMX counters are the confirmed ids in the ranges 0x200 thru 0x23B and 0x291
+thru 0x295. The names come from the simulator library libhexagonissv79.so. The
+phone stage pmu of 2026-09-24 (`tools/stages/pmu`) confirmed each id: it counts
+on the ops that use the HMX, and it is 0 on the other ops. `pmu.py todo` shows
+7 more HMX ids that counted 0 on all ops, thus they are not confirmed.
+
+The old list of `pmu.py todo`, the PMU_COPROC_* events of the Snapdragon
+Profiler NPU plugin, is not an HMX list. It is the HVX coprocessor family of V60
+to V62.
+
+pmu.py has three more sets:
+- `topdown`: all 11 top-down stall events and the cycles with a commit, in two
+  passes. The set `stalls` has 6 of the 11 stall events, thus its shares do not
+  add up to the full cycles.
+- `hmx`: the HMX active cycles, the HMX clock, the MAC cycles, the MAC stalls
+  and the HMX power limits, in two passes.
+- `dma-wait`: the DMA waits. It has the dmpoll cycles of a thread, the DMA read
+  that bypasses the caches, and the full DMA read buffer.
 
 ## prof/run.py — a measurement under the protocol
 
