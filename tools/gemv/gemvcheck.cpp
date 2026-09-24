@@ -124,39 +124,53 @@ std::vector<float> make_f32(size_t count, uint64_t seed) {
     return out;
 }
 
-// The tensors and the graph of REPS copies of one case in one context
+// The tensors and the graph of REPS copies of one case. The weights have their own context and
+// buffer (wctx, wbuf), as a model loader gives them: the Hexagon backend repacks a Q8_0 weight into
+// its tile layout only in a buffer with the usage GGML_BACKEND_BUFFER_USAGE_WEIGHTS. In a buffer with
+// no usage it copies the bytes, and the DSP then reads plain Q8_0 blocks as tiles.
 struct Built {
-    ggml_context *              ctx = nullptr;
-    ggml_cgraph *               gf  = nullptr;
+    ggml_context *              wctx = nullptr;
+    ggml_backend_buffer_t       wbuf = nullptr;
+    ggml_context *              ctx  = nullptr;
+    ggml_backend_buffer_t       buf  = nullptr;
+    ggml_cgraph *               gf   = nullptr;
     std::vector<ggml_tensor *>  w;
     std::vector<ggml_tensor *>  x;    // one activation for each copy
     std::vector<ggml_tensor *>  r;    // one residual for each copy (add only)
     std::vector<ggml_tensor *>  out;  // the outputs of the first copy
-    ggml_backend_buffer_t       buf = nullptr;
 
     ~Built() {
         if (buf) {
             ggml_backend_buffer_free(buf);
         }
+        if (wbuf) {
+            ggml_backend_buffer_free(wbuf);
+        }
         if (ctx) {
             ggml_free(ctx);
+        }
+        if (wctx) {
+            ggml_free(wctx);
         }
     }
 };
 
-// Builds the graph of one case with REPS copies and allocates its tensors on the backend. Returns
-// false when the allocation fails.
+// Builds the graph of one case with REPS copies and allocates its tensors on the backend. The weight
+// buffer gets the usage GGML_BACKEND_BUFFER_USAGE_WEIGHTS before the first set_tensor of a weight
+// (set_inputs). Returns false when a context or a buffer cannot be made.
 bool build(const Case & c, int reps, ggml_backend_t backend, Built & b) {
-    const size_t n_tensors = c.m.size() + (size_t) reps * (2 + 2 * c.m.size());
+    const size_t n_tensors = (size_t) reps * (2 + 2 * c.m.size());
     const size_t graph_size = std::max<size_t>(GGML_DEFAULT_GRAPH_SIZE, 4 * n_tensors);
+    ggml_init_params wp = { ggml_tensor_overhead() * (c.m.size() + 1), nullptr, true };
     ggml_init_params ip = { ggml_tensor_overhead() * (n_tensors + 16) + ggml_graph_overhead_custom(graph_size, false),
                             nullptr, true };
-    b.ctx = ggml_init(ip);
-    if (!b.ctx) {
+    b.wctx = ggml_init(wp);
+    b.ctx  = ggml_init(ip);
+    if (!b.wctx || !b.ctx) {
         return false;
     }
     for (size_t i = 0; i < c.m.size(); i++) {
-        b.w.push_back(ggml_new_tensor_2d(b.ctx, GGML_TYPE_Q8_0, c.k, c.m[i]));
+        b.w.push_back(ggml_new_tensor_2d(b.wctx, GGML_TYPE_Q8_0, c.k, c.m[i]));
     }
     b.gf = ggml_new_graph_custom(b.ctx, graph_size, false);
     for (int rep = 0; rep < reps; rep++) {
@@ -176,8 +190,13 @@ bool build(const Case & c, int reps, ggml_backend_t backend, Built & b) {
             }
         }
     }
-    b.buf = ggml_backend_alloc_ctx_tensors(b.ctx, backend);
-    return b.buf != nullptr;
+    b.wbuf = ggml_backend_alloc_ctx_tensors(b.wctx, backend);
+    b.buf  = ggml_backend_alloc_ctx_tensors(b.ctx, backend);
+    if (!b.wbuf || !b.buf) {
+        return false;
+    }
+    ggml_backend_buffer_set_usage(b.wbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    return true;
 }
 
 // Sets the inputs of the built cases b[0] .. b[nb - 1] (one graph for each backend) to the same

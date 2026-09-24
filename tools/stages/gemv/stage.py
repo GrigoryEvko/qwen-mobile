@@ -3,12 +3,21 @@
 
 Usage:
     stage.py tests [--out DIR]                write the test files of test-backend-ops (build/gemv/phone/tests)
-    stage.py commands [--out PATH]            write the phone command file (build/gemv/phone-commands.txt)
-    stage.py table [--root DIR] [--all]       print the tables from the pulled files (build/gemv/phone-out)
+    stage.py commands [--check-only] [--out PATH]
+                                              write the phone command file (build/gemv/phone-commands.txt, or
+                                              build/gemv-check/phone-commands.txt)
+    stage.py table [--check-only] [--root DIR] [--all]
+                                              print the tables from the pulled files (build/gemv/phone-out, or
+                                              build/gemv-check/phone-out)
+    stage.py libs [--check-only]              print the host libraries of the stage, one on each line
 
-The file is tools/stages/gemv/stage.py, and build/gemv/stage.py is a symbolic link to it. The stage files come
-from tools/stages/gemv/build.sh: one set of host libraries, and two DSP library directories, dsp/new (HEAD plus
-the patch) and dsp/base (HEAD). A run selects its DSP library with ADSP_LIBRARY_PATH.
+The file is tools/stages/gemv/stage.py, and build/gemv/stage.py and build/gemv-check/stage.py are symbolic links
+to it. The stage files come from tools/stages/gemv/build.sh: one set of host libraries, and two DSP library
+directories, dsp/new (HEAD plus the patch) and dsp/base (HEAD). A run selects its DSP library with
+ADSP_LIBRARY_PATH.
+
+With --check-only the file gives the check stage gemv-check (tools/stages/gemv/build-check.sh): only the check
+runs of question 1, with its own phone directory. It uses the libraries of build/gemv/phone.
 
 The questions of the stage and the runs that answer them:
     1. Does the new library give the bits of the base library? gemvcheck check (tools/gemv/gemvcheck.cpp)
@@ -53,21 +62,52 @@ def find_repo() -> Path:
 
 
 REPO = find_repo()
-HERE = REPO / "build" / "gemv"
 
 ADB = "adb -s 192.168.14.130:5555"
-PHONE = "/data/local/tmp/qwen/gemv"
 MODEL_DIR = "/data/local/tmp/qwen/models"
 MODEL = "Qwen3.5-4B-Q8_0.gguf"
-LAPTOP_STAGE = "build/gemv"
-BOX = "grigory@10.10.20.200:airi/qwen-mobile/build/gemv"
-# The environment of the app (init_impl in llama_jni.cpp). ADSP_LIBRARY_PATH comes from the variant.
-LIB_ENV = f"LD_LIBRARY_PATH={PHONE}/lib GGML_HEXAGON_OPFUSION=1 GGML_HEXAGON_OPFUSION_STATE=1"
-LIBS = ("libggml-base.so", "libggml-cpu.so", "libggml-hexagon.so", "libggml-opencl.so", "libggml.so",
-        "libllama-bench-impl.so", "libllama-common.so", "libllama.so", "libmtmd.so")
+BOX_REPO = "grigory@10.10.20.200:airi/qwen-mobile"
 DSP_LIBS = ("libggml-htp-v73.so", "libggml-htp-v75.so", "libggml-htp-v79.so")
-BINS = ("gate.sh", "gemvcheck", "llama-bench", "test-backend-ops")
-TEST_FILES = ("gemv-q8_0.txt", "kern-q8_0.txt")
+
+
+@dataclass(frozen=True)
+class Layout:
+    """The places and the files of one stage: the phone directory, the stage directory (relative to the
+    repository root, the same on the laptop and on the box), the programs of bin/, the host libraries of lib/
+    and the test files of tests/."""
+    phone: str
+    stage: str
+    bins: tuple[str, ...]
+    libs: tuple[str, ...]
+    tests: tuple[str, ...]
+
+    @property
+    def here(self) -> Path:
+        """The stage directory in this repository."""
+        return REPO / self.stage
+
+    @property
+    def box(self) -> str:
+        """The stage directory on the box, for rsync."""
+        return f"{BOX_REPO}/{self.stage}"
+
+
+FULL = Layout("/data/local/tmp/qwen/gemv", "build/gemv", ("gate.sh", "gemvcheck", "llama-bench", "test-backend-ops"),
+              ("libggml-base.so", "libggml-cpu.so", "libggml-hexagon.so", "libggml-opencl.so", "libggml.so",
+               "libllama-bench-impl.so", "libllama-common.so", "libllama.so", "libmtmd.so"),
+              ("gemv-q8_0.txt", "kern-q8_0.txt"))
+# The NEEDED entries of gemvcheck: libggml.so, libggml-cpu.so and libggml-base.so. libggml.so has entries for the two
+# other backends.
+CHECK = Layout("/data/local/tmp/qwen/gemvchk", "build/gemv-check", ("gate.sh", "gemvcheck"),
+               ("libggml-base.so", "libggml-cpu.so", "libggml-hexagon.so", "libggml-opencl.so", "libggml.so"), ())
+HERE = FULL.here
+
+
+def lib_env(lay: Layout) -> str:
+    """The environment of the app (init_impl in llama_jni.cpp). ADSP_LIBRARY_PATH comes from the variant."""
+    return f"LD_LIBRARY_PATH={lay.phone}/lib GGML_HEXAGON_OPFUSION=1 GGML_HEXAGON_OPFUSION_STATE=1"
+
+
 # The flags of the variant b of bench-kv (the app): flash attention on HTP0, a Q8_0 K and V cache.
 BENCH_ARGS = f"-m {MODEL_DIR}/{MODEL} -dev HTP0 -ngl 99 -t 4 -fa on -b 1024 -ub 1024 -o jsonl -ctk q8_0 -ctv q8_0"
 THERMAL = f"{ADB} shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
@@ -136,8 +176,8 @@ def bench_runs() -> list[Run]:
     return out
 
 
-def runs() -> list[Run]:
-    """The runs of the stage in their order. O(runs)."""
+def check_runs() -> list[Run]:
+    """The bit check runs of base and new for the v79, v75 and v73 library. O(runs)."""
     r: list[Run] = []
     for v in ("base", "new"):
         r.append(Run(f"check-v79-{v}", "check", v, "gemvcheck", "check --cases all", "", 110, GATE_CHECK,
@@ -147,8 +187,17 @@ def runs() -> list[Run]:
             r.append(Run(f"check-{arch}-{v}", "check", v, "gemvcheck", f"check --cases {NO_HEAD}",
                          f"GGML_HEXAGON_ARCH={arch}", 90, GATE_CHECK,
                          f"gemvcheck check of the 36 cases without the head with the {arch} library"))
+    return r
+
+
+def runs(lay: Layout = FULL) -> list[Run]:
+    """The runs of the stage in their order: the check runs only for CHECK, all runs for FULL. O(runs)."""
+    r = check_runs()
+    if lay == CHECK:
+        return r
+    phone = lay.phone
     r += [
-        Run("tbo-4b-new", "tbo", "new", "test-backend-ops", f"test -o MUL_MAT -b HTP0 --test-file {PHONE}/tests/kern-q8_0.txt",
+        Run("tbo-4b-new", "tbo", "new", "test-backend-ops", f"test -o MUL_MAT -b HTP0 --test-file {phone}/tests/kern-q8_0.txt",
             "GGML_HEXAGON_VERBOSE=1 GGML_HEXAGON_PROFILE=1", 90, GATE_SMALL,
             "test-backend-ops test of the 4B Q8_0 shapes, 1 to 4 rows, with the kernel of each op"),
         Run("tbo-q8-new", "tbo", "new", "test-backend-ops", "test -o MUL_MAT -b HTP0 -p type_a=q8_0", "", 110, GATE_SMALL,
@@ -160,7 +209,7 @@ def runs() -> list[Run]:
     ]
     # The GEMV rates: test-backend-ops perf base, new, then gemvcheck perf new, base (ABBA over the two tools)
     for v in ("base", "new"):
-        r.append(Run(f"perf-{v}", "perf", v, "test-backend-ops", f"perf -o MUL_MAT -b HTP0 --test-file {PHONE}/tests/gemv-q8_0.txt",
+        r.append(Run(f"perf-{v}", "perf", v, "test-backend-ops", f"perf -o MUL_MAT -b HTP0 --test-file {phone}/tests/gemv-q8_0.txt",
                      "", 100, GATE_SMALL, "test-backend-ops perf of the 4B Q8_0 shapes, 1 and 4 rows, and the head"))
     for v in ("new", "base"):
         r.append(Run(f"gperf-{v}", "gperf", v, "gemvcheck", f"perf --cases {PERF_CASES} --reps 16 --runs 5", "", 100,
@@ -187,15 +236,16 @@ def test_files() -> dict[str, list[str]]:
     }
 
 
-def run_lines(run: Run) -> list[str]:
+def run_lines(run: Run, lay: Layout) -> list[str]:
     """The lines of one run: a title, the thermal line, the run and the pgrep line. A run line of the model
     holds the text models/Qwen3.5 (a test of the model file), thus the runner applies to it the unlock wait,
     the screen wake, the memory gate and the CAPS line of a model run."""
-    stem = f"{PHONE}/out/{run.name}"
+    p = lay.phone
+    stem = f"{p}/out/{run.name}"
     gate = f"{stem}-gate.txt"
-    env = " ".join(x for x in (LIB_ENV, f"ADSP_LIBRARY_PATH={PHONE}/dsp/{run.variant}", run.env) if x)
-    cmd = (f"test -r {MODEL_DIR}/{MODEL} && sh {PHONE}/bin/gate.sh {run.gate_kb} > {gate} && {BEFORE} >> {gate} && "
-           f"timeout -s KILL {run.limit} env {env} {PHONE}/bin/{run.tool} {run.args} > {stem}.out 2> {stem}.log; "
+    env = " ".join(x for x in (lib_env(lay), f"ADSP_LIBRARY_PATH={p}/dsp/{run.variant}", run.env) if x)
+    cmd = (f"test -r {MODEL_DIR}/{MODEL} && sh {p}/bin/gate.sh {run.gate_kb} > {gate} && {BEFORE} >> {gate} && "
+           f"timeout -s KILL {run.limit} env {env} {p}/bin/{run.tool} {run.args} > {stem}.out 2> {stem}.log; "
            f"echo \"rc=$?\" >> {gate}; {AFTER} >> {gate}; cat {gate}")
     return ["#", f"# {run.name}: {run.text}, DSP {run.variant} (limit {run.limit} s)", THERMAL, f"{ADB} shell '{cmd}'",
             PGREP]
@@ -230,57 +280,88 @@ HEADER = """\
 # Then: python3 build/gemv/stage.py table (on the laptop or on the box).
 """
 
+CHECK_HEADER = """\
+# Phone stage "gemv-check": the bit check of the stage gemv. The packed Q8_0 tiles of the HVX GEMV (one DMA row for
+# each 32-row column tile), the new DSP library against the base library of HEAD.
+# The question: does the new library give the same bits as the base library for the 4B decode matmuls?
+#
+# The runs (tools/stages/gemv/stage.py --check-only gives each one):
+#   check   gemvcheck check (tools/gemv/gemvcheck.cpp): the hash of each output of the 4B decode matmuls (MUL_MAT,
+#           MUL_MAT_ADD, MUL_MAT_NX, the head, 1 to 4 rows, two shapes with an odd k-tile count), and the NMSE
+#           against the CPU backend of the phone. v79: 40 cases. v75 and v73 on the v79 DSP (GGML_HEXAGON_ARCH):
+#           the 36 cases without the head. gemvcheck puts the weights in a buffer with the usage
+#           GGML_BACKEND_BUFFER_USAGE_WEIGHTS, thus the backend repacks each Q8_0 weight as the model loader has it.
+# The result is satisfactory when each run has the exit code 0 (each output is finite, and each NMSE is 5e-4 or
+# less), and for each library each output of new has the hash of base.
+# The libraries: the files of build/gemv/phone (the stage gemv), thus the same bytes as the runs of that stage.
+# patch.sha256 names the patch.
+#
+# Each run: the thermal line, then the test of the model file (the text models/Qwen3.5 makes the runner treat the
+# line as a model run; no run loads a model), bin/gate.sh (the Qwen app stopped, the screen on, thermal 0, no
+# charger, MemAvailable 4 GB), gemvcheck under timeout -s KILL (110 s or less), the exit code and the conditions
+# after the run, then the pgrep line.
+#
+# Put this file into /tmp/phone-timing-stages.txt: the gate stops a run on a locked phone or with a charger. It is
+# not a timing stage: only the hashes and the NMSE give the result. Run from /home/grigory/airi/qwen-mobile on the
+# laptop, in order. Time: at most 10 minutes of tool time (6 runs), plus the gates. The push is about 45 MB.
+# Then: python3 build/gemv-check/stage.py table --check-only (on the laptop or on the box).
+"""
 
-def setup_lines() -> list[str]:
+
+def setup_lines(lay: Layout) -> list[str]:
     """The lines that copy the stage to the phone and check its files."""
-    bins = " ".join(f"{LAPTOP_STAGE}/phone/bin/{b}" for b in BINS)
-    libs = " ".join(f"{LAPTOP_STAGE}/phone/lib/{lib}" for lib in LIBS)
-    tests = " ".join(f"{LAPTOP_STAGE}/phone/tests/{name}" for name in TEST_FILES)
+    local, p = lay.stage, lay.phone
+    bins = " ".join(f"{local}/phone/bin/{b}" for b in lay.bins)
+    libs = " ".join(f"{local}/phone/lib/{lib}" for lib in lay.libs)
+    tests = " ".join(f"{local}/phone/tests/{name}" for name in lay.tests)
     lines = [
-        f"mkdir -p {LAPTOP_STAGE} && rsync -a --delete {BOX}/phone/ {LAPTOP_STAGE}/phone/",
-        f"(cd {LAPTOP_STAGE}/phone && sha256sum -c SHA256SUMS)",
+        f"mkdir -p {local} && rsync -a --delete {lay.box}/phone/ {local}/phone/",
+        f"(cd {local}/phone && sha256sum -c SHA256SUMS)",
         # No model path in this line: the runner gates each line with that text as a model run.
         f"{ADB} shell 'ls -l {MODEL_DIR} | grep -E \"{MODEL}\"'",
-        f"{ADB} shell 'rm -rf {PHONE} && mkdir -p {PHONE}/bin {PHONE}/lib {PHONE}/dsp/new {PHONE}/dsp/base "
-        f"{PHONE}/tests {PHONE}/out'",
-        f"{ADB} push {bins} {PHONE}/bin/",
-        f"{ADB} push {libs} {PHONE}/lib/",
+        f"{ADB} shell 'rm -rf {p} && mkdir -p {p}/bin {p}/lib {p}/dsp/new {p}/dsp/base "
+        + (f"{p}/tests " if lay.tests else "") + f"{p}/out'",
+        f"{ADB} push {bins} {p}/bin/",
+        f"{ADB} push {libs} {p}/lib/",
     ]
     for v in ("new", "base"):
-        dsp = " ".join(f"{LAPTOP_STAGE}/phone/dsp/{v}/{lib}" for lib in DSP_LIBS)
-        lines.append(f"{ADB} push {dsp} {PHONE}/dsp/{v}/")
+        dsp = " ".join(f"{local}/phone/dsp/{v}/{lib}" for lib in DSP_LIBS)
+        lines.append(f"{ADB} push {dsp} {p}/dsp/{v}/")
+    if lay.tests:
+        lines.append(f"{ADB} push {tests} {p}/tests/")
     lines += [
-        f"{ADB} push {tests} {PHONE}/tests/",
-        f"{ADB} push {LAPTOP_STAGE}/phone/SHA256SUMS {PHONE}/",
-        f"{ADB} shell 'cd {PHONE} && sha256sum -c SHA256SUMS | grep -c OK && chmod 755 {PHONE}/bin/*'",
+        f"{ADB} push {local}/phone/SHA256SUMS {p}/",
+        f"{ADB} shell 'cd {p} && sha256sum -c SHA256SUMS | grep -c OK && chmod 755 {p}/bin/*'",
     ]
     return lines
 
 
-def output_lines() -> list[str]:
+def output_lines(lay: Layout) -> list[str]:
     """The lines that pull the outputs, copy them to the box and remove the phone directory. The phone directory
     goes only when the pull has each of its files."""
+    local, p = lay.stage, lay.phone
     return [
         "#",
         "# ---- The outputs ----",
         "#",
         THERMAL,
-        f"{ADB} shell 'pgrep -x llama-bench; pgrep -x gemvcheck; ls {PHONE}/out | wc -l; du -sh {PHONE}/out'",
-        f"rm -rf {LAPTOP_STAGE}/phone-out",
-        f"{ADB} pull {PHONE}/out {LAPTOP_STAGE}/phone-out",
-        f"rsync -a --delete {LAPTOP_STAGE}/phone-out/ {BOX}/phone-out/",
-        f"test \"$(ls {LAPTOP_STAGE}/phone-out | wc -l)\" -eq "
-        f"\"$({ADB} shell 'ls {PHONE}/out | wc -l' | tr -d '\\r')\" "
-        f"&& {ADB} shell 'rm -rf {PHONE}' && echo removed {PHONE}",
+        f"{ADB} shell 'pgrep -x llama-bench; pgrep -x gemvcheck; ls {p}/out | wc -l; du -sh {p}/out'",
+        f"rm -rf {local}/phone-out",
+        f"{ADB} pull {p}/out {local}/phone-out",
+        f"rsync -a --delete {local}/phone-out/ {lay.box}/phone-out/",
+        f"test \"$(ls {local}/phone-out | wc -l)\" -eq "
+        f"\"$({ADB} shell 'ls {p}/out | wc -l' | tr -d '\\r')\" "
+        f"&& {ADB} shell 'rm -rf {p}' && echo removed {p}",
     ]
 
 
-def write_commands(path: Path) -> int:
-    """Write the command file and return its line count."""
-    lines = HEADER.rstrip("\n").split("\n") + setup_lines()
-    for run in runs():
-        lines += run_lines(run)
-    lines += output_lines()
+def write_commands(path: Path, lay: Layout) -> int:
+    """Write the command file of the stage and return its line count."""
+    header = CHECK_HEADER if lay == CHECK else HEADER
+    lines = header.rstrip("\n").split("\n") + setup_lines(lay)
+    for run in runs(lay):
+        lines += run_lines(run, lay)
+    lines += output_lines(lay)
     path.write_text("\n".join(lines) + "\n")
     return len(lines)
 
@@ -352,10 +433,10 @@ def pct(new: float | None, base: float | None) -> str:
     return "-" if not new or not base else f"{100 * (new / base - 1):+.1f}%"
 
 
-def conditions(results: dict[str, Result]) -> list[str]:
+def conditions(results: dict[str, Result], lay: Layout) -> list[str]:
     """The conditions of the runs: the counts, the caps and each flag."""
     got = list(results.values())
-    out = [f"conditions: {len(got)} of {len(runs())} runs have a gate file, {sum(r.ok for r in got)} ran to the end "
+    out = [f"conditions: {len(got)} of {len(runs(lay))} runs have a gate file, {sum(r.ok for r in got)} ran to the end "
            f"with exit code 0, {sum(r.ok and not r.flags for r in got)} have no flag"]
     caps = defaultdict(int)
     for r in got:
@@ -371,7 +452,7 @@ def conditions(results: dict[str, Result]) -> list[str]:
 
 def check_table(results: dict[str, Result]) -> list[str]:
     """The bit check: for each library and each output, the hash of base against new, and the NMSE against the
-    CPU. The runs of a check need no timing conditions. O(lines)."""
+    CPU. The timing conditions do not apply to the check runs. O(lines)."""
     out = ["Bit check (gemvcheck check): the hash of each output of base against new; nmse = the largest NMSE of the "
            "outputs against the CPU backend"]
     all_equal = True
@@ -579,14 +660,17 @@ def prof_table(results: dict[str, Result]) -> list[str]:
     return out
 
 
-def table(root: Path, include_all: bool) -> int:
-    """Print the tables."""
+def table(root: Path, include_all: bool, lay: Layout) -> int:
+    """Print the tables of the stage. The check stage has only the conditions and the bit check."""
     if not root.is_dir():
         print(f"stage.py: {root} is not a directory. Pull the outputs of the stage first.", file=sys.stderr)
         return 1
-    results = {run.name: read_result(root, run) for run in runs() if (root / f"{run.name}-gate.txt").exists()}
-    for part in (conditions(results), check_table(results), tbo_table(results), perf_tables(results, include_all),
-                 bench_table(results, include_all), prof_table(results)):
+    results = {run.name: read_result(root, run) for run in runs(lay) if (root / f"{run.name}-gate.txt").exists()}
+    parts = [conditions(results, lay), check_table(results)]
+    if lay == FULL:
+        parts += [tbo_table(results), perf_tables(results, include_all), bench_table(results, include_all),
+                  prof_table(results)]
+    for part in parts:
         print("\n".join(part))
         print()
     return 0
@@ -599,26 +683,34 @@ def main() -> int:
     t = sub.add_parser("tests", help="write the test files of test-backend-ops")
     t.add_argument("--out", type=Path, default=HERE / "phone" / "tests")
     c = sub.add_parser("commands", help="write the phone command file")
-    c.add_argument("--out", type=Path, default=HERE / "phone-commands.txt")
+    c.add_argument("--out", type=Path, default=None, help="the default is phone-commands.txt of the stage directory")
     tb = sub.add_parser("table", help="print the tables from the pulled files")
-    tb.add_argument("--root", type=Path, default=HERE / "phone-out")
+    tb.add_argument("--root", type=Path, default=None, help="the default is phone-out of the stage directory")
     tb.add_argument("--all", action="store_true", help="also use the timing runs with changed caps or heat")
+    lb = sub.add_parser("libs", help="print the host libraries of the stage, one on each line")
+    for p in (c, tb, lb):
+        p.add_argument("--check-only", action="store_true", help="the check stage gemv-check")
     a = ap.parse_args()
+    lay = CHECK if getattr(a, "check_only", False) else FULL
+    if a.cmd == "libs":
+        print("\n".join(lay.libs))
+        return 0
     if a.cmd == "tests":
         a.out.mkdir(parents=True, exist_ok=True)
         files = test_files()
-        if sorted(files) != sorted(TEST_FILES):
-            print(f"stage.py: TEST_FILES does not list the files of test_files(): {sorted(files)}", file=sys.stderr)
+        if sorted(files) != sorted(FULL.tests):
+            print(f"stage.py: FULL.tests does not list the files of test_files(): {sorted(files)}", file=sys.stderr)
             return 1
         for name, lines in files.items():
             (a.out / name).write_text("\n".join(lines) + "\n")
         print(f"{a.out}: {len(files)} test files")
         return 0
     if a.cmd == "commands":
-        n = write_commands(a.out)
-        print(f"{a.out}: {n} lines, {len(runs())} runs")
+        out = a.out or lay.here / "phone-commands.txt"
+        n = write_commands(out, lay)
+        print(f"{out}: {n} lines, {len(runs(lay))} runs")
         return 0
-    return table(a.root, a.all)
+    return table(a.root or lay.here / "phone-out", a.all, lay)
 
 
 if __name__ == "__main__":

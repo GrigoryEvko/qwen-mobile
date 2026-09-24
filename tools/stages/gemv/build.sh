@@ -14,7 +14,8 @@
 #      with the preset, the compiler flags (with -flto) and the build number and commit of
 #      scripts/build-native.sh. The new tree builds the libraries of the app (LLAMA_LIBS of
 #      scripts/lib.sh), the DSP libraries v73, v75, v79 and v81, llama-bench and test-backend-ops.
-#      The NDK clang++ compiles tools/gemv/gemvcheck.cpp against the libraries of the new tree. The
+#      The NDK clang++ compiles tools/gemv/gemvcheck.cpp against the libraries of the new tree, with
+#      the C++ library in the program (-static-libstdc++), thus it has no NEEDED entry for libc++_shared.so. The
 #      base tree builds the DSP libraries v73, v75 and v79.
 #   3. The script copies the files of the stage into build/gemv/phone:
 #        bin/        llama-bench, test-backend-ops, gemvcheck, gate.sh
@@ -96,7 +97,7 @@ cmake -S "$TREE" --preset arm64-android-snapdragon-release -B "$BDIR" \
 cmake --build "$BDIR" -j"$JOBS" --target $TARGETS
 if [ "$CHECKER" = 1 ]; then
     cxx=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang++
-    $cxx -O2 -std=c++17 -Wall -Wextra $FLAGS_EXTRA -I"$TREE/ggml/include" tools/gemv/gemvcheck.cpp \
+    $cxx -O2 -std=c++17 -Wall -Wextra $FLAGS_EXTRA -static-libstdc++ -I"$TREE/ggml/include" tools/gemv/gemvcheck.cpp \
         -o "$BDIR/bin/gemvcheck" -L"$BDIR/bin" -lggml -lggml-cpu -lggml-base -Wl,-rpath,"\$ORIGIN/../lib"
 fi
 '
