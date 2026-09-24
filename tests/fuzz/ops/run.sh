@@ -79,7 +79,8 @@ Other modes:
   phone-build [PROFILE-CONFIG...]  Build ops_replay for arm64 Android: one build for each profile
                 (debug, release) and each configuration (none, asan, hwasan, ubsan); the default is
                 all eight. The release none build links the shipped libraries of
-                android/snapdragon/jniLibs/arm64-v8a (hash-checked against build/hashes-native.txt).
+                android/snapdragon/jniLibs/arm64-v8a (hash-checked against build/hashes-native.txt),
+                and its runs use the shipped DSP library of that directory.
                 Then make the case pack, and stage the phone files in build/fuzz/ops/phone.
   phone-commands [probe|full|diag]   Print the adb commands. "diag" runs the diagnosis pack of
                 the HTP0 guard writes and run-to-run differences with repeats on HTP0. "probe" runs
@@ -146,8 +147,13 @@ Environment (defaults in parentheses):
   PHONE          the adb serial (192.168.14.130:5555)
   PHONE_DIR      the work directory on the phone (/data/local/tmp/qwen/fuzz/ops)
   PHONE_BUILDS   the builds of phone-commands full, for example "release-none debug-asan"
-  DSP_LIB        a DSP library to push as libggml-htp-v79.so; empty uses ADSP_DIR as it is
-  ADSP_DIR       the ADSP_LIBRARY_PATH on the phone without DSP_LIB (/data/local/tmp/qwen/q8ref/lib)
+  DSP_LIB        a DSP library to push as libggml-htp-v79.so for the builds other than release-none;
+                 empty uses ADSP_DIR as it is. release-none always uses the shipped DSP library
+                 (android/snapdragon/jniLibs/arm64-v8a, hash-checked against build/hashes-native.txt),
+                 which phone-build copies to its stage directory. phone_run.sh prints the SHA-256 of
+                 each DSP library of a run.
+  ADSP_DIR       the ADSP_LIBRARY_PATH on the phone of the builds other than release-none without
+                 DSP_LIB (/data/local/tmp/qwen/q8ref/lib)
   PACK_N         the random cases of each kind in the phone pack (20)
   PACK_CORPUS    the most inputs from each CPU corpus in the phone pack (40). The pack takes the
                  corpora of the fuzz suites of the none builds (debug and release) only
@@ -484,10 +490,15 @@ summary() {
     find "$dir/work" -path '*/artifacts/*' -type f 2> /dev/null | sort || true
 }
 
-# Check the shipped libraries against build/hashes-native.txt.
+# Check the shipped libraries against build/hashes-native.txt: the arguments, or without one the
+# host libraries that the release none replay driver links and the v79 DSP library that pairs with
+# them.
 check_shipped() {
     local lib want got
-    for lib in libggml.so libggml-base.so libggml-cpu.so libggml-hexagon.so libggml-opencl.so; do
+    local -a libs=("$@")
+    [[ ${#libs[@]} -gt 0 ]] \
+        || libs=(libggml.so libggml-base.so libggml-cpu.so libggml-hexagon.so libggml-opencl.so libggml-htp-v79.so)
+    for lib in "${libs[@]}"; do
         want=$(rg -F "  $lib" "$REPO_ROOT/build/hashes-native.txt" | cut -d' ' -f1)
         got=$(sha256sum "$SHIPPED_LIBS/$lib" | cut -d' ' -f1)
         [[ -n $want && $want == "$got" ]] || die "$SHIPPED_LIBS/$lib does not match build/hashes-native.txt ($got, want $want)"
@@ -594,6 +605,9 @@ fi
         if [[ $b == release-none ]]; then
             cp -f "$SHIPPED_LIBS"/libggml.so "$SHIPPED_LIBS"/libggml-base.so "$SHIPPED_LIBS"/libggml-cpu.so \
                 "$SHIPPED_LIBS"/libggml-hexagon.so "$SHIPPED_LIBS"/libggml-opencl.so "$stage/$b/"
+            # the shipped host libraries pair with the shipped DSP library, thus it goes with them
+            mkdir -p "$stage/$b/dsp"
+            cp -f "$SHIPPED_LIBS/libggml-htp-v79.so" "$stage/$b/dsp/"
         fi
     done
     cp -f "$HERE/phone_run.sh" "$stage/"
@@ -622,6 +636,24 @@ fi
     cat "$stage/SHA256SUMS"
 }
 
+# Print the ADSP_LIBRARY_PATH on the phone for one build. release-none links the shipped host
+# libraries, thus it takes the shipped DSP library in its stage directory (phone-build copies it
+# there after the check against build/hashes-native.txt). The other builds have the host code of
+# the snapshot: they take the staged DSP library of the snapshot (DSP_LIB or FUZZ_OPS_BUILD_DSP=1),
+# or ADSP_DIR when the stage has none.
+phone_adsp() {
+    local b=$1 stage="$MISC/phone"
+    if [[ $b == release-none ]]; then
+        [[ -f $stage/release-none/dsp/libggml-htp-v79.so ]] \
+            || die "no shipped DSP library in $stage/release-none/dsp: run phone-build release-none"
+        echo "$PHONE_DIR/release-none/dsp"
+    elif [[ -f $stage/libggml-htp-v79.so ]]; then
+        echo "$PHONE_DIR/dsp"
+    else
+        echo "$ADSP_DIR"
+    fi
+}
+
 # Print one phone run: the thermal status, the run inside timeout, the thermal status again, and
 # the check that no process is left.
 phone_run_cmd() {
@@ -637,7 +669,7 @@ phone_run_cmd() {
 
 phone_commands() {
     local what=${1:-probe}
-    local stage="$MISC/phone" d=$PHONE_DIR adsp=$ADSP_DIR b
+    local stage="$MISC/phone" d=$PHONE_DIR adsp b
     [[ -f "$stage/cases.pack" && -f "$stage/phone_run.sh" ]] || die "run tests/fuzz/ops/run.sh phone-build first"
     local -a staged=()
     for b in "$stage"/{debug,release}-{none,asan,hwasan,ubsan}/; do
@@ -649,8 +681,8 @@ phone_commands() {
         echo "adb -s $PHONE shell 'mkdir -p $d/out'"
         echo "adb -s $PHONE push $stage/phone_run.sh $stage/diag.pack $d/"
         echo "adb -s $PHONE push $stage/$DIAG_BUILD $d/"
-        if [[ -f "$stage/libggml-htp-v79.so" ]]; then
-            adsp="$d/dsp"
+        adsp=$(phone_adsp "$DIAG_BUILD")
+        if [[ $adsp == "$d/dsp" ]]; then
             echo "adb -s $PHONE shell 'mkdir -p $d/dsp'"
             echo "adb -s $PHONE push $stage/libggml-htp-v79.so $d/dsp/"
         fi
@@ -667,7 +699,6 @@ phone_commands() {
     [[ -d "$stage/asan-rt" ]] && echo "adb -s $PHONE push $stage/asan-rt $d/"
     echo "adb -s $PHONE shell 'chmod 755 $d/*/ops_replay $d/llvm-symbolizer; sha256sum $d/llvm-symbolizer $d/*/ops_replay | cut -c1-16'"
     if [[ -f "$stage/libggml-htp-v79.so" ]]; then
-        adsp="$d/dsp"
         echo "adb -s $PHONE push $stage/libggml-htp-v79.so $d/dsp/"
     fi
     fi
@@ -722,6 +753,7 @@ phone_commands() {
         echo "#    report that no entry matches)."
         for b in "${staged[@]}"; do
             echo "# probe of $b"
+            adsp=$(phone_adsp "$b")
             if [[ $b == *-asan ]]; then
                 phone_run_cmd "$b" probe CPU,HTP0 - 1 "$adsp" 3 0 trace
                 echo "adb -s $PHONE shell 'timeout -s KILL 20 logcat -d -b crash -t 60'"
@@ -752,18 +784,15 @@ phone_commands() {
             none) parts=3; pack=cases.pack ;; *) parts=1; pack=san.pack ;;
         esac
         [[ ${b%%-*} == debug ]] && parts=$((parts + 1))
+        adsp=$(phone_adsp "$b")
         for n in $(seq 1 "$parts"); do
             echo "# $b: app, part $n of $parts ($pack)"
-            # release-none links the shipped host libraries, thus it pairs with the shipped DSP
-            # library (ADSP_DIR); the other builds have the host code of the snapshot
-            local badsp=$adsp
-            [[ $b == release-none ]] && badsp=$ADSP_DIR
-            FUZZ_OPS_CMD_PACK=$pack phone_run_cmd "$b" app CPU,HTP0 - 1 "$badsp" all 1
+            FUZZ_OPS_CMD_PACK=$pack phone_run_cmd "$b" app CPU,HTP0 - 1 "$adsp" all 1
         done
         if [[ ${b#*-} == none ]]; then
             for n in 1 2; do
                 echo "# $b: nofuse, part $n of 2"
-                phone_run_cmd "$b" nofuse HTP0 -nofuse 0 "$badsp" all 1
+                phone_run_cmd "$b" nofuse HTP0 -nofuse 0 "$adsp" all 1
             done
         fi
     done
@@ -934,10 +963,13 @@ cmake --build $bdir -j$BUILD_JOBS --target $LLAMA_LIBS llama-bench
 #      after, with the thermal status, the clock caps and the battery between the runs.
 #      llama-bench and libllama-bench-impl.so are one tool set (the same files for the two
 #      library sets), in a directory after the library set in LD_LIBRARY_PATH.
+# The two library sets use the shipped DSP library (check-TAG-dsp): the check compares host
+# libraries, thus a fix of the DSP code needs a stage of its own.
 phone_check_commands() {
     [[ -n $TAG ]] || die "phone-check-commands needs FUZZ_OPS_TAG (the libraries of phone-libs)"
     local stage="$MISC/phone" d=$PHONE_DIR lib side
-    local after="$stage/libs-$TAG" tools="$stage/check-$TAG-tools"
+    local after="$stage/libs-$TAG" tools="$stage/check-$TAG-tools" dsp="$stage/check-$TAG-dsp"
+    local adsp="$d/check-$TAG-dsp"
     [[ -f $after/tools/llama-bench && -f $stage/release-none/ops_replay && -f $stage/cases.pack ]] \
         || die "run phone-build and phone-libs first"
     # "before": the shipped libraries, or with FUZZ_OPS_CHECK_BEFORE=TAG0 the private build libs-TAG0
@@ -964,16 +996,20 @@ phone_check_commands() {
     rm -rf "$tools"
     mkdir -p "$tools"
     cp -f "$after/tools/llama-bench" "$after/tools/libllama-bench-impl.so" "$tools/"
+    check_shipped libggml-htp-v79.so
+    rm -rf "$dsp"
+    mkdir -p "$dsp"
+    cp -f "$SHIPPED_LIBS/libggml-htp-v79.so" "$dsp/"
     local status="adb -s $PHONE shell 'dumpsys thermalservice | grep \"Thermal Status\"; cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq /sys/devices/system/cpu/cpu7/cpufreq/scaling_max_freq; dumpsys battery | grep -E \"powered|status|temperature\"'"
     local m4=/data/local/tmp/qwen/models/Qwen3.5-4B-Q8_0.gguf m2=/data/local/tmp/qwen/models/Qwen3.5-2B-Q8_0.gguf
     local bench="$d/check-$TAG-tools/llama-bench -dev none -ngl 0 -t 6 -fa 1 -o md"
     echo "# The phone check of FUZZ_OPS_TAG=$TAG, before = $before_dir. Do not run on the charger."
     echo "adb -s $PHONE shell 'mkdir -p $d/out'"
-    echo "adb -s $PHONE push $stage/check-$TAG-before $stage/check-$TAG-after $tools $d/"
+    echo "adb -s $PHONE push $stage/check-$TAG-before $stage/check-$TAG-after $tools $dsp $d/"
     echo "adb -s $PHONE shell 'chmod 755 $d/check-$TAG-*/ops_replay $d/check-$TAG-tools/llama-bench; cd $d && sha256sum check-$TAG-*/*.so check-$TAG-tools/llama-bench | cut -c1-16'"
     echo "# 1. The op pack with each library set (the first 600 cases, CPU and HTP0)."
     for side in before after; do
-        phone_run_cmd "check-$TAG-$side" libcheck CPU,HTP0 - 1 "$ADSP_DIR" 600 1
+        phone_run_cmd "check-$TAG-$side" libcheck CPU,HTP0 - 1 "$adsp" 600 1
     done
     echo "# 2. llama-bench on the CPU: tg on the 4B model, then pp on the 2B model."
     local what model args n
@@ -981,12 +1017,12 @@ phone_check_commands() {
         if [[ $what == tg ]]; then model=$m4; args="-p 0 -n 32"; else model=$m2; args="-p 128 -n 0"; fi
         echo "# $what: the warmup run (1 repetition, not measured)"
         echo "$status"
-        echo "adb -s $PHONE shell 'cd $d && timeout -s KILL 100 env LD_LIBRARY_PATH=$d/check-$TAG-before:$d/check-$TAG-tools ADSP_LIBRARY_PATH=$ADSP_DIR $bench -r 1 -m $model $args > /dev/null 2> out/bench-$TAG-$what-warmup.log; echo $what warmup rc=\$?'"
+        echo "adb -s $PHONE shell 'cd $d && timeout -s KILL 100 env LD_LIBRARY_PATH=$d/check-$TAG-before:$d/check-$TAG-tools ADSP_LIBRARY_PATH=$adsp $bench -r 1 -m $model $args > /dev/null 2> out/bench-$TAG-$what-warmup.log; echo $what warmup rc=\$?'"
         n=0
         for side in before after before after; do
             n=$((n + 1))
             echo "$status"
-            echo "adb -s $PHONE shell 'cd $d && timeout -s KILL 100 env LD_LIBRARY_PATH=$d/check-$TAG-$side:$d/check-$TAG-tools ADSP_LIBRARY_PATH=$ADSP_DIR $bench -r 5 -m $model $args 2> out/bench-$TAG-$what-$side-$n.log; echo $what $side $n rc=\$?'"
+            echo "adb -s $PHONE shell 'cd $d && timeout -s KILL 100 env LD_LIBRARY_PATH=$d/check-$TAG-$side:$d/check-$TAG-tools ADSP_LIBRARY_PATH=$adsp $bench -r 5 -m $model $args 2> out/bench-$TAG-$what-$side-$n.log; echo $what $side $n rc=\$?'"
         done
     done
     echo "$status"

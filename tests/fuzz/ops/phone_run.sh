@@ -11,7 +11,8 @@
 #   BACKENDS    the devices, for example CPU,HTP0
 #   SUFFIX      a tag suffix of the results, "-" for none. The results always get "-BUILD".
 #   FUSION      the value of GGML_HEXAGON_OPFUSION and GGML_HEXAGON_OPFUSION_STATE (0 or 1)
-#   ADSP_DIR    the ADSP_LIBRARY_PATH with libggml-htp-v79.so
+#   ADSP_DIR    the ADSP_LIBRARY_PATH with libggml-htp-v79.so. The script prints the SHA-256 of each
+#               DSP library in it before the first case.
 #   SECONDS     the run time before the deadline. Keep it 15 s below the outer timeout.
 #   COUNT       "all", or the number of cases from the start of the pack (a probe)
 #   UBSAN_HALT  1 stops at the first UBSan report without a suppression, 0 prints every report
@@ -52,6 +53,19 @@ xenv=${FUZZ_OPS_ENV:-}
 
 cd "$d" || exit 1
 [ -x "$d/$build/ops_replay" ] || { echo "no build $d/$build/ops_replay"; exit 1; }
+mkdir -p out
+
+# The DSP libraries of the run: the SHA-256 of each libggml-htp-v*.so in ADSP_DIR, in the output of
+# the command (the stage log) and in the log of the run. The results pair with these bytes.
+ndsp=0
+for lib in "$adsp"/libggml-htp-v*.so; do
+    [ -f "$lib" ] || continue
+    line="dsp: $(sha256sum "$lib")"
+    echo "build=$build tag=$tag $line"
+    echo "$line" >> "out/log-$build-$tag.txt"
+    ndsp=$((ndsp + 1))
+done
+[ $ndsp -gt 0 ] || echo "build=$build tag=$tag dsp: no libggml-htp-v*.so in $adsp"
 
 # the options of the one sanitizer of the build. With the symbolizer, the report frames have
 # function names, and the function-level entries of ubsan.supp can match them.
