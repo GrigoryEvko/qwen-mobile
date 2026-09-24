@@ -1,0 +1,255 @@
+hexagon: send a pointwise unary op on contiguous tensors with long rows
+Fold-into: upstream/hexagon-host
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+The defect
+
+The unary kernel of the DSP (htp/unary-ops.c) starts one DMA row and one HVX
+call for each row of src0. Thus rows of less than 512 bytes make the op slow,
+and a tensor that has a smaller number of rows than threads keeps some threads
+without work. Three ops of Qwen3.5 (src/models/qwen35.cpp, and build_rs of
+src/llama-graph.cpp) have such shapes. On the phone (the 4B Q8_0 on HTP0, a
+prompt ubatch of 1024 tokens):
+
+- The beta gate of each gated delta net layer is a SIGMOID of the shape
+  [1, 32, 1024], thus each row holds one element. The 24 ops took 10.4 ms, at
+  0.6 GB/s.
+- The SOFTPLUS of the gate has rows of 32 elements (128 bytes). The 24 ops took
+  1.9 ms, at 3 GB/s.
+- In the first ubatch of a sequence, a SCALE by 0 sets the recurrent state of
+  each layer to zero. The state of a gated delta net layer is one row of 2 MiB,
+  and one thread moved it in 115 us (24 ops, 2.8 ms).
+
+The change
+
+A pointwise op gives the same value for each element with each row length. The
+pointwise ops are SCALE, CLAMP, LEAKY_RELU, SQR, SQRT and the unary ops NEG,
+EXP, SIGMOID, SILU, GELU, GELU_QUICK, SOFTPLUS, TANH, ABS, LOG and RELU.
+ggml_hexagon_flatten_pointwise gives such an op new descriptors of src0 and dst
+when the two are contiguous, have the same type and the same element count, and
+when one of these conditions is true:
+
+- The rows are shorter than 512 bytes.
+- The rows are longer than 16 KiB, and the tensor has a smaller number of rows
+  than threads.
+
+The rows of the new descriptors have the largest length that divides the
+element count and holds a maximum of 16 KiB. The op node keeps the two
+descriptors as copies of the tensors (htp_opnode::add_dummy), with the data,
+the buffer and the extra of each tensor. The kernel params come from the new
+shape. The attention gate (a SIGMOID with rows of 4096 elements) and the norms
+keep their rows.
+
+The op reads and writes the same bytes, and each HVX lane computes one element.
+But the new rows put an element into a different block of the kernel: the
+SOFTPLUS computes a group of 4 vectors in its main block and the remaining
+vectors in its tail block, and the int16 SIGMOID converts two vectors to f16
+together. In the simulator, with the flags of the shipped library, the old and
+the new rows give the same bits. On the NPU, a small number of elements round
+differently (refer to The phone). The two forms have the same error against the
+CPU, thus the difference is an intended difference of the arithmetic.
+
+The switch GGML_HEXAGON_UNARY_FLAT (preset 1) gives 0: no op gets new rows. A
+different value is a mask of the kinds of op: 2 SIGMOID, 4 SOFTPLUS, 8 SCALE
+and 16 the other pointwise ops.
+
+The tests
+
+The symbolic check of tests/fuzz/hexhost (common/symexec.cpp) gives a pointwise
+op a value of its element count and not of its shape. Without that rule, the
+test mode gives 12 findings of sym-mismatch at the new descriptors. With it, the
+test mode gives 0 findings in the configurations none, asan, ubsan, tsan and
+msan, each with the debug and the release profile, and the graphs mode passes
+on the 2B and the 4B. On the fake DSP, each value of the switch changes the
+rows of the kinds that it names and of no other op.
+
+The phone
+
+The stage unary-rows (tools/stages/unary-rows, the 4B Q8_0 on HTP0) compared
+the old and the new rows:
+
+- With the value 0, the logits hashes are those of the series before this
+  patch. Of the three kinds, only the new rows of the SOFTPLUS move the hashes
+  of the 4B. On the 2B, the SIGMOID and the SCALE (the value 26) also move the
+  hashes.
+- unarycheck ran the ops in the shapes of the model on HTP0 and on the CPU of
+  the phone. The old and the new rows have the same error against the CPU: the
+  SIGMOID [1, 32, 1024] has an NMSE of 1.725e-9 with the two forms, and the
+  SOFTPLUS [32, 1024] has 2.460e-16 and 2.459e-16. Between the two forms, 167 of
+  32768 SOFTPLUS elements differ by 1 ulp, and 4 of 32768 SIGMOID elements by a
+  maximum of 9.2e-5 (one f16 step of the input). The SCALE by 0 clears its slot
+  with the two forms, and the decode shapes give the same bits.
+
+The stage unary-kl (tools/stages/unary-kl) measured the KL against the naive
+base naive-4B-q8.kld, with each variant two times:
+
+- Prefill (-b 512, 4 chunks of 512): 0.000579 +- 0.000039 before this patch
+  (maximum 0.019190, same top p 98.529 %), 0.000574 +- 0.000038 with it
+  (maximum 0.018415, same top p 98.529 %).
+- Decode (-b 1 -ub 1, 1 chunk of 512): 0.000557 +- 0.000089 with the two forms.
+  The decode logits have the same bits.
+
+llama-bench against the series before this patch, the medians of 3 alternated
+rounds: pp512 +2.46 % (range +0.78 to +3.02), pp1024 +0.66 % (+0.15 to
++0.92), and tg32 at the depth 0 -0.25 % (-0.77 to -0.23). The value 26 runs the
+same ops as this patch in decode, and it gives -0.41 % (-0.62 to +0.49) in the
+same rounds, thus the spread of the tg32 runs is more than 1 %. The profile of
+a prompt ubatch of 1024 tokens (the stage quick) gives the SIGMOID 10.37 ms to
+0.41 ms, the SOFTPLUS 1.90 ms to 0.93 ms and the clear SCALE 2.76 ms to 2.00 ms.
+
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 898e50d..4a17422 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -163,6 +163,11 @@ static int opt_mm_solver = 1;
+ static int opt_mm_chunks_m = -1;
+ static int opt_mm_chunks_n = -1;
+ 
++// GGML_HEXAGON_UNARY_FLAT: 1 = ggml_hexagon_flatten_pointwise gives new rows to each kind of pointwise op
++// (the default), 0 = to no op. A different value is a mask of the kinds: 2 = SIGMOID, 4 = SOFTPLUS,
++// 8 = SCALE, 16 = the other pointwise ops. Thus an A/B run of each kind needs no other build.
++static int opt_unary_flat = 1;
++
+ static inline bool ggml_hexagon_is_fusion_enabled(int flag) {
+     if (opt_opfusion <= 0) return false;
+     if (opt_opfusion == 1) return true; // 1 enables all
+@@ -5629,6 +5634,114 @@ static void ggml_hexagon_precompute_unary_params(
+     kparams->div_tpr   = init_fastdiv_values(tiles_per_row);
+ }
+ 
++// A row of less than this many bytes makes the unary kernel slow. The phone measured 3 GB/s for rows of
++// 128 bytes and 58 GB/s for rows of 512 bytes.
++static constexpr size_t HTP_UNARY_SHORT_ROW_BYTES = 512;
++
++// The maximum bytes of one row that ggml_hexagon_flatten_pointwise makes. With 6 threads, 8 MiB of VTCM
++// holds 21 such rows of src0 and of dst for each thread, in two halves.
++static constexpr size_t HTP_UNARY_FLAT_ROW_BYTES = 16384;
++
++// True for a unary opcode whose value at each element uses only the source value at that element
++static bool ggml_hexagon_op_is_pointwise(uint32_t opcode) {
++    switch (opcode) {
++        case HTP_OP_SCALE:
++        case HTP_OP_CLAMP:
++        case HTP_OP_LEAKY_RELU:
++        case HTP_OP_SQR:
++        case HTP_OP_SQRT:
++        case HTP_OP_UNARY_NEG:
++        case HTP_OP_UNARY_EXP:
++        case HTP_OP_UNARY_SIGMOID:
++        case HTP_OP_UNARY_SILU:
++        case HTP_OP_UNARY_GELU:
++        case HTP_OP_UNARY_GELU_QUICK:
++        case HTP_OP_UNARY_SOFTPLUS:
++        case HTP_OP_UNARY_TANH:
++        case HTP_OP_UNARY_ABS:
++        case HTP_OP_UNARY_LOG:
++        case HTP_OP_UNARY_RELU:
++            return true;
++        default:
++            return false;
++    }
++}
++
++// True when GGML_HEXAGON_UNARY_FLAT includes the kind of this pointwise opcode
++static bool ggml_hexagon_unary_flat_enabled(uint32_t opcode) {
++    if (opt_unary_flat <= 0) {
++        return false;
++    }
++    if (opt_unary_flat == 1) {
++        return true;
++    }
++    const int kind = opcode == HTP_OP_UNARY_SIGMOID  ? 2 :
++                     opcode == HTP_OP_UNARY_SOFTPLUS ? 4 :
++                     opcode == HTP_OP_SCALE          ? 8 : 16;
++    return (opt_unary_flat & kind) != 0;
++}
++
++// The unary kernel of the DSP (htp/unary-ops.c) starts one DMA row and one HVX call for each row of
++// src0. Thus rows of less than HTP_UNARY_SHORT_ROW_BYTES make the op slow. On the phone, the beta gate of
++// a gated delta net layer has rows of one element, and it moved 0.6 GB/s. A tensor that has a smaller
++// number of rows than threads keeps some threads without work. The SCALE by 0 that sets a recurrent
++// state to zero (build_rs of llama-graph.cpp) is one row of 2 MiB, and one thread moves it.
++//
++// A pointwise op on contiguous tensors gives the same value for each element with each row length. Thus
++// the host gives such an op new descriptors of src0 and dst. Their rows have the largest length that
++// divides the element count and holds a maximum of HTP_UNARY_FLAT_ROW_BYTES. The op node keeps the two
++// descriptors as copies of the tensors (htp_opnode::add_dummy), with the data, the buffer and the extra of
++// each tensor. When the rows of the tensor are short, the rows of the copies are not shorter, because ne0
++// divides the element count. O(HTP_UNARY_FLAT_ROW_BYTES / element size) when the host makes the op node.
++static void ggml_hexagon_flatten_pointwise(const struct ggml_hexagon_session * sess, htp_opnode & node) {
++    if (!ggml_hexagon_op_is_pointwise(node.opcode) || !ggml_hexagon_unary_flat_enabled(node.opcode) ||
++        !node.fused.empty() || node.inputs.size() != 1 || node.outputs.size() != 1 || node.inputs[0] == nullptr) {
++        return;
++    }
++
++    const ggml_tensor * src0 = node.inputs[0];
++    const ggml_tensor * dst  = node.outputs[0];
++    if (src0->type != dst->type || ggml_blck_size(src0->type) != 1 || !ggml_is_contiguous(src0) ||
++        !ggml_is_contiguous(dst) || ggml_nelements(src0) != ggml_nelements(dst) || ggml_nelements(src0) <= 0) {
++        return;
++    }
++
++    const int64_t n    = ggml_nelements(src0);
++    const size_t  es   = ggml_type_size(src0->type);
++    const int64_t ne0  = src0->ne[0];
++    const int64_t rows = n / ne0;
++
++    const bool short_rows = (size_t) ne0 * es < HTP_UNARY_SHORT_ROW_BYTES;
++    const bool long_rows  = (size_t) ne0 * es > HTP_UNARY_FLAT_ROW_BYTES;
++    if (!short_rows && !(long_rows && rows < (int64_t) sess->n_threads)) {
++        return;
++    }
++
++    int64_t len = std::min<int64_t>(n, (int64_t) (HTP_UNARY_FLAT_ROW_BYTES / es));
++    while (n % len != 0) {
++        len--;
++    }
++    if (len == ne0) {
++        return;
++    }
++
++    auto flat = [&](const ggml_tensor * t) {
++        ggml_tensor c = *t;
++        c.ne[0] = len;
++        c.ne[1] = n / len;
++        c.ne[2] = 1;
++        c.ne[3] = 1;
++        c.nb[0] = es;
++        c.nb[1] = (size_t) len * es;
++        c.nb[2] = (size_t) n * es;
++        c.nb[3] = (size_t) n * es;
++        return node.add_dummy(c);
++    };
++
++    node.inputs[0]  = flat(src0);
++    node.outputs[0] = flat(dst);
++}
++
+ static void ggml_hexagon_precompute_get_rows_params(
+     const struct ggml_hexagon_session * sess,
+     const struct ggml_tensor * src0,
+@@ -7128,6 +7241,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+                     (struct htp_fa_kernel_params *)node.kernel_params
+                 );
+             } else if (htp_op_is_unary(node.opcode)) {
++                ggml_hexagon_flatten_pointwise(sess, node);
+                 auto inputs = node.get_inputs();
+                 const struct ggml_tensor * src0 = inputs[0];
+                 const struct ggml_tensor * src1 = inputs.size() > 1 ? inputs[1] : nullptr;
+@@ -8568,6 +8682,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     const char * str_batchcache_multi = getenv("GGML_HEXAGON_BATCHCACHE_MULTI");
+     const char * str_graphcache = getenv("GGML_HEXAGON_GRAPHCACHE");
+     const char * str_mmap_lru   = getenv("GGML_HEXAGON_MMAP_LRU");
++    const char * str_unary_flat = getenv("GGML_HEXAGON_UNARY_FLAT");
+     const char * str_hostprof   = getenv("LLAMA_HOSTPROF");
+ 
+     ggml_hexagon_mm_fusion_read_env();
+@@ -8639,6 +8754,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     opt_batchcache_multi = str_batchcache_multi ? atoi(str_batchcache_multi) : opt_batchcache_multi;
+     opt_graphcache = str_graphcache ? atoi(str_graphcache)                : opt_graphcache;
+     opt_mmap_lru   = str_mmap_lru   ? atoi(str_mmap_lru)                  : opt_mmap_lru;
++    opt_unary_flat = str_unary_flat ? atoi(str_unary_flat)                : opt_unary_flat;
+     opt_hostprof   = str_hostprof   ? atoi(str_hostprof)                  : opt_hostprof;
+ 
+     if (opt_batchcache) {
