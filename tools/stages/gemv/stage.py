@@ -215,8 +215,9 @@ def runs(lay: Layout = FULL) -> list[Run]:
         r.append(Run(f"gperf-{v}", "gperf", v, "gemvcheck", f"perf --cases {PERF_CASES} --reps 16 --runs 5", "", 100,
                      GATE_CHECK, "gemvcheck perf of MUL_MAT, MUL_MAT_ADD, MUL_MAT_NX and the head, 1 and 4 rows"))
     r += bench_runs()
+    # -v: without it llama-bench drops the debug lines of ggml, thus the log has no profile line
     for v in ("base", "new"):
-        r.append(Run(f"prof-{v}", "prof", v, "llama-bench", f"{BENCH_ARGS} -p 0 -n 8 -d 4096 -r 1",
+        r.append(Run(f"prof-{v}", "prof", v, "llama-bench", f"{BENCH_ARGS} -p 0 -n 8 -d 4096 -r 1 -v",
                      "GGML_HEXAGON_PROFILE=1", 90, GATE_MODEL,
                      "llama-bench tg8 at the depth 4096 with the op profile"))
     return r
@@ -265,7 +266,7 @@ HEADER = """\
 #   gperf   gemvcheck perf (MUL_MAT, MUL_MAT_ADD, MUL_MAT_NX, the head), new then base
 #   bench   llama-bench of the 4B, the flags of the variant b of bench-kv: pp512 + tg32 at d0, tg32 at d4096, tg32 at
 #           d16384; 3 rounds, base then new in rounds 1 and 3, new then base in round 2
-#   prof    llama-bench tg8 at d4096 with GGML_HEXAGON_PROFILE=1, base and new
+#   prof    llama-bench -v tg8 at d4096 with GGML_HEXAGON_PROFILE=1, base and new
 # The libraries: build/gemv/phone (tools/stages/gemv/build.sh): the host libraries of HEAD plus the patch, and the
 # DSP libraries dsp/new (HEAD plus the patch) and dsp/base (HEAD). patch.sha256 names the patch.
 #
