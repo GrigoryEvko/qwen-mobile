@@ -5,7 +5,16 @@
 // activation are in VTCM, as after the DMA and the quantization task of the operator. The compact
 // activation is in DDR, because the compact dots read it with scalar loads.
 //
-// Arguments: --k 2048 --rows 4 --ct 4 --iters 5
+// The weight tiles have the VTCM layout of the kernel tree: the packed layout (a pitch of 1088
+// bytes, when hvx-mm-kernels-tiled.h defines HTP_MM_HAVE_PACKED_Q8_0) or a pitch of 1152 bytes.
+// Each column tile has a slot of n_k * 1152 bytes, as in the operator. The bytes of a slot that
+// hold no tile are random, thus a result that reads them differs from the reference.
+//
+// Each variant prints an FNV-1a hash of all its output bits. Two kernel trees give the same bits
+// when they print the same hashes for the same arguments (the inputs come from a fixed seed).
+//
+// Arguments: --k 2048 --rows 4 --ct 4 --iters 5. k is a multiple of 32. The compact dots run only
+// when k is a multiple of 128, because the operator uses them only then.
 #pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
 #pragma clang diagnostic ignored "-Wunused-function"
 #pragma clang diagnostic ignored "-Wunused-variable"
@@ -42,15 +51,34 @@ static const uint8_t __attribute__((aligned(VLEN))) kvalues_mxfp4_lut[128] = { 0
 
 #include "hvx-mm-kernels-tiled.h"
 
+// The dots and the weight pitch of the kernel tree
+#ifdef HTP_MM_HAVE_PACKED_Q8_0
+#define Q8_W_PITCH HTP_MM_WEIGHT_TILE_SIZE_Q8_0  // 1088
+#define DOT_32X1   tiled_vec_dot_q8_0_packed_32x1
+#define DOT_32X2   tiled_vec_dot_q8_0_packed_32x2
+#define DOT_32X1C  tiled_vec_dot_q8_0_packed_32x1c
+#define DOT_32X2C  tiled_vec_dot_q8_0_packed_32x2c
+#define DOT_32X3C  tiled_vec_dot_q8_0_packed_32x3c
+#define DOT_32X4C  tiled_vec_dot_q8_0_packed_32x4c
+#else
+#define Q8_W_PITCH HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q8_0  // 1152
+#define DOT_32X1   tiled_vec_dot_q8_0_32x1
+#define DOT_32X2   tiled_vec_dot_q8_0_32x2
+#define DOT_32X1C  tiled_vec_dot_q8_0_32x1c
+#define DOT_32X2C  tiled_vec_dot_q8_0_32x2c
+#define DOT_32X3C  tiled_vec_dot_q8_0_32x3c
+#define DOT_32X4C  tiled_vec_dot_q8_0_32x4c
+#endif
+
 #define KERNEL_WRAP __attribute__((noinline))
 
 static KERNEL_WRAP void kernel_q8_0_32x1(const uint32_t n, float * s, const void * vx, const void * vy, uint32_t valid_rows) {
-    tiled_vec_dot_q8_0_32x1(n, s, vx, vy, valid_rows, NULL);
+    DOT_32X1(n, s, vx, vy, valid_rows, NULL);
 }
 
 static KERNEL_WRAP void kernel_q8_0_32x2(const uint32_t n, float * s0, float * s1, const void * vx,
                                          const void * vy0, const void * vy1, uint32_t valid_rows) {
-    tiled_vec_dot_q8_0_32x2(n, s0, s1, vx, vy0, vy1, valid_rows, NULL, NULL);
+    DOT_32X2(n, s0, s1, vx, vy0, vy1, valid_rows, NULL, NULL);
 }
 
 static KERNEL_WRAP void kernel_quantize_q8_0(float * x, uint8_t * y, uint32_t k) {
@@ -60,14 +88,14 @@ static KERNEL_WRAP void kernel_quantize_q8_0(float * x, uint8_t * y, uint32_t k)
 #ifdef HTP_MM_HAVE_MULTIROW
 static KERNEL_WRAP void kernel_q8_0_32x1c(const uint32_t n, float * s0, const void * vx, const void * vy0,
                                           const uint32_t * ya0, const int32_t * yb0, uint32_t valid_rows) {
-    tiled_vec_dot_q8_0_32x1c(n, s0, vx, vy0, ya0, yb0, valid_rows, NULL);
+    DOT_32X1C(n, s0, vx, vy0, ya0, yb0, valid_rows, NULL);
 }
 
 static KERNEL_WRAP void kernel_q8_0_32x2c(const uint32_t n, float * s0, float * s1, const void * vx,
                                           const void * vy0, const void * vy1,
                                           const uint32_t * ya0, const uint32_t * ya1,
                                           const int32_t * yb0, const int32_t * yb1, uint32_t valid_rows) {
-    tiled_vec_dot_q8_0_32x2c(n, s0, s1, vx, vy0, vy1, ya0, ya1, yb0, yb1, valid_rows, NULL, NULL);
+    DOT_32X2C(n, s0, s1, vx, vy0, vy1, ya0, ya1, yb0, yb1, valid_rows, NULL, NULL);
 }
 
 static KERNEL_WRAP void kernel_q8_0_32x3c(const uint32_t n, float * s0, float * s1, float * s2, const void * vx,
@@ -75,7 +103,7 @@ static KERNEL_WRAP void kernel_q8_0_32x3c(const uint32_t n, float * s0, float * 
                                           const uint32_t * ya0, const uint32_t * ya1, const uint32_t * ya2,
                                           const int32_t * yb0, const int32_t * yb1, const int32_t * yb2,
                                           uint32_t valid_rows) {
-    tiled_vec_dot_q8_0_32x3c(n, s0, s1, s2, vx, vy0, vy1, vy2, ya0, ya1, ya2, yb0, yb1, yb2, valid_rows, NULL, NULL, NULL);
+    DOT_32X3C(n, s0, s1, s2, vx, vy0, vy1, vy2, ya0, ya1, ya2, yb0, yb1, yb2, valid_rows, NULL, NULL, NULL);
 }
 
 static KERNEL_WRAP void kernel_q8_0_32x4c(const uint32_t n, float * s0, float * s1, float * s2, float * s3,
@@ -84,8 +112,8 @@ static KERNEL_WRAP void kernel_q8_0_32x4c(const uint32_t n, float * s0, float * 
                                           const uint32_t * ya2, const uint32_t * ya3,
                                           const int32_t * yb0, const int32_t * yb1, const int32_t * yb2,
                                           const int32_t * yb3, uint32_t valid_rows) {
-    tiled_vec_dot_q8_0_32x4c(n, s0, s1, s2, s3, vx, vy0, vy1, vy2, vy3, ya0, ya1, ya2, ya3,
-                             yb0, yb1, yb2, yb3, valid_rows, NULL, NULL, NULL, NULL);
+    DOT_32X4C(n, s0, s1, s2, s3, vx, vy0, vy1, vy2, vy3, ya0, ya1, ya2, ya3,
+              yb0, yb1, yb2, yb3, valid_rows, NULL, NULL, NULL, NULL);
 }
 
 static KERNEL_WRAP void kernel_quantize_q8_0_compact(float * x, uint8_t * y, uint8_t * y_compact, int32_t * y_sum, uint32_t k) {
@@ -154,6 +182,15 @@ static float ref_dot(const struct q8_block * wrow, const int8_t * qa, const floa
     return acc;
 }
 
+// The FNV-1a hash of n bytes, continued from h. O(n).
+static uint64_t fnv1a(const void * p, size_t n, uint64_t h) {
+    const uint8_t * b = p;
+    for (size_t i = 0; i < n; i++) {
+        h = (h ^ b[i]) * 0x100000001B3ull;
+    }
+    return h;
+}
+
 static uint64_t g_best;
 
 static void timing_reset(void) {
@@ -173,15 +210,18 @@ static size_t report_rows(const char * variant, uint32_t n, double tiles, float 
     snprintf(key, sizeof(key), "rows%u_%s_weight_bytes_per_cycle", n, variant);
     lab_report(TARGET, key, (double) Q8_W_TILE * tiles / (double) g_best, "B/cycle");
     size_t bad = 0, bits = 0;
+    uint64_t h = 0xCBF29CE484222325ull;
     for (uint32_t r = 0; r < n; r++) {
         snprintf(key, sizeof(key), "rows%u_%s_out%u", n, variant, r);
         bad += lab_compare_f32(key, out[r], ref[r], n_w_rows, 1e-2f, 1e-4f);
         for (uint32_t i = 0; i < n_w_rows; i++) {
             bits += memcmp(&out[r][i], &ref[r][i], sizeof(float)) != 0;
         }
+        h = fnv1a(out[r], (size_t) n_w_rows * sizeof(float), h);
     }
     snprintf(key, sizeof(key), "rows%u_%s_bits_different", n, variant);
     lab_report(TARGET, key, (double) bits, "of the outputs");
+    printf("lab: %s rows%u_%s_hash = 0x%016llx fnv1a\n", TARGET, n, variant, (unsigned long long) h);
     return bad;
 }
 
@@ -191,15 +231,17 @@ int main(int argc, char ** argv) {
     const uint32_t n_ct   = (uint32_t) lab_arg_long(argc, argv, "--ct", 4);
     const uint32_t iters  = (uint32_t) lab_arg_long(argc, argv, "--iters", 5);
 
-    if (k % 128 != 0 || n_rows < 1 || n_rows > MAX_ROWS || n_ct < 1) {
-        printf("lab: error: k must be a multiple of 128, rows 1..4, ct >= 1\n");
+    if (k == 0 || k % 32 != 0 || n_rows < 1 || n_rows > MAX_ROWS || n_ct < 1) {
+        printf("lab: error: k must be a multiple of 32, rows 1..4, ct >= 1\n");
         return 2;
     }
     lab_init();
 
     const uint32_t n_k_tiles = k / 32;
+    const uint32_t k_pad     = (k + 127) / 128 * 128;
     const uint32_t n_w_rows  = n_ct * 32;
     const double   tiles     = (double) n_ct * n_k_tiles;
+    const size_t   slot      = (size_t) n_k_tiles * Q8_W_TILE_ALN;
 
     struct q8_block * wq = lab_ddr_alloc((size_t) n_w_rows * n_k_tiles * sizeof(struct q8_block), 128);
     for (uint32_t i = 0; i < n_w_rows * n_k_tiles; i++) {
@@ -209,20 +251,21 @@ int main(int argc, char ** argv) {
         }
     }
 
-    uint8_t * wt = lab_vtcm_alloc((size_t) n_ct * n_k_tiles * Q8_W_TILE_ALN, 128);
-    memset(wt, 0, (size_t) n_ct * n_k_tiles * Q8_W_TILE_ALN);
+    uint8_t * wt = lab_vtcm_alloc((size_t) n_ct * slot, 128);
+    lab_fill_u8(wt, (size_t) n_ct * slot);
     for (uint32_t ct = 0; ct < n_ct; ct++) {
         for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
-            repack_tile(wt + ((size_t) ct * n_k_tiles + kt) * Q8_W_TILE_ALN, wq + (size_t) ct * 32 * n_k_tiles, n_k_tiles, kt);
+            repack_tile(wt + ct * slot + (size_t) kt * Q8_W_PITCH, wq + (size_t) ct * 32 * n_k_tiles, n_k_tiles, kt);
         }
     }
 
+    // The quantizer reads k rounded up to 128 values, and the zeros after k are the padding of the operator
     const size_t act_row_size = htp_mm_q8_0_tiled_row_size(k);
     float *   act_f32[MAX_ROWS];
     uint8_t * act_q8[MAX_ROWS];
     uint8_t * act_ddr[MAX_ROWS];
     for (uint32_t r = 0; r < n_rows; r++) {
-        act_f32[r] = lab_ddr_alloc(k * sizeof(float), 128);
+        act_f32[r] = lab_ddr_alloc(k_pad * sizeof(float), 128);
         act_q8[r]  = lab_vtcm_alloc(act_row_size, 128);
         act_ddr[r] = lab_ddr_alloc(act_row_size, 128);
         lab_fill_f32(act_f32[r], k, -1.0f, 1.0f);
@@ -230,6 +273,7 @@ int main(int argc, char ** argv) {
         memcpy(act_ddr[r], act_q8[r], act_row_size);
     }
     lab_report(TARGET, "k", k, "");
+    lab_report(TARGET, "weight_pitch", Q8_W_PITCH, "bytes");
 
     float * out[MAX_ROWS];
     float * ref[MAX_ROWS];
@@ -253,13 +297,13 @@ int main(int argc, char ** argv) {
         o2[0] = lab_ddr_alloc(n_w_rows * sizeof(float) + 128, 128);
         o2[1] = lab_ddr_alloc(n_w_rows * sizeof(float) + 128, 128);
         for (uint32_t ct = 0; ct < n_ct; ct++) {
-            const uint8_t * w_tile = wt + (size_t) ct * n_k_tiles * Q8_W_TILE_ALN;
+            const uint8_t * w_tile = wt + ct * slot;
             kernel_q8_0_32x2(k, o2[0] + ct * 32, o2[1] + ct * 32, w_tile, act_q8[0], act_q8[1], 32);
         }
         size_t diff = 0;
         for (uint32_t r = 0; r < 2; r++) {
             for (uint32_t ct = 0; ct < n_ct; ct++) {
-                const uint8_t * w_tile = wt + (size_t) ct * n_k_tiles * Q8_W_TILE_ALN;
+                const uint8_t * w_tile = wt + ct * slot;
                 kernel_q8_0_32x1(k, o1 + ct * 32, w_tile, act_q8[r], 32);
             }
             for (uint32_t i = 0; i < n_w_rows; i++) {
@@ -276,7 +320,7 @@ int main(int argc, char ** argv) {
             LAB_BARRIER();
             const uint64_t t0 = lab_cycles();
             for (uint32_t ct = 0; ct < n_ct; ct++) {
-                const uint8_t * w_tile = wt + (size_t) ct * n_k_tiles * Q8_W_TILE_ALN;
+                const uint8_t * w_tile = wt + ct * slot;
                 uint32_t r = 0;
                 for (; r + 1 < n; r += 2) {
                     kernel_q8_0_32x2(k, out[r] + ct * 32, out[r + 1] + ct * 32, w_tile, act_q8[r], act_q8[r + 1], 32);
@@ -293,83 +337,85 @@ int main(int argc, char ** argv) {
     }
 
 #ifdef HTP_MM_HAVE_MULTIROW
-    uint8_t * act_c[MAX_ROWS];
-    int32_t * act_s[MAX_ROWS];
-    for (uint32_t r = 0; r < n_rows; r++) {
-        act_c[r] = lab_ddr_alloc(k, 128);
-        act_s[r] = lab_ddr_alloc((size_t) n_k_tiles * sizeof(int32_t), 128);
-    }
-    timing_reset();
-    for (uint32_t it = 0; it < iters; it++) {
-        LAB_BARRIER();
-        const uint64_t t0 = lab_cycles();
+    if (k % 128 == 0) {
+        uint8_t * act_c[MAX_ROWS];
+        int32_t * act_s[MAX_ROWS];
         for (uint32_t r = 0; r < n_rows; r++) {
-            kernel_quantize_q8_0_compact(act_f32[r], act_q8[r], act_c[r], act_s[r], k);
+            act_c[r] = lab_ddr_alloc(k, 128);
+            act_s[r] = lab_ddr_alloc((size_t) n_k_tiles * sizeof(int32_t), 128);
         }
-        const uint64_t t1 = lab_cycles();
-        LAB_BARRIER();
-        timing_add(t1 - t0);
-    }
-    lab_report(TARGET, "quant_compact_cycles_per_128", (double) g_best / ((double) n_rows * k / 128), "cycles");
-
-    size_t bad_compact = 0;
-    for (uint32_t r = 0; r < n_rows; r++) {
-        memcpy(act_ddr[r], act_q8[r], act_row_size);
-        for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
-            int8_t qt[32];
-            float  dt;
-            read_act_tile(act_ddr[r], kt, qt, &dt);
-            if (memcmp(qt, act_c[r] + kt * 32, 32) != 0) {
-                bad_compact++;
-            }
-            int32_t sum = 0;
-            for (uint32_t j = 0; j < 32; j++) {
-                sum += (int32_t) qt[j];
-            }
-            if (act_s[r][kt] != sum) {
-                bad_compact++;
-            }
-        }
-    }
-    lab_report(TARGET, "compact_tiles_different", (double) bad_compact, "");
-    bad += bad_compact;
-
-    for (uint32_t n = 1; n <= n_rows; n++) {
         timing_reset();
         for (uint32_t it = 0; it < iters; it++) {
             LAB_BARRIER();
             const uint64_t t0 = lab_cycles();
-            for (uint32_t ct = 0; ct < n_ct; ct++) {
-                const uint8_t * w_tile = wt + (size_t) ct * n_k_tiles * Q8_W_TILE_ALN;
-                const uint32_t * ya0 = (const uint32_t *) act_c[0];
-                const uint32_t * ya1 = (const uint32_t *) act_c[n > 1 ? 1 : 0];
-                const uint32_t * ya2 = (const uint32_t *) act_c[n > 2 ? 2 : 0];
-                const uint32_t * ya3 = (const uint32_t *) act_c[n > 3 ? 3 : 0];
-                switch (n) {
-                    case 1:
-                        kernel_q8_0_32x1c(k, out[0] + ct * 32, w_tile, act_q8[0], ya0, act_s[0], 32);
-                        break;
-                    case 2:
-                        kernel_q8_0_32x2c(k, out[0] + ct * 32, out[1] + ct * 32, w_tile, act_q8[0], act_q8[1],
-                                          ya0, ya1, act_s[0], act_s[1], 32);
-                        break;
-                    case 3:
-                        kernel_q8_0_32x3c(k, out[0] + ct * 32, out[1] + ct * 32, out[2] + ct * 32, w_tile,
-                                          act_q8[0], act_q8[1], act_q8[2], ya0, ya1, ya2,
-                                          act_s[0], act_s[1], act_s[2], 32);
-                        break;
-                    default:
-                        kernel_q8_0_32x4c(k, out[0] + ct * 32, out[1] + ct * 32, out[2] + ct * 32, out[3] + ct * 32,
-                                          w_tile, act_q8[0], act_q8[1], act_q8[2], act_q8[3], ya0, ya1, ya2, ya3,
-                                          act_s[0], act_s[1], act_s[2], act_s[3], 32);
-                        break;
-                }
+            for (uint32_t r = 0; r < n_rows; r++) {
+                kernel_quantize_q8_0_compact(act_f32[r], act_q8[r], act_c[r], act_s[r], k);
             }
             const uint64_t t1 = lab_cycles();
             LAB_BARRIER();
             timing_add(t1 - t0);
         }
-        bad += report_rows("compact", n, tiles, out, ref, n_w_rows);
+        lab_report(TARGET, "quant_compact_cycles_per_128", (double) g_best / ((double) n_rows * k / 128), "cycles");
+
+        size_t bad_compact = 0;
+        for (uint32_t r = 0; r < n_rows; r++) {
+            memcpy(act_ddr[r], act_q8[r], act_row_size);
+            for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
+                int8_t qt[32];
+                float  dt;
+                read_act_tile(act_ddr[r], kt, qt, &dt);
+                if (memcmp(qt, act_c[r] + kt * 32, 32) != 0) {
+                    bad_compact++;
+                }
+                int32_t sum = 0;
+                for (uint32_t j = 0; j < 32; j++) {
+                    sum += (int32_t) qt[j];
+                }
+                if (act_s[r][kt] != sum) {
+                    bad_compact++;
+                }
+            }
+        }
+        lab_report(TARGET, "compact_tiles_different", (double) bad_compact, "");
+        bad += bad_compact;
+
+        for (uint32_t n = 1; n <= n_rows; n++) {
+            timing_reset();
+            for (uint32_t it = 0; it < iters; it++) {
+                LAB_BARRIER();
+                const uint64_t t0 = lab_cycles();
+                for (uint32_t ct = 0; ct < n_ct; ct++) {
+                    const uint8_t * w_tile = wt + ct * slot;
+                    const uint32_t * ya0 = (const uint32_t *) act_c[0];
+                    const uint32_t * ya1 = (const uint32_t *) act_c[n > 1 ? 1 : 0];
+                    const uint32_t * ya2 = (const uint32_t *) act_c[n > 2 ? 2 : 0];
+                    const uint32_t * ya3 = (const uint32_t *) act_c[n > 3 ? 3 : 0];
+                    switch (n) {
+                        case 1:
+                            kernel_q8_0_32x1c(k, out[0] + ct * 32, w_tile, act_q8[0], ya0, act_s[0], 32);
+                            break;
+                        case 2:
+                            kernel_q8_0_32x2c(k, out[0] + ct * 32, out[1] + ct * 32, w_tile, act_q8[0], act_q8[1],
+                                              ya0, ya1, act_s[0], act_s[1], 32);
+                            break;
+                        case 3:
+                            kernel_q8_0_32x3c(k, out[0] + ct * 32, out[1] + ct * 32, out[2] + ct * 32, w_tile,
+                                              act_q8[0], act_q8[1], act_q8[2], ya0, ya1, ya2,
+                                              act_s[0], act_s[1], act_s[2], 32);
+                            break;
+                        default:
+                            kernel_q8_0_32x4c(k, out[0] + ct * 32, out[1] + ct * 32, out[2] + ct * 32, out[3] + ct * 32,
+                                              w_tile, act_q8[0], act_q8[1], act_q8[2], act_q8[3], ya0, ya1, ya2, ya3,
+                                              act_s[0], act_s[1], act_s[2], act_s[3], 32);
+                            break;
+                    }
+                }
+                const uint64_t t1 = lab_cycles();
+                LAB_BARRIER();
+                timing_add(t1 - t0);
+            }
+            bad += report_rows("compact", n, tiles, out, ref, n_w_rows);
+        }
     }
 #endif
 

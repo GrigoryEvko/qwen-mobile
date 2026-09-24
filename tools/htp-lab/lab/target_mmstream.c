@@ -10,7 +10,7 @@
 // The cases:
 //   read          sequential vector loads with a cheap integer accumulate: the read ceiling
 //   read_l2f<N>   the same with an l2fetch N vectors ahead
-//   dot_prod      tiled_vec_dot_q8_0_32x1 of the checkout, weights in DDR, activation in VTCM
+//   dot_prod      the Q8_0 32x1 dot of the checkout (DOT_PROD_32X1), weights in DDR, activation in VTCM
 //   dot_lane      the same arithmetic with two changes, described below
 //
 // dot_lane changes the weight tile layout and the activation form. The tile of the checkout holds
@@ -65,6 +65,16 @@ static const uint8_t __attribute__((aligned(VLEN))) kvalues_mxfp4_lut[128] = { 0
 #define W_TILE   1152          // HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q8_0
 #define A_TILE   1152          // HTP_MM_ACT_TILE_SIZE_Q8_0
 #define MHZ      2112.0
+
+// The 32x1 dot of the kernel tree and the pitch of its weight tiles: the packed layout (1088 bytes)
+// or 1152 bytes. A column tile keeps a slot of n_k * 1152 bytes in the two layouts.
+#ifdef HTP_MM_HAVE_PACKED_Q8_0
+#define PROD_PITCH    HTP_MM_WEIGHT_TILE_SIZE_Q8_0
+#define DOT_PROD_32X1 tiled_vec_dot_q8_0_packed_32x1
+#else
+#define PROD_PITCH    W_TILE
+#define DOT_PROD_32X1 tiled_vec_dot_q8_0_32x1
+#endif
 
 struct q8_block {
     uint16_t d;
@@ -192,7 +202,7 @@ int main(int argc, char ** argv) {
     for (uint32_t ct = 0; ct < n_ref_ct; ct++) {
         for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
             const size_t off = ((size_t) ct * n_k_tiles + kt) * W_TILE;
-            repack_prod(w_prod + off, wq + (size_t) ct * 32 * n_k_tiles, n_k_tiles, kt);
+            repack_prod(w_prod + ct * ct_bytes + (size_t) kt * PROD_PITCH, wq + (size_t) ct * 32 * n_k_tiles, n_k_tiles, kt);
             repack_lane(w_lane + off, wq + (size_t) ct * 32 * n_k_tiles, n_k_tiles, kt);
         }
     }
@@ -266,7 +276,7 @@ int main(int argc, char ** argv) {
         LAB_BARRIER();
         const uint64_t t0 = lab_cycles();
         for (uint32_t ct = 0; ct < n_ct; ct++) {
-            tiled_vec_dot_q8_0_32x1(k, out + ct * 32, w_prod + (size_t) ct * ct_bytes, a_q, 32, NULL);
+            DOT_PROD_32X1(k, out + ct * 32, w_prod + (size_t) ct * ct_bytes, a_q, 32, NULL);
         }
         const uint64_t t1 = lab_cycles();
         LAB_BARRIER();
