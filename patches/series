@@ -222,3 +222,4 @@ fuzz-ops/0018-hexagon-htp-keep-the-sign-of-zero-in-the-f16-conversion-of-v79-cop
 # Walsh-Hadamard transform, for the decode shapes and for rows of 64 values.
 memory/0006-hexagon-run-the-kv-cache-rotation-as-a-fast-walsh-hadamard-transform.patch
 fuzz-ops/0019-hexagon-htp-store-only-the-columns-of-dst-in-the-hmx-mul-mat-id-output.patch
+memory/0007-hexagon-an-environment-switch-for-the-fwht-form-of-the-kv-cache-rotation.patch

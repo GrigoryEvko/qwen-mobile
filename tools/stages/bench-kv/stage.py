@@ -8,7 +8,7 @@ Usage:
 The four forms. Each one has flash attention on HTP0 and the one library set of build/bench-kv/build.sh:
     A  F16 K and V
     B  Q8_0 K and V, the rotation as the DSP op FWHT where patches/memory/0006 sends it (the app)
-    C  Q8_0 K and V, each rotation as MUL_MAT (GGML_HEXAGON_FWHT=0, build/bench-kv/fwht-switch.patch)
+    C  Q8_0 K and V, each rotation as MUL_MAT (GGML_HEXAGON_FWHT=0, patches/memory/0007)
     D  Q8_0 K and V without the rotation (LLAMA_ATTN_ROT_DISABLE=1)
 
 One run matrix (BLOCKS, GROUPS) gives the command file and the parser, thus the two agree on each run

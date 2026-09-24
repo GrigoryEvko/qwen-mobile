@@ -1,0 +1,86 @@
+hexagon: an environment switch for the FWHT form of the KV cache rotation
+Fold-into: memory/0006-hexagon-run-the-kv-cache-rotation-as-a-fast-walsh-hadamard-transform.patch
+
+The defect
+
+patches/memory/0006 sends each rotation of a quantized KV cache that
+ggml_hexagon_is_fwht accepts (a MUL_MAT with the hint
+GGML_HINT_SRC0_IS_HADAMARD) to the DSP op HTP_OP_FWHT. No switch keeps
+such a rotation as HTP_OP_MUL_MAT. Thus a comparison of the two forms on
+the phone must use two library sets.
+
+The change
+
+GGML_HEXAGON_FWHT=0 keeps each such rotation as HTP_OP_MUL_MAT. The preset
+value 1 keeps the behavior of patches/memory/0006. With the value 0, the
+backend writes the log line "ggml-hex: the KV cache rotation stays MUL_MAT
+(GGML_HEXAGON_FWHT=0)" when it starts.
+
+The results
+
+On the phone (HTP0, 2026-09-24), the stage bench-kv (tools/stages/bench-kv)
+used the libraries of the series of e8a3a07 with this patch. Each of the
+116 runs of llama-bench and memprobe (58 for the 4B Q8_0 and 58 for the 2B
+Q8_0) gave the exit code 0. In the profile runs with the value 0 (Q8_0 K
+and V, variant C), no rotation was an HTP_OP_FWHT op, and each of the 18
+logs of variant C has the log line of the switch. With the preset value
+(variant B), each of the 32 rotations of a decode token of the 4B was an
+HTP_OP_FWHT op.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    ggml/src/ggml-hexagon/ggml-hexagon.cpp
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -126,6 +126,11 @@
+ // kernel params of each GATED_DELTA_NET op, thus an A/B run needs no other build.
+ static int opt_gdn_chunk = 1;
+ 
++// GGML_HEXAGON_FWHT: 1 = the host sends a rotation of a quantized KV cache (a MUL_MAT with the hint
++// GGML_HINT_SRC0_IS_HADAMARD) that ggml_hexagon_is_fwht accepts as HTP_OP_FWHT (the default), 0 = each
++// such rotation stays HTP_OP_MUL_MAT. Thus an A/B run of the two forms needs no other build.
++static int opt_fwht = 1;
++
+ // GGML_HEXAGON_BATCHCACHE: 0 = pack the ops of each graph_compute call, 1 = replay the packed batch of a
+ // repeated graph when only the input data changed, 2 = replay and compare the replay with a fresh packing
+ static int opt_batchcache = 1;
+@@ -5674,9 +5679,10 @@
+ // against 8 to 19 us for the MUL_MAT. From 64 rows the HMX MUL_MAT is faster: 17.5 against 19 us at
+ // 64 rows, 452 against 594 us at 8192 rows. Thus the limit is 32 rows of 256 values (8192 values),
+ // which holds each decode step (2 to 16 rows). Rows of 128 values get the same count of values. A
+-// different MUL_MAT stays HTP_OP_MUL_MAT, which multiplies by the matrix.
++// different MUL_MAT stays HTP_OP_MUL_MAT, which multiplies by the matrix. With GGML_HEXAGON_FWHT=0 each
++// rotation stays HTP_OP_MUL_MAT.
+ static bool ggml_hexagon_is_fwht(const struct ggml_tensor * t) {
+-    if (t->op != GGML_OP_MUL_MAT || ggml_get_op_params_i32(t, 1) != GGML_HINT_SRC0_IS_HADAMARD) {
++    if (!opt_fwht || t->op != GGML_OP_MUL_MAT || ggml_get_op_params_i32(t, 1) != GGML_HINT_SRC0_IS_HADAMARD) {
+         return false;
+     }
+     const struct ggml_tensor * src1 = t->src[1];
+@@ -8254,6 +8260,7 @@
+     const char * str_opfusion_state = getenv("GGML_HEXAGON_OPFUSION_STATE");
+     const char * str_multirow = getenv("GGML_HEXAGON_MULTIROW");
+     const char * str_gdn_chunk = getenv("GGML_HEXAGON_GDN_CHUNK");
++    const char * str_fwht     = getenv("GGML_HEXAGON_FWHT");
+     const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
+     const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
+     const char * str_etm      = getenv("GGML_HEXAGON_ETM");
+@@ -8324,6 +8331,7 @@
+     opt_multirow  = str_multirow ? atoi(str_multirow)                     : opt_multirow;
+     opt_opfusion_state = str_opfusion_state ? atoi(str_opfusion_state)    : opt_opfusion_state;
+     opt_gdn_chunk = str_gdn_chunk ? atoi(str_gdn_chunk)                   : opt_gdn_chunk;
++    opt_fwht      = str_fwht     ? atoi(str_fwht)                         : opt_fwht;
+     opt_profile   = str_profile  ? atoi(str_profile)                      : 0;
+     opt_etm       = str_etm      ? atoi(str_etm)                          : 0;
+     opt_nhvx      = str_nhvx     ? strtoul(str_nhvx, NULL, 0)             : opt_nhvx;
+@@ -8341,6 +8349,9 @@
+     if (opt_batchcache) {
+         GGML_LOG_INFO("ggml-hex: batch cache %s\n", opt_batchcache >= 2 ? "on, with a verify packing of each replay" : "on");
+     }
++    if (!opt_fwht) {
++        GGML_LOG_INFO("ggml-hex: the KV cache rotation stays MUL_MAT (GGML_HEXAGON_FWHT=0)\n");
++    }
+ 
+     // Parse device configuration
+     const char * str_devices  = getenv("GGML_HEXAGON_DEVICES");

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Build the phone stage "bench-kv": the libraries of the app from a private tree of HEAD plus the
-# switch GGML_HEXAGON_FWHT, and llama-bench and memprobe against them.
+# Build the phone stage "bench-kv": the libraries of the app from a private tree of HEAD, and
+# llama-bench and memprobe against them. The switch GGML_HEXAGON_FWHT (patches/memory/0007) gives
+# the MUL_MAT form of the KV cache rotation on the same libraries.
 #
 #   JOBS=24 tools/stages/bench-kv/build.sh
 #
@@ -8,7 +9,7 @@
 #
 # The steps:
 #   1. tests/sanitizers/llama-copy.sh makes build/bench-kv/src, the llama.cpp tree of HEAD (the
-#      pin plus patches/series). git apply puts build/bench-kv/fwht-switch.patch on it.
+#      pin plus patches/series).
 #   2. In the Snapdragon container, under the lock build/.container.lock, CMake configures the
 #      tree into build/bench-kv/android with the preset, the compiler flags (with -flto) and the
 #      build number and commit of scripts/build-native.sh. It builds the libraries of the app
@@ -39,7 +40,6 @@ readonly remap="-ffile-prefix-map=/workspace/$tree=./third_party/llama.cpp -ffil
 
 # 1. The tree.
 tests/sanitizers/llama-copy.sh "$tree"
-git apply --directory="$tree" "$stage/fwht-switch.patch"
 cp -f android/snapdragon/CMakeUserPresets.json "$tree/CMakeUserPresets.json"
 
 # 2. The build.
