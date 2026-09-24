@@ -19,8 +19,12 @@ TWO TRAPS, both of which cost a wrong answer once:
 
 Each ``profile-op`` line carries the dimensions, the types and the byte strides of every
 source and of the destination, thus the bytes one op touches are exact and not modelled.
-A pass ends at the output head, which runs once per forward pass, so the passes are the
-segments between head operations. A decode pass is one whose head destination has one row.
+A ``!`` after a stride group marks a tensor that is not contiguous (for example the permuted
+K and V views of flash attention, or the q and k views of a norm). The bytes of a tensor are
+its extent, as ggml_nbytes gives it: the first row plus (ne - 1) strides of each other
+dimension. A pass ends at the output head, which runs once per forward pass, so the passes
+are the segments between head operations. A decode pass is one whose head destination has
+one row.
 """
 
 from __future__ import annotations
@@ -30,8 +34,14 @@ import sys
 from collections import defaultdict
 
 LINE = re.compile(
-    r"profile-op ([A-Z_0-9+]+)\|(.*?)\|([0-9: x>-]+)\|([\w: x>-]+)\|([0-9: x>-]+)\|"
+    r"profile-op ([A-Z_0-9+]+)\|(.*?)\|([0-9: x>-]+)\|([\w: x>-]+)\|([0-9: x>!-]+)\|"
     r"(.*?)\|usec (\d+) cycles (\d+)")
+
+# The elements of one block of each type. A type that is not in the table has blocks of one element.
+BLOCK_ELEMS: dict[str, int] = {
+    "q8_0": 32, "q4_0": 32, "q4_1": 32, "iq4_nl": 32, "mxfp4": 32,
+    "q4_k": 256, "q6_k": 256, "q8_k": 256,
+}
 
 
 def split_arrow(s: str) -> tuple[list[str], str]:
@@ -41,27 +51,35 @@ def split_arrow(s: str) -> tuple[list[str], str]:
 
 
 def dims_of(field: str) -> list[int]:
-    """The integers of a ``ne0:ne1`` group."""
-    return [int(x) for x in field.split(":")]
+    """The integers of a ``ne0:ne1`` group. A ``!`` at the end (not contiguous) is not part of a value."""
+    return [int(x) for x in field.rstrip("!").split(":")]
 
 
-def tensor_bytes(dim: str, stride: str) -> int:
-    """Bytes of one tensor: the row count times the row stride.
+def tensor_bytes(dim: str, stride: str, typ: str) -> int:
+    """Bytes of one tensor as ggml_nbytes gives them. O(dimensions).
+
+    The first dimension gives the bytes of one row: its blocks times the stride of a block. Each
+    other dimension adds (ne - 1) times its stride. For a contiguous tensor this is the element
+    count times the element size. For a permuted view it is the span of the bytes of the view.
 
     Args:
-        dim: The ``ne0:ne1`` field
-        stride: The ``nb0:nb1`` field
+        dim: The ``ne0:ne1`` or ``ne0:ne1:ne2:ne3`` field
+        stride: The ``nb0:nb1`` or ``nb0:nb1:nb2:nb3`` field, with or without a ``!``
+        typ: The ggml type name of the tensor, for example ``f32`` or ``q8_0``
 
     Returns:
-        The byte count, or 0 when the fields do not parse
+        The byte count, or 0 when the fields do not parse or a dimension is 0
     """
     try:
         d, s = dims_of(dim), dims_of(stride)
     except ValueError:
         return 0
-    if len(d) < 2 or len(s) < 2:
+    if len(d) < 2 or len(d) != len(s) or min(d) <= 0:
         return 0
-    return d[1] * s[1]
+    b = d[0] // BLOCK_ELEMS.get(typ, 1) * s[0]
+    for n, st in zip(d[1:], s[1:]):
+        b += (n - 1) * st
+    return b
 
 
 def main(path: str) -> int:
@@ -76,7 +94,8 @@ def main(path: str) -> int:
         sname, dname = split_arrow(names)
         sdim, ddim = split_arrow(dims)
         sstr, dstr = split_arrow(strides)
-        rec = (op, sname, dname, sdim, ddim, sstr, dstr, kern, int(usec))
+        styp, dtyp = split_arrow(types)
+        rec = (op, sname, dname, sdim, ddim, sstr, dstr, styp, dtyp, kern, int(usec))
         cur.append(rec)
         # the head closes a forward pass
         if op.startswith("MUL_MAT") and ddim.startswith("248320:"):
@@ -94,23 +113,23 @@ def main(path: str) -> int:
     # take the median-length decode pass, so a warm-up or a split pass does not skew it
     dec.sort(key=len)
     p = dec[len(dec) // 2]
-    print(f"decode pass: {len(p)} ops, {sum(r[8] for r in p) / 1000:.2f} ms")
+    print(f"decode pass: {len(p)} ops, {sum(r[-1] for r in p) / 1000:.2f} ms")
 
     by_op: dict[str, list] = defaultdict(lambda: [0, 0.0, 0])   # calls, us, bytes
     weight_b = act_b = 0
     seen_w: dict[str, int] = {}
     rows = []
-    for op, sname, dname, sdim, ddim, sstr, dstr, kern, usec in p:
+    for op, sname, dname, sdim, ddim, sstr, dstr, styp, dtyp, kern, usec in p:
         b = 0
-        for n, d, s in zip(sname, sdim, sstr):
-            tb = tensor_bytes(d, s)
+        for n, d, s, t in zip(sname, sdim, sstr, styp):
+            tb = tensor_bytes(d, s, t)
             b += tb
             if ".weight" in n or "token_embd" in n:
                 weight_b += tb
                 seen_w[n] = seen_w.get(n, 0) + 1
             else:
                 act_b += tb
-        db = tensor_bytes(ddim, dstr)
+        db = tensor_bytes(ddim, dstr, dtyp)
         b += db
         act_b += db
         e = by_op[op]
