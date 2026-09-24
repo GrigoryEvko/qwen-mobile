@@ -11,10 +11,13 @@ build/unary-kl/stage.py is a link to this file, and tools/stages/unary-kl/build.
 The stage unary-rows found that the new rows of the SOFTPLUS move the logits hashes: on the NPU, 167 of 32768
 elements of the prompt shape differ by 1 ulp, with the same error against the CPU for the old and the new rows.
 The SIGMOID and the SCALE did not move the hashes of the 4B. This stage decides the preset of the switch:
-    - If the KL of the value 1 against the naive base stays at the floor (the KL of HEAD, with the error of the mean
-      and the spread of the two runs of each), the preset stays 1 and each kind of op gets new rows.
-    - If the KL moves, the preset is 26 (SIGMOID, SCALE and the other pointwise ops, not SOFTPLUS), if the hashes of
-      26 equal the hashes of HEAD on the 4B and on the 2B.
+    - The value 1 passes a KL block when the difference of its mean KLD against HEAD is inside the ± error of HEAD
+      that llama-perplexity prints, its same top p agrees inside the error of HEAD, and its maximum KLD is at most
+      2 times the maximum KLD of HEAD. The NPU repeats each run bit for bit, thus the two runs of a variant give
+      the same values and the error of the mean is the spread. If the value 1 passes kp and kd, the preset stays 1
+      and each kind of op gets new rows.
+    - Else the preset is 26 (SIGMOID, SCALE and the other pointwise ops, not SOFTPLUS), if the hashes of 26 equal
+      the hashes of HEAD on the 4B and on the 2B.
 
 The variants, each in the app configuration (Q8_0 K and V with the FWHT rotation, op fusion and state fusion on):
     a  the HEAD libraries (lib-base)
@@ -159,8 +162,9 @@ HEADER = """\
 #   i   memprobe --hash -p 1024 -n 16 on the 2B: A M. Decides: M has the hashes of A.
 #   kp  KL of the prefill path on the 4B against the naive base (4 chunks, -b 512): A F, 2 rounds.
 #   kd  KL of the decode path on the 4B against the naive base (1 chunk, -b 1 -ub 1): A F, 2 rounds.
-#       Decides: the mean KL of F is inside the KL of A, with the error of the mean and the spread of the two runs.
-#       Then the preset stays 1. If the KL of F moves, the preset is 26, if h and i give the hashes of A.
+#       Decides: F passes when its mean KLD minus the mean KLD of A is inside the ± error of A, its same top p
+#       agrees with A inside the error of A, and its maximum KLD is at most 2 times that of A. If F passes kp and kd,
+#       the preset stays 1. Else the preset is 26, if h and i give the hashes of A.
 #   p   llama-bench pp512 and pp1024 at depth 0, -r 3: A M F, 3 rounds. Decides: the prefill gain of M and of F.
 #   g   llama-bench tg32 at depth 0, -r 3: A M F, 3 rounds. Decides: the decode speed of M and F against A.
 # The variants run in the order of the block in an odd round and in the reverse order in an even round.
@@ -170,7 +174,7 @@ HEADER = """\
 #
 # Put this file into /tmp/phone-timing-stages.txt: it is a timing stage (unlocked phone, no charger).
 # Run from /home/grigory/airi/qwen-mobile on the laptop, in order. Time: about 21 minutes of tool time plus about
-# 4 minutes of gates and checks, plus the waits for thermal status 0. The push is about 170 MB, the pull less than
+# 4 minutes of gates and checks, plus the waits for thermal status 0. The push is about 145 MB, the pull less than
 # 2 MB. Then on the box: python3 build/unary-kl/stage.py table
 """
 
@@ -275,6 +279,29 @@ def hashes(root: Path, name: str) -> list[tuple[str, str]]:
     return re.findall(r"^HASH (.*) ([0-9a-f]{16})$", read(root, name)[1], re.M)
 
 
+def kl_checks(key: str, vals: dict[str, list[tuple[float, float, float, float, float]]]) -> str:
+    """The three checks of the value 1 (F) against HEAD (A) of one KL block, each value the mean of the rounds:
+    1. the difference of the mean KLD is inside the ± error of HEAD,
+    2. the difference of the same top p is inside the ± error of HEAD,
+    3. the maximum KLD of F is at most 2 times the maximum KLD of HEAD.
+    F passes when the three checks pass."""
+    if not vals.get("a") or not vals.get("f"):
+        return f"  {key}: no check, a run of A or F has no KLD, maximum or top p line"
+    a = [statistics.mean(col) for col in zip(*vals["a"])]
+    f = [statistics.mean(col) for col in zip(*vals["f"])]
+    # llama-perplexity prints 6 decimals of a KLD and 3 of a top p, thus the checks round the differences to them
+    d_kld, d_top = round(f[0] - a[0], 6), round(f[3] - a[3], 3)
+    checks = [
+        ("mean KLD", abs(d_kld) <= a[1] + 1e-12, f"F - A {d_kld:+.6f}, the error of A ± {a[1]:.6f}"),
+        ("same top p", abs(d_top) <= a[4] + 1e-9, f"F - A {d_top:+.3f} %, the error of A ± {a[4]:.3f} %"),
+        ("maximum KLD", f[2] <= 2.0 * a[2], f"F {f[2]:.6f}, 2 times A {2.0 * a[2]:.6f}"),
+    ]
+    lines = [f"  {key} checks of F against A:"]
+    lines += [f"    {'PASS' if ok else 'FAIL'} {name}: {text}" for name, ok, text in checks]
+    lines.append(f"    {key}: F {'PASSES' if all(ok for _, ok, _ in checks) else 'DOES NOT PASS'}")
+    return "\n".join(lines)
+
+
 def table(root: Path, include_all: bool) -> int:
     """Print the results of each block."""
     if not root.is_dir():
@@ -295,22 +322,21 @@ def table(root: Path, include_all: bool) -> int:
     print("KL against the naive base naive-4B-q8.kld: mean ± error of the mean, maximum, same top-1 ± error, PPL")
     for key in ("kp", "kd"):
         block = next(b for b in BLOCKS if b.key == key)
-        means: dict[str, list[float]] = {}
+        # For each variant, the values of each round: (mean KLD, its error, maximum KLD, same top p, its error)
+        vals: dict[str, list[tuple[float, float, float, float, float]]] = {}
         for k in block.variants:
             for rnd in range(1, block.rounds + 1):
                 _, out, log = read(root, f"{key}-{rnd}-{k}")
                 text = out + log
                 m, t, mx, ppl = KLD_RE.search(text), TOP_RE.search(text), MAXKL_RE.search(text), PPL_RE.search(text)
-                if m:
-                    means.setdefault(k, []).append(float(m.group(1)))
+                if m and t and mx:
+                    vals.setdefault(k, []).append((float(m.group(1)), float(m.group(2)), float(mx.group(1)),
+                                                   float(t.group(1)), float(t.group(2))))
                 cell = (f"{m.group(1)} ± {m.group(2)}, max {mx.group(1) if mx else '?'}, "
                         f"top-1 {t.group(1) + ' ± ' + t.group(2) if t else '?'} %, PPL {ppl.group(1) if ppl else '?'}"
                         if m else "no KLD line")
                 print(f"  {key}-{rnd}-{k} {VARIANTS[k].text:32s}: {cell}")
-        if means.get("a") and means.get("f"):
-            lo, hi = min(means["a"]), max(means["a"])
-            fm = statistics.mean(means["f"])
-            print(f"  {key}: A {lo:.6f} to {hi:.6f}, F mean {fm:.6f}, F - A {fm - statistics.mean(means['a']):+.6f}")
+        print(kl_checks(key, vals))
     print()
 
     rates: dict[tuple, dict[str, dict[int, float]]] = {}
