@@ -111,7 +111,7 @@ HEADER = f"""\
 #
 # Put this file into /tmp/phone-timing-stages.txt: it is a timing stage (unlocked phone, no charger).
 # Run from /home/grigory/airi/qwen-mobile on the laptop, in order. Time: about 12 minutes of tool time (10 runs of
-# about 70 s) plus about 2 minutes of gates and checks, plus the waits for thermal status 0. The push is about 60 MB,
+# about 70 s) plus about 2 minutes of gates and checks, plus the waits for thermal status 0. The push is about 130 MB,
 # the pull less than 1 MB. Then on the box: python3 build/unary-tg/stage.py table
 """
 
