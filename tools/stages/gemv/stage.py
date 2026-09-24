@@ -190,11 +190,19 @@ def check_runs() -> list[Run]:
     return r
 
 
+def gperf_runs() -> list[Run]:
+    """The gemvcheck perf runs, new then base. O(runs)."""
+    return [Run(f"gperf-{v}", "gperf", v, "gemvcheck", f"perf --cases {PERF_CASES} --reps 16 --runs 5", "", 100,
+                GATE_CHECK, "gemvcheck perf of MUL_MAT, MUL_MAT_ADD, MUL_MAT_NX and the head, 1 and 4 rows")
+            for v in ("new", "base")]
+
+
 def runs(lay: Layout = FULL) -> list[Run]:
-    """The runs of the stage in their order: the check runs only for CHECK, all runs for FULL. O(runs)."""
+    """The runs of the stage in their order: for CHECK the check runs and the gemvcheck perf runs, for FULL all
+    runs. O(runs)."""
     r = check_runs()
     if lay == CHECK:
-        return r
+        return r + gperf_runs()
     phone = lay.phone
     r += [
         Run("tbo-4b-new", "tbo", "new", "test-backend-ops", f"test -o MUL_MAT -b HTP0 --test-file {phone}/tests/kern-q8_0.txt",
@@ -211,9 +219,7 @@ def runs(lay: Layout = FULL) -> list[Run]:
     for v in ("base", "new"):
         r.append(Run(f"perf-{v}", "perf", v, "test-backend-ops", f"perf -o MUL_MAT -b HTP0 --test-file {phone}/tests/gemv-q8_0.txt",
                      "", 100, GATE_SMALL, "test-backend-ops perf of the 4B Q8_0 shapes, 1 and 4 rows, and the head"))
-    for v in ("new", "base"):
-        r.append(Run(f"gperf-{v}", "gperf", v, "gemvcheck", f"perf --cases {PERF_CASES} --reps 16 --runs 5", "", 100,
-                     GATE_CHECK, "gemvcheck perf of MUL_MAT, MUL_MAT_ADD, MUL_MAT_NX and the head, 1 and 4 rows"))
+    r += gperf_runs()
     r += bench_runs()
     # -v: without it llama-bench drops the debug lines of ggml, thus the log has no profile line
     for v in ("base", "new"):
@@ -284,7 +290,8 @@ HEADER = """\
 CHECK_HEADER = """\
 # Phone stage "gemv-check": the bit check of the stage gemv. The packed Q8_0 tiles of the HVX GEMV (one DMA row for
 # each 32-row column tile), the new DSP library against the base library of HEAD.
-# The question: does the new library give the same bits as the base library for the 4B decode matmuls?
+# The questions: does the new library give the same bits as the base library for the 4B decode matmuls, and what
+# is the rate of each library?
 #
 # The runs (tools/stages/gemv/stage.py --check-only gives each one):
 #   check   gemvcheck check (tools/gemv/gemvcheck.cpp): the hash of each output of the 4B decode matmuls (MUL_MAT,
@@ -292,8 +299,10 @@ CHECK_HEADER = """\
 #           against the CPU backend of the phone. v79: 40 cases. v75 and v73 on the v79 DSP (GGML_HEXAGON_ARCH):
 #           the 36 cases without the head. gemvcheck puts the weights in a buffer with the usage
 #           GGML_BACKEND_BUFFER_USAGE_WEIGHTS, thus the backend repacks each Q8_0 weight as the model loader has it.
-# The result is satisfactory when each run has the exit code 0 (each output is finite, and each NMSE is 5e-4 or
-# less), and for each library each output of new has the hash of base.
+#   gperf   gemvcheck perf (MUL_MAT, MUL_MAT_ADD, MUL_MAT_NX, the head, 1 and 4 rows), new then base
+# The result of the check is satisfactory when each check run has the exit code 0 (each output is finite, and each
+# NMSE is 5e-4 or less), and for each library each output of new has the hash of base. The gperf runs give the
+# rate of the weights of each case, base against new.
 # The libraries: the files of build/gemv/phone (the stage gemv), thus the same bytes as the runs of that stage.
 # patch.sha256 names the patch.
 #
@@ -302,9 +311,9 @@ CHECK_HEADER = """\
 # charger, MemAvailable 4 GB), gemvcheck under timeout -s KILL (110 s or less), the exit code and the conditions
 # after the run, then the pgrep line.
 #
-# Put this file into /tmp/phone-timing-stages.txt: the gate stops a run on a locked phone or with a charger. It is
-# not a timing stage: only the hashes and the NMSE give the result. Run from /home/grigory/airi/qwen-mobile on the
-# laptop, in order. Time: at most 10 minutes of tool time (6 runs), plus the gates. The push is about 45 MB.
+# Put this file into /tmp/phone-timing-stages.txt: it is a timing stage for the gperf runs (unlocked phone, no
+# charger). Run from /home/grigory/airi/qwen-mobile on the laptop, in order. Time: at most 13 minutes of tool time
+# (8 runs), plus the gates. The push is about 45 MB.
 # Then: python3 build/gemv-check/stage.py table --check-only (on the laptop or on the box).
 """
 
@@ -534,8 +543,13 @@ def perf_tables(results: dict[str, Result], include_all: bool) -> list[str]:
         b, n = rates["base"].get(key), rates["new"].get(key)
         out.append(f"  {key[0]:6d} {key[1]:7d} {key[2]:2d} {fmt(b):>10s} {fmt(n):>10s} {pct(n, b):>8s}  "
                    f"{labels.get((key[0], key[1]), '')}")
-    out += ["", "GEMV rate (gemvcheck perf, 16 copies of the case in one graph, the median of 5 computes): GB/s",
-            f"  {'case':32s} {'base GB/s':>10s} {'new GB/s':>10s} {'change':>8s} {'base us':>10s} {'new us':>10s}"]
+    return out + [""] + gperf_table(results, include_all)
+
+
+def gperf_table(results: dict[str, Result], include_all: bool) -> list[str]:
+    """The GEMV rates of base and new from gemvcheck perf. O(lines)."""
+    out = ["GEMV rate (gemvcheck perf, 16 copies of the case in one graph, the median of 5 computes): GB/s",
+           f"  {'case':32s} {'base GB/s':>10s} {'new GB/s':>10s} {'change':>8s} {'base us':>10s} {'new us':>10s}"]
     g: dict[str, dict[str, tuple[float, float]]] = {}
     for v in ("base", "new"):
         r = results.get(f"gperf-{v}")
@@ -668,7 +682,9 @@ def table(root: Path, include_all: bool, lay: Layout) -> int:
         return 1
     results = {run.name: read_result(root, run) for run in runs(lay) if (root / f"{run.name}-gate.txt").exists()}
     parts = [conditions(results, lay), check_table(results)]
-    if lay == FULL:
+    if lay == CHECK:
+        parts.append(gperf_table(results, include_all))
+    else:
         parts += [tbo_table(results), perf_tables(results, include_all), bench_table(results, include_all),
                   prof_table(results)]
     for part in parts:
