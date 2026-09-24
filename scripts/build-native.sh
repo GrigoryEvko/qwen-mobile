@@ -55,6 +55,16 @@ readonly DEFAULT_TARGETS="$LLAMA_LIBS$htp_targets"
 NATIVE_TARGETS=${NATIVE_TARGETS:-$DEFAULT_TARGETS}
 JOBS=${JOBS:-$(nproc)}
 
+# Step 5 copies one DSP library for each version of HTP_DSPS into jniLibs. With KEEP_BUILD=1 a target list
+# without htp-<version> leaves the library of an earlier build in build/native, and the APK then gets DSP
+# libraries of two different patch series. Thus each version must be in the target list ("all" has them).
+if [[ " $NATIVE_TARGETS " != *" all "* ]]; then
+    for dsp in $HTP_DSPS; do
+        [[ " $NATIVE_TARGETS " == *" htp-$dsp "* ]] \
+            || die "NATIVE_TARGETS has no htp-$dsp: the APK needs the DSP library of each version of HTP_DSPS from this build. Add htp-$dsp, or unset NATIVE_TARGETS."
+    done
+fi
+
 cd "$REPO_ROOT"
 
 # 1. The patches.
