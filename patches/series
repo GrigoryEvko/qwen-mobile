@@ -216,3 +216,4 @@ fuzz-hexhost/0017-hexagon-give-a-replayed-batch-the-node-of-its-last-op.patch
 fuzz-core/0025-reject-a-nan-or-an-inf-in-the-data-of-a-state-blob.patch
 fuzz-hexhost/0018-hexagon-retry-a-dspqueue-read-or-write-that-a-signal-interrupts.patch
 fuzz-core/0026-check-the-data-of-a-state-blob-in-the-copy-of-the-host-reader.patch
+fuzz-ops/0018-hexagon-htp-keep-the-sign-of-zero-in-the-f16-conversion-of-v79-copy-to-f16-without-unroll.patch
