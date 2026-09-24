@@ -223,3 +223,4 @@ fuzz-ops/0018-hexagon-htp-keep-the-sign-of-zero-in-the-f16-conversion-of-v79-cop
 memory/0006-hexagon-run-the-kv-cache-rotation-as-a-fast-walsh-hadamard-transform.patch
 fuzz-ops/0019-hexagon-htp-store-only-the-columns-of-dst-in-the-hmx-mul-mat-id-output.patch
 memory/0007-hexagon-an-environment-switch-for-the-fwht-form-of-the-kv-cache-rotation.patch
+hexagon-fusion/0008-hexagon-fuse-the-gate-chains-of-the-qwen35-layers.patch

@@ -1,0 +1,1255 @@
+hexagon: fuse the gate chains of the Qwen3.5 layers into two DSP ops
+Fold-into: upstream/hexagon-htp
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+The cost
+
+Each layer of Qwen3.5 ends with an elementwise gate before its output projection:
+  - A gated delta net layer: MUL(MUL(RMS_NORM(x), ssm_norm), SILU(z)), for each head of 128 values.
+  - An attention layer: MUL(attn, SIGMOID(CONT(g))), where g is the gate half of the joint q projection.
+HTP0 runs each chain as three ops that each read and write the full tensor in f32: RMS_NORM+MUL, SILU and
+MUL, or CPY, SIGMOID and MUL. The per-op profile of the 4B (one prefill ubatch of 1024 tokens, the flags of
+the app) gives 16.9 + 15.3 + 23.3 ms for the 24 gated delta net layers and 8.1 + 4.5 + 6.5 ms for the 8
+attention layers. These ops run at the byte roofline (48 to 62 GB/s), thus only fewer bytes make them faster.
+A decode token runs 96 such ops at about 4 us each.
+
+The change
+
+Two DSP ops (htp/gate-ops.c) do each chain in one pass over the rows:
+  - HTP_OP_RMS_NORM_GATE (x, w, z): dst = (rms_norm(x) * w) * silu(z)
+  - HTP_OP_SIGMOID_GATE (a, g): dst = a * sigmoid(g), where g can have any row strides
+Each thread moves blocks of rows into the VTCM with a DMA double buffer. It computes a block with the row
+routines of the unfused ops: hvx_fast_rms_norm_mul_f32 for each row, the SiLU and the sigmoid of
+unary-ops.c, and hvx_mul_f32_aaa of the MUL. The last three give each value from its own inputs only, thus
+they take all rows of a block in one call. The output has the bits of the unfused ops, for each row length
+and each block size. The DDR traffic of a row falls from 7 row passes to 3 in each of the two chains (the
+unfused chain reads or writes 2 + 2 + 3 rows).
+
+The compute of one output vector on one thread (the lab, timing mode): 93.7 cycles for RMS_NORM_GATE (rows of
+128 values: the norm 60.4, the SiLU 26.1, the MUL 7.5) and 31.3 for SIGMOID_GATE (rows of 256 values). The
+DDR moves the 3 vectors of an output vector in about 14 cycles for all threads together, thus with 6
+threads RMS_NORM_GATE is near the limit of its compute (about 16 cycles) and SIGMOID_GATE is at the limit of
+the DDR. A copy of the norm routine with the same intrinsics in the same sequence for 4 rows together takes
+48.6 cycles in place of 60.4, but with the flags of the DSP library (the release profile of the lab) the
+copy did not give the bits of the routine: 1 or 2 ulp in 16 % of the values, and finite values in a row
+where the routine gives NaN (a row with an Inf). The same source does not give the same bits in a
+different code context, thus the op calls the routine itself.
+
+The host (htp-gate-fusion.h) finds the two chains in graph_compute and puts the fused op at the index of
+the last MUL. The op then reads its inputs later than the unfused ops did. In the graph of the model the z
+projection of a gated delta net layer comes after the RMS_NORM, and without more work ggml-alloc gives the
+bytes of the GATED_DELTA_NET output to that projection. Two parts keep the inputs intact:
+  - graph_optimize asks the scheduler (add_alloc_dep) to keep each input of a chain allocated until the
+    last MUL. The compute buffer of the 4B does not change (the hexhost graphs harness: 495.52 MiB with
+    and without the fusion).
+  - graph_compute checks the bytes of the allocated graph and rejects a chain when a node between the read
+    of an input and the output writes a byte of the input, when the output shares bytes with an input and
+    the rows are not the same, when an intermediate has a reader outside the chain or in a different split,
+    or when no block of one row fits in the VTCM.
+The environment switches GGML_HEXAGON_FUSE_NORM_GATE and GGML_HEXAGON_FUSE_ATTN_GATE are 1 when not set.
+0 keeps the unfused ops, thus one library can do an A/B run. GGML_HEXAGON_OPFUSION=0 also keeps them.
+
+test-backend-ops gets the cases NORM_GATE_FUSION and SIGMOID_GATE_FUSION: the 4B shapes at 1, 7, 64 and
+1024 tokens, x as the head of a GATED_DELTA_NET output, rows with a gap, widths that are not a multiple of
+32 values, the gate first in the MUL, a gate with no CONT, and a second reader of the activation (no
+fusion).
+
+The results on the host
+
+The hexhost graphs harness (the host code with a fake DSP, the real graphs of the 4B Q8_0): the prefill,
+decode, decode with 4 recurrent snapshots, MTP and image turn paths fuse each chain (24 RMS_NORM_GATE and
+8 SIGMOID_GATE ops in each forward pass), and no candidate is rejected. Each forward pass sends 64 ops
+less. With no allocation dependency the prefill rejects the 24 norm chains, because the z projection writes
+the bytes of the GATED_DELTA_NET output. Thus the dependency is necessary, and the check finds the hazard.
+
+The kernel lab (tools/htp-lab, target gate, functional mode, v79, release and debug flags): the fused op
+against the unfused ops (RMS_NORM_MUL or RMS_NORM and MUL, SILU and MUL, or the CONT, SIGMOID and MUL), 26
+cases with 1 to 6 threads, blocks of 1 row to the VTCM limit, rows of 1 to 256 values, strided x, the gate
+first, and inputs with +-0, subnormals, 1e30, +-Inf, NaN and the band [14.49, 15.73] of the int16 SiLU:
+each output value has the bits of the unfused ops.
+
+The results on the phone
+
+HTP0 of the OnePlus 13 (v79), one library set with the patch, the fusions on (no switch set) and off
+(GGML_HEXAGON_FUSE_NORM_GATE=0 GGML_HEXAGON_FUSE_ATTN_GATE=0), the 4B Q8_0, 2026-09-24, thermal status 0 in
+each run:
+  - test-backend-ops -b HTP0 against the CPU: NORM_GATE_FUSION 9/9, SIGMOID_GATE_FUSION 9/9 and SIGMOID_MUL
+    13/13, on and off. With the op profile, the runs with the fusions on show 8 RMS_NORM_GATE ops, 8
+    SIGMOID_GATE ops and 9 SIGMOID_GATE ops (the SIGMOID_MUL layouts that the match takes).
+  - The logits of the 4B (the FNV-1a hash of each llama_decode, hexhost_logits_hash): 32 decode steps, a
+    prefill of 1024 tokens, and 16 steps of the MTP draft path give the same hash with the fusions on and
+    off. Thus the logits are bit exact.
+  - The HTP0 compute buffer does not change: 992.04 MiB (decode), 990.00 MiB (prefill), 992.04 and 130.03
+    MiB (MTP), on and off.
+  - llama-bench, the flags of the app (flash attention, Q8_0 K and V, n_batch = n_ubatch = 1024, 4 threads,
+    GGML_HEXAGON_OPFUSION=1, GGML_HEXAGON_OPFUSION_STATE=1), 3 rounds with the two variants alternated. The
+    change is the median of the ratio on/off of the rounds, and the ratios of the 3 rounds follow it:
+      pp512  d0     931.3 against 901.5 t/s  +3.9 %  (+2.5, +4.2, +3.9 %)
+      pp1024 d0     898.9 against 872.9 t/s  +3.5 %  (+5.0, +3.5, +1.4 %)
+      tg32   d0     10.56 against 10.54 t/s  -0.1 %  (-0.2, -0.1, +0.4 %)
+      tg32   d4096  10.22 against 10.16 t/s  +0.5 %  (+0.5, +0.6, +0.3 %)
+    The samples of one tg32 run at d0 spread by 2 %, thus the decode change at d0 is in the noise.
+
+Files:
+    ggml/src/ggml-hexagon/htp/gate-ops.h        the two ops, the kernel params, the VTCM rule of host and DSP
+    ggml/src/ggml-hexagon/htp/gate-ops.c        the DSP ops
+    ggml/src/ggml-hexagon/htp-gate-fusion.h     the match of the chains, the allocation dependencies, the node
+    ggml/src/ggml-hexagon/ggml-hexagon.cpp      the calls in graph_optimize and graph_compute, the op names
+    ggml/src/ggml-hexagon/htp/htp-ops.h         the two op codes
+    ggml/src/ggml-hexagon/htp/htp-ctx.h         op_gate
+    ggml/src/ggml-hexagon/htp/main.c            the dispatch of the two op codes
+    ggml/src/ggml-hexagon/htp/CMakeLists.txt    gate-ops.c
+    tests/test-backend-ops.cpp                  NORM_GATE_FUSION and SIGMOID_GATE_FUSION
+
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 0d679d1..2c7c9de 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -53,6 +53,7 @@
+ #include "ggml-quants.h"
+ #include "htp-opnode.h"
+ #include "htp-gdn-match.h"
++#include "htp-gate-fusion.h"
+ #include "htp-ops.h"
+ #include "htp/matmul-ops.h"
+ #include "htp/flash-attn-ops.h"
+@@ -185,6 +186,8 @@ static const char * htp_op_name(uint32_t opcode) {
+         case HTP_OP_DIV:              return "DIV";
+         case HTP_OP_MUL_MAT:          return "MUL_MAT";
+         case HTP_OP_FWHT:             return "FWHT";
++        case HTP_OP_RMS_NORM_GATE:    return "RMS_NORM_GATE";
++        case HTP_OP_SIGMOID_GATE:     return "SIGMOID_GATE";
+         case HTP_OP_MUL_MAT_ID:       return "MUL_MAT_ID";
+         case HTP_OP_MUL_MAT_NX:       return "MUL_MAT_NX";
+         case HTP_OP_MUL_MAT_ID_NX:    return "MUL_MAT_ID_NX";
+@@ -6837,6 +6840,10 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+         if (ggml_hexagon_is_gdn_state_fusion_enabled() && sess->mdev.count == 1) {
+             ggml_hexagon_match_gdn_fusions(sess, graph, gdn_fu);
+         }
++        // The gate chains of the Qwen3.5 layers (htp-gate-fusion.h)
++        if (opt_opfusion > 0 && sess->mdev.count == 1) {
++            ggml_hexagon_gate_match_all(graph, sess->n_threads, sess->vtcm_size, gdn_fu.skip, gdn_fu.at, sess->c_name(), opt_verbose != 0);
++        }
+ 
+         computed_nodes.reserve(graph->n_nodes);
+ 
+@@ -7197,6 +7204,11 @@ static void ggml_backend_hexagon_graph_optimize(ggml_backend_t backend, ggml_cgr
+         }
+     }
+ 
++    // The gate chains read their inputs at the index of their output (htp-gate-fusion.h)
++    if (opt_opfusion > 0) {
++        ggml_hexagon_gate_keep_inputs(gf, params);
++    }
++
+     GGML_UNUSED(backend);
+ }
+ 
+diff --git a/ggml/src/ggml-hexagon/htp-gate-fusion.h b/ggml/src/ggml-hexagon/htp-gate-fusion.h
+new file mode 100644
+index 0000000..9175180
+--- /dev/null
++++ b/ggml/src/ggml-hexagon/htp-gate-fusion.h
+@@ -0,0 +1,395 @@
++// The graph match of the two gate chains of the Qwen3.5 layers (host side). Refer to htp/gate-ops.h for
++// the DSP ops.
++//
++//   MUL(MUL(RMS_NORM(x), w), SILU(z))                  -> HTP_OP_RMS_NORM_GATE (x, w, z)
++//   MUL(a, SIGMOID(CONT(g))) or MUL(a, SIGMOID(g))     -> HTP_OP_SIGMOID_GATE (a, g)
++//
++// Each MUL can also have its two operands in the other sequence. The fused op reads a CONT source with
++// its strides, thus the CONT goes away.
++//
++// The fused op goes to the index of the last MUL, thus it reads each input at that index and not at the
++// index of the node that reads the input in the graph. Two parts keep the inputs intact until the MUL:
++//   - ggml_hexagon_gate_keep_inputs (graph_optimize, before ggml-alloc) asks the scheduler to keep each
++//     input allocated until the MUL. Thus ggml-alloc gives no byte of an input to a node before the MUL.
++//   - ggml_hexagon_gate_match_all (graph_compute) checks the bytes of the allocated graph: no node
++//     between the two indexes writes a byte of an input, and the output shares no byte with an input
++//     unless the two have the same rows at the same addresses.
++// The fused op does not write the replaced nodes, thus the match rejects a chain when a node outside the
++// chain reads one of them.
++//
++// The switches: GGML_HEXAGON_FUSE_NORM_GATE and GGML_HEXAGON_FUSE_ATTN_GATE. 1 (the preset value) fuses
++// the chain, and 0 keeps the unfused ops. GGML_HEXAGON_OPFUSION=0 also keeps them.
++
++#ifndef HTP_GATE_FUSION_H
++#define HTP_GATE_FUSION_H
++
++#include "ggml.h"
++#include "ggml-backend.h"
++#include "ggml-backend-impl.h"
++#include "ggml-impl.h"
++
++#include "htp-gdn-match.h"
++#include "htp-opnode.h"
++#include "htp/gate-ops.h"
++
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++
++// The value of one switch: 1 when the variable is not set or is not 0
++static inline bool ggml_hexagon_gate_switch(const char * name) {
++    const char * v = getenv(name);
++    return v == nullptr || atoi(v) != 0;
++}
++
++// The process reads each switch one time
++static inline bool ggml_hexagon_fuse_norm_gate() {
++    static const bool on = ggml_hexagon_gate_switch("GGML_HEXAGON_FUSE_NORM_GATE");
++    return on;
++}
++
++static inline bool ggml_hexagon_fuse_attn_gate() {
++    static const bool on = ggml_hexagon_gate_switch("GGML_HEXAGON_FUSE_ATTN_GATE");
++    return on;
++}
++
++struct ggml_hexagon_gate_match {
++    htp_op_code                opcode = HTP_OP_INVALID;
++    ggml_tensor *              out    = nullptr;  // the last MUL, the output of the fused op
++    ggml_tensor *              in0    = nullptr;  // x or a
++    ggml_tensor *              w      = nullptr;  // the norm weight of RMS_NORM_GATE
++    ggml_tensor *              in1    = nullptr;  // z or g, the tensor with the shape of the rows
++    std::vector<ggml_tensor *> members;           // the replaced nodes in graph order, the last MUL included
++    std::vector<ggml_tensor *> inter;             // the replaced nodes that the fused op does not write
++    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> reads;  // each input and the member that reads it
++    float                      eps  = 0.0f;
++    bool                       swap = false;
++    bool                       cont = false;  // SIGMOID_GATE: the graph reads g through a CONT
++};
++
++// A node that the fused op replaces: an op result, not a view, F32
++static inline bool ggml_hexagon_gate_is_op(const ggml_tensor * t, ggml_op op) {
++    return t && t->op == op && t->view_src == nullptr && t->type == GGML_TYPE_F32;
++}
++
++static inline bool ggml_hexagon_gate_is_unary(const ggml_tensor * t, ggml_unary_op uop) {
++    return ggml_hexagon_gate_is_op(t, GGML_OP_UNARY) && ggml_get_unary_op(t) == uop;
++}
++
++// The rule of gate_operand_init (htp/gate-ops.c): the tensor has the shape of the rows (the shape of
++// `rows`), or it is contiguous with the same number of values. The row stride must fit in one DMA
++// transfer. Keep the two in agreement: the DSP refuses an op that this check accepts in error.
++static inline bool ggml_hexagon_gate_operand_ok(const ggml_tensor * t, const ggml_tensor * rows) {
++    if (t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float)) {
++        return false;
++    }
++    size_t nb1;
++    if (ggml_are_same_shape(t, rows)) {
++        nb1 = t->nb[1];
++    } else if (ggml_is_contiguous(t) && ggml_nelements(t) == ggml_nelements(rows)) {
++        nb1 = (size_t) rows->ne[0] * sizeof(float);
++    } else {
++        return false;
++    }
++    return nb1 <= HTP_GATE_DMA_MAX_STRIDE;
++}
++
++// True when the rows of the two tensors are at the same addresses: then the fused op reads each row of
++// the input before it writes the same row of the output. `rows` gives the shape of the rows.
++static inline bool ggml_hexagon_gate_same_rows(const ggml_tensor * a, const ggml_tensor * b, const ggml_tensor * rows) {
++    if (a->data != b->data) {
++        return false;
++    }
++    const bool a_flat = ggml_is_contiguous(a);
++    const bool b_flat = ggml_is_contiguous(b);
++    if (a_flat && b_flat) {
++        return true;
++    }
++    if (!ggml_are_same_shape(a, rows) || !ggml_are_same_shape(b, rows)) {
++        return false;
++    }
++    for (int d = 1; d < GGML_MAX_DIMS; d++) {
++        if (rows->ne[d] > 1 && a->nb[d] != b->nb[d]) {
++            return false;
++        }
++    }
++    return true;
++}
++
++// The shape of the chain that ends at the MUL `e`, without the graph. Returns nullptr when the chain
++// matches, or a short text for the first failed condition. *candidate is true when one operand of `e`
++// is a SILU or a SIGMOID, thus a failure is worth a log line.
++static inline const char * ggml_hexagon_gate_chain(ggml_tensor * e, bool norm_on, bool attn_on,
++                                                   ggml_hexagon_gate_match & m, bool * candidate) {
++    *candidate = false;
++    if (!ggml_hexagon_gate_is_op(e, GGML_OP_MUL) || !e->src[0] || !e->src[1]) {
++        return "not an F32 MUL";
++    }
++
++    ggml_tensor * s0 = e->src[0];
++    ggml_tensor * s1 = e->src[1];
++
++    const bool silu0 = ggml_hexagon_gate_is_unary(s0, GGML_UNARY_OP_SILU);
++    const bool silu1 = ggml_hexagon_gate_is_unary(s1, GGML_UNARY_OP_SILU);
++    const bool sig0  = ggml_hexagon_gate_is_unary(s0, GGML_UNARY_OP_SIGMOID);
++    const bool sig1  = ggml_hexagon_gate_is_unary(s1, GGML_UNARY_OP_SIGMOID);
++
++    m   = ggml_hexagon_gate_match();
++    m.out = e;
++
++    if (norm_on && (silu0 || silu1)) {
++        *candidate = true;
++        // The operand that is not the SILU must be the MUL of an RMS_NORM and a weight
++        ggml_tensor * S = silu1 ? s1 : s0;
++        ggml_tensor * N = silu1 ? s0 : s1;
++        m.swap = !silu1;
++        if (!ggml_hexagon_gate_is_op(N, GGML_OP_MUL) || !N->src[0] || !N->src[1]) {
++            return "no MUL of an RMS_NORM beside the SILU";
++        }
++        ggml_tensor * R = ggml_hexagon_gate_is_op(N->src[0], GGML_OP_RMS_NORM) ? N->src[0] : N->src[1];
++        ggml_tensor * w = R == N->src[0] ? N->src[1] : N->src[0];
++        if (!ggml_hexagon_gate_is_op(R, GGML_OP_RMS_NORM) || !R->src[0]) {
++            return "no RMS_NORM in the norm side";
++        }
++        ggml_tensor * x = R->src[0];
++        ggml_tensor * z = S->src[0];
++        if (!z || !w) {
++            return "a missing source";
++        }
++        if (!ggml_are_same_shape(x, e) || !ggml_are_same_shape(z, e) || !ggml_are_same_shape(R, e) ||
++            !ggml_are_same_shape(N, e) || !ggml_are_same_shape(S, e)) {
++            return "the shapes of the chain differ";
++        }
++        if (w->type != GGML_TYPE_F32 || w->ne[0] != e->ne[0] || ggml_nelements(w) != w->ne[0] || w->nb[0] != sizeof(float)) {
++            return "the weight is not one F32 row of the norm width";
++        }
++        if (!ggml_is_contiguous(e)) {
++            return "the output is not contiguous";
++        }
++        if (!ggml_hexagon_gate_operand_ok(x, z) || !ggml_hexagon_gate_operand_ok(z, z) ||
++            !ggml_hexagon_gate_operand_ok(e, z)) {
++            return "an operand has rows that the op cannot read";
++        }
++        m.opcode  = HTP_OP_RMS_NORM_GATE;
++        m.in0     = x;
++        m.w       = w;
++        m.in1     = z;
++        m.members = { R, N, S, e };
++        m.inter   = { R, N, S };
++        m.reads   = { { x, R }, { w, N }, { z, S } };
++        memcpy(&m.eps, R->op_params, sizeof(float));
++    } else if (attn_on && (sig0 || sig1)) {
++        *candidate = true;
++        ggml_tensor * SIG = sig1 ? s1 : s0;
++        ggml_tensor * a   = sig1 ? s0 : s1;
++        m.swap = !sig1;
++        ggml_tensor * g = SIG->src[0];
++        if (!g) {
++            return "a missing source";
++        }
++        ggml_tensor * C = nullptr;
++        if (ggml_hexagon_gate_is_op(g, GGML_OP_CONT) && g->src[0] && g->src[0]->type == GGML_TYPE_F32 &&
++            ggml_nelements(g->src[0]) == ggml_nelements(g)) {
++            C = g;
++            g = C->src[0];
++        }
++        if (!ggml_are_same_shape(SIG, e) || !ggml_are_same_shape(a, e) || (C && !ggml_are_same_shape(C, e))) {
++            return "the shapes of the chain differ";
++        }
++        // CONT writes the values of g in the order of its shape, thus without the CONT the gate must have
++        // the shape of the output
++        if (!C && !ggml_are_same_shape(g, e)) {
++            return "the gate has another shape";
++        }
++        if (!ggml_is_contiguous(e)) {
++            return "the output is not contiguous";
++        }
++        if (!ggml_hexagon_gate_operand_ok(a, g) || !ggml_hexagon_gate_operand_ok(g, g) ||
++            !ggml_hexagon_gate_operand_ok(e, g)) {
++            return "an operand has rows that the op cannot read";
++        }
++        m.opcode = HTP_OP_SIGMOID_GATE;
++        m.in0    = a;
++        m.in1    = g;
++        m.cont   = C != nullptr;
++        if (C) {
++            m.members = { C, SIG, e };
++            m.inter   = { C, SIG };
++            m.reads   = { { g, C }, { a, e } };
++        } else {
++            m.members = { SIG, e };
++            m.inter   = { SIG };
++            m.reads   = { { g, SIG }, { a, e } };
++        }
++    } else {
++        return "no SILU or SIGMOID operand";
++    }
++
++    const ggml_tensor * rows  = m.in1;
++    const int64_t       nrows = rows->ne[1] * rows->ne[2] * rows->ne[3];
++    if (rows->ne[0] <= 0 || nrows <= 0 || nrows > (int64_t) UINT32_MAX ||
++        rows->ne[0] * (int64_t) sizeof(float) > (int64_t) HTP_GATE_DMA_MAX_STRIDE) {
++        return "the row count or the row size is out of range";
++    }
++    return nullptr;
++}
++
++// The checks of the chain in the graph of one split: the members are nodes of the split and are not
++// part of a different fused op, no node outside the chain reads an intermediate, no node between the
++// read of an input and the output writes a byte of the input, and the output shares no byte with an
++// input unless the rows are the same. Needs the data of the allocated graph.
++// O(nodes * (GGML_MAX_SRC + members)) for each chain.
++static inline const char * ggml_hexagon_gate_placement(const ggml_cgraph * gf,
++                                                       const std::unordered_map<const ggml_tensor *, int> & index,
++                                                       const std::vector<uint8_t> & skip, const ggml_hexagon_gate_match & m,
++                                                       int * emit) {
++    for (auto * t : m.members) {
++        auto it = index.find(t);
++        if (it == index.end()) {
++            return "a member is not a node of this split";
++        }
++        if (skip[it->second]) {
++            return "a member is part of a different fused op";
++        }
++    }
++    *emit = index.at(m.out);
++
++    const char * reason = ggml_hexagon_gdn_chain_is_private(gf, m.inter, m.members, nullptr, 0);
++    if (reason) {
++        return reason;
++    }
++    for (const auto & rd : m.reads) {
++        if (!ggml_hexagon_gdn_move_is_safe(gf, *emit, index.at(rd.second), rd.first, false, m.members)) {
++            return "a node between the read of an input and the output writes a byte of the input";
++        }
++    }
++    for (const ggml_tensor * t : { m.in0, m.w, m.in1 }) {
++        if (t && ggml_hexagon_gdn_bytes_overlap(m.out, t) && (t == m.w || !ggml_hexagon_gate_same_rows(m.out, t, m.in1))) {
++            return "the output shares bytes with an input";
++        }
++    }
++    return nullptr;
++}
++
++// Builds the fused op of a matched chain. False when no block of one row fits in the VTCM.
++static inline bool ggml_hexagon_gate_make_node(const ggml_hexagon_gate_match & m, uint32_t n_threads, size_t vtcm_size,
++                                               htp_opnode & node) {
++    const ggml_tensor * rows      = m.in1;
++    const bool          has_w     = m.opcode == HTP_OP_RMS_NORM_GATE;
++    const uint32_t      nrows     = (uint32_t) (rows->ne[1] * rows->ne[2] * rows->ne[3]);
++    const uint32_t      threads   = std::min(std::max(n_threads, 1u), nrows);
++    const size_t        row_bytes = (size_t) rows->ne[0] * sizeof(float);
++    const size_t        row_align = (row_bytes + 127) / 128 * 128;
++    const uint32_t      per_thr   = (nrows + threads - 1) / threads;
++    const uint32_t      block     = htp_gate_max_block(has_w, row_align, threads, vtcm_size, per_thr);
++    if (block == 0) {
++        return false;
++    }
++
++    node = htp_opnode(m.opcode, m.out);
++    node.name = has_w ? "RMS_NORM_GATE" : "SIGMOID_GATE";
++    if (has_w) {
++        node.inputs = { m.in0, m.w, m.in1 };
++    } else {
++        node.inputs = { m.in0, m.in1 };
++    }
++    node.outputs = { m.out };
++    node.fused.assign(m.members.begin(), m.members.end() - 1);
++
++    htp_gate_kernel_params kp;
++    memset(&kp, 0, sizeof(kp));
++    kp.n_threads = threads;
++    kp.block     = block;
++    memcpy(&kp.eps_bits, &m.eps, sizeof(float));
++    kp.flags = (m.swap ? HTP_GATE_FLAG_SWAP : 0) | (m.cont ? HTP_GATE_FLAG_CONT : 0);
++    memcpy(node.kernel_params, &kp, sizeof(kp));
++    return true;
++}
++
++// graph_optimize: asks the scheduler to keep the inputs of each chain allocated until its output. A
++// weight is not a tensor of ggml-alloc, thus it needs no such request. O(nodes * members) with the
++// check of each chain.
++static inline void ggml_hexagon_gate_keep_inputs(ggml_cgraph * gf, ggml_backend_graph_optimize_params * params) {
++    const bool norm_on = ggml_hexagon_fuse_norm_gate();
++    const bool attn_on = ggml_hexagon_fuse_attn_gate();
++    if (!params || !params->add_alloc_dep || (!norm_on && !attn_on)) {
++        return;
++    }
++    for (int i = 0; i < gf->n_nodes; i++) {
++        ggml_hexagon_gate_match m;
++        bool                    candidate = false;
++        if (ggml_hexagon_gate_chain(gf->nodes[i], norm_on, attn_on, m, &candidate) ||
++            ggml_hexagon_gdn_chain_is_private(gf, m.inter, m.members, nullptr, 0)) {
++            continue;
++        }
++        for (ggml_tensor * t : { m.in0, m.w, m.in1 }) {
++            if (!t) {
++                continue;
++            }
++            const ggml_tensor * root = ggml_hexagon_gdn_root(t);
++            if (root->buffer && ggml_backend_buffer_get_usage(root->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
++                continue;
++            }
++            params->add_alloc_dep(params->user_data, t, m.out);
++        }
++    }
++}
++
++// graph_compute: matches the chains of one split. A matched chain puts its fused op at the index of its
++// output into `at`, and marks each member in `skip`. The fused ops of the gated delta net state (the
++// entries that `skip` and `at` already hold) keep their nodes. `name` and `verbose` are for the log.
++static inline void ggml_hexagon_gate_match_all(const ggml_cgraph * gf, uint32_t n_threads, size_t vtcm_size,
++                                               std::vector<uint8_t> & skip, std::unordered_map<int, htp_opnode> & at,
++                                               const char * name, bool verbose) {
++    const bool norm_on = ggml_hexagon_fuse_norm_gate();
++    const bool attn_on = ggml_hexagon_fuse_attn_gate();
++    if (!norm_on && !attn_on) {
++        return;
++    }
++    const auto index = ggml_hexagon_gdn_index(gf);
++
++    for (int i = 0; i < gf->n_nodes; i++) {
++        if (skip[i] || gf->nodes[i]->op != GGML_OP_MUL) {
++            continue;
++        }
++        ggml_hexagon_gate_match m;
++        bool                    candidate = false;
++        int                     emit      = -1;
++        htp_opnode              node;
++
++        const char * reason = ggml_hexagon_gate_chain(gf->nodes[i], norm_on, attn_on, m, &candidate);
++        if (!candidate) {
++            continue;
++        }
++        if (!reason) {
++            reason = ggml_hexagon_gate_placement(gf, index, skip, m, &emit);
++        }
++        if (!reason && at.count(emit)) {
++            reason = "a different fused op has the same index";
++        }
++        if (!reason && !ggml_hexagon_gate_make_node(m, n_threads, vtcm_size, node)) {
++            reason = "no block of one row fits in the VTCM";
++        }
++        if (reason) {
++            if (verbose) {
++                GGML_LOG_DEBUG("ggml-hex: %s gate candidate %s (node %d): %s\n", name, gf->nodes[i]->name, i, reason);
++            }
++            continue;
++        }
++
++        for (auto * t : m.members) {
++            skip[index.at(t)] = 1;
++        }
++        if (verbose) {
++            GGML_LOG_DEBUG("ggml-hex: %s fused %s %s (rows %lld of %lld) at node %d\n", name, node.name.c_str(),
++                           m.out->name, (long long) (m.in1->ne[1] * m.in1->ne[2] * m.in1->ne[3]),
++                           (long long) m.in1->ne[0], emit);
++        }
++        at.emplace(emit, std::move(node));
++    }
++}
++
++#endif  // HTP_GATE_FUSION_H
+diff --git a/ggml/src/ggml-hexagon/htp/CMakeLists.txt b/ggml/src/ggml-hexagon/htp/CMakeLists.txt
+index 580eb9e..15c10a6 100644
+--- a/ggml/src/ggml-hexagon/htp/CMakeLists.txt
++++ b/ggml/src/ggml-hexagon/htp/CMakeLists.txt
+@@ -40,6 +40,7 @@ add_library(${HTP_LIB} SHARED
+     cumsum-ops.c
+     fill-ops.c
+     fwht-ops.c
++    gate-ops.c
+     concat-ops.c
+     diag-ops.c
+     solve-tri-ops.c
+diff --git a/ggml/src/ggml-hexagon/htp/gate-ops.c b/ggml/src/ggml-hexagon/htp/gate-ops.c
+new file mode 100644
+index 0000000..1579fe3
+--- /dev/null
++++ b/ggml/src/ggml-hexagon/htp/gate-ops.c
+@@ -0,0 +1,371 @@
++#pragma clang diagnostic ignored "-Wunused-function"
++#pragma clang diagnostic ignored "-Wunused-variable"
++
++#include <HAP_farf.h>
++
++#include <string.h>
++
++#include "hex-common.h"
++#include "hex-dma.h"
++#include "hex-fastdiv.h"
++#include "hex-profile.h"
++
++#include "hvx-utils.h"
++#include "hvx-act-i16.h"
++
++#include "gate-ops.h"
++#include "htp-ctx.h"
++#include "htp-ops.h"
++#include "htp-tensor.h"
++
++// The gate ops of gate-ops.h. Each thread takes a range of rows. It moves blocks of rows from DDR to
++// the VTCM with a DMA double buffer, computes a block in the VTCM, and moves the output block back
++// with the DMA. The DDR traffic of a row is one read of each input and one write of the output.
++// O(rows * D) time.
++
++// The codes of octx->err_detail when the op refuses its descriptors or its kernel params
++enum {
++    GATE_ERR_TENSOR = 1,  // a tensor is missing, or it is not F32
++    GATE_ERR_SHAPE  = 2,  // an operand has neither the shape of the rows nor their value count in a contiguous tensor
++    GATE_ERR_WEIGHT = 3,  // the weight is not one row of D values
++    GATE_ERR_EXTENT = 4,  // the last row of an operand ends past the end of its tensor
++    GATE_ERR_DMA    = 5,  // a row size or a row stride is more than one DMA transfer can move
++    GATE_ERR_BLOCK  = 6,  // the block of the kernel params is 0, or more rows than one DMA transfer can move
++    GATE_ERR_OUTPUT = 7,  // the output is not contiguous
++    GATE_ERR_ROWS   = 8,  // the row count does not fit in 32 bits
++};
++
++// The addressing of the rows of one operand
++struct gate_operand {
++    const uint8_t * data;
++    uint32_t        nb1;
++    uint32_t        nb2;
++    uint32_t        nb3;
++    bool            flat;  // row r starts at r * nb1
++};
++
++struct htp_gate_context {
++    struct htp_ops_context * octx;
++
++    struct gate_operand in0;  // x or a
++    struct gate_operand in1;  // z or g
++    struct gate_operand out;
++    const uint8_t *     w;    // the weight row of RMS_NORM_GATE, NULL for SIGMOID_GATE
++
++    uint32_t D;
++    uint32_t ne1;
++    uint32_t ne2;
++    uint32_t nrows;
++    uint32_t rows_per_thread;
++    uint32_t block;
++
++    struct fastdiv_values div_ne1;
++    struct fastdiv_values div_ne2;
++    struct fastdiv_values div_ne12;
++
++    size_t row_bytes;    // D * 4
++    size_t row_aligned;  // row_bytes rounded up to a multiple of 128
++
++    bool  has_weight;
++    bool  swap;
++    bool  all_flat;      // each operand is flat, thus a block can cross the end of dim 1
++    bool  packed;        // row_bytes == row_aligned: the rows of a block lie back to back in the VTCM
++    float eps;
++
++    uint8_t * vtcm;
++    size_t    vtcm_per_thread;
++};
++
++// Sets the row addressing of one operand. A tensor with the shape of the rows keeps its strides. A
++// contiguous tensor with the same number of values gives row r at r * D values. False, with the
++// error code in *err, for another tensor or when the last row ends past the end of the tensor.
++static bool gate_operand_init(struct gate_operand * o, const struct htp_tensor * t, uint32_t D, uint32_t ne1,
++                              uint32_t ne2, uint32_t ne3, uint32_t * err) {
++    const uint64_t row_bytes = (uint64_t) D * sizeof(float);
++    const uint64_t nvals     = (uint64_t) t->ne[0] * t->ne[1] * t->ne[2] * t->ne[3];
++
++    uint64_t nb1, nb2, nb3;
++    if (t->nb[0] != sizeof(float)) {
++        *err = GATE_ERR_SHAPE;
++        return false;
++    }
++    if (t->ne[0] == D && t->ne[1] == ne1 && t->ne[2] == ne2 && t->ne[3] == ne3) {
++        nb1 = t->nb[1];
++        nb2 = t->nb[2];
++        nb3 = t->nb[3];
++    } else if (htp_tensor_is_contiguous(t, sizeof(float)) && nvals == row_bytes / sizeof(float) * ne1 * ne2 * ne3) {
++        nb1 = row_bytes;
++        nb2 = nb1 * ne1;
++        nb3 = nb2 * ne2;
++    } else {
++        *err = GATE_ERR_SHAPE;
++        return false;
++    }
++
++    // The byte after the last value of the last row
++    const uint64_t extent = (uint64_t) (ne1 - 1) * nb1 + (uint64_t) (ne2 - 1) * nb2 + (uint64_t) (ne3 - 1) * nb3 + row_bytes;
++    if (extent > t->size) {
++        *err = GATE_ERR_EXTENT;
++        return false;
++    }
++    if (nb1 > HTP_GATE_DMA_MAX_STRIDE) {
++        *err = GATE_ERR_DMA;
++        return false;
++    }
++
++    o->data = (const uint8_t *) t->data;
++    o->nb1  = (uint32_t) nb1;
++    o->nb2  = (uint32_t) nb2;
++    o->nb3  = (uint32_t) nb3;
++    o->flat = (ne2 == 1 || nb2 == nb1 * ne1) && (ne3 == 1 || nb3 == nb1 * ne1 * ne2);
++    return true;
++}
++
++// The byte offset of row ir in one operand
++static inline size_t gate_row_offset(const struct htp_gate_context * g, const struct gate_operand * o, uint32_t ir) {
++    if (o->flat) {
++        return (size_t) ir * o->nb1;
++    }
++    const uint32_t i1 = fastmodulo(ir, g->ne1, &g->div_ne1);
++    const uint32_t i2 = fastmodulo(fastdiv(ir, &g->div_ne1), g->ne2, &g->div_ne2);
++    const uint32_t i3 = fastdiv(ir, &g->div_ne12);
++    return (size_t) i1 * o->nb1 + (size_t) i2 * o->nb2 + (size_t) i3 * o->nb3;
++}
++
++// The rows of the block that starts at row ir. One DMA transfer has one row stride, thus a block of an
++// operand that is not flat stops at the end of dim 1.
++static inline uint32_t gate_block_rows(const struct htp_gate_context * g, uint32_t ir, uint32_t end) {
++    uint32_t n = MIN(g->block, end - ir);
++    if (!g->all_flat) {
++        n = MIN(n, g->ne1 - fastmodulo(ir, g->ne1, &g->div_ne1));
++    }
++    return n;
++}
++
++// The SiLU of silu_f32 in unary-ops.c, over cnt values
++static inline void gate_silu(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t cnt) {
++    if (htp_act_i16_mode) {
++        hvx_silu_i16_f32_aa(dst, src, cnt);
++    } else {
++        hvx_sigmoid_f32_aa(dst, src, cnt);
++        hvx_mul_f32_aaa(dst, src, dst, cnt);
++    }
++}
++
++// The sigmoid of sigmoid_f32 in unary-ops.c, over cnt values
++static inline void gate_sigmoid(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t cnt) {
++    if (htp_act_i16_mode) {
++        hvx_sigmoid_i16_f32_aa(dst, src, cnt);
++    } else {
++        hvx_sigmoid_f32_aa(dst, src, cnt);
++    }
++}
++
++// Computes n rows in the VTCM: o from a (x or a), b (z or g) and the weight row. When the rows are
++// packed, the activation and the product take all rows of the block in one call, which gives the
++// same value for each lane as one call for each row.
++static void gate_compute(const struct htp_gate_context * g, uint8_t * o, const uint8_t * a, const uint8_t * b,
++                         uint8_t * act, const uint8_t * wrow, uint32_t n) {
++    const uint32_t D     = g->D;
++    const size_t   Ra    = g->row_aligned;
++    const uint32_t calls = g->packed ? 1 : n;
++    const uint32_t cnt   = g->packed ? n * D : D;
++
++    if (g->has_weight) {
++        for (uint32_t r = 0; r < n; r++) {
++            hvx_fast_rms_norm_mul_f32(a + r * Ra, wrow, o + r * Ra, (int) D, g->eps);
++        }
++        for (uint32_t r = 0; r < calls; r++) {
++            gate_silu(act + r * Ra, b + r * Ra, cnt);
++        }
++        for (uint32_t r = 0; r < calls; r++) {
++            if (g->swap) {
++                hvx_mul_f32_aaa(o + r * Ra, act + r * Ra, o + r * Ra, cnt);
++            } else {
++                hvx_mul_f32_aaa(o + r * Ra, o + r * Ra, act + r * Ra, cnt);
++            }
++        }
++    } else {
++        for (uint32_t r = 0; r < calls; r++) {
++            gate_sigmoid(act + r * Ra, b + r * Ra, cnt);
++        }
++        for (uint32_t r = 0; r < calls; r++) {
++            if (g->swap) {
++                hvx_mul_f32_aaa(o + r * Ra, act + r * Ra, a + r * Ra, cnt);
++            } else {
++                hvx_mul_f32_aaa(o + r * Ra, a + r * Ra, act + r * Ra, cnt);
++            }
++        }
++    }
++}
++
++// One thread: the rows [ith * rows_per_thread, +rows_per_thread). The queue holds, for each block in
++// flight, the output slot, the first input and the second input, in this sequence. A pop of the output
++// slot waits for the write of the block that used the slot two blocks before.
++static void gate_worker(unsigned int nth, unsigned int ith, void * data) {
++    const struct htp_gate_context * g    = (const struct htp_gate_context *) data;
++    struct htp_ops_context *        octx = g->octx;
++
++    const uint32_t start = ith * g->rows_per_thread;
++    if (start >= g->nrows) {
++        return;
++    }
++    const uint32_t end = MIN(start + g->rows_per_thread, g->nrows);
++
++    const size_t Ra   = g->row_aligned;
++    const size_t half = (size_t) g->block * Ra;
++
++    uint8_t * base    = g->vtcm + (size_t) ith * g->vtcm_per_thread;
++    uint8_t * in0_buf = base;
++    uint8_t * in1_buf = base + 2 * half;
++    uint8_t * out_buf = base + 4 * half;
++    uint8_t * act     = base + 6 * half;
++    uint8_t * wrow    = base + 7 * half;
++
++    dma_queue *               q  = octx->ctx->dma[ith];
++    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
++
++    if (g->has_weight) {
++        dma_queue_push(q, dma_make_ptr(wrow, g->w), Ra, 0, g->row_bytes, 1);
++        dma_queue_flush(q);
++    }
++
++    uint32_t pf = start;
++    for (uint32_t k = 0; k < 2 && pf < end; k++) {
++        const uint32_t n = gate_block_rows(g, pf, end);
++        dma_queue_push(q, dma_make_ptr((void *) g->out.data, out_buf + k * half), g->out.nb1, Ra, g->row_bytes, 0);
++        dma_queue_push(q, dma_make_ptr(in0_buf + k * half, g->in0.data + gate_row_offset(g, &g->in0, pf)), Ra,
++                       g->in0.nb1, g->row_bytes, n);
++        dma_queue_push(q, dma_make_ptr(in1_buf + k * half, g->in1.data + gate_row_offset(g, &g->in1, pf)), Ra,
++                       g->in1.nb1, g->row_bytes, n);
++        pf += n;
++    }
++
++    for (uint32_t ir = start; ir < end;) {
++        const uint32_t n = gate_block_rows(g, ir, end);
++
++        uint8_t * o = (uint8_t *) dma_queue_pop(q).src;
++        uint8_t * a = (uint8_t *) dma_queue_pop(q).dst;
++        uint8_t * b = (uint8_t *) dma_queue_pop(q).dst;
++
++        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
++        gate_compute(g, o, a, b, act, wrow, n);
++        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
++
++        dma_queue_push(q, dma_make_ptr((uint8_t *) g->out.data + gate_row_offset(g, &g->out, ir), o), g->out.nb1, Ra,
++                       g->row_bytes, n);
++
++        if (pf < end) {
++            const uint32_t m = gate_block_rows(g, pf, end);
++            dma_queue_push(q, dma_make_ptr(a, g->in0.data + gate_row_offset(g, &g->in0, pf)), Ra, g->in0.nb1,
++                           g->row_bytes, m);
++            dma_queue_push(q, dma_make_ptr(b, g->in1.data + gate_row_offset(g, &g->in1, pf)), Ra, g->in1.nb1,
++                           g->row_bytes, m);
++            pf += m;
++        }
++        ir += n;
++    }
++
++    dma_queue_flush(q);
++}
++
++// Refuses the op with the status and the error code
++static int gate_refuse(struct htp_ops_context * octx, int status, uint32_t code) {
++    octx->err_detail = code;
++    FARF(ERROR, "gate-op %u: refused, code %u\n", octx->op, code);
++    return status;
++}
++
++int op_gate(struct htp_ops_context * octx) {
++    const bool                has_weight = octx->op == HTP_OP_RMS_NORM_GATE;
++    const struct htp_tensor * in0        = octx->src[0];
++    const struct htp_tensor * w          = has_weight ? octx->src[1] : NULL;
++    const struct htp_tensor * in1        = has_weight ? octx->src[2] : octx->src[1];
++    const struct htp_tensor * dst        = octx->dst;
++
++    if (!in0 || !in1 || !dst || (has_weight && !w)) {
++        return gate_refuse(octx, HTP_STATUS_INVAL_PARAMS, GATE_ERR_TENSOR);
++    }
++    if (in0->type != HTP_TYPE_F32 || in1->type != HTP_TYPE_F32 || dst->type != HTP_TYPE_F32 ||
++        (has_weight && w->type != HTP_TYPE_F32)) {
++        return gate_refuse(octx, HTP_STATUS_NO_SUPPORT, GATE_ERR_TENSOR);
++    }
++    // The host sends the op only to a single device, thus the op does not split its rows between devices
++    if (octx->ctx->mdev.count > 1) {
++        return HTP_STATUS_NO_SUPPORT;
++    }
++
++    const struct htp_gate_kernel_params * kp = (const struct htp_gate_kernel_params *) octx->kernel_params;
++    if (!htp_ops_context_set_n_threads(octx, kp->n_threads)) {
++        return HTP_STATUS_INVAL_PARAMS;
++    }
++
++    const uint32_t D     = in1->ne[0];
++    const uint32_t ne1   = in1->ne[1];
++    const uint32_t ne2   = in1->ne[2];
++    const uint32_t ne3   = in1->ne[3];
++    const uint64_t nrows = (uint64_t) ne1 * ne2 * ne3;
++    if (nrows > UINT32_MAX) {
++        return gate_refuse(octx, HTP_STATUS_INVAL_PARAMS, GATE_ERR_ROWS);
++    }
++    if (D == 0 || nrows == 0) {
++        return HTP_STATUS_OK;
++    }
++    if ((uint64_t) D * sizeof(float) > HTP_GATE_DMA_MAX_STRIDE) {
++        return gate_refuse(octx, HTP_STATUS_NO_SUPPORT, GATE_ERR_DMA);
++    }
++
++    struct htp_gate_context g;
++    memset(&g, 0, sizeof(g));
++    uint32_t err = 0;
++    if (!gate_operand_init(&g.in0, in0, D, ne1, ne2, ne3, &err) || !gate_operand_init(&g.in1, in1, D, ne1, ne2, ne3, &err) ||
++        !gate_operand_init(&g.out, dst, D, ne1, ne2, ne3, &err)) {
++        return gate_refuse(octx, HTP_STATUS_INVAL_PARAMS, err);
++    }
++    if (!htp_tensor_is_contiguous(dst, sizeof(float))) {
++        return gate_refuse(octx, HTP_STATUS_INVAL_PARAMS, GATE_ERR_OUTPUT);
++    }
++    if (has_weight && (w->ne[0] != D || w->ne[1] != 1 || w->ne[2] != 1 || w->ne[3] != 1 || w->nb[0] != sizeof(float) ||
++                       w->size < (uint64_t) D * sizeof(float))) {
++        return gate_refuse(octx, HTP_STATUS_INVAL_PARAMS, GATE_ERR_WEIGHT);
++    }
++    if (kp->block == 0 || kp->block > HTP_GATE_DMA_MAX_ROWS) {
++        return gate_refuse(octx, HTP_STATUS_INVAL_PARAMS, GATE_ERR_BLOCK);
++    }
++
++    const uint32_t n_threads = octx->n_threads;
++
++    g.octx            = octx;
++    g.w               = has_weight ? (const uint8_t *) w->data : NULL;
++    g.D               = D;
++    g.ne1             = ne1;
++    g.ne2             = ne2;
++    g.nrows           = (uint32_t) nrows;
++    g.rows_per_thread = (uint32_t) ((nrows + n_threads - 1) / n_threads);
++    g.block           = kp->block;
++    g.div_ne1         = init_fastdiv_values(ne1);
++    g.div_ne2         = init_fastdiv_values(ne2);
++    g.div_ne12        = init_fastdiv_values(ne1 * ne2);
++    g.row_bytes       = (size_t) D * sizeof(float);
++    g.row_aligned     = hex_round_up((uint32_t) g.row_bytes, 128);
++    g.has_weight      = has_weight;
++    g.swap            = (kp->flags & HTP_GATE_FLAG_SWAP) != 0;
++    g.all_flat        = g.in0.flat && g.in1.flat && g.out.flat;
++    g.packed          = g.row_bytes == g.row_aligned;
++    memcpy(&g.eps, &kp->eps_bits, sizeof(float));
++
++    g.vtcm_per_thread = htp_gate_vtcm_per_thread(has_weight, g.row_aligned, g.block);
++    if ((uint64_t) g.vtcm_per_thread * n_threads > octx->ctx->vtcm_size) {
++        FARF(ERROR, "gate-op %u: VTCM of %zu bytes is too small, needed %zu\n", octx->op, octx->ctx->vtcm_size,
++             g.vtcm_per_thread * n_threads);
++        return HTP_STATUS_VTCM_TOO_SMALL;
++    }
++    g.vtcm = octx->ctx->vtcm_base;
++
++    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
++        return HTP_STATUS_OK;
++    }
++
++    work_queue_run(octx->ctx->work_queue, gate_worker, &g, n_threads);
++    return HTP_STATUS_OK;
++}
+diff --git a/ggml/src/ggml-hexagon/htp/gate-ops.h b/ggml/src/ggml-hexagon/htp/gate-ops.h
+new file mode 100644
+index 0000000..c84ce19
+--- /dev/null
++++ b/ggml/src/ggml-hexagon/htp/gate-ops.h
+@@ -0,0 +1,88 @@
++#ifndef HTP_GATE_OPS_H
++#define HTP_GATE_OPS_H
++
++// The two gate ops of the Qwen3.5 layers. Each op does a chain of elementwise ops in one pass over
++// the rows, thus it reads each input one time and writes the output one time.
++//
++//   HTP_OP_RMS_NORM_GATE  dst = (rms_norm(x) * w) * silu(z)
++//                         src0 = x, src1 = w (one row), src2 = z
++//                         The output of a gated delta net layer before its ssm_out projection.
++//   HTP_OP_SIGMOID_GATE   dst = a * sigmoid(g)
++//                         src0 = a, src1 = g
++//                         The output gate of an attention layer before its output projection.
++//
++// A row has D values. The shape of the rows is the shape of the last src (z or g): D = ne[0], and
++// the row count is ne[1] * ne[2] * ne[3]. Each other operand (x, a, dst) has the same shape and its
++// own strides, or it is contiguous with the same number of values: then row r starts at value r * D.
++// Thus the op reads the gate half of a joint q and gate projection with its strides, and it needs no
++// CONT of that half.
++//
++// The op calls the row routines of the unfused ops in the same sequence: hvx_fast_rms_norm_mul_f32
++// of RMS_NORM_MUL, the SiLU and the sigmoid of unary-ops.c, and hvx_mul_f32_aaa of the MUL of
++// binary-ops.c. Each routine gives each value from its own inputs only, thus the output has the bits
++// of the unfused ops.
++
++#include "hex-common.h"
++#include "htp-ops.h"
++
++// The kernel params that the host computes (htp_op_desc.kernel_params)
++struct htp_gate_kernel_params {
++    uint32_t n_threads;  // the worker threads, 1 to the thread count of the session
++    uint32_t block;      // the rows of one DMA block of one thread
++    uint32_t eps_bits;   // RMS_NORM_GATE: the epsilon of the RMS norm, the bits of an f32
++    uint32_t flags;      // HTP_GATE_FLAG_*
++};
++
++#if defined(__cplusplus)
++static_assert(sizeof(struct htp_gate_kernel_params) <= HTP_OP_MAX_KERN_PARAMS * sizeof(int32_t),
++              "htp_gate_kernel_params is too large for the kernel params of an op");
++#else
++_Static_assert(sizeof(struct htp_gate_kernel_params) <= HTP_OP_MAX_KERN_PARAMS * sizeof(int32_t),
++               "htp_gate_kernel_params is too large for the kernel params of an op");
++#endif
++
++enum htp_gate_flags {
++    // The graph multiplies the gate first: MUL(silu(z), norm) or MUL(sigmoid(g), a). The op keeps the
++    // operand order of the MUL.
++    HTP_GATE_FLAG_SWAP = 1u << 0,
++    // SIGMOID_GATE: the chain of the graph reads g through a CONT. A CONT copies the values, thus the op
++    // reads g with its strides and does not read this flag. The flag gives the form of the chain to the
++    // host tools that compare the op with the graph.
++    HTP_GATE_FLAG_CONT = 1u << 1,
++};
++
++// The limits of one 2D DMA transfer of the v75 and later cores: the fields of a stride and of a row
++// size have 24 bits, and the field of the row count has 16 bits (dma-queue.h)
++#define HTP_GATE_DMA_MAX_STRIDE 0xffffffu
++#define HTP_GATE_DMA_MAX_ROWS   0xffffu
++
++// The VTCM of one thread for a block of `block` rows of `row_aligned` bytes: two halves of the first
++// input, of the second input and of the output (the DMA double buffer), one block for the result of
++// the activation, and for RMS_NORM_GATE one row for the weight.
++static inline size_t htp_gate_vtcm_per_thread(bool has_weight, size_t row_aligned, uint32_t block) {
++    return (size_t) block * row_aligned * 7 + (has_weight ? row_aligned : 0);
++}
++
++// The largest block that fits in the VTCM, to a maximum of `rows_per_thread` rows and of the row count
++// of one DMA transfer. 0 when one row does not fit. The host and the DSP use the same function.
++static inline uint32_t htp_gate_max_block(bool has_weight, size_t row_aligned, uint32_t n_threads,
++                                          size_t vtcm_size, uint32_t rows_per_thread) {
++    if (n_threads == 0 || row_aligned == 0) {
++        return 0;
++    }
++    const size_t per_thread = vtcm_size / n_threads;
++    const size_t fixed      = has_weight ? row_aligned : 0;
++    if (per_thread <= fixed) {
++        return 0;
++    }
++    size_t block = (per_thread - fixed) / (row_aligned * 7);
++    if (block > rows_per_thread) {
++        block = rows_per_thread;
++    }
++    if (block > HTP_GATE_DMA_MAX_ROWS) {
++        block = HTP_GATE_DMA_MAX_ROWS;
++    }
++    return (uint32_t) block;
++}
++
++#endif /* HTP_GATE_OPS_H */
+diff --git a/ggml/src/ggml-hexagon/htp/htp-ctx.h b/ggml/src/ggml-hexagon/htp/htp-ctx.h
+index 49a2fdc..4aa04f3 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-ctx.h
++++ b/ggml/src/ggml-hexagon/htp/htp-ctx.h
+@@ -171,6 +171,7 @@ int op_ssm_conv(struct htp_ops_context * octx);
+ int op_cumsum(struct htp_ops_context * octx);
+ int op_fill(struct htp_ops_context * octx);
+ int op_fwht(struct htp_ops_context * octx);
++int op_gate(struct htp_ops_context * octx);
+ int op_concat(struct htp_ops_context * octx);
+ int op_diag(struct htp_ops_context * octx);
+ int op_solve_tri(struct htp_ops_context * octx);
+diff --git a/ggml/src/ggml-hexagon/htp/htp-ops.h b/ggml/src/ggml-hexagon/htp/htp-ops.h
+index 9f6906a..18741b1 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-ops.h
++++ b/ggml/src/ggml-hexagon/htp/htp-ops.h
+@@ -109,6 +109,8 @@ enum htp_op_code {
+     HTP_OP_GDN_STATE_STEP,  // fused GET_ROWS + GATED_DELTA_NET + CPY of the delta net state (one token)
+     HTP_OP_GDN_CONV_CHUNK,  // the same conv chain over a batch of tokens
+     HTP_OP_FWHT,            // a MUL_MAT by the Hadamard matrix of llama.cpp (GGML_HINT_SRC0_IS_HADAMARD)
++    HTP_OP_RMS_NORM_GATE,   // RMS_NORM + MUL (weight) + SILU + MUL: the gated norm of a gated delta net output
++    HTP_OP_SIGMOID_GATE,    // (CONT) + SIGMOID + MUL: the output gate of an attention layer
+ 
+     HTP_OP_INVALID
+ };
+diff --git a/ggml/src/ggml-hexagon/htp/main.c b/ggml/src/ggml-hexagon/htp/main.c
+index 9d425a6..7000d69 100644
+--- a/ggml/src/ggml-hexagon/htp/main.c
++++ b/ggml/src/ggml-hexagon/htp/main.c
+@@ -871,6 +871,10 @@ static int execute_op(struct htp_ops_context * octx) {
+         case HTP_OP_FWHT:
+             return op_fwht(octx);
+ 
++        case HTP_OP_RMS_NORM_GATE:
++        case HTP_OP_SIGMOID_GATE:
++            return op_gate(octx);
++
+         case HTP_OP_DIAG:
+             return op_diag(octx);
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 2469ad4..a8effef 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4945,6 +4945,148 @@ struct test_gdn_state_fusion : public test_case {
+     bool run_whole_graph() override { return true; }
+ };
+ 
++// GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_UNARY_OP_SILU + GGML_OP_MUL: the gated norm of the output of a gated
++// delta net layer, out = (rms_norm(x) * w) * silu(z) for each head of each token. The Hexagon backend runs
++// the chain as one op (RMS_NORM_GATE).
++struct test_norm_gate_fusion : public test_case {
++    const int64_t head_dim;
++    const int64_t n_heads;
++    const int64_t n_tokens;
++    const bool    swap;    // MUL(silu(z), norm) in place of MUL(norm, silu(z))
++    const int     layout;  // x: 0 a tensor of its own, 1 the head of a GATED_DELTA_NET output, 2 rows with a gap after each head group
++    const bool    reuse;   // a second reader of the SILU output, which keeps the unfused ops
++    const float   eps;
++
++    std::string vars() override {
++        return VARS_TO_STR7(head_dim, n_heads, n_tokens, swap, layout, reuse, eps);
++    }
++
++    test_norm_gate_fusion(int64_t head_dim = 128, int64_t n_heads = 32, int64_t n_tokens = 1, bool swap = false,
++            int layout = 0, bool reuse = false, float eps = 1e-6f)
++        : head_dim(head_dim), n_heads(n_heads), n_tokens(n_tokens), swap(swap), layout(layout), reuse(reuse), eps(eps) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * x = nullptr;
++        if (layout == 1) {
++            // GATED_DELTA_NET writes the attention output first and the state after it
++            ggml_tensor * base = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim * n_heads, n_tokens + 3);
++            ggml_set_name(base, "gdn_out");
++            x = ggml_view_4d(ctx, base, head_dim, n_heads, n_tokens, 1,
++                    ggml_row_size(base->type, head_dim), ggml_row_size(base->type, head_dim * n_heads),
++                    ggml_row_size(base->type, head_dim * n_heads * n_tokens), 0);
++        } else if (layout == 2) {
++            // one more head in each token, thus the rows of one token are not next to the rows of the next token
++            ggml_tensor * base = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_heads + 1, n_tokens);
++            ggml_set_name(base, "x_base");
++            x = ggml_view_4d(ctx, base, head_dim, n_heads, n_tokens, 1, base->nb[1], base->nb[2], base->nb[3], 0);
++        } else {
++            x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_heads, n_tokens, 1);
++            ggml_set_name(x, "x");
++        }
++        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
++        ggml_set_name(w, "w");
++        // z is the output of a projection with all heads of a token in one row
++        ggml_tensor * z2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim * n_heads, n_tokens);
++        ggml_set_name(z2, "z");
++        ggml_tensor * z = ggml_reshape_4d(ctx, z2, head_dim, n_heads, n_tokens, 1);
++
++        ggml_tensor * norm = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w);
++        ggml_tensor * gate = ggml_silu(ctx, z);
++        ggml_tensor * out  = swap ? ggml_mul(ctx, gate, norm) : ggml_mul(ctx, norm, gate);
++        if (reuse) {
++            ggml_set_name(out, "gated");
++            out = ggml_add(ctx, out, gate);
++        }
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++            if (ggml_is_view_op(t->op)) { continue; }
++            if (strcmp(t->name, "z") == 0) {
++                // the SiLU of the int16 path of the HTP has an octave table to |z| = 16 and a clamp above it
++                init_tensor_uniform(t, -20.0f, 20.0f);
++            } else if (strcmp(t->name, "w") == 0) {
++                init_tensor_uniform(t, -2.0f, 2.0f);
++            } else {
++                init_tensor_uniform(t, -10.0f, 10.0f);
++            }
++        }
++    }
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "NORM_GATE_FUSION";
++    }
++
++    bool run_whole_graph() override { return true; }
++};
++
++// GGML_OP_CONT + GGML_UNARY_OP_SIGMOID + GGML_OP_MUL: the output gate of an attention layer with a joint q and
++// gate projection, out = a * sigmoid(g). The gate is the second half of the head_dim * 2 values of each head.
++// The Hexagon backend runs the chain as one op (SIGMOID_GATE) that reads the gate half with its strides.
++struct test_sigmoid_gate_fusion : public test_case {
++    const int64_t head_dim;
++    const int64_t n_heads;
++    const int64_t n_tokens;
++    const bool    swap;   // MUL(sigmoid(g), a) in place of MUL(a, sigmoid(g))
++    const bool    cont;   // the gate is the CONT of the gate half, else a contiguous tensor of its own
++    const bool    reuse;  // a second reader of the SIGMOID output, which keeps the unfused ops
++
++    std::string vars() override {
++        return VARS_TO_STR6(head_dim, n_heads, n_tokens, swap, cont, reuse);
++    }
++
++    test_sigmoid_gate_fusion(int64_t head_dim = 256, int64_t n_heads = 16, int64_t n_tokens = 1, bool swap = false,
++            bool cont = true, bool reuse = false)
++        : head_dim(head_dim), n_heads(n_heads), n_tokens(n_tokens), swap(swap), cont(cont), reuse(reuse) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * g = nullptr;
++        if (cont) {
++            ggml_tensor * qg = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim * 2 * n_heads, n_tokens);
++            ggml_set_name(qg, "qg");
++            const size_t es = ggml_element_size(qg);
++            g = ggml_view_3d(ctx, qg, head_dim, n_heads, n_tokens, es * head_dim * 2, es * head_dim * 2 * n_heads,
++                    es * head_dim);
++            g = ggml_cont_2d(ctx, g, head_dim * n_heads, n_tokens);
++        } else {
++            g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim * n_heads, n_tokens);
++            ggml_set_name(g, "g");
++        }
++        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim * n_heads, n_tokens);
++        ggml_set_name(a, "a");
++
++        ggml_tensor * gate = ggml_sigmoid(ctx, g);
++        ggml_tensor * out  = swap ? ggml_mul(ctx, gate, a) : ggml_mul(ctx, a, gate);
++        if (reuse) {
++            ggml_set_name(out, "gated");
++            out = ggml_add(ctx, out, gate);
++        }
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++            if (ggml_is_view_op(t->op)) { continue; }
++            if (strcmp(t->name, "a") == 0) {
++                init_tensor_uniform(t, -4.0f, 4.0f);
++            } else {
++                init_tensor_uniform(t, -20.0f, 20.0f);
++            }
++        }
++    }
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "SIGMOID_GATE_FUSION";
++    }
++
++    bool run_whole_graph() override { return true; }
++};
++
+ // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
+ struct test_gated_delta_net_cache_fusion : public test_case {
+     const ggml_type type;
+@@ -11325,6 +11467,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_gdn_state_fusion(16, 128, 1, 0, 0));
+     test_cases.emplace_back(new test_gdn_state_fusion(16, 128, 3, 2, 1));
+     test_cases.emplace_back(new test_gdn_state_fusion(4, 32, 2, 1, 1));
++
++    // the gated norm of a gated delta net output: the Qwen3.5-4B shape (128 values x 32 heads) at one token,
++    // at 7, 64 and 1024 tokens, x as the head of a GATED_DELTA_NET output, rows with a gap, a width that is
++    // not a multiple of 32 values, the gate first in the MUL, and a second reader of the SILU output
++    for (int64_t n_tokens : { 1, 7, 64, 1024 }) {
++        test_cases.emplace_back(new test_norm_gate_fusion(128, 32, n_tokens));
++    }
++    test_cases.emplace_back(new test_norm_gate_fusion(128, 32, 5, false, 1));
++    test_cases.emplace_back(new test_norm_gate_fusion(128, 16, 3, false, 2));
++    test_cases.emplace_back(new test_norm_gate_fusion(100, 8, 9));
++    test_cases.emplace_back(new test_norm_gate_fusion(128, 32, 4, true));
++    test_cases.emplace_back(new test_norm_gate_fusion(128, 32, 4, false, 0, true));
++    // the attention output gate: the Qwen3.5-4B shape (256 values x 16 heads) at one token, at 7, 64 and
++    // 1024 tokens, a head of 64 and a head of 80 values (320 bytes, not a multiple of 128), the gate first
++    // in the MUL, a contiguous gate with no CONT, and a second reader of the SIGMOID output
++    for (int64_t n_tokens : { 1, 7, 64, 1024 }) {
++        test_cases.emplace_back(new test_sigmoid_gate_fusion(256, 16, n_tokens));
++    }
++    test_cases.emplace_back(new test_sigmoid_gate_fusion(64, 4, 9));
++    test_cases.emplace_back(new test_sigmoid_gate_fusion(80, 3, 5));
++    test_cases.emplace_back(new test_sigmoid_gate_fusion(256, 16, 4, true));
++    test_cases.emplace_back(new test_sigmoid_gate_fusion(256, 16, 4, false, false));
++    test_cases.emplace_back(new test_sigmoid_gate_fusion(256, 16, 4, false, true, true));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2));

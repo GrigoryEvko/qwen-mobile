@@ -11,6 +11,7 @@
 
 #include "htp-ops.h"
 #include "matmul-ops.h"
+#include "gate-ops.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -514,6 +515,45 @@ void checker::dev_op(const fakedsp::op_record & op) {
             const val    v_rms  = op_value(HTP_OP_RMS_NORM, op.params, xne, x.type, { dev_content(x) }, false);
             dev_write_all(d0, op_value(HTP_OP_MUL, ZERO_PARAMS, dne, d0.type,
                                        { const_content(v_rms, nelements(xne)), dev_content(op.src[1]) }, true));
+            return;
+        }
+        case HTP_OP_RMS_NORM_GATE: {
+            // The chain MUL(MUL(RMS_NORM(x), w), SILU(z)) (htp-gate-fusion.h). The RMS_NORM gets its epsilon
+            // from the kernel params, the SILU gets its unary op code, as the nodes of the graph have them.
+            const auto & x = op.src[0];
+            const auto & z = op.src[2];
+            const htp_gate_kernel_params * kp = (const htp_gate_kernel_params *) op.kparams;
+            int32_t      p_rms[16] = { 0 };
+            int32_t      p_silu[16] = { 0 };
+            p_rms[0]  = (int32_t) kp->eps_bits;
+            p_silu[0] = (int32_t) GGML_UNARY_OP_SILU;
+            int64_t      xne[4] = { x.ne[0], x.ne[1], x.ne[2], x.ne[3] };
+            int64_t      zne[4] = { z.ne[0], z.ne[1], z.ne[2], z.ne[3] };
+            int64_t      dne[4] = { d0.ne[0], d0.ne[1], d0.ne[2], d0.ne[3] };
+            const val    v_rms  = op_value(HTP_OP_RMS_NORM, p_rms, xne, x.type, { dev_content(x) }, false);
+            const val    v_n    = op_value(HTP_OP_MUL, ZERO_PARAMS, xne, x.type,
+                                           { const_content(v_rms, nelements(xne)), dev_content(op.src[1]) }, true);
+            const val    v_s    = op_value(HTP_OP_UNARY_SILU, p_silu, zne, z.type, { dev_content(z) }, false);
+            dev_write_all(d0, op_value(HTP_OP_MUL, ZERO_PARAMS, dne, d0.type,
+                                       { const_content(v_n, nelements(xne)), const_content(v_s, nelements(zne)) }, true));
+            return;
+        }
+        case HTP_OP_SIGMOID_GATE: {
+            // The chain MUL(a, SIGMOID(CONT(g))) or MUL(a, SIGMOID(g)) (htp-gate-fusion.h). The CONT and the
+            // SIGMOID have the shape of the output, and the flag CONT tells if the chain has the CONT.
+            const auto & g = op.src[1];
+            const htp_gate_kernel_params * kp = (const htp_gate_kernel_params *) op.kparams;
+            int32_t      p_sig[16] = { 0 };
+            p_sig[0] = (int32_t) GGML_UNARY_OP_SIGMOID;
+            int64_t      dne[4] = { d0.ne[0], d0.ne[1], d0.ne[2], d0.ne[3] };
+            int64_t      gne[4] = { g.ne[0], g.ne[1], g.ne[2], g.ne[3] };
+            const bool   cont   = (kp->flags & HTP_GATE_FLAG_CONT) != 0;
+            const val    c_in   = cont ? const_content(op_value(HTP_OP_CPY, ZERO_PARAMS, dne, g.type, { dev_content(g) }, false),
+                                                       nelements(dne))
+                                       : dev_content(g);
+            const val    v_sig  = op_value(HTP_OP_UNARY_SIGMOID, p_sig, cont ? dne : gne, g.type, { c_in }, false);
+            dev_write_all(d0, op_value(HTP_OP_MUL, ZERO_PARAMS, dne, d0.type,
+                                       { dev_content(op.src[0]), const_content(v_sig, nelements(dne)) }, true));
             return;
         }
         case HTP_OP_MUL_MAT_ADD: {
