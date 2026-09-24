@@ -100,8 +100,38 @@ uint64_t nelements(const int64_t ne[4]) {
     return (uint64_t) ne[0] * ne[1] * ne[2] * ne[3];
 }
 
+// True for an HTP opcode whose value at each element uses only the source value at that element. The host
+// can send such an op on contiguous tensors with different rows (ggml_hexagon_flatten_pointwise of
+// ggml-hexagon.cpp). The list is independent of the list of the host: when the host changes the rows of a
+// different op, the two values differ.
+bool is_pointwise(uint32_t key) {
+    switch (key) {
+        case HTP_OP_SCALE:
+        case HTP_OP_CLAMP:
+        case HTP_OP_LEAKY_RELU:
+        case HTP_OP_SQR:
+        case HTP_OP_SQRT:
+        case HTP_OP_UNARY_NEG:
+        case HTP_OP_UNARY_EXP:
+        case HTP_OP_UNARY_SIGMOID:
+        case HTP_OP_UNARY_SILU:
+        case HTP_OP_UNARY_GELU:
+        case HTP_OP_UNARY_GELU_QUICK:
+        case HTP_OP_UNARY_SOFTPLUS:
+        case HTP_OP_UNARY_TANH:
+        case HTP_OP_UNARY_ABS:
+        case HTP_OP_UNARY_LOG:
+        case HTP_OP_UNARY_RELU:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // The value of an op: a hash of the key (the HTP opcode), the params, the
-// output shape and type, and the contents of the inputs.
+// output shape and type, and the contents of the inputs. The shape of a
+// pointwise op is its element count, thus the rows of such an op do not change
+// its value.
 val op_value(uint32_t key, const int32_t * params, const int64_t ne[4], uint32_t type, std::vector<val> contents,
              bool commutative) {
     if (commutative && contents.size() == 2 && contents[0] > contents[1]) {
@@ -111,8 +141,10 @@ val op_value(uint32_t key, const int32_t * params, const int64_t ne[4], uint32_t
     for (int i = 0; i < 16; i++) {
         h = mix(h, (uint32_t) (params ? params[i] : 0));
     }
+    const int64_t flat[4] = { (int64_t) nelements(ne), 1, 1, 1 };
+    const int64_t * shp   = is_pointwise(key) ? flat : ne;
     for (int i = 0; i < 4; i++) {
-        h = mix(h, (uint64_t) ne[i]);
+        h = mix(h, (uint64_t) shp[i]);
     }
     h = mix(h, type);
     for (val c : contents) {
