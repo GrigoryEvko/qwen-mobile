@@ -14,6 +14,8 @@ which the host gives to GATED_DELTA_NET in kernel_params[7]. Version 2 of the ch
     2  writes the final state with vector stores through the cache, not with the DMA
     4  skips the update of the state by the last chunk
     8  waits 2 M cycles before that update (a late HMX store)
+   64  logs the qfloat forms around a zero operand on this core (the sum of a product by zero, and
+       the conversions to f32 and f16), one time for each op
 
 The variants:
     A  the shipped paths (no DMA path of GDN_CONV_CHUNK, version 1, the q/k norm as its own ops)
@@ -24,8 +26,9 @@ The variants:
 B to D have the DMA path of GDN_CONV_CHUNK.
 
 The runs (RUNS), in the order of the stage: the tests of the gated delta net ops for C and D, the log of
-each phase for one chunk and for four chunks, and the KL of the prefill path (A, C, D) and of the decode
-path (D) against the naive base.
+each phase for one chunk (with the qfloat forms of probe 64) and for four chunks, the KL of the prefill
+path (A, C, D) and of the decode path (D) against the naive base, and the test-backend-ops perf of
+GATED_DELTA_NET (stage.PERF_CASES) for B, C and D.
 
 A run name is the stem of its output files in the phone directory out/: <name>-gate.txt,
 <name>.out, <name>.log, and <name>-logcat.txt for the runs with the log. This file is
@@ -64,16 +67,21 @@ T_MULTI = f"test -b HTP0 -o GATED_DELTA_NET -p \"{MULTI}\""
 T_BOTH = f"test -b HTP0 -o GATED_DELTA_NET -p \"{ONE}|{MULTI}\""
 KL_PRE = f"-m {S.MODEL} {S.PPL_ARGS} --chunks 4 -b 512"
 KL_DEC = f"-m {S.MODEL} {S.PPL_ARGS} --chunks 1 -b 1 -ub 1"
+PERF = f"perf -b HTP0 -o GATED_DELTA_NET -p \"{S.PERF_CASES}\""
 # name, variant, probe bits, tool, arguments, log capture, text
 RUNS = (
     ("tC", "C", 0, "test-backend-ops", T_ALL, False, "the tests of the gated delta net ops, version 2"),
     ("tD", "D", 0, "test-backend-ops", T_GDN, False, "GATED_DELTA_NET and the state step, version 2 with the norm"),
-    ("x1D", "D", 1, "test-backend-ops", T_ONE, True, "the log of each phase, one chunk, version 2 with the norm"),
+    ("x1D", "D", 65, "test-backend-ops", T_ONE, True,
+     "the log of each phase and the qfloat forms, one chunk, version 2 with the norm"),
     ("xmD", "D", 1, "test-backend-ops", T_MULTI, True, "the log of each phase, four chunks, version 2 with the norm"),
     ("kpA", "A", 0, "llama-perplexity", KL_PRE, False, "KL of the prefill path, 4 chunks of 512, -b 512"),
     ("kpC", "C", 0, "llama-perplexity", KL_PRE, False, "KL of the prefill path, 4 chunks of 512, -b 512"),
     ("kpD", "D", 0, "llama-perplexity", KL_PRE, False, "KL of the prefill path, 4 chunks of 512, -b 512"),
     ("kdD", "D", 0, "llama-perplexity", KL_DEC, False, "KL of the decode path, 1 chunk of 512, -b 1 -ub 1"),
+    ("fB", "B", 0, "test-backend-ops", PERF, False, "the perf of GATED_DELTA_NET, version 1"),
+    ("fC", "C", 0, "test-backend-ops", PERF, False, "the perf of GATED_DELTA_NET, version 2"),
+    ("fD", "D", 0, "test-backend-ops", PERF, False, "the perf of GATED_DELTA_NET, version 2 with the norm"),
 )
 LIMIT = 100
 
@@ -92,18 +100,20 @@ def stage_files() -> list[str]:
     return files
 
 HEADER = """\
-# Phone stage "gdnk2": the variants of the stage gdnk one by one, and the probes of the state path of version 2
-# of the chunked gated delta net kernel (tools/stages/gdnk/probe.py): the check of the flush of each multiply
-# operand of version 2. One library set: the patches of the stage gdnk plus a diagnostic patch (the switch
-# GGML_HEXAGON_GDN_PROBE). 8 runs:
+# Phone stage "gdnk2": the check of version 2 of the chunked gated delta net kernel, with the solve of version 1
+# arithmetic for a chunk with a zero coefficient (tools/stages/gdnk/probe.py). One library set: the patches of the
+# stage gdnk plus a diagnostic patch (the switch GGML_HEXAGON_GDN_PROBE). 11 runs:
 #   tC tD           NO-MODEL, the tests of the gated delta net ops for the variants C (version 2) and D (version 2
 #                   with the q/k norm inside)
-#   x1D xmD         NO-MODEL, probe 1: the DSP log of each phase of version 2 (logcat, a .farf mask file in lib/)
+#   x1D xmD         NO-MODEL, probe 1: the DSP log of each phase of version 2 (logcat, a .farf mask file in lib/);
+#                   x1D also logs the qfloat forms around a zero operand (probe 64)
 #   kpA kpC kpD     REAL-MODEL, the KL of the prefill path (4 chunks of 512, -b 512) against the naive base
 #   kdD             REAL-MODEL, the KL of the decode path (1 chunk, -b 1 -ub 1) against the naive base
+#   fB fC fD        NO-MODEL, test-backend-ops perf of GATED_DELTA_NET (one token, 1024 tokens with gates from -20,
+#                   and the 4B shape with gates from -0.5)
 # Each run: the thermal line, then bin/gate.sh, the tool under timeout -s KILL (110 s or less), the exit code and
-# the conditions after the run, then the pgrep line. It is a check stage, not a timing stage.
-# Run from /home/grigory/airi/qwen-mobile on the laptop, in order. Time: about 7 minutes of tool time plus the
+# the conditions after the run, then the pgrep line. It is a check stage; the perf runs are one round each.
+# Run from /home/grigory/airi/qwen-mobile on the laptop, in order. Time: about 9 minutes of tool time plus the
 # gates. Then: build/gdnk2/probe.py table
 """
 
@@ -202,10 +212,11 @@ def table(root: Path) -> int:
               f"passed {', '.join('/'.join(x) for x in passed) or '-'}{kl_text}")
         for line in out.splitlines():
             m = FAIL_RE.search(line)
-            if not m:
-                continue
-            detail = DETAIL_RE.search(line)
-            print(f"    FAIL {m.group(1)[:160]}  {detail.group(1)[:80] if detail else ''}")
+            if m:
+                detail = DETAIL_RE.search(line)
+                print(f"    FAIL {m.group(1)[:160]}  {detail.group(1)[:80] if detail else ''}")
+        for case, runs, us in S.PERF_RE.findall(out):
+            print(f"    perf {case[:150]}: {us} us per run, {runs} runs")
         if logcat:
             lc = root / f"{name}-logcat.txt"
             for line in (lc.read_text(errors="replace").splitlines() if lc.exists() else ["no logcat file"]):
