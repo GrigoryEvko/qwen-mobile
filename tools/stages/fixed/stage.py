@@ -293,11 +293,16 @@ FIELD_RE = re.compile(r"([a-z_]+) (-?\d+)")
 CLASSES = ("HEAD", "W MUL_MAT", "FA", "GDN", "rest")
 
 
+# The src0 names of a matmul of the output head: the head of the model, the tied head (the 4B Q8_0 reads the token
+# embedding), and the reduced draft head of patches/draft-head/0001. blk.N.attn_output.weight is not a head.
+HEAD_SRC0 = re.compile(r"^(output\.weight|token_embd\.weight|blk\.\d+\.nextn\.draft_head\.weight)\b")
+
+
 def op_class(name: str, names: str) -> str:
-    """The class of one profile-op line from its op name and its tensor names. HEAD is the matmul of the output
-    head (output.weight, or token_embd.weight when the head is tied). GDN is the recurrent-state path."""
+    """The class of one profile-op line from its op name and its tensor names. HEAD is a matmul whose src0 (the
+    first name) is a head. GDN is the recurrent-state path."""
     parts = name.split("+")
-    if any(p.startswith("MUL_MAT") for p in parts) and ("output.weight" in names or "token_embd.weight" in names):
+    if any(p.startswith("MUL_MAT") for p in parts) and HEAD_SRC0.match(names.split(" x ")[0].strip()):
         return "HEAD"
     if "FLASH_ATTN_EXT" in parts:
         return "FA"
@@ -316,6 +321,7 @@ class Window:
     t1: float = 0.0
     tgt: Counter = field(default_factory=Counter)
     dft: Counter = field(default_factory=Counter)
+    draft_decodes: int = 0  # the decode lines of the draft context inside a draft window (not the follows)
     session: Counter = field(default_factory=Counter)
     cpu_split_us: int = 0
     htp_split_us: int = 0
@@ -339,16 +345,36 @@ class Event:
 
 
 def parse_log(text: str) -> tuple[list[Event], list[tuple[float | None, str]]]:
-    """The STAMP events and all lines (time, text) of one stderr file. O(lines)."""
-    events: list[Event] = []
-    lines: list[tuple[float | None, str]] = []
-    for i, raw in enumerate(text.splitlines()):
+    """The STAMP events and all lines (time, text) of one stderr file. O(lines).
+
+    The Hexagon session prints the hostprof line of a graph at the next synchronize, or at the start of the next
+    graph compute when no synchronize came. The last llama.cpp decode line before it is thus the decode that owns
+    it. The parser moves each session line to the position after that decode line, thus a window that holds the
+    decode also holds its session line. A session line with no decode line before it stays where it is."""
+    raw_lines: list[tuple[float | None, str]] = []
+    for raw in text.splitlines():
         m = TS_RE.match(raw)
         t, body = (None, raw)
         if m:
             t = ((int(m.group(1)) * 60 + int(m.group(2))) * 1000 + int(m.group(3))) * 1000.0 + int(m.group(4))
             body = m.group(5)
-        lines.append((t, body))
+        raw_lines.append((t, body))
+    moved: dict[int, list[tuple[float | None, str]]] = defaultdict(list)
+    keep = [True] * len(raw_lines)
+    last_decode = -1
+    for i, (_, body) in enumerate(raw_lines):
+        if DECODE_RE.search(body):
+            last_decode = i
+        elif last_decode >= 0 and SESSION_RE.search(body):
+            moved[last_decode].append(raw_lines[i])
+            keep[i] = False
+    lines: list[tuple[float | None, str]] = []
+    for i, item in enumerate(raw_lines):
+        if keep[i]:
+            lines.append(item)
+        lines.extend(moved.get(i, ()))
+    events: list[Event] = []
+    for i, (t, body) in enumerate(lines):
         s = STAMP_RE.search(body)
         if s and t is not None:
             events.append(Event(t, s.group(1), dict(KV_RE.findall(s.group(2))), i))
@@ -360,18 +386,22 @@ def window(lines: list[tuple[float | None, str]], events: list[Event], begin: Ev
     context. O(lines of the window)."""
     w = Window(begin.t, end.t)
     in_dft = False
+    in_draft = False
     for t, body in lines[begin.line:end.line + 1]:
         s = STAMP_RE.search(body)
         if s:
             name = s.group(1)
             if name in ("follow-begin", "draft-begin"):
                 in_dft = True
+                in_draft = name == "draft-begin"
             elif name in ("follow-end", "draft-end"):
                 in_dft = False
+                in_draft = False
             continue
         m = DECODE_RE.search(body)
         if m:
             c = w.dft if in_dft else w.tgt
+            w.draft_decodes += 1 if in_draft else 0
             c["calls"] += 1
             c["reused"] += int(m.group(3))
             for k, v in FIELD_RE.findall(m.group(4)):
@@ -712,6 +742,7 @@ def profile_table(results: dict[str, Result]) -> list[str]:
         steps = [window(res.lines, res.events, b, e) for b, e in pairs(res.events, "step-begin", "step-end")]
         if steps:
             out.append(prof_median("median of all steps", steps))
+        out += draft_summary(res)
     for key, name, begin, end in (("pp", "decode token", "step-begin", "step-end"), ("hq", "pass", "pass-begin", "pass-end")):
         res = results.get(f"4b-{key}-1-{'n' if key == 'pp' else 'c'}")
         if res is None or not res.ok:
@@ -723,6 +754,27 @@ def profile_table(results: dict[str, Result]) -> list[str]:
         if key == "pp" and len(wins) > 1:
             out.append(prof_median("median of tokens 1 and later", wins[1:]))
     return out
+
+
+def draft_summary(res: Result) -> list[str]:
+    """The draft steps of a run with the draft on: the draft length that the policy asked for (draft-begin n=)
+    against the MTP passes that the driver ran (the draft decodes inside the draft window), and the head time of
+    a step. The MTP drafter of common/speculative.cpp stops at its configured maximum and not at the length of the
+    call, thus the two numbers differ when the driver ignores the length. O(lines)."""
+    asked, ran, heads = Counter(), [], []
+    for b, e in pairs(res.events, "step-begin", "step-end"):
+        drafts = [ev for ev in res.events if b.t <= ev.t <= e.t and ev.name == "draft-begin"]
+        if not drafts:
+            continue
+        w = window(res.lines, res.events, b, e)
+        asked[drafts[0].kv.get("n", "?")] += 1
+        ran.append(w.draft_decodes)
+        heads.append(w.classes.get("HEAD", 0) / 1000)
+    if not ran:
+        return []
+    return [f"  draft steps: {len(ran)}, asked length: " + ", ".join(f"{k} x{n}" for k, n in sorted(asked.items())) +
+            f"; MTP passes per step: median {med(ran):.0f}, min {min(ran)}, max {max(ran)}" +
+            (f"; HEAD ms per step: median {med(heads):.1f}" if any(heads) else "")]
 
 
 def prof_row(label: str, w: Window) -> str:
