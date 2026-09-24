@@ -435,6 +435,9 @@ int main(int argc, char ** argv) {
     std::filesystem::create_directories(libdir);
     fclose(fopen((libdir / "libggml-htp-v79.so").c_str(), "w"));
     setenv("ADSP_LIBRARY_PATH", libdir.c_str(), 1);
+    // The fake DSP computes no op, thus the start-up self-test of the backend (htp-canary.h) would fail
+    // and the backend would register no device.
+    setenv("GGML_HEXAGON_CANARY", "0", 1);
 
     // 6 threads, 1 HMX unit, 8 MB of VTCM, v79. HEXHOST_TOUCH=1: the fake DSP writes 0xA5 into the
     // output bytes of each op when the host sends the batch, thus a host read of bytes that an op
