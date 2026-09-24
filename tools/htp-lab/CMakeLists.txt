@@ -66,6 +66,7 @@ function(lab_add_target name source htp_include)
         ${CMAKE_CURRENT_SOURCE_DIR}/lab
         ${htp_include}
         ${LLAMA_DIR}/ggml/src
+        ${LLAMA_DIR}/ggml/src/ggml-hexagon
         ${LLAMA_DIR}/ggml/include)
     target_link_options(${name} PRIVATE ${LAB_LINK_FLAGS})
 endfunction()

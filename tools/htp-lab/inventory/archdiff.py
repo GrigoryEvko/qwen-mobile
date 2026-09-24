@@ -13,6 +13,10 @@ classes of defect that passed the simulator and failed on silicon:
   V.qf32 = V.sf (v81), or a value that the analysis does not see (a load, a copy after a merge).
 - wrap: a conversion to IEEE (V.sf = V.qf32 or V.hf = W.qf32) of a qf32 product. A product below
   the normal f32 range can wrap its exponent on silicon and give a large value.
+- zero: each qf32 product (mpy), and each qf32 add or subtract with an operand that a qf32 product
+  made (mpy_add). On v79 silicon a product by an exact zero is not zero (0.5 x 0 gives the qf32 word
+  0x00000080, 2^-22), and the simulator gives 0. The residue goes into the sum of an mpy_add
+  without a conversion to IEEE.
 
 It also counts the IEEE-form HVX float opcodes, which must be 0, and the direct conversions
 V.qf32 = V.sf. A function is flagged when a count or its set of dataflow signatures differs between
@@ -48,8 +52,8 @@ RE_TO_SF = "V.sf = V.qf32"
 CVT_SF_QF = "V.qf32 = V.sf"
 
 METRICS: tuple[str, ...] = (
-    "chain", "narrow_mpy", "narrow_addsub", "narrow_cvt", "narrow_other", "wrap", "cvt_sf_qf32", "ieee_hvx_float",
-    "qf32_qq_addsub",
+    "chain", "narrow_mpy", "narrow_addsub", "narrow_cvt", "narrow_other", "wrap", "zero_mpy", "zero_mpy_add",
+    "cvt_sf_qf32", "ieee_hvx_float", "qf32_qq_addsub",
 )
 
 
@@ -66,11 +70,14 @@ def function_metrics(forms: Counter[str], sigs: Counter[str], classes: Counter[s
     m["ieee_hvx_float"] = classes.get("ieee_hvx_float", 0)
     m["cvt_sf_qf32"] = forms.get(CVT_SF_QF, 0)
     m["qf32_qq_addsub"] = sum(n for f, n in forms.items() if re.match(r"^V\.qf32 = v(add|sub)\(V\.qf32,V\.qf32\)", f))
+    m["zero_mpy"] = sum(n for f, n in forms.items() if RE_QF_MPY.match(f))
     for sig, n in sigs.items():
         form, operands = split_signature(sig)
         producers = [p for op in operands for p in op]
         if RE_QF_ADDSUB.match(form) and any(RE_QF_ADDSUB.match(p) for p in producers):
             m["chain"] += n
+        if RE_QF_ADDSUB.match(form) and any(RE_QF_MPY.match(p) for p in producers):
+            m["zero_mpy_add"] += n
         if form == RE_NARROW:
             if any(p == CVT_SF_QF for p in producers):
                 m["narrow_cvt"] += n
