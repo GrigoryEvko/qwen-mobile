@@ -10,11 +10,13 @@
 //   attn_gated    the gated attention output, the input of the attn_output MUL_MAT
 // and each tensor that --also PREFIX names.
 //
-// Usage: actrange -m MODEL [--ctx N] [--chunks N] [--threads N] [--special] [--also PREFIX] FILE...
+// Usage: actrange -m MODEL [--ctx N] [--chunks N] [--threads N] [--special] [--also PREFIX] [--above LIST] FILE...
 //   Each FILE gives the first N chunks (preset 2) of N tokens (preset 1024). Each chunk is a new sequence, thus
 //   its first token is at position 0. --special parses the special tokens of the text (a chat template).
-// Output: for each tensor name without the layer, the largest magnitude, the layer, the file and the token of
-// it, and the count of values above 32768 and above 65504. Then the largest magnitude of each layer.
+//   --above gives the limits of the counts, comma-separated (preset 32768,65504).
+// Output: for each tensor name without the layer, the largest magnitude, the smallest and the largest value, the
+// layer, the file and the token of the largest magnitude, and the count of values with a magnitude above each
+// limit. Then the largest magnitude of each layer.
 // Time: about 1 minute for 3 files of 2 chunks with 32 threads. O(tokens * parameters).
 
 #include "llama.h"
@@ -33,17 +35,19 @@
 namespace {
 
 struct stat_t {
-    double      max_abs  = 0.0;
-    int         max_tok  = -1;  // the token in the chunk
-    std::string max_file;
-    size_t      n        = 0;
-    size_t      n_above_32k = 0;
-    size_t      n_above_f16 = 0;
-    size_t      n_nonfinite = 0;
+    double              max_abs  = 0.0;
+    double              max_pos  = 0.0;  // the largest value
+    double              min_neg  = 0.0;  // the smallest value
+    int                 max_tok  = -1;   // the token in the chunk of the largest magnitude
+    std::string         max_file;
+    size_t              n        = 0;
+    std::vector<size_t> n_above;         // the count of the values with a magnitude above each limit
+    size_t              n_nonfinite = 0;
 };
 
 struct state_t {
     std::vector<std::string>      prefixes;
+    std::vector<double>           limits = { 32768.0, 65504.0 };
     std::string                   file;
     std::map<std::string, stat_t> by_name;  // the full name, with the layer
     std::vector<float>            buf;
@@ -72,6 +76,7 @@ bool on_tensor(ggml_tensor * t, bool ask, void * user) {
     ggml_backend_tensor_get(t, st->buf.data(), 0, n * sizeof(float));
     stat_t &      s   = st->by_name[t->name];
     const int64_t row = t->ne[0];
+    s.n_above.resize(st->limits.size(), 0);
     for (size_t i = 0; i < n; i++) {
         const float v = st->buf[i];
         s.n++;
@@ -80,8 +85,11 @@ bool on_tensor(ggml_tensor * t, bool ask, void * user) {
             continue;
         }
         const double a = std::fabs((double) v);
-        s.n_above_32k += a > 32768.0;
-        s.n_above_f16 += a > 65504.0;
+        for (size_t l = 0; l < st->limits.size(); l++) {
+            s.n_above[l] += a > st->limits[l];
+        }
+        s.max_pos = std::max(s.max_pos, (double) v);
+        s.min_neg = std::min(s.min_neg, (double) v);
         if (a > s.max_abs) {
             s.max_abs  = a;
             s.max_tok  = (int) (i / (size_t) row);
@@ -123,11 +131,17 @@ int main(int argc, char ** argv) {
             special = true;
         } else if (a == "--also" && i + 1 < argc) {
             st.prefixes.push_back(argv[++i]);
+        } else if (a == "--above" && i + 1 < argc) {
+            st.limits.clear();
+            std::stringstream ss(argv[++i]);
+            for (std::string item; std::getline(ss, item, ',');) {
+                st.limits.push_back(atof(item.c_str()));
+            }
         } else if (!a.empty() && a[0] != '-') {
             files.push_back(a);
         } else {
             fprintf(stderr, "usage: actrange -m MODEL [--ctx N] [--chunks N] [--threads N] [--special] "
-                            "[--also PREFIX] FILE...\n");
+                            "[--also PREFIX] [--above L1,L2,...] FILE...\n");
             return 2;
         }
     }
@@ -186,10 +200,14 @@ int main(int argc, char ** argv) {
     for (const auto & [name, s] : st.by_name) {
         const std::string kind = name.substr(0, name.find_last_of('-'));
         stat_t &          k    = by_kind[kind];
+        k.n_above.resize(st.limits.size(), 0);
         k.n += s.n;
-        k.n_above_32k += s.n_above_32k;
-        k.n_above_f16 += s.n_above_f16;
+        for (size_t l = 0; l < st.limits.size() && l < s.n_above.size(); l++) {
+            k.n_above[l] += s.n_above[l];
+        }
         k.n_nonfinite += s.n_nonfinite;
+        k.max_pos = std::max(k.max_pos, s.max_pos);
+        k.min_neg = std::min(k.min_neg, s.min_neg);
         if (s.max_abs > k.max_abs) {
             k.max_abs  = s.max_abs;
             k.max_tok  = s.max_tok;
@@ -197,9 +215,14 @@ int main(int argc, char ** argv) {
         }
     }
     for (const auto & [kind, k] : by_kind) {
-        printf("actrange %-14s max=%.6g at %s token %d, above 32768: %zu, above 65504: %zu, nonfinite: %zu, of %zu\n",
-               kind.c_str(), k.max_abs, k.max_file.c_str(), k.max_tok, k.n_above_32k, k.n_above_f16, k.n_nonfinite,
-               k.n);
+        std::string above;
+        for (size_t l = 0; l < st.limits.size(); l++) {
+            char t[64];
+            snprintf(t, sizeof(t), ", above %g: %zu", st.limits[l], l < k.n_above.size() ? k.n_above[l] : 0);
+            above += t;
+        }
+        printf("actrange %-14s max=%.6g (from %.6g to %.6g) at %s token %d%s, nonfinite: %zu, of %zu\n", kind.c_str(),
+               k.max_abs, k.min_neg, k.max_pos, k.max_file.c_str(), k.max_tok, above.c_str(), k.n_nonfinite, k.n);
     }
     for (const auto & [kind, k] : by_kind) {
         std::vector<std::pair<int, double>> layers;
