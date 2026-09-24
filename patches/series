@@ -237,3 +237,4 @@ hexagon-fusion/0009-hexagon-an-f16-swiglu-output-for-its-only-reader-an-hmx-mul-
 
 # The host gives a pointwise unary op on contiguous tensors rows of up to 16 KiB (GGML_HEXAGON_UNARY_FLAT).
 hexagon-host/0008-hexagon-send-a-pointwise-unary-op-on-contiguous-tensors-with-long-rows.patch
+hexagon-v81/0001-hexagon-htp-v81-uses-the-f32-to-f16-conversion-of-v79.patch

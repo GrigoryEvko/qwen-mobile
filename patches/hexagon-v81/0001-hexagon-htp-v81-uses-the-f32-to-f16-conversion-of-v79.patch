@@ -1,0 +1,68 @@
+hexagon: htp: v81 uses the f32 to f16 conversion of v79
+Fold-into: upstream/hexagon-htp
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+hvx_vec_f32_to_f16_shuff (htp/hvx-base.h) gave v81 the conversion
+Vqf32 = Vsf, an instruction that only v81 has. v79 multiplies by 1.0 into
+qf32. With this patch v81 also multiplies by 1.0. No silicon of this project
+executed Vqf32 = Vsf, and the v79 silicon verified the multiply form.
+
+The kernel lab (tools/htp-lab, the release flags of the DSP library, the
+core v81na_2: 12 threads, 8 HVX contexts, 8 MB VTCM):
+  - target f16rne: each of the two forms gives the round to nearest even of
+    the CPU for the 862208 values of the sweep and the 25 special values (a
+    NaN gives a NaN). A copy of 2560 values takes 411.8 to 411.9 cycles
+    with each form.
+  - target gdnk (the chunked GATED_DELTA_NET, the HVX part, 2 heads of 128,
+    64 tokens, 2 threads): 716725 cycles with Vqf32 = Vsf, 719517 cycles
+    with the multiply (+0.4 %).
+  - The HVX census (tools/htp-lab/isa, v79na_1 against v81na_2): the
+    multiply form gives the same bits on v79 and v81, also for a NaN. Each
+    qf32 and qf16 operation and each conversion to IEEE gives the same bits
+    on the two cores.
+  - The HMX census (tools/htp-lab/hmxisa): the same bytes on v75, v79 and v81
+    for each HMX mode.
+
+The float instructions (tools/htp-lab/inventory/archdiff.py):
+  - Without this patch, 28 functions of the Qwen3.5 ops have other float
+    instructions on v81 than on v79: 410 sites of Vqf32 = Vsf.
+  - With this patch, each function of the Qwen3.5 ops has the float
+    instructions of v79. The other differences are moves, loads, stores and
+    nops. The one v81 form that stays is Vqf32 = Vsf in the f16 DIV of the
+    binary jobs (96 sites), where the compiler lowers Q6_Vhf_vcvt_VsfVsf.
+    The Qwen3.5 graph has no f16 DIV.
+
+The v79 library keeps its bytes: libggml-htp-v79.so has the SHA-256
+61c028af9bb1f3622d5502e1af43c7ce2f1da4f24e0bf3d0707a00494f35e606 with and
+without this patch (tools/stages/v81/build.sh, the flags of the app build).
+
+No v81 silicon verified this patch.
+diff --git a/ggml/src/ggml-hexagon/htp/hvx-base.h b/ggml/src/ggml-hexagon/htp/hvx-base.h
+index 99c8e0e..3624dc7 100644
+--- a/ggml/src/ggml-hexagon/htp/hvx-base.h
++++ b/ggml/src/ggml-hexagon/htp/hvx-base.h
+@@ -122,14 +122,16 @@ static inline HVX_VectorPred hvx_vec_is_nan_f16(HVX_Vector v) {
+ }
+ 
+ // The f16 values of two f32 vectors. On v79 and v81 the result is the IEEE conversion with round to
+-// nearest even, the conversion of the CPU backend. On v79 the multiply by 1.0 keeps the sign of a
+-// zero, where an add of 0 gives +0 for -0. Before v79 the qf32 to hf conversion rounds a tie up,
+-// and it gives a NaN for an Inf (tools/htp-lab, target f16rne).
++// nearest even, the conversion of the CPU backend. The multiply by 1.0 keeps the sign of a zero,
++// where an add of 0 gives +0 for -0. Before v79 the qf32 to hf conversion rounds a tie up, and it
++// gives a NaN for an Inf (tools/htp-lab, target f16rne).
++//
++// v81 also has the conversion Vqf32 = Vsf. In the v81 simulator it gives the same bits as the
++// multiply for all values of the target f16rne, and a copy loop takes the same cycles. v81 uses the
++// multiply, thus the v81 library has the float instruction forms of the v79 library, which the v79
++// silicon verified. Vqf32 = Vsf is an instruction that no silicon of this project executed.
+ static inline HVX_Vector hvx_vec_f32_to_f16_shuff(HVX_Vector v0, HVX_Vector v1) {
+-#if __HVX_ARCH__ >= 81
+-    HVX_Vector q0 = Q6_Vqf32_equals_Vsf(v0);
+-    HVX_Vector q1 = Q6_Vqf32_equals_Vsf(v1);
+-#elif __HVX_ARCH__ >= 79
++#if __HVX_ARCH__ >= 79
+     const HVX_Vector one = hvx_vec_splat_f32(1.0f);
+     HVX_Vector q0 = Q6_Vqf32_vmpy_VsfVsf(v0, one);
+     HVX_Vector q1 = Q6_Vqf32_vmpy_VsfVsf(v1, one);
