@@ -564,7 +564,12 @@ op_verdict model_glu(const dsp_ctx & ctx, const op_record & op) {
     if (!src0.present || !dst.present || src0.type != HTP_TYPE_F32) {
         return fail(HTP_STATUS_NO_SUPPORT, "glu: src0 missing or not F32");
     }
-    if ((uint64_t) dst.ne[0] * 4 != dst.nb[1]) {
+    // SWIGLU takes an F16 dst (the F16 activation of htp-mm-fusion.h). The VTCM rows stay F32.
+    const bool dst_f16 = dst.type == HTP_TYPE_F16;
+    if ((dst_f16 && op.opcode != HTP_OP_GLU_SWIGLU) || (dst.type != HTP_TYPE_F32 && !dst_f16)) {
+        return fail(HTP_STATUS_NO_SUPPORT, "glu: dst type %u", dst.type);
+    }
+    if ((uint64_t) dst.ne[0] * (dst_f16 ? 2 : 4) != dst.nb[1]) {
         return fail(HTP_STATUS_NO_SUPPORT, "glu: the dst rows are not contiguous");
     }
     if (src0.ne[1] * src0.ne[2] * src0.ne[3] == 0) {

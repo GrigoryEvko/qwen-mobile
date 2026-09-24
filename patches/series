@@ -233,3 +233,4 @@ hexagon-host/0005-hexagon-replay-the-packed-batches-of-a-graph-of-more-than-one-
 hexagon-host/0006-hexagon-format-the-profile-line-of-an-op-when-the-host-packs-the-batch.patch
 hexagon-mm/0002-hexagon-select-the-hmx-2d-chunks-with-the-cost-of-the-kernel.patch
 hexagon-host/0007-hexagon-refuse-a-mul-mat-weight-of-a-tiled-type-in-the-plain-layout.patch
+hexagon-fusion/0009-hexagon-an-f16-swiglu-output-for-its-only-reader-an-hmx-mul-mat.patch

@@ -645,7 +645,9 @@ void checker::dev_op(const fakedsp::op_record & op) {
                 }
             }
             int64_t dne[4] = { d0.ne[0], d0.ne[1], d0.ne[2], d0.ne[3] };
-            dev_write_all(d0, op_value(op.opcode, op.params, dne, d0.type, c, is_commutative(op.opcode)));
+            // An F16 dst of SWIGLU holds the value of its F32 output (htp-mm-fusion.h)
+            const uint32_t type = (op.opcode == HTP_OP_GLU_SWIGLU && d0.type == GGML_TYPE_F16) ? GGML_TYPE_F32 : d0.type;
+            dev_write_all(d0, op_value(op.opcode, op.params, dne, type, c, is_commutative(op.opcode)));
             return;
         }
     }

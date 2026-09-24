@@ -1,0 +1,723 @@
+hexagon: an F16 SwiGLU output for its only reader, an HMX MUL_MAT
+Fold-into: upstream/hexagon-htp
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+The HMX MUL_MAT converts its F32 activation to F16 before the multiply. In
+the FFN block of Qwen3.5, ffn_down is the only reader of the SwiGLU output.
+The GLU op writes that tensor as F32, and ffn_down reads it and converts
+each value to F16. With this patch the two ops move an F16 tensor, half the
+bytes:
+  - ggml_hexagon_mm_fusion_plan (htp-mm-fusion.h) finds each SwiGLU op
+    whose only reader is a MUL_MAT on the HMX 2D path. It gives the two op
+    nodes an F16 view of the output tensor, with the same data and buffer.
+  - The GLU op (act-ops.c) writes the F16 rows. It converts each VTCM row
+    with hvx_vec_f32_to_f16, the conversion of the HMX activation load.
+    Thus each value gets the F16 bits that the MUL_MAT makes from the F32
+    value, also a value outside the F16 range.
+  - hmx_mm_op_matmul (matmul-ops.c) reads an F16 src1 on the HMX 2D path.
+    The DMA moves the F16 rows into VTCM, and HVX puts them into the
+    activation tiles in the lane order of the F32 path.
+  - try_fuse_mul_mat_add keeps the F16 view as the src1 of the fused
+    MUL_MAT_ADD, and it computes the kernel params from the F32 tensor.
+The switch GGML_HEXAGON_FUSE_F16_ACT: 1 is the preset value, 0 disables
+the plan.
+
+test-backend-ops gets the case FFN_SWIGLU: the FFN block of Qwen3.5 on a
+whole graph (the norm, the gate and the up MUL_MAT, the SwiGLU, the down
+MUL_MAT and the residual ADD), with the HVX and the HMX shapes and the 4B
+shapes.
+
+The tests on the host:
+  - The lab target f16act (hexagon-sim v79, functional): the GLU op with
+    an F16 dst against the F32 dst and the conversion, and MUL_MAT (+ADD)
+    with an F16 src1 against the F32 src1, also with values outside the
+    F16 range. 8 cases, 0 differences.
+  - hexhost_graphs (the fake DSP) on the 2B and the 4B: decode, decode
+    with 4 state snapshots, prefill 512 and 1024, the MTP draft and the
+    image turn at 576 and 768 tokens, with the F16 cache and with the Q8_0
+    cache and flash attention, each with the plan on and off (56 runs).
+    Each run passes, and the supports_op decisions and the DSP ops of on
+    and off are the same. The 4B prefill of 1024 tokens has 32 plans.
+
+The tests on the phone (HTP0, v79, the 4B Q8_0), the plan on against
+GGML_HEXAGON_FUSE_F16_ACT=0:
+  - ffncheck: the same hashes and non-finite counts in all 18 cases,
+    among them the cases with values outside the F16 range.
+  - test-backend-ops FFN_SWIGLU: 70/70.
+  - llama-perplexity -b 1 (the decode path), two runs of each: the same KL
+    numbers in the four runs (mean KLD 0.000557).
+  - llama-bench, the median of the paired ratios of 3 alternated rounds:
+    pp512 +1.1% at the depth 0 and +2.3% at 3072, pp1024 +1.8% at 0 and
+    +2.6% at 3072, tg32 +0.0% at 0 and -0.1% at 4096. The plan has no
+    effect on a decode of one token.
+  - The op profile for the 32 layers: SWIGLU 29.2 against 34.3 ms and
+    ffn_down 85.2 against 88.4 ms at 512 tokens, SWIGLU 51.3 against
+    61.5 ms and ffn_down 154.3 against 157.7 ms at 1024 tokens.
+
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index ef719b7..898e50d 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -3045,12 +3045,15 @@ struct ggml_hexagon_opbatch {
+ 
+         const ggml_tensor * src0 = last_node.src0();
+         const ggml_tensor * src1 = last_node.src1();
++        // The input of the MUL_MAT op: src1, or its F16 view (ggml_hexagon_mm_fusion_plan)
++        const ggml_tensor * src1_in = last_node.inputs.size() > 1 ? last_node.inputs[1] : src1;
+ 
+         struct htp_mm_kernel_params kparams;
+         ggml_hexagon_precompute_fused_matmul_add_params(sess, src0, src1, src2, node.dst(), &kparams);
+         const int src1_nrows = src1->ne[1] * src1->ne[2] * src1->ne[3];
+         const bool can_fuse = (kparams.n_hmx > 0) || (src1_nrows == 1);
+         if (!can_fuse) return false;
++        if (src1_in != src1 && kparams.kernel_type != HTP_MM_KERNEL_HMX_2D) return false;
+ 
+         if ((size_t) kparams.vtcm_size > sess->vtcm_size) {
+             HEX_VERBOSE("ggml-hex: %s skip MUL_MAT_ADD fusion: VTCM needed (%d) > budget (%zu)\n",
+@@ -3079,7 +3082,7 @@ struct ggml_hexagon_opbatch {
+         last_node.name   = "MUL_MAT+ADD";
+         last_node.inputs.clear();
+         last_node.inputs.push_back(src0);
+-        last_node.inputs.push_back(src1);
++        last_node.inputs.push_back(src1_in);
+         last_node.inputs.push_back(src2);
+         last_node.outputs.clear();
+         last_node.outputs.push_back(node.dst());
+@@ -3091,7 +3094,7 @@ struct ggml_hexagon_opbatch {
+         memcpy(o.kernel_params, &kparams, sizeof(kparams));
+ 
+         o.src[0] = add_tensor(src0);
+-        o.src[1] = add_tensor(src1);
++        o.src[1] = add_tensor(src1_in);
+         o.src[2] = add_tensor(src2);
+         for (uint32_t s = 3; s < HTP_OP_MAX_INPUTS; s++) {
+             o.src[s] = 0xffff;
+@@ -3444,6 +3447,8 @@ struct ggml_hexagon_opbatch {
+     }
+ };
+ 
++#include "htp-mm-fusion.h"
++
+ struct ggml_hexagon_registry {
+     ggml_hexagon_registry(ggml_backend_reg_t reg);
+     ~ggml_hexagon_registry();
+@@ -7178,6 +7183,8 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+             computed_nodes.push_back(make_node(n));
+         }
+ 
++        ggml_hexagon_mm_fusion_plan(sess, graph, computed_nodes);
++
+         if (graph->uid != 0) {
+             entry     = &sess->graph_cache_insert(graph->uid, std::move(computed_nodes));
+             nodes_ptr = &entry->nodes;
+@@ -8563,6 +8570,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     const char * str_mmap_lru   = getenv("GGML_HEXAGON_MMAP_LRU");
+     const char * str_hostprof   = getenv("LLAMA_HOSTPROF");
+ 
++    ggml_hexagon_mm_fusion_read_env();
++
+     // Init Arch first since it affects other defaults
+     bool arch_ok = true;
+     if (!str_arch) {
+diff --git a/ggml/src/ggml-hexagon/htp-mm-fusion.h b/ggml/src/ggml-hexagon/htp-mm-fusion.h
+new file mode 100644
+index 0000000..7e9c8c1
+--- /dev/null
++++ b/ggml/src/ggml-hexagon/htp-mm-fusion.h
+@@ -0,0 +1,121 @@
++#ifndef HTP_MM_FUSION_H
++#define HTP_MM_FUSION_H
++
++// The plans around the weight matmuls of the Hexagon backend. graph_compute calls
++// ggml_hexagon_mm_fusion_plan after it builds the op nodes of a graph. ggml-hexagon.cpp includes this
++// file after the definition of ggml_hexagon_opbatch.
++//
++// The switch (an environment variable, read at the start of the backend). 1 is the preset value and
++// enables the plan, 0 disables it. GGML_HEXAGON_OPFUSION=0 also disables it.
++//
++//   GGML_HEXAGON_FUSE_F16_ACT  an F16 SwiGLU output for its only reader, an HMX MUL_MAT
++//
++// The F16 activation. The HMX MUL_MAT converts its F32 activation to F16 before the multiply
++// (hvx_vec_f32_to_f16_shuff). When a SwiGLU output has one reader and that reader is a MUL_MAT on the
++// HMX 2D path, the SwiGLU op writes the F16 value of each lane with the same conversion, and the MUL_MAT
++// reads F16. The MUL_MAT thus gets the bytes that it gets from the F32 tensor, and the two ops move half
++// the bytes of that tensor. The plan gives the two op nodes an F16 view of the F32 tensor (the same data
++// and buffer): the output of the SwiGLU op and the src1 of the MUL_MAT.
++
++#include <cstdlib>
++#include <memory>
++#include <unordered_map>
++#include <vector>
++
++static int opt_fuse_f16_act = 1;  // GGML_HEXAGON_FUSE_F16_ACT
++
++// Reads the switch of this file from the environment. The backend calls it one time, together with the
++// read of the other options.
++static void ggml_hexagon_mm_fusion_read_env() {
++    const char * s = getenv("GGML_HEXAGON_FUSE_F16_ACT");
++    if (s) {
++        opt_fuse_f16_act = atoi(s);
++    }
++}
++
++// Returns the graph index of the only reader of the node at index i, or -1. O(nodes).
++static int ggml_hexagon_mm_only_reader(const struct ggml_cgraph * graph, int i) {
++    if (!ggml_hexagon_product_has_one_reader(graph, i)) {
++        return -1;
++    }
++    const ggml_tensor * t = graph->nodes[i];
++    for (int j = i + 1; j < graph->n_nodes; j++) {
++        for (int s = 0; s < GGML_MAX_SRC; s++) {
++            if (graph->nodes[j]->src[s] == t) {
++                return j;
++            }
++        }
++    }
++    return -1;
++}
++
++// The plan of the F16 activations of one graph (the part of graph_compute that builds the op nodes).
++// It changes the op nodes of each pair of a SwiGLU op and its only reader, a MUL_MAT on the HMX 2D
++// path: the SwiGLU op writes an F16 view of its output, and the MUL_MAT reads that view as src1. The
++// two op nodes own the view. O(nodes) for each SwiGLU op.
++static void ggml_hexagon_mm_fusion_plan(const struct ggml_hexagon_session * sess, const struct ggml_cgraph * graph,
++                                        std::vector<htp_opnode> & nodes) {
++    if (!opt_opfusion || !opt_fuse_f16_act) {
++        return;
++    }
++
++    std::unordered_map<const ggml_tensor *, int>    gidx;
++    std::unordered_map<const ggml_tensor *, size_t> oidx;
++    for (int i = 0; i < graph->n_nodes; i++) {
++        gidx[graph->nodes[i]] = i;
++    }
++    for (size_t j = 0; j < nodes.size(); j++) {
++        if (nodes[j].node && nodes[j].outputs.size() == 1 && nodes[j].outputs[0] == nodes[j].node) {
++            oidx[nodes[j].node] = j;
++        }
++    }
++
++    for (auto & g : nodes) {
++        if (g.opcode != HTP_OP_GLU_SWIGLU || g.outputs.size() != 1 || g.outputs[0] != g.node) {
++            continue;
++        }
++        ggml_tensor * t = g.node;
++        if (!t->src[0] || !t->src[1] || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || t->ne[2] != 1 ||
++            t->ne[3] != 1 || !t->buffer || !t->extra) {
++            continue;
++        }
++        const auto gi = gidx.find(t);
++        if (gi == gidx.end()) {
++            continue;
++        }
++        const int ri = ggml_hexagon_mm_only_reader(graph, gi->second);
++        if (ri < 0) {
++            continue;
++        }
++        const ggml_tensor * c = graph->nodes[ri];
++        if (c->op != GGML_OP_MUL_MAT || c->src[1] != t || c->src[0] == t) {
++            continue;
++        }
++        const auto oc = oidx.find(c);
++        if (oc == oidx.end()) {
++            continue;
++        }
++        htp_opnode & cn = nodes[oc->second];
++        const auto * kp = (const struct htp_mm_kernel_params *) cn.kernel_params;
++        if (cn.opcode != HTP_OP_MUL_MAT || cn.inputs.size() < 2 || cn.inputs[1] != t || !kp->n_hmx ||
++            kp->kernel_type != HTP_MM_KERNEL_HMX_2D) {
++            continue;
++        }
++
++        ggml_tensor v = *t;
++        v.type        = GGML_TYPE_F16;
++        v.nb[0]       = ggml_type_size(GGML_TYPE_F16);
++        v.nb[1]       = v.nb[0] * v.ne[0];
++        v.nb[2]       = v.nb[1] * v.ne[1];
++        v.nb[3]       = v.nb[2] * v.ne[2];
++        auto view     = std::make_shared<ggml_tensor>(v);
++        g.dummy.push_back(view);
++        cn.dummy.push_back(view);
++        g.outputs[0]  = view.get();
++        cn.inputs[1]  = view.get();
++
++        HEX_VERBOSE("ggml-hex: %s F16 activation %s for %s\n", sess->c_name(), t->name, c->name);
++    }
++}
++
++#endif // HTP_MM_FUSION_H
+diff --git a/ggml/src/ggml-hexagon/htp/act-ops.c b/ggml/src/ggml-hexagon/htp/act-ops.c
+index adef690..ba026f3 100644
+--- a/ggml/src/ggml-hexagon/htp/act-ops.c
++++ b/ggml/src/ggml-hexagon/htp/act-ops.c
+@@ -78,6 +78,7 @@ struct htp_act_context {
+     size_t                   dst_spad_half_size;
+ 
+     uint32_t                 block;
++    uint32_t                 dst_f16;       // 1: the SwiGLU rows go to an F16 dst
+     uint32_t                 src0_nrows;
+     uint32_t                 src0_nrows_per_thread;
+     uint32_t                 row_start;
+@@ -127,6 +128,23 @@ static inline void htp_act_vtcm_layout_build(struct htp_act_vtcm_layout * L,
+     L->total_bytes = L->off_dst + L->dst_bytes_per_thread * n_threads;
+ }
+ 
++// Converts the first n F32 values of each VTCM row to F16 in place, at the start of the row. The value
++// of a lane is the value that the HMX activation load of a MUL_MAT gives for the F32 value
++// (hvx_vec_f32_to_f16_shuff), thus a MUL_MAT that reads the F16 row gets the bytes of the F32 path.
++// Iteration j reads the vectors 2j and 2j + 1 and writes the vector j, which the loop read before.
++// O(n_rows * n).
++static void htp_act_rows_f32_to_f16(uint8_t * restrict rows, uint32_t n_rows, size_t row_stride, uint32_t n) {
++    const uint32_t nvec = (n + 31) / 32;
++    for (uint32_t r = 0; r < n_rows; r++) {
++        HVX_Vector * v = (HVX_Vector *) (rows + r * row_stride);
++        for (uint32_t j = 0; 2 * j < nvec; j++) {
++            const HVX_Vector lo = v[2 * j];
++            const HVX_Vector hi = (2 * j + 1 < nvec) ? v[2 * j + 1] : Q6_V_vzero();
++            v[j] = hvx_vec_f32_to_f16(lo, hi);
++        }
++    }
++}
++
+ #define htp_glu_op_preamble                                            \
+     const size_t src0_row_size_aligned = actx->src0_row_size_aligned;  \
+     const size_t src1_row_size_aligned = actx->src1_row_size_aligned;  \
+@@ -147,6 +165,10 @@ static void swiglu_f32(const float * restrict src0,
+         uint8_t * restrict dst_ptr        = (uint8_t *) dst + (ib * dst_row_size_aligned);
+ 
+         // One pass gives the SwiGLU. The two-pass form reads and writes the row twice.
++        // For a gate far below 0, the SiLU of the one-pass form is -2^-15 (-3.05e-5), not the smaller true
++        // value. Thus the product has an absolute error of up to 3.05e-5 * |up|, at most about 5e-4 for the
++        // Qwen3.5 4B (|up| of 15.1 or less on real text). For gates from -1024 to 1024 the SiLU is within
++        // 1e-3 * max(1, |SiLU|) of the true value (lab target f16act, --glu-sweep 1).
+         if (htp_act_i16_mode) {
+             hvx_swiglu_i16_f32_aa(dst_ptr, src0_ptr, src1_ptr, nc);
+         } else {
+@@ -415,6 +437,9 @@ static void geglu_f32(const float * restrict src0,
+                                                                                                                          \
+             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ir);                                                       \
+             CORE_EXPR;                                                                                                   \
++            if (actx->dst_f16) {                                                                                         \
++                htp_act_rows_f32_to_f16((uint8_t *) dst_spad, block_size, dst_row_size_aligned, actx->nc);               \
++            }                                                                                                            \
+             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ir);                                                        \
+                                                                                                                          \
+             dma_queue_push_vtcm_to_ddr(dma_queue, dma_make_ptr(data_dst + (ir * dst_row_size), dst_spad),                \
+@@ -445,7 +470,16 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
+     const struct htp_tensor * src1 = octx->src[1];
+     const struct htp_tensor * dst  = octx->dst;
+ 
+-    if ((dst->ne[0] * SIZEOF_FP32) != dst->nb[1]) {
++    // An F16 dst holds the SwiGLU for an HMX MUL_MAT that reads F16 (the host plan of htp-mm-fusion.h)
++    const bool   dst_f16  = dst->type == HTP_TYPE_F16;
++    const size_t dst_elem = dst_f16 ? sizeof(__fp16) : SIZEOF_FP32;
++    if (dst_f16 && octx->op != HTP_OP_GLU_SWIGLU) {
++        return HTP_STATUS_NO_SUPPORT;
++    }
++    if (dst->type != HTP_TYPE_F32 && !dst_f16) {
++        return HTP_STATUS_NO_SUPPORT;
++    }
++    if ((dst->ne[0] * dst_elem) != dst->nb[1]) {
+         FARF(ERROR, "Non-contiguous dst is not supported at this time \n");
+         return HTP_STATUS_NO_SUPPORT;
+     }
+@@ -544,7 +578,8 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
+ 
+     actx.src0_row_size = src0_row_size;
+     actx.src1_row_size = src1_row_size;
+-    actx.dst_row_size  = dst_row_size;
++    actx.dst_row_size  = dst->ne[0] * dst_elem;  // the bytes of a row in DDR (a VTCM row holds F32)
++    actx.dst_f16       = dst_f16 ? 1 : 0;
+ 
+     actx.src0_row_size_aligned = src0_row_size_aligned;
+     actx.src1_row_size_aligned = src1_row_size_aligned;
+diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
+index ee3a599..e83cd06 100644
+--- a/ggml/src/ggml-hexagon/htp/matmul-ops.c
++++ b/ggml/src/ggml-hexagon/htp/matmul-ops.c
+@@ -2494,9 +2494,153 @@ struct activation_transfer_params {
+     int                           k_valid;
+     float *                       vtcm_f32_act;
+     size_t                        vtcm_f32_act_bytes;
++    const __fp16 *                src_f16;     // an F16 activation in place of src, NULL for an F32 activation
+ };
+ 
++// The rows r and r + 1 of an F16 activation into the HMX tiles. The tile vector of a column block holds
++// the two rows in alternate lanes, row r in the even lanes: the order that hvx_vec_f32_to_f16_shuff
++// gives for an F32 activation. A missing row and the columns from k_valid are zero. Each row is in VTCM
++// at a multiple of 128 bytes, with at least 64 bytes after the last value when k_block is not a
++// multiple of 64. O(k_block).
++static void transfer_activation_row_pair_f16(__fp16 * restrict vtcm_dst, const __fp16 * row0, const __fp16 * row1,
++                                             uint32_t r, uint32_t k_block, uint32_t k_valid, bool row0_valid,
++                                             bool row1_valid) {
++    const uint32_t r0          = r / HTP_MM_HMX_TILE_N_ROWS;
++    const uint32_t r1          = r % HTP_MM_HMX_TILE_N_ROWS;
++    const uint32_t n_col_tiles = k_block / HTP_MM_HMX_TILE_N_COLS;
++
++    for (uint32_t c = 0; c < k_block; c += 64) {
++        HVX_Vector v0 = row0_valid ? hvx_vmem(row0 + c) : Q6_V_vzero();
++        HVX_Vector v1 = row1_valid ? hvx_vmem(row1 + c) : Q6_V_vzero();
++        if (c + 64 > k_valid) {
++            const uint32_t       rem  = k_valid > c ? k_valid - c : 0;
++            const HVX_VectorPred mask = Q6_Q_vsetq2_R(rem * sizeof(__fp16));
++            v0 = Q6_V_vmux_QVV(mask, v0, Q6_V_vzero());
++            v1 = Q6_V_vmux_QVV(mask, v1, Q6_V_vzero());
++        }
++        const HVX_VectorPair w  = Q6_W_vshuff_VVR(v1, v0, -2);
++        const uint32_t       c0 = c / HTP_MM_HMX_TILE_N_COLS;
++        ((HVX_Vector *) (vtcm_dst + (size_t) (r0 * n_col_tiles + c0) * HTP_MM_HMX_TILE_N_ELMS))[r1 / 2] = Q6_V_lo_W(w);
++        if (c0 + 1 < n_col_tiles) {
++            ((HVX_Vector *) (vtcm_dst + (size_t) (r0 * n_col_tiles + c0 + 1) * HTP_MM_HMX_TILE_N_ELMS))[r1 / 2] =
++                Q6_V_hi_W(w);
++        }
++    }
++}
++
++typedef struct {
++    struct htp_context *      ctx;
++    __fp16 *                  dst;
++    const __fp16 *            src;
++    uint8_t *                 scratch;           // the DMA buffers of the threads
++    size_t                    scratch_per_thread;
++    uint32_t                  n_rows;
++    uint32_t                  n_tasks;
++    uint32_t                  k_block;
++    uint32_t                  k_stride;          // F16 values between two rows of src
++    uint32_t                  k_valid;
++} activation_transfer_f16_state_t;
++
++// The bytes of one row of an F16 activation in the DMA buffers of transfer_activation_f16_worker_fn: a
++// multiple of 128, thus each load of 64 values is aligned and stays in the row. O(1).
++static inline size_t htp_mm_act_f16_row_bytes(uint32_t k_block) {
++    return hex_align_up((size_t) k_block * sizeof(__fp16), 128);
++}
++
++// The F16 activation of one thread: tasks of 32 rows. The DMA moves R rows at a time into one of the
++// two buffers of the thread while the thread puts the rows of the other buffer into the tiles.
++// The caller gives each thread room for 2 buffers of at least 2 rows. O(rows * k_block) for each thread.
++static void transfer_activation_f16_worker_fn(unsigned int n, unsigned int i, void * data) {
++    const activation_transfer_f16_state_t * st = (const activation_transfer_f16_state_t *) data;
++    struct htp_thread_trace * tr = &st->ctx->trace[i];
++    dma_queue *               q  = st->ctx->dma[i];
++
++    const size_t row_bytes = htp_mm_act_f16_row_bytes(st->k_block);
++    uint32_t     R         = (uint32_t) (st->scratch_per_thread / (2 * row_bytes));
++    R = MIN(R, HTP_MM_HMX_TILE_N_ROWS) & ~1u;
++    uint8_t * bufs[2] = { st->scratch + (size_t) i * st->scratch_per_thread,
++                          st->scratch + (size_t) i * st->scratch_per_thread + (size_t) R * row_bytes };
++
++    const size_t   src_stride = (size_t) st->k_stride * sizeof(__fp16);
++    const size_t   width      = (size_t) st->k_valid * sizeof(__fp16);
++    const uint32_t n_steps    = (HTP_MM_HMX_TILE_N_ROWS + R - 1) / R;
++
++    for (uint32_t task = i; task < st->n_tasks; task += n) {
++        const uint32_t row0   = task * HTP_MM_HMX_TILE_N_ROWS;
++        const uint32_t n_rows = MIN(HTP_MM_HMX_TILE_N_ROWS, st->n_rows - row0);
++        __fp16 *       dst    = st->dst + (size_t) row0 * st->k_block;
++        const __fp16 * src    = st->src + (size_t) row0 * st->k_stride;
++
++        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_PREP, row0);
++
++        // Steps of R rows: push the steps 0 and 1, then for each step pop, put into the tiles, push s + 2
++        for (uint32_t s = 0; s < 2 && s < n_steps; s++) {
++            const uint32_t r = s * R;
++            if (r < n_rows) {
++                dma_queue_push(q, dma_make_ptr(bufs[s], src + (size_t) r * st->k_stride), row_bytes, src_stride, width,
++                               MIN(R, n_rows - r));
++            }
++        }
++        for (uint32_t s = 0; s < n_steps; s++) {
++            const uint32_t  r   = s * R;
++            const uint8_t * buf = bufs[s % 2];
++            if (r < n_rows) {
++                buf = (const uint8_t *) dma_queue_pop(q).dst;
++            }
++            for (uint32_t p = 0; p < R && r + p < HTP_MM_HMX_TILE_N_ROWS; p += 2) {
++                transfer_activation_row_pair_f16(dst, (const __fp16 *) (buf + (size_t) p * row_bytes),
++                                                 (const __fp16 *) (buf + (size_t) (p + 1) * row_bytes), r + p,
++                                                 st->k_block, st->k_valid, r + p < n_rows, r + p + 1 < n_rows);
++            }
++            const uint32_t r2 = (s + 2) * R;
++            if (s + 2 < n_steps && r2 < n_rows) {
++                dma_queue_push(q, dma_make_ptr((void *) buf, src + (size_t) r2 * st->k_stride), row_bytes, src_stride,
++                               width, MIN(R, n_rows - r2));
++            }
++        }
++        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_PREP, row0);
++    }
++}
++
++// The F16 activation path of transfer_activation_chunk_threaded. The scratch of the F32 path holds the
++// DMA buffers: the layout gives it at least 4 F32 rows for each thread, which is room for 2 buffers
++// of 4 F16 rows. With less room the function uses fewer threads. O(n_rows * k_block).
++static void transfer_activation_chunk_f16_threaded(const struct activation_transfer_params * params) {
++    if (params->n_rows <= 0) {
++        return;
++    }
++    activation_transfer_f16_state_t st;
++    st.ctx      = params->ctx;
++    st.dst      = params->dst;
++    st.src      = params->src_f16;
++    st.scratch  = (uint8_t *) params->vtcm_f32_act;
++    st.n_rows   = (uint32_t) params->n_rows;
++    st.n_tasks  = (st.n_rows + HTP_MM_HMX_TILE_N_ROWS - 1) / HTP_MM_HMX_TILE_N_ROWS;
++    st.k_block  = (uint32_t) params->k_block;
++    st.k_stride = (uint32_t) params->k_stride;
++    st.k_valid  = (uint32_t) params->k_valid;
++
++    const size_t   min_bytes = 4 * htp_mm_act_f16_row_bytes(st.k_block);  // 2 buffers of 2 rows
++    const uint32_t fit       = params->vtcm_f32_act ? (uint32_t) (params->vtcm_f32_act_bytes / min_bytes) : 0;
++    const uint32_t n_threads = MIN(MIN((uint32_t) params->n_threads, st.n_tasks), fit);
++    if (n_threads == 0) {
++        FARF(ERROR, "hmx-act-f16: the scratch of %zu bytes holds no DMA buffers for k %u", params->vtcm_f32_act_bytes,
++             st.k_block);
++        return;
++    }
++    st.scratch_per_thread = hex_align_down(params->vtcm_f32_act_bytes / n_threads, 128);
++    if (n_threads == 1) {
++        transfer_activation_f16_worker_fn(1, 0, &st);
++    } else {
++        worker_pool_run_func(params->ctx->worker_pool, transfer_activation_f16_worker_fn, &st, n_threads);
++    }
++}
++
+ static void transfer_activation_chunk_threaded(const struct activation_transfer_params * params) {
++    if (params->src_f16) {
++        transfer_activation_chunk_f16_threaded(params);
++        return;
++    }
+     struct htp_context *          ctx                = params->ctx;
+     __fp16 *                      dst                = params->dst;
+     const float *                 src                = params->src;
+@@ -2628,6 +2772,7 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
+                                   float *restrict dst,
+                                   const float *restrict src2,
+                                   const float *activation,
++                                  const __fp16 *activation_f16,  // an F16 activation in place of activation, or NULL
+                                   const uint8_t *weight,
+                                   int m, int k, int n,
+                                   int act_stride,
+@@ -2651,7 +2796,8 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
+     htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);
+ 
+     if (k % 32 != 0 || n % 32 != 0) { return -1; }
+-    if (!hex_is_aligned(dst, VLEN) || !hex_is_aligned(activation, VLEN)) { return -1; }
++    if (!hex_is_aligned(dst, VLEN)) { return -1; }
++    if (!hex_is_aligned(activation_f16 ? (const void *) activation_f16 : (const void *) activation, VLEN)) { return -1; }
+ 
+     size_t row_stride = htp_mm_get_tiled_row_stride(weight_type, k);
+     if (row_stride == 0) {
+@@ -2736,7 +2882,7 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
+             struct activation_transfer_params act_params = {
+                 .ctx = ctx,
+                 .dst = vtcm_f16_act,
+-                .src = activation + mr * act_stride,
++                .src = activation_f16 ? NULL : activation + mr * act_stride,
+                 .n_rows = (int) n_rows,
+                 .k_block = k,
+                 .k_stride = act_stride,
+@@ -2746,6 +2892,7 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
+                 .k_valid = k_valid,
+                 .vtcm_f32_act = vtcm_f32_act,
+                 .vtcm_f32_act_bytes = L.act_f32_bytes,
++                .src_f16 = activation_f16 ? activation_f16 + mr * act_stride : NULL,
+             };
+             transfer_activation_chunk_threaded(&act_params);
+ 
+@@ -2827,7 +2974,7 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
+             struct activation_transfer_params act_params = {
+                 .ctx = ctx,
+                 .dst = vtcm_f16_act,
+-                .src = activation + mr * act_stride,
++                .src = activation_f16 ? NULL : activation + mr * act_stride,
+                 .n_rows = (int) n_rows,
+                 .k_block = k,
+                 .k_stride = act_stride,
+@@ -2837,6 +2984,7 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
+                 .k_valid = k_valid,
+                 .vtcm_f32_act = vtcm_f32_act,
+                 .vtcm_f32_act_bytes = L.act_f32_bytes,
++                .src_f16 = activation_f16 ? activation_f16 + mr * act_stride : NULL,
+             };
+             transfer_activation_chunk_threaded(&act_params);
+ 
+@@ -3213,7 +3361,7 @@ static int hmx_mm_f16_f32_batched_simple(struct htp_context *ctx,
+         for (int b2 = 0; b2 < params->ne12 && ret == 0; ++b2) {
+             ret = hmx_mm_2d_f32(ctx, hmx_mm_dst_batch_ptr(params, b2, b3),
+                                            hmx_mm_src2_batch_ptr(params, b2, b3),
+-                                           hmx_mm_activation_batch_ptr(params, b2, b3),
++                                           hmx_mm_activation_batch_ptr(params, b2, b3), NULL,
+                                            (const uint8_t *)hmx_mm_weight_batch_ptr(params, b2, b3),
+                                            params->m, params->k, params->n,
+                                            params->act_stride, params->weight_stride * (int)sizeof(__fp16),
+@@ -3650,9 +3798,19 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
+     int k = (int) src0->ne[0];
+     int n = (int) src0->ne[1];
+     const int m_total    = (int) src1->ne[1];
+-    const int act_stride = (int)(src1->nb[1] / sizeof(float));
++    // An F16 src1 is the F16 view that the host plan of htp-mm-fusion.h gives to the only reader of
++    // an F32 tensor (the 2D path only). act_stride counts the values of src1.
++    const bool act_f16   = src1->type == HTP_TYPE_F16;
++    const int act_stride = (int)(src1->nb[1] / (act_f16 ? sizeof(__fp16) : sizeof(float)));
+     const int wgt_stride = (int)(src0->nb[1] / sizeof(__fp16));
+ 
++    if (src1->type != HTP_TYPE_F32 && !act_f16) {
++        return HTP_STATUS_NO_SUPPORT;
++    }
++    if (act_f16 && (kparams->kernel_type != HTP_MM_KERNEL_HMX_2D || src1->nb[0] != sizeof(__fp16))) {
++        return HTP_STATUS_NO_SUPPORT;
++    }
++
+     int m_start = 0;
+     int m_rows  = m_total;
+     if (octx->ctx->mdev.count > 1) {
+@@ -3679,7 +3837,8 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
+ 
+     const int dst_stride = (int)(dst->nb[1] / sizeof(float));
+     float       * dst_ptr = (float *)       dst->data  + m_start * dst_stride;
+-    const float * act_ptr = (const float *) src1->data + m_start * act_stride;
++    const float *  act_ptr     = act_f16 ? NULL : (const float *) src1->data + m_start * act_stride;
++    const __fp16 * act_ptr_f16 = act_f16 ? (const __fp16 *) src1->data + m_start * act_stride : NULL;
+ 
+     int ret = -1;
+     const int n_threads = kparams->n_threads;
+@@ -3722,7 +3881,7 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
+                                      kparams->vtcm_size);
+     } else {
+         ret = hmx_mm_2d_f32(
+-            octx->ctx, dst_ptr, src2_ptr, act_ptr, (const uint8_t *) src0->data,
++            octx->ctx, dst_ptr, src2_ptr, act_ptr, act_ptr_f16, (const uint8_t *) src0->data,
+             m_rows, k, n, act_stride, (int) src0->nb[1], (int) src0->type, (int) src1->ne[0],
+             dst_stride, src2_stride, (int)dst->ne[0],
+             kparams->m_chunk, kparams->n_chunk, kparams->pipeline, n_threads,
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index a8effef..949887b 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -7548,6 +7548,101 @@ struct test_mul_mat_vec_fusion : public test_case {
+     }
+ };
+ 
++// The FFN block of Qwen3.5 on a whole graph: an optional RMS_NORM + MUL of the input, the gate and the
++// up MUL_MAT of one activation, the SwiGLU of the two products, and an optional down MUL_MAT with the
++// residual ADD. On the HMX path the Hexagon backend gives the SwiGLU op an F16 output that the down
++// MUL_MAT reads (GGML_HEXAGON_FUSE_F16_ACT).
++struct test_ffn_swiglu : public test_case {
++    const ggml_type type;
++    const int64_t   k;          // the input width
++    const int64_t   n;          // the rows of the gate and the up weight
++    const int64_t   m;          // the tokens
++    const bool      gate_first; // the gate MUL_MAT comes before the up MUL_MAT in the graph
++    const bool      with_norm;
++    const int64_t   k_down;     // the rows of the down weight, 0 for no down MUL_MAT
++
++    test_ffn_swiglu(ggml_type type, int64_t k, int64_t n, int64_t m, bool gate_first = true, bool with_norm = false,
++                    int64_t k_down = 0)
++        : type(type), k(k), n(n), m(m), gate_first(gate_first), with_norm(with_norm), k_down(k_down) {}
++
++    std::string vars() override {
++        return VARS_TO_STR7(type, k, n, m, gate_first, with_norm, k_down);
++    }
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "FFN_SWIGLU";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
++        ggml_set_name(x, "x");
++
++        ggml_tensor * cur = x;
++        if (with_norm) {
++            ggml_tensor * w_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
++            ggml_set_name(w_norm, "w_norm");
++            cur = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w_norm);
++            ggml_set_name(cur, "norm");
++        }
++
++        ggml_tensor * w_gate = ggml_new_tensor_2d(ctx, type, k, n);
++        ggml_tensor * w_up   = ggml_new_tensor_2d(ctx, type, k, n);
++        ggml_set_name(w_gate, "w_gate");
++        ggml_set_name(w_up, "w_up");
++
++        ggml_tensor * gate = nullptr;
++        ggml_tensor * up   = nullptr;
++        if (gate_first) {
++            gate = ggml_mul_mat(ctx, w_gate, cur);
++            up   = ggml_mul_mat(ctx, w_up, cur);
++        } else {
++            up   = ggml_mul_mat(ctx, w_up, cur);
++            gate = ggml_mul_mat(ctx, w_gate, cur);
++        }
++        ggml_set_name(gate, "gate");
++        ggml_set_name(up, "up");
++
++        ggml_tensor * out = ggml_swiglu_split(ctx, gate, up);
++        ggml_set_name(out, "swiglu");
++
++        if (k_down > 0) {
++            ggml_tensor * w_down = ggml_new_tensor_2d(ctx, type, n, k_down);
++            ggml_tensor * res    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k_down, m);
++            ggml_set_name(w_down, "w_down");
++            ggml_set_name(res, "res");
++            out = ggml_add(ctx, ggml_mul_mat(ctx, w_down, out), res);
++        }
++
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    // Values like the values of the model: a weight has the range sqrt(3 / its input width), thus a product has
++    // about the range of its input. With the preset range [-1, 1] the down output of the 4B shape has a standard
++    // deviation of about 1e4 and at times a value above 65504, the largest value of the F16 output tiles of the HMX.
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            const std::string name = ggml_get_name(t);
++            if (name == "w_gate" || name == "w_up") {
++                const float a = std::sqrt(3.0f / (float) k);
++                init_tensor_uniform(t, -a, a);
++            } else if (name == "w_down") {
++                const float a = std::sqrt(3.0f / (float) n);
++                init_tensor_uniform(t, -a, a);
++            } else {
++                init_tensor_uniform(t);
++            }
++        }
++    }
++
++    double max_nmse_err() override {
++        return 1e-3;
++    }
++};
++
+ // GGML_OP_SUM
+ struct test_sum : public test_case {
+     const ggml_type type;
+@@ -11407,6 +11502,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     //    }
+     //}
+ 
++    // The FFN block with the SwiGLU: the HVX path (1 to 4 rows) and the HMX path (more rows), weights with
++    // a row count that is not a multiple of 32 or of 64, and the shapes of the Qwen3.5 4B.
++    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
++        for (int64_t m : {1, 2, 3, 4, 5, 8, 33, 64, 100, 256}) {
++            test_cases.emplace_back(new test_ffn_swiglu(type, 256, 512, m));
++            test_cases.emplace_back(new test_ffn_swiglu(type, 256, 100, m, false));
++            test_cases.emplace_back(new test_ffn_swiglu(type, 128, 96, m, true, true, 64));
++        }
++    }
++    for (int64_t m : {5, 64, 100}) {
++        test_cases.emplace_back(new test_ffn_swiglu(GGML_TYPE_F16, 256, 512, m));
++        test_cases.emplace_back(new test_ffn_swiglu(GGML_TYPE_F16, 256, 96, m, false, true, 128));
++    }
++    for (int64_t m : {1, 4, 64, 512}) {
++        test_cases.emplace_back(new test_ffn_swiglu(GGML_TYPE_Q8_0, 2560, 9216, m, true, true, 2560));
++    }
++
+     // Both sides of the same row-count boundary as above, on the fused path.
+     for (int64_t rows : {6271, 6272, 6273}) {
+         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 2, rows, 256,
