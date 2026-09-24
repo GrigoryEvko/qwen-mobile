@@ -1,0 +1,940 @@
+hexagon: htp: move each Q8_0 column tile of the HVX matmul with one DMA row
+Fold-into: upstream/hexagon-htp
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+The cost
+
+The HVX path of the Q8_0 matmul (the decode, 1 to 4 activation rows) moves the weights of each
+32-row column tile from DDR to VTCM with one 2D DMA descriptor: n_k rows of 1088 bytes (one weight
+tile in each row), at a pitch of 1152 bytes in VTCM. The DMA engine divides a row of 1088 bytes
+into five bus requests, and the last request has 64 bytes. The DMA probe of the phone stage bw
+(tools/ddrbw, HTP0 v79, 6 threads) reads rows of 1088 bytes at 54.4 GB/s, and one row of the same
+87040 bytes at 62.3 GB/s. The DDR ceiling is 61 to 63 GB/s. A decode token of the 4B Q8_0 at a
+depth of 4096 uses 85.2 ms for its weight matmuls, at 52.7 GB/s.
+
+The change
+
+The tiles of a column tile are adjacent in DDR. hvx_mm_push_weight_tiles (matmul-ops.c) moves
+them with one descriptor row when the VTCM pitch is the tile size. The Q8_0 dots of the tiled
+activation read the tiles at a pitch of 1088 bytes, the packed layout (hvx-mm-kernels-tiled.h):
+  - 1088 bytes are 8.5 vectors, thus an even tile starts on a vector edge and an odd tile starts
+    64 bytes after one. The dots load only full vectors from vector edges.
+  - A shuffle of 64-byte elements puts the lower halves of two weight groups into one vector and
+    their upper halves into a second vector. A shuffle of 2-byte elements of the two vectors then
+    gives the two groups. The dots of the checkout use a rotation and a shuffle for each group. The
+    32x1 dot and the multi-row dots first do a valign of each vector by the offset of the tile (0 or
+    64 bytes), thus one loop step serves the even and the odd tiles. The 32x2 dot does one more
+    64-byte shuffle for an odd tile.
+  - The 32x1 dot and the multi-row dots do one k-tile in each loop step. The 32x2 dot does an even
+    and an odd k-tile in each step.
+  - Each dot computes the same weight vectors and the same arithmetic in the same order. The
+    multi-row dots keep one k-tile in each loop step: with two k-tiles in one step the compiler
+    gives the qf32 result of the first tile to the add of the second tile without the conversion to
+    IEEE. A qf32 result is not always equal to its IEEE value. Thus with two k-tiles in one step the
+    v73 and v75 libraries in the simulator, and the v79 library on the phone (the stage gemv-check),
+    gave other bits than the checkout for 4 rows, although the v79 simulator gave the same bits. In
+    the v79 library of this patch, each multi-row dot has the qf32 instruction forms of the checkout
+    (a vmpy, a vadd and four conversions to IEEE for each tile and row), and no qf32 add of two qf32
+    values.
+The Q8_0 dots get new names (tiled_vec_dot_q8_0_packed_32x1 and the others), thus a caller that
+moves the tiles at the old pitch does not compile.
+
+The paths that change: MUL_MAT and MUL_MAT_ADD of 1 row (hvx_mv_2d_repacked_q8_0), of 2 to 4 rows
+(the multi-row path and the row-pair path), and of more rows without the HMX, MUL_MAT_NX
+(hvx_mm_nx_2d_repacked_q8_0), and the four MUL_MAT_ID jobs, which get the pitch of the weight type
+from hvx_mm_tiled_weight_pitch. The flat dots keep the pitch of 1152 bytes. The VTCM layout does not
+change: a slot keeps n_k * 1152 bytes, and a dot reads at most 64 bytes after the last tile of its
+slot. Q4_1, Q4_K and Q6_K have a tile size that is a multiple of 128 bytes: they get the same bytes
+in VTCM through one descriptor row for each column tile. Q4_0 keeps its layout.
+
+htp-opnode.h gives the kernel HTP_MM_KERNEL_HVX_QUANT_MULTIROW the name hvx-multirow in the profile
+lines. It printed "unknown".
+
+The results on the host
+
+The kernel lab (tools/htp-lab, the release flags of the DSP library):
+  - target q8: the 32x1, 32x2 and multi-row dots with the tiles in the VTCM layout of the tree and
+    random bytes in the parts of each slot that hold no tile. On v79, for k = 96, 2080, 2560, 4096
+    and 9216, each output hash of the patched tree is the hash of the checkout, and no output
+    differs from the scalar reference. On v73, v75 and v81, for k = 2080 and 2560, each output hash
+    of the patched tree is the hash of the checkout.
+  - target gemvop (v79): op_matmul, op_matmul_nx and op_matmul_id with the kernel params of the
+    host and a DMA shim that copies the rows of each descriptor: 25 cases (1 to 7 rows, the fused
+    ADD, 2 and 3 weights, the expert paths, 100 and 200 weight rows, 3 and 65 k-tiles). Each output
+    hash of the patched tree is the hash of the checkout, and each output agrees with a float64
+    reference. The checkout pushes 80 descriptor rows for each column tile of k = 2560, the patched
+    tree one.
+  - The simulated cycles for each 32x32 weight tile on one thread (v79), the checkout against the
+    patch, for k = 2560 (k = 9216 in parentheses):
+      the 32x1 dot:                   52.6 and 50.6 (52.2 and 50.2)
+      the 32x2 dot:                   92.4 and 93.4 (92.1 and 93.1)
+      the multi-row dot of 1 row:     48.7 and 50.7 (48.2 and 50.2)
+      the multi-row dot of 2 rows:    82.5 and 63.2 (82.1 and 62.3)
+      the multi-row dot of 3 rows:    82.7 and 90.7 (82.2 and 90.2)
+      the multi-row dot of 4 rows:   103.2 and 107.2 (125.0 and 122.3)
+    At 62 GB/s the DMA of 6 threads gives one thread a tile every 222 cycles.
+  - The packets of the loops (v79): the 32x1 dot has 22 packets for each tile (the checkout 21),
+    with 18 aligned vector loads, 18 permutes (9 valign and 9 vshuff, the checkout 8 vror and 9
+    vshuff) and 8 vrmpy. The loops of the multi-row dots have 23, 29, 39 and 49 packets for each
+    tile of 1 to 4 rows (the checkout 21, 34, 40 and 48), with one permute more than the checkout.
+    No dot uses an unaligned load. In the 32x1 and 32x2 dots the HVX stalls (COPROC_BUSY) set the
+    cycles, not the permutes or the loads.
+
+If the weight matmuls of a decode token read at 62 GB/s, they use approximately 72 ms, 13 ms less
+(a calculation, not a measurement).
+
+The results on the phone
+
+The phone stage gemv (tools/stages/gemv, HTP0 v79, thermal status 0, no charger) compared a DSP
+library with the DSP library of the series before this patch. That library had the DMA change and
+the 32x1 and 32x2 dots of this patch, and multi-row dots with two k-tiles in each loop step:
+  - test-backend-ops test of that library: the 30 cases of the 4B Q8_0 shapes (1 to 4 rows;
+    the kernel is hvx-tiled for 1 row and hvx-multirow for 2 to 4 rows), the 43 Q8_0 MUL_MAT cases,
+    the 75 Q8_0 MUL_MAT_ID cases, and the 62 MUL_MAT cases of Q4_1, Q4_K and Q6_K pass.
+  - test-backend-ops perf of the 4B Q8_0 shapes: for 1 row the rate of the weights increases from
+    49.4 to 54.9 GB/s to 57.2 to 61.8 GB/s (+12.0% to +15.7%), and for 4 rows by 6.5% to 13.9%.
+  - llama-bench of the 4B Q8_0 (-fa on, a Q8_0 K and V cache, 3 alternated rounds, the change is the
+    median of the ratios of one round; each run had a change of the cpu7 cap only). A decode token
+    uses the 32x1 dot, and a prompt uses the HMX kernel:
+      tg32 at the depth 0:        10.33 and 11.49 t/s (+11.3%)
+      tg32 at the depth 4096:     10.19 and 11.35 t/s (+12.0%)
+      tg32 at the depth 16384:     9.26 and 10.11 t/s (+10.0%)
+      pp512 at the depth 0:       903.5 and 904.0 t/s (+0.1%)
+    At the depth 4096 a token uses 10.0 ms less.
+The phone stage gemv-check (HTP0 v79, thermal status 0, no charger) compared the DSP library of
+this patch with the DSP library of the series before this patch:
+  - gemvcheck check: the 4B decode matmuls (MUL_MAT, MUL_MAT_ADD, MUL_MAT_NX and the head, 1 to 4
+    rows, and two shapes with an odd k-tile count) with the weights in a weight buffer, thus with
+    the repack of the model loader. Each output of the v79 library (56 outputs), and of the v75 and
+    v73 libraries on the v79 DSP (52 outputs each), has the bits of the base library. Each output
+    is finite, and its NMSE against the CPU backend is less than 1e-8.
+  - gemvcheck perf (16 copies of a case in one graph, the median of 5 computes, one run of each
+    library, no change of the caps). For 1 row the rate increases by 1.9% to 14.3%. For 4 rows,
+    in GB/s:
+      gate 2560 x 4096:           49.14 and 53.29 (+8.4%)
+      qkv 2560 x 8192:            52.18 and 57.23 (+9.7%)
+      kv 2560 x 1024:             36.37 and 35.82 (-1.5%)
+      out 4096 x 2560 + ADD:      47.58 and 51.73 (+8.7%)
+      down 9216 x 2560 + ADD:     50.21 and 50.39 (+0.4%)
+      NX gate + up 2560 x 9216:   47.16 and 52.63 (+11.6%)
+      NX q + v + k 2560 x 8192:   52.19 and 55.99 (+7.3%)
+    The seven cases of 4 rows use 2839 us against 3061 us (-7.2%). The base library gave 37.18
+    GB/s for kv at 4 rows in the stage gemv, thus a difference of 2% for this case is in the
+    spread of one run.
+
+diff --git a/ggml/src/ggml-hexagon/htp-opnode.h b/ggml/src/ggml-hexagon/htp-opnode.h
+index 0376bc1..0d5a224 100644
+--- a/ggml/src/ggml-hexagon/htp-opnode.h
++++ b/ggml/src/ggml-hexagon/htp-opnode.h
+@@ -333,6 +333,8 @@ struct htp_opformat {
+                        type == HTP_MM_KERNEL_HVX_F32_F32_DDR  || type == HTP_MM_KERNEL_HVX_F32_F16_DDR ||
+                        type == HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT) {
+                 path = "hvx-flat";
++            } else if (type == HTP_MM_KERNEL_HVX_QUANT_MULTIROW) {
++                path = "hvx-multirow";
+             }
+             if (type == HTP_MM_KERNEL_HMX_2D || type == HTP_MM_KERNEL_HMX_F16_BATCHED) {
+                 // The chunks of the HMX kernel. The first word stays the path for the readers of the field.
+diff --git a/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h b/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
+index 785a0af..f02774f 100644
+--- a/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
++++ b/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
+@@ -302,6 +302,78 @@ static inline HVX_VectorPair accum_4bit_32x2_lut(
+     return Q6_W_vcombine_VV(v_sum1, v_sum0);
+ }
+ 
++// The packed layout of the Q8_0 weight tiles in VTCM. The operator moves the n_k weight tiles of
++// one column tile (32 weight rows) with one DMA descriptor row, thus the tiles lie back to back at
++// a pitch of 1088 bytes, the tile size. 1088 bytes are 8.5 vectors, thus tile kt starts on a
++// vector edge when kt is even, and 64 bytes after a vector edge when kt is odd. The dots load only
++// full vectors from vector edges: for tile kt they read from the edge kt * 1088 - odd * 64, where
++// odd = kt % 2.
++//
++// Why one row for each column tile: the DMA engine divides a row of 1088 bytes into five bus
++// requests, the last one of 64 bytes. On HTP0 v79 with 6 threads, rows of 1088 bytes read at
++// 54 GB/s, and one row of the same 87040 bytes reads at 62 GB/s, the DDR ceiling.
++#define HTP_MM_HAVE_PACKED_Q8_0 1
++
++// The vector edge at or before the start of tile kt of a packed column tile of tiles of pitch
++// bytes, with pitch equal to 64 plus a multiple of 128. odd must be kt % 2.
++static inline const HVX_Vector * packed_tile_edge(const uint8_t * restrict col, uint32_t kt, uint32_t pitch, const int odd) {
++    return (const HVX_Vector *) (col + kt * pitch - (odd ? 64 : 0));
++}
++
++// The weights of the groups g and g + 1 (g even, group g holds k = 4g thru 4g+3) of a Q8_0 tile,
++// with the four values of row r in the bytes 4r thru 4r+3. The lower vector of the pair is group g,
++// the upper vector group g + 1. Group g has 128 bytes: k 4g and 4g+1 of row r in the bytes 2r and
++// 2r+1 (the lower half), and k 4g+2 and 4g+3 in the bytes 64+2r and 65+2r (the upper half).
++//
++// The shuffle of 64-byte elements puts the lower halves of the two groups into one vector and their
++// upper halves into a second vector. The shuffle of 2-byte elements of these two vectors then gives
++// the two groups. Thus two groups cost two permutes (a rotation and a shuffle for each group cost
++// four).
++//   odd = 0: vp is the start of the tile, thus vector g of vp is group g.
++//   odd = 1: vp is 64 bytes before the start of the tile. Vector g of vp holds the upper half of
++//            group g - 1 and the lower half of group g, thus the halves come from two 64-byte
++//            shuffles: three permutes for two groups.
++static inline HVX_VectorPair q8_0_group_pair(const HVX_Vector * restrict vp, int g, const int odd) {
++    HVX_Vector lower;  // the lower half of group g, then the lower half of group g + 1
++    HVX_Vector upper;  // the upper half of group g, then the upper half of group g + 1
++    if (odd) {
++        lower = Q6_V_hi_W(Q6_W_vshuff_VVR(vp[g + 1], vp[g], -64));
++        upper = Q6_V_lo_W(Q6_W_vshuff_VVR(vp[g + 2], vp[g + 1], -64));
++    } else {
++        const HVX_VectorPair halves = Q6_W_vshuff_VVR(vp[g + 1], vp[g], -64);
++        lower = Q6_V_lo_W(halves);
++        upper = Q6_V_hi_W(halves);
++    }
++    return Q6_W_vshuff_VVR(upper, lower, -2);
++}
++
++// The 32 f16 row scales of a Q8_0 tile in the lower 64 bytes of a vector. vp and odd are those of
++// q8_0_group_pair. The upper 64 bytes hold other bytes of the column tile: the scale product reads
++// only the lower 64 bytes.
++static inline HVX_Vector q8_0_scales(const HVX_Vector * restrict vp, const int odd) {
++    return odd ? Q6_V_vror_VR(vp[8], 64) : vp[8];
++}
++
++// The weights of the groups g and g + 1 of a Q8_0 tile of either parity, as q8_0_group_pair gives
++// them. u is the vector edge at or before the start of the tile, and shift is the distance from u
++// to the start: 0 or 64. A valign by the shift gives the 128 bytes of each group, then the two
++// shuffles of q8_0_group_pair: four permutes for two groups, and no branch on the parity.
++static inline HVX_VectorPair q8_0_group_pair_at(const HVX_Vector * restrict u, int g, uint32_t shift) {
++    const HVX_Vector g0 = Q6_V_valign_VVR(u[g + 1], u[g], shift);
++    const HVX_Vector g1 = Q6_V_valign_VVR(u[g + 2], u[g + 1], shift);
++    const HVX_VectorPair halves = Q6_W_vshuff_VVR(g1, g0, -64);
++    return Q6_W_vshuff_VVR(Q6_V_hi_W(halves), Q6_V_lo_W(halves), -2);
++}
++
++// The step from the vector edge of tile kt to the vector edge of tile kt + 1 of a packed column
++// tile, and the shift of tile kt + 1. An even tile starts on its edge, and the next tile starts
++// 64 bytes after the edge 1024 bytes later. An odd tile starts 64 bytes after its edge, and the
++// next tile starts on the edge 1152 bytes later.
++#define Q8_0_PACKED_NEXT_TILE(edge, shift)                                                         \
++    do {                                                                                           \
++        (edge) += (shift) ? HTP_MM_WEIGHT_TILE_SIZE_Q8_0 + 64 : HTP_MM_WEIGHT_TILE_SIZE_Q8_0 - 64; \
++        (shift) ^= 64;                                                                             \
++    } while (0)
+ static inline HVX_Vector accum_q8_0_32x1(
+     const HVX_Vector * restrict vptr,
+     const HVX_Vector * restrict v_act
+@@ -536,10 +608,21 @@ static void tiled_vec_dot_q4_0_32x2(const uint32_t n, float * restrict s0, float
+ // every weight tile twice.
+ #define HTP_MM_HAVE_MULTIROW 1
+ 
+-// The body of a compact dot. TILE is the stride of a weight tile, SHIFT the log2 of the offset of
+-// the weight format, and PREP the block that gives the weight vectors of one k-tile.
+-#define TILED_VEC_DOT_COMPACT_BODY(NR, TILE, SHIFT, PREP_BLOCK)                                    \
++// The body of a compact dot. PITCH is the distance between two weight tiles in VTCM, PACKED is 1
++// when PITCH is the tile size (the packed layout, the odd tiles start 64 bytes after a vector edge),
++// SHIFT is the log2 of the offset of the weight format, and PREP_BLOCK gives the weights of one
++// k-tile and v_scale_w. vptr is the vector edge at or before the start of tile kt, and wshift is
++// the distance from vptr to the start of the tile: 0, or 64 for an odd tile of the packed layout.
++//
++// One loop step does one k-tile of either parity. Do not put two k-tiles into one step: then the
++// compiler gives the qf32 result of the first tile to the add of the second tile without the
++// conversion to IEEE. A qf32 result is not always equal to its IEEE value, thus the bits change: in
++// the simulator before v79, and on the v79 DSP of the phone, although the v79 simulator gives the
++// same bits.
++#define TILED_VEC_DOT_COMPACT_BODY(NR, PITCH, PACKED, SHIFT, PREP_BLOCK)                           \
+     const uint8_t * restrict tile_ptr = vx;                                                        \
++    const uint8_t * restrict edge     = vx;                                                        \
++    uint32_t wshift = 0;                                                                           \
+     const HVX_Vector mask_h4  = Q6_Vb_vsplat_R(0x0F);                                              \
+     const HVX_Vector v_bias_b = Q6_Vb_vsplat_R(0x80);                                              \
+     HVX_Vector v_sum_float[NR];                                                                    \
+@@ -551,7 +634,8 @@ static void tiled_vec_dot_q4_0_32x2(const uint32_t n, float * restrict s0, float
+     (void) v_bias_b;                                                                               \
+     const uint32_t n_k_tiles = n / 32;                                                             \
+     for (uint32_t kt = 0; kt < n_k_tiles; kt++) {                                                  \
+-        const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * (TILE));          \
++        const HVX_Vector * restrict vptr =                                                         \
++            (const HVX_Vector *) ((PACKED) ? edge : tile_ptr + kt * (PITCH));                      \
+         HVX_Vector acc[NR];                                                                        \
+         _Pragma("unroll")                                                                          \
+         for (int r = 0; r < NR; r++) {                                                             \
+@@ -566,6 +650,9 @@ static void tiled_vec_dot_q4_0_32x2(const uint32_t n, float * restrict s0, float
+             HVX_Vector v_sum_scaled = hvx_vec_mul_f32_f32(Q6_Vsf_equals_Vw(v_sum), v_scale_comb);  \
+             v_sum_float[r] = hvx_vec_add_f32_f32(v_sum_float[r], v_sum_scaled);                    \
+         }                                                                                          \
++        if (PACKED) {                                                                              \
++            Q8_0_PACKED_NEXT_TILE(edge, wshift);                                                   \
++        }                                                                                          \
+     }                                                                                              \
+     _Pragma("unroll")                                                                              \
+     for (int r = 0; r < NR; r++) {                                                                 \
+@@ -591,22 +678,24 @@ static void tiled_vec_dot_q4_0_32x2(const uint32_t n, float * restrict s0, float
+     }                                                                                              \
+     const HVX_Vector v_scale_w = vptr[4];
+ 
+-// The eight byte groups of a Q8_0 k-tile, and the scales of the tile at vector 8
++// The eight byte groups of a packed Q8_0 k-tile, and the scales of the tile
+ #define MULTIROW_Q8_0_TILE(NR)                                                                     \
+     _Pragma("unroll")                                                                              \
+-    for (int g = 0; g < 8; g++) {                                                                  \
+-        HVX_Vector v_rot = Q6_V_vror_VR(vptr[g], 64);                                              \
+-        HVX_Vector v_W   = Q6_V_vxor_VV(Q6_V_lo_W(Q6_W_vshuff_VVR(v_rot, vptr[g], -2)), v_bias_b); \
++    for (int g = 0; g < 8; g += 2) {                                                               \
++        const HVX_VectorPair v_W = q8_0_group_pair_at(vptr, g, wshift);                            \
++        const HVX_Vector v_W0 = Q6_V_vxor_VV(Q6_V_lo_W(v_W), v_bias_b);                            \
++        const HVX_Vector v_W1 = Q6_V_vxor_VV(Q6_V_hi_W(v_W), v_bias_b);                            \
+         _Pragma("unroll")                                                                          \
+         for (int r = 0; r < NR; r++) {                                                             \
+-            acc[r] = Q6_Vw_vrmpyacc_VwVubRb(acc[r], v_W, (int32_t) ya[r][kt * 8 + g]);             \
++            acc[r] = Q6_Vw_vrmpyacc_VwVubRb(acc[r], v_W0, (int32_t) ya[r][kt * 8 + g + 0]);        \
++            acc[r] = Q6_Vw_vrmpyacc_VwVubRb(acc[r], v_W1, (int32_t) ya[r][kt * 8 + g + 1]);        \
+         }                                                                                          \
+     }                                                                                              \
+-    const HVX_Vector v_scale_w = vptr[8];
++    const HVX_Vector v_scale_w = Q6_V_valign_VVR(vptr[8], vptr[8], wshift);
+ 
+ // The argument lists of the compact dots. NR outputs, one weight tile, NR tiled rows, NR compact
+ // rows, NR sum arrays, the valid rows of the tile, and NR fused-add rows.
+-#define TILED_VEC_DOT_COMPACT_1(NAME, TILE, SHIFT, TILE_BLOCK)                                     \
++#define TILED_VEC_DOT_COMPACT_1(NAME, PITCH, PACKED, SHIFT, TILE_BLOCK)                            \
+ static void NAME(const uint32_t n, float * restrict s0, const void * restrict vx,                  \
+                  const void * restrict vy0, const uint32_t * restrict ya0,                         \
+                  const int32_t * restrict yb0, uint32_t valid_rows, const float * restrict sz0) {  \
+@@ -615,10 +704,10 @@ static void NAME(const uint32_t n, float * restrict s0, const void * restrict vx
+     const uint32_t * const ya[1] = { ya0 };                                                        \
+     const int32_t * const  yb[1] = { yb0 };                                                        \
+     const float * const    sz[1] = { sz0 };                                                        \
+-    TILED_VEC_DOT_COMPACT_BODY(1, TILE, SHIFT, TILE_BLOCK(1))                                      \
++    TILED_VEC_DOT_COMPACT_BODY(1, PITCH, PACKED, SHIFT, TILE_BLOCK(1))                             \
+ }
+ 
+-#define TILED_VEC_DOT_COMPACT_2(NAME, TILE, SHIFT, TILE_BLOCK)                                     \
++#define TILED_VEC_DOT_COMPACT_2(NAME, PITCH, PACKED, SHIFT, TILE_BLOCK)                            \
+ static void NAME(const uint32_t n, float * restrict s0, float * restrict s1,                       \
+                  const void * restrict vx, const void * restrict vy0, const void * restrict vy1,   \
+                  const uint32_t * restrict ya0, const uint32_t * restrict ya1,                     \
+@@ -629,10 +718,10 @@ static void NAME(const uint32_t n, float * restrict s0, float * restrict s1,
+     const uint32_t * const ya[2] = { ya0, ya1 };                                                   \
+     const int32_t * const  yb[2] = { yb0, yb1 };                                                   \
+     const float * const    sz[2] = { sz0, sz1 };                                                   \
+-    TILED_VEC_DOT_COMPACT_BODY(2, TILE, SHIFT, TILE_BLOCK(2))                                      \
++    TILED_VEC_DOT_COMPACT_BODY(2, PITCH, PACKED, SHIFT, TILE_BLOCK(2))                             \
+ }
+ 
+-#define TILED_VEC_DOT_COMPACT_3(NAME, TILE, SHIFT, TILE_BLOCK)                                     \
++#define TILED_VEC_DOT_COMPACT_3(NAME, PITCH, PACKED, SHIFT, TILE_BLOCK)                            \
+ static void NAME(const uint32_t n, float * restrict s0, float * restrict s1, float * restrict s2,  \
+                  const void * restrict vx, const void * restrict vy0, const void * restrict vy1,   \
+                  const void * restrict vy2,                                                        \
+@@ -645,10 +734,10 @@ static void NAME(const uint32_t n, float * restrict s0, float * restrict s1, flo
+     const uint32_t * const ya[3] = { ya0, ya1, ya2 };                                              \
+     const int32_t * const  yb[3] = { yb0, yb1, yb2 };                                              \
+     const float * const    sz[3] = { sz0, sz1, sz2 };                                              \
+-    TILED_VEC_DOT_COMPACT_BODY(3, TILE, SHIFT, TILE_BLOCK(3))                                      \
++    TILED_VEC_DOT_COMPACT_BODY(3, PITCH, PACKED, SHIFT, TILE_BLOCK(3))                             \
+ }
+ 
+-#define TILED_VEC_DOT_COMPACT_4(NAME, TILE, SHIFT, TILE_BLOCK)                                     \
++#define TILED_VEC_DOT_COMPACT_4(NAME, PITCH, PACKED, SHIFT, TILE_BLOCK)                            \
+ static void NAME(const uint32_t n, float * restrict s0, float * restrict s1, float * restrict s2,  \
+                  float * restrict s3, const void * restrict vx,                                    \
+                  const void * restrict vy0, const void * restrict vy1, const void * restrict vy2,  \
+@@ -664,18 +753,18 @@ static void NAME(const uint32_t n, float * restrict s0, float * restrict s1, flo
+     const uint32_t * const ya[4] = { ya0, ya1, ya2, ya3 };                                         \
+     const int32_t * const  yb[4] = { yb0, yb1, yb2, yb3 };                                         \
+     const float * const    sz[4] = { sz0, sz1, sz2, sz3 };                                         \
+-    TILED_VEC_DOT_COMPACT_BODY(4, TILE, SHIFT, TILE_BLOCK(4))                                      \
++    TILED_VEC_DOT_COMPACT_BODY(4, PITCH, PACKED, SHIFT, TILE_BLOCK(4))                             \
+ }
+ 
+-TILED_VEC_DOT_COMPACT_1(tiled_vec_dot_q4_0_32x1c, 640, 3, MULTIROW_Q4_0_TILE)
+-TILED_VEC_DOT_COMPACT_2(tiled_vec_dot_q4_0_32x2c, 640, 3, MULTIROW_Q4_0_TILE)
+-TILED_VEC_DOT_COMPACT_3(tiled_vec_dot_q4_0_32x3c, 640, 3, MULTIROW_Q4_0_TILE)
+-TILED_VEC_DOT_COMPACT_4(tiled_vec_dot_q4_0_32x4c, 640, 3, MULTIROW_Q4_0_TILE)
++TILED_VEC_DOT_COMPACT_1(tiled_vec_dot_q4_0_32x1c, 640, 0, 3, MULTIROW_Q4_0_TILE)
++TILED_VEC_DOT_COMPACT_2(tiled_vec_dot_q4_0_32x2c, 640, 0, 3, MULTIROW_Q4_0_TILE)
++TILED_VEC_DOT_COMPACT_3(tiled_vec_dot_q4_0_32x3c, 640, 0, 3, MULTIROW_Q4_0_TILE)
++TILED_VEC_DOT_COMPACT_4(tiled_vec_dot_q4_0_32x4c, 640, 0, 3, MULTIROW_Q4_0_TILE)
+ 
+-TILED_VEC_DOT_COMPACT_1(tiled_vec_dot_q8_0_32x1c, 1152, 7, MULTIROW_Q8_0_TILE)
+-TILED_VEC_DOT_COMPACT_2(tiled_vec_dot_q8_0_32x2c, 1152, 7, MULTIROW_Q8_0_TILE)
+-TILED_VEC_DOT_COMPACT_3(tiled_vec_dot_q8_0_32x3c, 1152, 7, MULTIROW_Q8_0_TILE)
+-TILED_VEC_DOT_COMPACT_4(tiled_vec_dot_q8_0_32x4c, 1152, 7, MULTIROW_Q8_0_TILE)
++TILED_VEC_DOT_COMPACT_1(tiled_vec_dot_q8_0_packed_32x1c, HTP_MM_WEIGHT_TILE_SIZE_Q8_0, 1, 7, MULTIROW_Q8_0_TILE)
++TILED_VEC_DOT_COMPACT_2(tiled_vec_dot_q8_0_packed_32x2c, HTP_MM_WEIGHT_TILE_SIZE_Q8_0, 1, 7, MULTIROW_Q8_0_TILE)
++TILED_VEC_DOT_COMPACT_3(tiled_vec_dot_q8_0_packed_32x3c, HTP_MM_WEIGHT_TILE_SIZE_Q8_0, 1, 7, MULTIROW_Q8_0_TILE)
++TILED_VEC_DOT_COMPACT_4(tiled_vec_dot_q8_0_packed_32x4c, HTP_MM_WEIGHT_TILE_SIZE_Q8_0, 1, 7, MULTIROW_Q8_0_TILE)
+ 
+ static void tiled_vec_dot_q4_1_32x1(const uint32_t n, float * restrict s, const void * restrict vx, const void * restrict vy, uint32_t valid_rows, const float * restrict sz) {
+     const uint8_t * restrict tile_ptr = vx;
+@@ -843,26 +932,34 @@ static void tiled_vec_dot_q4_1_32x2(const uint32_t n, float * restrict s0, float
+     }
+ }
+ 
+-static void tiled_vec_dot_q8_0_32x1(const uint32_t n, float * restrict s, const void * restrict vx, const void * restrict vy, uint32_t valid_rows, const float * restrict sz) {
+-    const uint8_t * restrict tile_ptr = vx;
++// The dot of one packed Q8_0 column tile and one tiled activation row. One loop step does one
++// k-tile of either parity, and the compiler pipelines this loop. It does not pipeline a loop step
++// over an even and an odd k-tile (36 vector loads), and in the simulator that form is 17 % slower.
++static void tiled_vec_dot_q8_0_packed_32x1(const uint32_t n, float * restrict s, const void * restrict vx, const void * restrict vy, uint32_t valid_rows, const float * restrict sz) {
++    const uint8_t * restrict edge = vx;
+     const uint8_t * restrict y_q = vy;
++    uint32_t shift = 0;
+ 
+     HVX_Vector v_sum_float = Q6_V_vzero();
+ 
+-    uint32_t n_k_tiles = n / 32;
++    const uint32_t n_k_tiles = n / 32;
+     for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
+-        const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * 1152);
+-        const HVX_Vector * restrict v_act = (const HVX_Vector *) (y_q + kt * 1152);
+-
+-        HVX_Vector v_sum = accum_q8_0_32x1(vptr, v_act);
+-        HVX_Vector v_sum_sf = Q6_Vsf_equals_Vw(v_sum);
+-
+-        HVX_Vector v_scale_w = vptr[8];
+-        HVX_Vector v_scale_a = v_act[8];
+-        HVX_Vector v_scale_comb = hvx_vec_mul_f16_f16_to_f32_lower32(v_scale_w, v_scale_a);
+-        HVX_Vector v_sum_scaled = hvx_vec_mul_f32_f32(v_sum_sf, v_scale_comb);
++        const HVX_Vector * restrict u     = (const HVX_Vector *) edge;
++        const HVX_Vector * restrict v_act = (const HVX_Vector *) (y_q + kt * HTP_MM_ACT_TILE_SIZE_Q8_0);
++
++        HVX_Vector v_sum = Q6_V_vzero();
++        #pragma unroll
++        for (int g = 0; g < 8; g += 2) {
++            const HVX_VectorPair v_W = q8_0_group_pair_at(u, g, shift);
++            v_sum = Q6_Vw_vrmpyacc_VwVbVb(v_sum, Q6_V_lo_W(v_W), v_act[g + 0]);
++            v_sum = Q6_Vw_vrmpyacc_VwVbVb(v_sum, Q6_V_hi_W(v_W), v_act[g + 1]);
++        }
++        const HVX_Vector v_scale_w    = Q6_V_valign_VVR(u[8], u[8], shift);
++        const HVX_Vector v_scale_comb = hvx_vec_mul_f16_f16_to_f32_lower32(v_scale_w, v_act[8]);
++        const HVX_Vector v_sum_sf     = Q6_Vsf_equals_Vw(v_sum);
++        v_sum_float = hvx_vec_add_f32_f32(v_sum_float, hvx_vec_mul_f32_f32(v_sum_sf, v_scale_comb));
+ 
+-        v_sum_float = hvx_vec_add_f32_f32(v_sum_float, v_sum_scaled);
++        Q8_0_PACKED_NEXT_TILE(edge, shift);
+     }
+ 
+     if (sz) {
+@@ -872,7 +969,7 @@ static void tiled_vec_dot_q8_0_32x1(const uint32_t n, float * restrict s, const
+     }
+ }
+ 
+-static void tiled_vec_dot_q8_0_32x2(const uint32_t n, float * restrict s0, float * restrict s1, const void * restrict vx, const void * restrict vy0, const void * restrict vy1, uint32_t valid_rows, const float * restrict sz0, const float * restrict sz1) {
++static void tiled_vec_dot_q8_0_packed_32x2(const uint32_t n, float * restrict s0, float * restrict s1, const void * restrict vx, const void * restrict vy0, const void * restrict vy1, uint32_t valid_rows, const float * restrict sz0, const float * restrict sz1) {
+     const uint8_t * restrict tile_ptr = vx;
+     const uint8_t * restrict y0_q = vy0;
+     const uint8_t * restrict y1_q = vy1;
+@@ -880,76 +977,71 @@ static void tiled_vec_dot_q8_0_32x2(const uint32_t n, float * restrict s0, float
+     HVX_Vector v_sum_float_c0 = Q6_V_vzero();
+     HVX_Vector v_sum_float_c1 = Q6_V_vzero();
+ 
+-    uint32_t n_k_tiles = n / 32;
++    // The loop takes the k-tiles in pairs, an even one and an odd one: with two activation rows, a
++    // step has 54 vector loads and the compiler does not pipeline the loop, thus the two tiles give
++    // the scheduler independent work. It adds the k-tiles in the order of the 32x1 dot.
++    const uint32_t n_k_tiles = n / 32;
+     uint32_t kt = 0;
+     for (; kt + 1 < n_k_tiles; kt += 2) {
+-        const HVX_Vector * restrict vptr0 = (const HVX_Vector *) (tile_ptr + (kt + 0) * 1152);
+-        const HVX_Vector * restrict v_act0_0 = (const HVX_Vector *) (y0_q + (kt + 0) * 1152);
+-        const HVX_Vector * restrict v_act1_0 = (const HVX_Vector *) (y1_q + (kt + 0) * 1152);
+-
+-        const HVX_Vector * restrict vptr1 = (const HVX_Vector *) (tile_ptr + (kt + 1) * 1152);
+-        const HVX_Vector * restrict v_act0_1 = (const HVX_Vector *) (y0_q + (kt + 1) * 1152);
+-        const HVX_Vector * restrict v_act1_1 = (const HVX_Vector *) (y1_q + (kt + 1) * 1152);
+-
+-        HVX_VectorPair v_sums0 = accum_q8_0_32x2(vptr0, v_act0_0, v_act1_0);
+-        HVX_VectorPair v_sums1 = accum_q8_0_32x2(vptr1, v_act0_1, v_act1_1);
+-
+-        HVX_Vector v_sum_c0_0 = Q6_V_lo_W(v_sums0);
+-        HVX_Vector v_sum_c1_0 = Q6_V_hi_W(v_sums0);
+-        HVX_Vector v_sum_c0_1 = Q6_V_lo_W(v_sums1);
+-        HVX_Vector v_sum_c1_1 = Q6_V_hi_W(v_sums1);
+-
+-        HVX_Vector v_sum_sf_c0_0 = Q6_Vsf_equals_Vw(v_sum_c0_0);
+-        HVX_Vector v_sum_sf_c1_0 = Q6_Vsf_equals_Vw(v_sum_c1_0);
+-        HVX_Vector v_sum_sf_c0_1 = Q6_Vsf_equals_Vw(v_sum_c0_1);
+-        HVX_Vector v_sum_sf_c1_1 = Q6_Vsf_equals_Vw(v_sum_c1_1);
+-
+-        HVX_Vector v_scale_w0 = vptr0[8];
+-        HVX_Vector v_scale_w1 = vptr1[8];
+-        HVX_Vector v_scale_a_c0_0 = v_act0_0[8];
+-        HVX_Vector v_scale_a_c1_0 = v_act1_0[8];
+-        HVX_Vector v_scale_a_c0_1 = v_act0_1[8];
+-        HVX_Vector v_scale_a_c1_1 = v_act1_1[8];
+-
+-        HVX_Vector v_scale_comb_c0_0 = hvx_vec_mul_f16_f16_to_f32_lower32(v_scale_w0, v_scale_a_c0_0);
+-        HVX_Vector v_scale_comb_c1_0 = hvx_vec_mul_f16_f16_to_f32_lower32(v_scale_w0, v_scale_a_c1_0);
+-        HVX_Vector v_scale_comb_c0_1 = hvx_vec_mul_f16_f16_to_f32_lower32(v_scale_w1, v_scale_a_c0_1);
+-        HVX_Vector v_scale_comb_c1_1 = hvx_vec_mul_f16_f16_to_f32_lower32(v_scale_w1, v_scale_a_c1_1);
++        const HVX_Vector * restrict vp0 = packed_tile_edge(tile_ptr, kt + 0, HTP_MM_WEIGHT_TILE_SIZE_Q8_0, 0);
++        const HVX_Vector * restrict vp1 = packed_tile_edge(tile_ptr, kt + 1, HTP_MM_WEIGHT_TILE_SIZE_Q8_0, 1);
++        const HVX_Vector * restrict a00 = (const HVX_Vector *) (y0_q + (kt + 0) * 1152);
++        const HVX_Vector * restrict a10 = (const HVX_Vector *) (y1_q + (kt + 0) * 1152);
++        const HVX_Vector * restrict a01 = (const HVX_Vector *) (y0_q + (kt + 1) * 1152);
++        const HVX_Vector * restrict a11 = (const HVX_Vector *) (y1_q + (kt + 1) * 1152);
++
++        // sRT: the int32 sums of activation row R and tile kt + T
++        HVX_Vector s00 = Q6_V_vzero();
++        HVX_Vector s10 = Q6_V_vzero();
++        HVX_Vector s01 = Q6_V_vzero();
++        HVX_Vector s11 = Q6_V_vzero();
++        #pragma unroll
++        for (int g = 0; g < 8; g += 2) {
++            const HVX_VectorPair w0 = q8_0_group_pair(vp0, g, 0);
++            const HVX_VectorPair w1 = q8_0_group_pair(vp1, g, 1);
++            s00 = Q6_Vw_vrmpyacc_VwVbVb(s00, Q6_V_lo_W(w0), a00[g + 0]);
++            s10 = Q6_Vw_vrmpyacc_VwVbVb(s10, Q6_V_lo_W(w0), a10[g + 0]);
++            s01 = Q6_Vw_vrmpyacc_VwVbVb(s01, Q6_V_lo_W(w1), a01[g + 0]);
++            s11 = Q6_Vw_vrmpyacc_VwVbVb(s11, Q6_V_lo_W(w1), a11[g + 0]);
++            s00 = Q6_Vw_vrmpyacc_VwVbVb(s00, Q6_V_hi_W(w0), a00[g + 1]);
++            s10 = Q6_Vw_vrmpyacc_VwVbVb(s10, Q6_V_hi_W(w0), a10[g + 1]);
++            s01 = Q6_Vw_vrmpyacc_VwVbVb(s01, Q6_V_hi_W(w1), a01[g + 1]);
++            s11 = Q6_Vw_vrmpyacc_VwVbVb(s11, Q6_V_hi_W(w1), a11[g + 1]);
++        }
+ 
+-        HVX_Vector v_sum_scaled_c0_0 = hvx_vec_mul_f32_f32(v_sum_sf_c0_0, v_scale_comb_c0_0);
+-        HVX_Vector v_sum_scaled_c1_0 = hvx_vec_mul_f32_f32(v_sum_sf_c1_0, v_scale_comb_c1_0);
+-        HVX_Vector v_sum_scaled_c0_1 = hvx_vec_mul_f32_f32(v_sum_sf_c0_1, v_scale_comb_c0_1);
+-        HVX_Vector v_sum_scaled_c1_1 = hvx_vec_mul_f32_f32(v_sum_sf_c1_1, v_scale_comb_c1_1);
++        const HVX_Vector sw0 = q8_0_scales(vp0, 0);
++        const HVX_Vector sw1 = q8_0_scales(vp1, 1);
++        const HVX_Vector x00 = hvx_vec_mul_f32_f32(Q6_Vsf_equals_Vw(s00), hvx_vec_mul_f16_f16_to_f32_lower32(sw0, a00[8]));
++        const HVX_Vector x10 = hvx_vec_mul_f32_f32(Q6_Vsf_equals_Vw(s10), hvx_vec_mul_f16_f16_to_f32_lower32(sw0, a10[8]));
++        const HVX_Vector x01 = hvx_vec_mul_f32_f32(Q6_Vsf_equals_Vw(s01), hvx_vec_mul_f16_f16_to_f32_lower32(sw1, a01[8]));
++        const HVX_Vector x11 = hvx_vec_mul_f32_f32(Q6_Vsf_equals_Vw(s11), hvx_vec_mul_f16_f16_to_f32_lower32(sw1, a11[8]));
+ 
+-        // one k-tile after the other, in the order of the 32x1 dot, thus each column gets its bits
+-        v_sum_float_c0 = hvx_vec_add_f32_f32(hvx_vec_add_f32_f32(v_sum_float_c0, v_sum_scaled_c0_0), v_sum_scaled_c0_1);
+-        v_sum_float_c1 = hvx_vec_add_f32_f32(hvx_vec_add_f32_f32(v_sum_float_c1, v_sum_scaled_c1_0), v_sum_scaled_c1_1);
++        v_sum_float_c0 = hvx_vec_add_f32_f32(hvx_vec_add_f32_f32(v_sum_float_c0, x00), x01);
++        v_sum_float_c1 = hvx_vec_add_f32_f32(hvx_vec_add_f32_f32(v_sum_float_c1, x10), x11);
+     }
+ 
+-    for (; kt < n_k_tiles; kt++) {
+-        const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * 1152);
+-        const HVX_Vector * restrict v_act0 = (const HVX_Vector *) (y0_q + kt * 1152);
+-        const HVX_Vector * restrict v_act1 = (const HVX_Vector *) (y1_q + kt * 1152);
+-
+-        HVX_VectorPair v_sums = accum_q8_0_32x2(vptr, v_act0, v_act1);
+-        HVX_Vector v_sum_c0 = Q6_V_lo_W(v_sums);
+-        HVX_Vector v_sum_c1 = Q6_V_hi_W(v_sums);
+-
+-        HVX_Vector v_sum_sf_c0 = Q6_Vsf_equals_Vw(v_sum_c0);
+-        HVX_Vector v_sum_sf_c1 = Q6_Vsf_equals_Vw(v_sum_c1);
+-
+-        HVX_Vector v_scale_w = vptr[8];
+-        HVX_Vector v_scale_a_c0 = v_act0[8];
+-        HVX_Vector v_scale_a_c1 = v_act1[8];
+-
+-        HVX_Vector v_scale_comb_c0 = hvx_vec_mul_f16_f16_to_f32_lower32(v_scale_w, v_scale_a_c0);
+-        HVX_Vector v_scale_comb_c1 = hvx_vec_mul_f16_f16_to_f32_lower32(v_scale_w, v_scale_a_c1);
+-
+-        HVX_Vector v_sum_scaled_c0 = hvx_vec_mul_f32_f32(v_sum_sf_c0, v_scale_comb_c0);
+-        HVX_Vector v_sum_scaled_c1 = hvx_vec_mul_f32_f32(v_sum_sf_c1, v_scale_comb_c1);
++    // the last k-tile of an odd count: kt is even, thus the tile starts on a vector edge
++    if (kt < n_k_tiles) {
++        const HVX_Vector * restrict vp0 = packed_tile_edge(tile_ptr, kt, HTP_MM_WEIGHT_TILE_SIZE_Q8_0, 0);
++        const HVX_Vector * restrict a00 = (const HVX_Vector *) (y0_q + kt * 1152);
++        const HVX_Vector * restrict a10 = (const HVX_Vector *) (y1_q + kt * 1152);
++
++        HVX_Vector s00 = Q6_V_vzero();
++        HVX_Vector s10 = Q6_V_vzero();
++        #pragma unroll
++        for (int g = 0; g < 8; g += 2) {
++            const HVX_VectorPair w0 = q8_0_group_pair(vp0, g, 0);
++            s00 = Q6_Vw_vrmpyacc_VwVbVb(s00, Q6_V_lo_W(w0), a00[g + 0]);
++            s10 = Q6_Vw_vrmpyacc_VwVbVb(s10, Q6_V_lo_W(w0), a10[g + 0]);
++            s00 = Q6_Vw_vrmpyacc_VwVbVb(s00, Q6_V_hi_W(w0), a00[g + 1]);
++            s10 = Q6_Vw_vrmpyacc_VwVbVb(s10, Q6_V_hi_W(w0), a10[g + 1]);
++        }
+ 
+-        v_sum_float_c0 = hvx_vec_add_f32_f32(v_sum_float_c0, v_sum_scaled_c0);
+-        v_sum_float_c1 = hvx_vec_add_f32_f32(v_sum_float_c1, v_sum_scaled_c1);
++        const HVX_Vector sw0 = q8_0_scales(vp0, 0);
++        v_sum_float_c0 = hvx_vec_add_f32_f32(v_sum_float_c0, hvx_vec_mul_f32_f32(Q6_Vsf_equals_Vw(s00),
++                                             hvx_vec_mul_f16_f16_to_f32_lower32(sw0, a00[8])));
++        v_sum_float_c1 = hvx_vec_add_f32_f32(v_sum_float_c1, hvx_vec_mul_f32_f32(Q6_Vsf_equals_Vw(s10),
++                                             hvx_vec_mul_f16_f16_to_f32_lower32(sw0, a10[8])));
+     }
+ 
+     if (sz0) {
+diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
+index e83cd06..136fcac 100644
+--- a/ggml/src/ggml-hexagon/htp/matmul-ops.c
++++ b/ggml/src/ggml-hexagon/htp/matmul-ops.c
+@@ -336,8 +336,36 @@ static void hvx_mm_4d(unsigned int nth, unsigned int ith, void * data) {
+ #include "hmx-mm-kernels-tiled.h"
+ #include "hvx-mm-kernels-flat.h"
+ 
+-// Specialized repacked matmul macros
+-#define MATMUL_2D_REPACKED_IMPL(SUFFIX, TILE_SIZE, DOT_2X2, DOT_2X1)                                                              \
++// Push the DMA of one column tile of a repacked weight: its n_k weight tiles of tile_size bytes,
++// which lie back to back in DDR, to VTCM at dst, with pitch bytes from the start of one tile to the
++// start of the next. A pitch equal to the tile size (the packed layout, refer to
++// hvx-mm-kernels-tiled.h) gives one descriptor row for the full column tile. That row has
++// n_k * tile_size bytes, which is less than the VTCM, thus the row size field of a descriptor holds
++// it: 24 bits from v75, and dma_queue_push uses a 1D descriptor for a long row before v75.
++static inline void hvx_mm_push_weight_tiles(dma_queue * q, uint8_t * dst, const uint8_t * src, uint32_t tile_size,
++                                            uint32_t pitch, uint32_t n_k) {
++    if (pitch == tile_size) {
++        const size_t bytes = (size_t) n_k * tile_size;
++        dma_queue_push(q, dma_make_ptr(dst, src), bytes, bytes, bytes, 1);
++    } else {
++        dma_queue_push(q, dma_make_ptr(dst, src), pitch, tile_size, tile_size, n_k);
++    }
++}
++
++// The VTCM pitch of the weight tiles that the dot of hvx_mm_init_vec_dot reads for a weight type
++static inline uint32_t hvx_mm_tiled_weight_pitch(int weight_type) {
++    switch (weight_type) {
++        case HTP_TYPE_Q8_0:
++            return HTP_MM_WEIGHT_TILE_SIZE_Q8_0;
++        default:
++            return htp_mm_get_weight_aligned_tile_size(weight_type);
++    }
++}
++
++// Specialized repacked matmul macros. TILE_SIZE is the size of a weight tile, and PITCH the distance
++// between two weight tiles in VTCM that the dots read: TILE_SIZE (the packed layout) or TILE_SIZE
++// rounded up to 128 bytes. A slot of VTCM holds n_k tiles at the rounded size in the two layouts.
++#define MATMUL_2D_REPACKED_IMPL(SUFFIX, TILE_SIZE, PITCH, DOT_2X2, DOT_2X1)                                                       \
+ static void hvx_mm_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void * data) {                                        \
+     htp_matmul_preamble;                                                                                                          \
+                                                                                                                                   \
+@@ -378,8 +406,8 @@ static void hvx_mm_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
+     uint32_t push_ct = ct_start;                                                                                                  \
+     if (src0_start_row < src0_end_row) {                                                                                          \
+         for (uint32_t d = 0; d < n_prefetch && push_ct < ct_end; d++, push_ct++) {                                                \
+-            dma_queue_push(dma_queue, dma_make_ptr(vtcm_src0_ptr + d * tile_row_transfer_size_aligned,                            \
+-                           src0_row + push_ct * tile_row_stride), aligned_tile_size, tile_size, tile_size, n_k_tiles_a);          \
++            hvx_mm_push_weight_tiles(dma_queue, vtcm_src0_ptr + d * tile_row_transfer_size_aligned,                               \
++                                     src0_row + push_ct * tile_row_stride, tile_size, (PITCH), n_k_tiles_a);                      \
+         }                                                                                                                         \
+     }                                                                                                                             \
+                                                                                                                                   \
+@@ -432,8 +460,8 @@ static void hvx_mm_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
+         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);                                                                     \
+                                                                                                                                   \
+         if (push_ct < ct_end) {                                                                                                   \
+-            dma_queue_push(dma_queue, dma_make_ptr((uint8_t *)w_tile, src0_row + push_ct * tile_row_stride),                      \
+-                           aligned_tile_size, tile_size, tile_size, n_k_tiles_a);                                                 \
++            hvx_mm_push_weight_tiles(dma_queue, (uint8_t *) w_tile, src0_row + push_ct * tile_row_stride,                         \
++                                     tile_size, (PITCH), n_k_tiles_a);                                                            \
+             push_ct++;                                                                                                            \
+         }                                                                                                                         \
+     }                                                                                                                             \
+@@ -451,7 +479,7 @@ static void hvx_mm_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
+ 
+ // The decode step of 2 to 4 activation rows. The job streams each weight tile from DDR once and
+ // computes every row from it, thus a verify step of speculative decoding costs one weight stream.
+-#define MATMUL_2D_REPACKED_MULTIROW_IMPL(SUFFIX, TILE_SIZE, DOT_4, DOT_3, DOT_2)                                                  \
++#define MATMUL_2D_REPACKED_MULTIROW_IMPL(SUFFIX, TILE_SIZE, PITCH, DOT_4, DOT_3, DOT_2)                                           \
+ static void hvx_mm_2d_repacked_##SUFFIX##_multirow(unsigned int nth, unsigned int ith, void * data) {                             \
+     htp_matmul_preamble;                                                                                                          \
+                                                                                                                                   \
+@@ -490,8 +518,8 @@ static void hvx_mm_2d_repacked_##SUFFIX##_multirow(unsigned int nth, unsigned in
+     uint32_t push_ct = ct_start;                                                                                                  \
+     if (src0_start_row < src0_end_row) {                                                                                          \
+         for (uint32_t d = 0; d < n_prefetch && push_ct < ct_end; d++, push_ct++) {                                                \
+-            dma_queue_push(dma_queue, dma_make_ptr(vtcm_src0_ptr + d * tile_row_transfer_size_aligned,                            \
+-                           src0_row + push_ct * tile_row_stride), aligned_tile_size, tile_size, tile_size, n_k_tiles_a);          \
++            hvx_mm_push_weight_tiles(dma_queue, vtcm_src0_ptr + d * tile_row_transfer_size_aligned,                               \
++                                     src0_row + push_ct * tile_row_stride, tile_size, (PITCH), n_k_tiles_a);                      \
+         }                                                                                                                         \
+     }                                                                                                                             \
+                                                                                                                                   \
+@@ -527,14 +555,14 @@ static void hvx_mm_2d_repacked_##SUFFIX##_multirow(unsigned int nth, unsigned in
+         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);                                                                     \
+                                                                                                                                   \
+         if (push_ct < ct_end) {                                                                                                   \
+-            dma_queue_push(dma_queue, dma_make_ptr((uint8_t *) w_tile, src0_row + push_ct * tile_row_stride),                     \
+-                           aligned_tile_size, tile_size, tile_size, n_k_tiles_a);                                                 \
++            hvx_mm_push_weight_tiles(dma_queue, (uint8_t *) w_tile, src0_row + push_ct * tile_row_stride,                         \
++                                     tile_size, (PITCH), n_k_tiles_a);                                                            \
+             push_ct++;                                                                                                            \
+         }                                                                                                                         \
+     }                                                                                                                             \
+ }
+ 
+-#define MATVEC_2D_REPACKED_IMPL(SUFFIX, TILE_SIZE, DOT_2X1)                                                                       \
++#define MATVEC_2D_REPACKED_IMPL(SUFFIX, TILE_SIZE, PITCH, DOT_2X1)                                                                \
+ static void hvx_mv_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void * data) {                                        \
+     htp_matmul_preamble;                                                                                                          \
+                                                                                                                                   \
+@@ -578,8 +606,8 @@ static void hvx_mv_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
+     uint32_t push_ct = ct_start;                                                                                                  \
+     if (src0_start_row < src0_end_row) {                                                                                          \
+         for (uint32_t d = 0; d < n_prefetch && push_ct < ct_end; d++, push_ct++) {                                                \
+-            dma_queue_push(dma_queue, dma_make_ptr(vtcm_src0_ptr + d * tile_row_transfer_size_aligned,                            \
+-                           src0_row + push_ct * tile_row_stride), aligned_tile_size, tile_size, tile_size, n_k_tiles_a);          \
++            hvx_mm_push_weight_tiles(dma_queue, vtcm_src0_ptr + d * tile_row_transfer_size_aligned,                               \
++                                     src0_row + push_ct * tile_row_stride, tile_size, (PITCH), n_k_tiles_a);                      \
+         }                                                                                                                         \
+     }                                                                                                                             \
+                                                                                                                                   \
+@@ -601,8 +629,8 @@ static void hvx_mv_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
+         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);                                                                     \
+                                                                                                                                   \
+         if (push_ct < ct_end) {                                                                                                   \
+-            dma_queue_push(dma_queue, dma_make_ptr((uint8_t *)w_tile, src0_row + push_ct * tile_row_stride),                      \
+-                           aligned_tile_size, tile_size, tile_size, n_k_tiles_a);                                                 \
++            hvx_mm_push_weight_tiles(dma_queue, (uint8_t *) w_tile, src0_row + push_ct * tile_row_stride,                         \
++                                     tile_size, (PITCH), n_k_tiles_a);                                                            \
+             push_ct++;                                                                                                            \
+         }                                                                                                                         \
+     }                                                                                                                             \
+@@ -623,7 +651,7 @@ static void hvx_mv_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
+     }                                                                                                                             \
+ }
+ 
+-#define MATMUL_NX_2D_REPACKED_IMPL(SUFFIX, TILE_SIZE, DOT_2X2, DOT_2X1)                                                           \
++#define MATMUL_NX_2D_REPACKED_IMPL(SUFFIX, TILE_SIZE, PITCH, DOT_2X2, DOT_2X1)                                                    \
+ static void hvx_mm_nx_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void * data) {                                     \
+     struct htp_mm_context * mmctx = data;                                                                                         \
+     struct htp_ops_context * octx = mmctx->octx;                                                                                  \
+@@ -687,8 +715,8 @@ static void hvx_mm_nx_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, v
+                                                                                                                                   \
+         uint32_t push_ct = ct_start;                                                                                              \
+         for (uint32_t d = 0; d < n_prefetch && push_ct < ct_end; d++, push_ct++) {                                                \
+-            dma_queue_push(dma_queue, dma_make_ptr(vtcm_weight_ptr + d * tile_row_transfer_size_aligned,                          \
+-                           src_w_row + push_ct * tile_row_stride), aligned_tile_size, tile_size, tile_size, n_k_tiles_a);         \
++            hvx_mm_push_weight_tiles(dma_queue, vtcm_weight_ptr + d * tile_row_transfer_size_aligned,                             \
++                                     src_w_row + push_ct * tile_row_stride, tile_size, (PITCH), n_k_tiles_a);                     \
+         }                                                                                                                         \
+                                                                                                                                   \
+         for (uint32_t ct = ct_start; ct < ct_end; ct++) {                                                                         \
+@@ -719,27 +747,27 @@ static void hvx_mm_nx_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, v
+             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);                                                                 \
+                                                                                                                                   \
+             if (push_ct < ct_end) {                                                                                               \
+-                dma_queue_push(dma_queue, dma_make_ptr((uint8_t *)w_tile, src_w_row + push_ct * tile_row_stride),                 \
+-                               aligned_tile_size, tile_size, tile_size, n_k_tiles_a);                                             \
++                hvx_mm_push_weight_tiles(dma_queue, (uint8_t *) w_tile, src_w_row + push_ct * tile_row_stride,                    \
++                                         tile_size, (PITCH), n_k_tiles_a);                                                        \
+                 push_ct++;                                                                                                        \
+             }                                                                                                                     \
+         }                                                                                                                         \
+     }                                                                                                                             \
+ }
+ 
+-MATMUL_2D_REPACKED_IMPL(q4_0,       576,  tiled_vec_dot_q4_0_32x2,  tiled_vec_dot_q4_0_32x1)
+-MATMUL_2D_REPACKED_IMPL(q4_1,       640,  tiled_vec_dot_q4_1_32x2,  tiled_vec_dot_q4_1_32x1)
+-MATMUL_2D_REPACKED_IMPL(q8_0,       1088, tiled_vec_dot_q8_0_32x2,  tiled_vec_dot_q8_0_32x1)
+-MATMUL_2D_REPACKED_IMPL(q6_k,       896,  tiled_vec_dot_q6_k_32x2,  tiled_vec_dot_q6_k_32x1)
+-MATMUL_2D_REPACKED_IMPL(iq4nl,      576,  tiled_vec_dot_iq4nl_32x2, tiled_vec_dot_iq4nl_32x1)
+-MATMUL_2D_REPACKED_IMPL(mxfp4,      544,  tiled_vec_dot_mxfp4_32x2, tiled_vec_dot_mxfp4_32x1)
++MATMUL_2D_REPACKED_IMPL(q4_0,       576,  640,  tiled_vec_dot_q4_0_32x2,  tiled_vec_dot_q4_0_32x1)
++MATMUL_2D_REPACKED_IMPL(q4_1,       640,  640,  tiled_vec_dot_q4_1_32x2,  tiled_vec_dot_q4_1_32x1)
++MATMUL_2D_REPACKED_IMPL(q8_0,       1088, 1088, tiled_vec_dot_q8_0_packed_32x2, tiled_vec_dot_q8_0_packed_32x1)
++MATMUL_2D_REPACKED_IMPL(q6_k,       896,  896,  tiled_vec_dot_q6_k_32x2,  tiled_vec_dot_q6_k_32x1)
++MATMUL_2D_REPACKED_IMPL(iq4nl,      576,  640,  tiled_vec_dot_iq4nl_32x2, tiled_vec_dot_iq4nl_32x1)
++MATMUL_2D_REPACKED_IMPL(mxfp4,      544,  640,  tiled_vec_dot_mxfp4_32x2, tiled_vec_dot_mxfp4_32x1)
+ 
+-MATMUL_2D_REPACKED_IMPL(q4_0_flat,  576,  flat_vec_dot_q4_0_32x2,   flat_vec_dot_q4_0_32x1)
+-MATMUL_2D_REPACKED_IMPL(q4_1_flat,  640,  flat_vec_dot_q4_1_32x2,   flat_vec_dot_q4_1_32x1)
+-MATMUL_2D_REPACKED_IMPL(q8_0_flat,  1088, flat_vec_dot_q8_0_32x2,   flat_vec_dot_q8_0_32x1)
+-MATMUL_2D_REPACKED_IMPL(q6_k_flat,  896,  flat_vec_dot_q6_k_32x2,   flat_vec_dot_q6_k_32x1)
+-MATMUL_2D_REPACKED_IMPL(iq4nl_flat, 576,  flat_vec_dot_iq4nl_32x2,  flat_vec_dot_iq4nl_32x1)
+-MATMUL_2D_REPACKED_IMPL(mxfp4_flat, 544,  flat_vec_dot_mxfp4_32x2,  flat_vec_dot_mxfp4_32x1)
++MATMUL_2D_REPACKED_IMPL(q4_0_flat,  576,  640,  flat_vec_dot_q4_0_32x2,   flat_vec_dot_q4_0_32x1)
++MATMUL_2D_REPACKED_IMPL(q4_1_flat,  640,  640,  flat_vec_dot_q4_1_32x2,   flat_vec_dot_q4_1_32x1)
++MATMUL_2D_REPACKED_IMPL(q8_0_flat,  1088, 1152, flat_vec_dot_q8_0_32x2,   flat_vec_dot_q8_0_32x1)
++MATMUL_2D_REPACKED_IMPL(q6_k_flat,  896,  896,  flat_vec_dot_q6_k_32x2,   flat_vec_dot_q6_k_32x1)
++MATMUL_2D_REPACKED_IMPL(iq4nl_flat, 576,  640,  flat_vec_dot_iq4nl_32x2,  flat_vec_dot_iq4nl_32x1)
++MATMUL_2D_REPACKED_IMPL(mxfp4_flat, 544,  640,  flat_vec_dot_mxfp4_32x2,  flat_vec_dot_mxfp4_32x1)
+ 
+ #define QUANTIZE_IMPL(name, log_name, kernel_fn, dst_row_size_expr)                                        \
+ static void name(unsigned int nth, unsigned int ith, void * data) {                                        \
+@@ -872,35 +900,36 @@ static void quantize_f32_q8_1_tiled_block(unsigned int nth, unsigned int ith, vo
+     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_QUANT, mmctx->quant_ib_first[ith]);
+ }
+ 
+-MATMUL_2D_REPACKED_MULTIROW_IMPL(q4_0, 576, tiled_vec_dot_q4_0_32x4c, tiled_vec_dot_q4_0_32x3c, tiled_vec_dot_q4_0_32x2c)
+-MATMUL_2D_REPACKED_MULTIROW_IMPL(q8_0, 1088, tiled_vec_dot_q8_0_32x4c, tiled_vec_dot_q8_0_32x3c, tiled_vec_dot_q8_0_32x2c)
+-
+-MATVEC_2D_REPACKED_IMPL(q4_0,       576,  tiled_vec_dot_q4_0_32x1)
+-MATVEC_2D_REPACKED_IMPL(q4_1,       640,  tiled_vec_dot_q4_1_32x1)
+-MATVEC_2D_REPACKED_IMPL(q8_0,       1088, tiled_vec_dot_q8_0_32x1)
+-MATVEC_2D_REPACKED_IMPL(q6_k,       896,  tiled_vec_dot_q6_k_32x1)
+-MATVEC_2D_REPACKED_IMPL(iq4nl,      576,  tiled_vec_dot_iq4nl_32x1)
+-MATVEC_2D_REPACKED_IMPL(mxfp4,      544,  tiled_vec_dot_mxfp4_32x1)
+-
+-MATVEC_2D_REPACKED_IMPL(q4_0_flat,  576,  flat_vec_dot_q4_0_32x1)
+-MATVEC_2D_REPACKED_IMPL(q4_1_flat,  640,  flat_vec_dot_q4_1_32x1)
+-MATVEC_2D_REPACKED_IMPL(q8_0_flat,  1088, flat_vec_dot_q8_0_32x1)
+-MATVEC_2D_REPACKED_IMPL(q6_k_flat,  896,  flat_vec_dot_q6_k_32x1)
+-MATVEC_2D_REPACKED_IMPL(iq4nl_flat, 576,  flat_vec_dot_iq4nl_32x1)
+-MATVEC_2D_REPACKED_IMPL(mxfp4_flat, 544,  flat_vec_dot_mxfp4_32x1)
+-
+-
+-MATMUL_NX_2D_REPACKED_IMPL(q4_0,       576,  tiled_vec_dot_q4_0_32x2,  tiled_vec_dot_q4_0_32x1)
+-MATMUL_NX_2D_REPACKED_IMPL(q4_1,       640,  tiled_vec_dot_q4_1_32x2,  tiled_vec_dot_q4_1_32x1)
+-MATMUL_NX_2D_REPACKED_IMPL(q8_0,       1088, tiled_vec_dot_q8_0_32x2,  tiled_vec_dot_q8_0_32x1)
+-MATMUL_NX_2D_REPACKED_IMPL(iq4nl,      576,  tiled_vec_dot_iq4nl_32x2, tiled_vec_dot_iq4nl_32x1)
+-MATMUL_NX_2D_REPACKED_IMPL(mxfp4,      544,  tiled_vec_dot_mxfp4_32x2, tiled_vec_dot_mxfp4_32x1)
+-
+-MATMUL_NX_2D_REPACKED_IMPL(q4_0_flat,  576,  flat_vec_dot_q4_0_32x2,   flat_vec_dot_q4_0_32x1)
+-MATMUL_NX_2D_REPACKED_IMPL(q4_1_flat,  640,  flat_vec_dot_q4_1_32x2,   flat_vec_dot_q4_1_32x1)
+-MATMUL_NX_2D_REPACKED_IMPL(q8_0_flat,  1088, flat_vec_dot_q8_0_32x2,   flat_vec_dot_q8_0_32x1)
+-MATMUL_NX_2D_REPACKED_IMPL(iq4nl_flat, 576,  flat_vec_dot_iq4nl_32x2,  flat_vec_dot_iq4nl_32x1)
+-MATMUL_NX_2D_REPACKED_IMPL(mxfp4_flat, 544,  flat_vec_dot_mxfp4_32x2,  flat_vec_dot_mxfp4_32x1)
++MATMUL_2D_REPACKED_MULTIROW_IMPL(q4_0, 576, 640, tiled_vec_dot_q4_0_32x4c, tiled_vec_dot_q4_0_32x3c, tiled_vec_dot_q4_0_32x2c)
++MATMUL_2D_REPACKED_MULTIROW_IMPL(q8_0, 1088, 1088, tiled_vec_dot_q8_0_packed_32x4c, tiled_vec_dot_q8_0_packed_32x3c,
++                                 tiled_vec_dot_q8_0_packed_32x2c)
++
++MATVEC_2D_REPACKED_IMPL(q4_0,       576,  640,  tiled_vec_dot_q4_0_32x1)
++MATVEC_2D_REPACKED_IMPL(q4_1,       640,  640,  tiled_vec_dot_q4_1_32x1)
++MATVEC_2D_REPACKED_IMPL(q8_0,       1088, 1088, tiled_vec_dot_q8_0_packed_32x1)
++MATVEC_2D_REPACKED_IMPL(q6_k,       896,  896,  tiled_vec_dot_q6_k_32x1)
++MATVEC_2D_REPACKED_IMPL(iq4nl,      576,  640,  tiled_vec_dot_iq4nl_32x1)
++MATVEC_2D_REPACKED_IMPL(mxfp4,      544,  640,  tiled_vec_dot_mxfp4_32x1)
++
++MATVEC_2D_REPACKED_IMPL(q4_0_flat,  576,  640,  flat_vec_dot_q4_0_32x1)
++MATVEC_2D_REPACKED_IMPL(q4_1_flat,  640,  640,  flat_vec_dot_q4_1_32x1)
++MATVEC_2D_REPACKED_IMPL(q8_0_flat,  1088, 1152, flat_vec_dot_q8_0_32x1)
++MATVEC_2D_REPACKED_IMPL(q6_k_flat,  896,  896,  flat_vec_dot_q6_k_32x1)
++MATVEC_2D_REPACKED_IMPL(iq4nl_flat, 576,  640,  flat_vec_dot_iq4nl_32x1)
++MATVEC_2D_REPACKED_IMPL(mxfp4_flat, 544,  640,  flat_vec_dot_mxfp4_32x1)
++
++
++MATMUL_NX_2D_REPACKED_IMPL(q4_0,       576,  640,  tiled_vec_dot_q4_0_32x2,  tiled_vec_dot_q4_0_32x1)
++MATMUL_NX_2D_REPACKED_IMPL(q4_1,       640,  640,  tiled_vec_dot_q4_1_32x2,  tiled_vec_dot_q4_1_32x1)
++MATMUL_NX_2D_REPACKED_IMPL(q8_0,       1088, 1088, tiled_vec_dot_q8_0_packed_32x2, tiled_vec_dot_q8_0_packed_32x1)
++MATMUL_NX_2D_REPACKED_IMPL(iq4nl,      576,  640,  tiled_vec_dot_iq4nl_32x2, tiled_vec_dot_iq4nl_32x1)
++MATMUL_NX_2D_REPACKED_IMPL(mxfp4,      544,  640,  tiled_vec_dot_mxfp4_32x2, tiled_vec_dot_mxfp4_32x1)
++
++MATMUL_NX_2D_REPACKED_IMPL(q4_0_flat,  576,  640,  flat_vec_dot_q4_0_32x2,   flat_vec_dot_q4_0_32x1)
++MATMUL_NX_2D_REPACKED_IMPL(q4_1_flat,  640,  640,  flat_vec_dot_q4_1_32x2,   flat_vec_dot_q4_1_32x1)
++MATMUL_NX_2D_REPACKED_IMPL(q8_0_flat,  1088, 1152, flat_vec_dot_q8_0_32x2,   flat_vec_dot_q8_0_32x1)
++MATMUL_NX_2D_REPACKED_IMPL(iq4nl_flat, 576,  640,  flat_vec_dot_iq4nl_32x2,  flat_vec_dot_iq4nl_32x1)
++MATMUL_NX_2D_REPACKED_IMPL(mxfp4_flat, 544,  640,  flat_vec_dot_mxfp4_32x2,  flat_vec_dot_mxfp4_32x1)
+ 
+ static void hvx_mm_2d(unsigned int nth, unsigned int ith, void * data) {
+     htp_matmul_preamble;
+@@ -1152,6 +1181,7 @@ static void hvx_mm_id(unsigned int nth, unsigned int ith, void * data) {
+ 
+         const uint32_t tile_size = htp_mm_get_weight_tile_size(src0->type);
+         const uint32_t aligned_tile_size = htp_mm_get_weight_aligned_tile_size(src0->type);
++        const uint32_t pitch = hvx_mm_tiled_weight_pitch(src0->type);
+         const uint32_t n_k_tiles_w = ne00 / 32;
+         const uint32_t n_k_tiles_a = ne10 / 32;
+         const uint32_t tile_row_stride = n_k_tiles_w * tile_size;
+@@ -1162,8 +1192,8 @@ static void hvx_mm_id(unsigned int nth, unsigned int ith, void * data) {
+ 
+         uint32_t push_ct = ct_start;
+         for (uint32_t d = 0; d < n_prefetch && push_ct < ct_end; d++, push_ct++) {
+-            dma_queue_push(dma_queue, dma_make_ptr(vtcm_src0_ptr + d * tile_row_transfer_size_aligned, src0_row + push_ct * tile_row_stride),
+-                           aligned_tile_size, tile_size, tile_size, n_k_tiles_a);
++            hvx_mm_push_weight_tiles(dma_queue, vtcm_src0_ptr + d * tile_row_transfer_size_aligned, src0_row + push_ct * tile_row_stride,
++                                     tile_size, pitch, n_k_tiles_a);
+         }
+ 
+         for (uint32_t ct = ct_start; ct < ct_end; ct++) {
+@@ -1188,8 +1218,8 @@ static void hvx_mm_id(unsigned int nth, unsigned int ith, void * data) {
+             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
+ 
+             if (push_ct < ct_end) {
+-                dma_queue_push(dma_queue, dma_make_ptr((uint8_t *)w_tile, src0_row + push_ct * tile_row_stride),
+-                               aligned_tile_size, tile_size, tile_size, n_k_tiles_a);
++                hvx_mm_push_weight_tiles(dma_queue, (uint8_t *) w_tile, src0_row + push_ct * tile_row_stride,
++                                         tile_size, pitch, n_k_tiles_a);
+                 push_ct++;
+             }
+         }
+@@ -1242,6 +1272,7 @@ static void hvx_mv_id(unsigned int nth, unsigned int ith, void * data) {
+ 
+         const uint32_t tile_size = htp_mm_get_weight_tile_size(src0->type);
+         const uint32_t aligned_tile_size = htp_mm_get_weight_aligned_tile_size(src0->type);
++        const uint32_t pitch = hvx_mm_tiled_weight_pitch(src0->type);
+         const uint32_t n_k_tiles_w = ne00 / 32;
+         const uint32_t n_k_tiles_a = ne10 / 32;
+         const uint32_t tile_row_stride = n_k_tiles_w * tile_size;
+@@ -1252,8 +1283,8 @@ static void hvx_mv_id(unsigned int nth, unsigned int ith, void * data) {
+ 
+         uint32_t push_ct = ct_start;
+         for (uint32_t d = 0; d < n_prefetch && push_ct < ct_end; d++, push_ct++) {
+-            dma_queue_push(dma_queue, dma_make_ptr(vtcm_src0_ptr + d * tile_row_transfer_size_aligned, src0_row + push_ct * tile_row_stride),
+-                           aligned_tile_size, tile_size, tile_size, n_k_tiles_a);
++            hvx_mm_push_weight_tiles(dma_queue, vtcm_src0_ptr + d * tile_row_transfer_size_aligned, src0_row + push_ct * tile_row_stride,
++                                     tile_size, pitch, n_k_tiles_a);
+         }
+ 
+         for (uint32_t ct = ct_start; ct < ct_end; ct++) {
+@@ -1268,8 +1299,8 @@ static void hvx_mv_id(unsigned int nth, unsigned int ith, void * data) {
+             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
+ 
+             if (push_ct < ct_end) {
+-                dma_queue_push(dma_queue, dma_make_ptr((uint8_t *)w_tile, src0_row + push_ct * tile_row_stride),
+-                               aligned_tile_size, tile_size, tile_size, n_k_tiles_a);
++                hvx_mm_push_weight_tiles(dma_queue, (uint8_t *) w_tile, src0_row + push_ct * tile_row_stride,
++                                         tile_size, pitch, n_k_tiles_a);
+                 push_ct++;
+             }
+         }
+@@ -1333,6 +1364,7 @@ static void hvx_mv_id_nx(unsigned int nth, unsigned int ith, void * data) {
+ 
+             const uint32_t tile_size = htp_mm_get_weight_tile_size(src_w->type);
+             const uint32_t aligned_tile_size = htp_mm_get_weight_aligned_tile_size(src_w->type);
++            const uint32_t pitch = hvx_mm_tiled_weight_pitch(src_w->type);
+             const uint32_t n_k_tiles_w = src_w->ne[0] / 32;
+             const uint32_t n_k_tiles_a = act->ne[0] / 32;
+             const uint32_t tile_row_stride = n_k_tiles_w * tile_size;
+@@ -1343,8 +1375,8 @@ static void hvx_mv_id_nx(unsigned int nth, unsigned int ith, void * data) {
+ 
+             uint32_t push_ct = ct_start;
+             for (uint32_t d = 0; d < n_prefetch && push_ct < ct_end; d++, push_ct++) {
+-                dma_queue_push(dma_queue, dma_make_ptr(vtcm_src0_ptr + d * tile_row_transfer_size_aligned, src0_row + push_ct * tile_row_stride),
+-                               aligned_tile_size, tile_size, tile_size, n_k_tiles_a);
++                hvx_mm_push_weight_tiles(dma_queue, vtcm_src0_ptr + d * tile_row_transfer_size_aligned, src0_row + push_ct * tile_row_stride,
++                                         tile_size, pitch, n_k_tiles_a);
+             }
+ 
+             for (uint32_t ct = ct_start; ct < ct_end; ct++) {
+@@ -1359,8 +1391,8 @@ static void hvx_mv_id_nx(unsigned int nth, unsigned int ith, void * data) {
+                 htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
+ 
+                 if (push_ct < ct_end) {
+-                    dma_queue_push(dma_queue, dma_make_ptr((uint8_t *)w_tile, src0_row + push_ct * tile_row_stride),
+-                                   aligned_tile_size, tile_size, tile_size, n_k_tiles_a);
++                    hvx_mm_push_weight_tiles(dma_queue, (uint8_t *) w_tile, src0_row + push_ct * tile_row_stride,
++                                             tile_size, pitch, n_k_tiles_a);
+                     push_ct++;
+                 }
+             }
+@@ -1426,6 +1458,7 @@ static void hvx_mm_id_nx(unsigned int nth, unsigned int ith, void * data) {
+ 
+             const uint32_t tile_size = htp_mm_get_weight_tile_size(src_w->type);
+             const uint32_t aligned_tile_size = htp_mm_get_weight_aligned_tile_size(src_w->type);
++            const uint32_t pitch = hvx_mm_tiled_weight_pitch(src_w->type);
+             const uint32_t n_k_tiles_w = src_w->ne[0] / 32;
+             const uint32_t n_k_tiles_a = act->ne[0] / 32;
+             const uint32_t tile_row_stride = n_k_tiles_w * tile_size;
+@@ -1436,8 +1469,8 @@ static void hvx_mm_id_nx(unsigned int nth, unsigned int ith, void * data) {
+ 
+             uint32_t push_ct = ct_start;
+             for (uint32_t d = 0; d < n_prefetch && push_ct < ct_end; d++, push_ct++) {
+-                dma_queue_push(dma_queue, dma_make_ptr(vtcm_src0_ptr + d * tile_row_transfer_size_aligned, src0_row + push_ct * tile_row_stride),
+-                               aligned_tile_size, tile_size, tile_size, n_k_tiles_a);
++                hvx_mm_push_weight_tiles(dma_queue, vtcm_src0_ptr + d * tile_row_transfer_size_aligned, src0_row + push_ct * tile_row_stride,
++                                         tile_size, pitch, n_k_tiles_a);
+             }
+ 
+             for (uint32_t ct = ct_start; ct < ct_end; ct++) {
+@@ -1462,8 +1495,8 @@ static void hvx_mm_id_nx(unsigned int nth, unsigned int ith, void * data) {
+                 htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
+ 
+                 if (push_ct < ct_end) {
+-                    dma_queue_push(dma_queue, dma_make_ptr((uint8_t *)w_tile, src0_row + push_ct * tile_row_stride),
+-                                   aligned_tile_size, tile_size, tile_size, n_k_tiles_a);
++                    hvx_mm_push_weight_tiles(dma_queue, (uint8_t *) w_tile, src0_row + push_ct * tile_row_stride,
++                                             tile_size, pitch, n_k_tiles_a);
+                     push_ct++;
+                 }
+             }
+@@ -1484,7 +1517,7 @@ static int hvx_mm_init_vec_dot(struct htp_mm_context * mmctx, enum htp_data_type
+             return 0;
+         case HTP_TYPE_Q8_0:
+             mmctx->type         = "q8_0_tiled-f32";
+-            mmctx->vec_dot_32x1 = tiled_vec_dot_q8_0_32x1;
++            mmctx->vec_dot_32x1 = tiled_vec_dot_q8_0_packed_32x1;
+             return 0;
+         case HTP_TYPE_Q6_K:
+             mmctx->type         = "q6_k_tiled-f32";
