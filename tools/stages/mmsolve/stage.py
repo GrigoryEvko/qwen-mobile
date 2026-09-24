@@ -2,8 +2,9 @@
 """The phone stage "mmsolve": the chunks of the HMX 2D matmul, the old cost model against the cost of the kernel.
 
 Usage (tools/stages/mmsolve/build.sh makes the libraries and the tools first, then runs "files"):
-    stage.py files                        write phone/tests, phone/SHA256SUMS and phone-commands.txt
-    stage.py table [--root DIR]           print the tables from the pulled outputs (phone-out)
+    stage.py files [--only bx]            write phone/tests, the checksum file and the command file
+                                          (phone-commands.txt, or phone-commands-bx.txt for the runs bx-*)
+    stage.py table [--only bx] [--root DIR]   print the tables from the pulled outputs (phone-out or phone-out-bx)
 
 One library set holds the two models. GGML_HEXAGON_MM_SOLVER=0 gives the old model (the activation conversion
 is a cost of each weight chunk) and 1 the cost of the kernel (the patch default). GGML_HEXAGON_MM_CHUNKS=mc,nc
@@ -73,7 +74,6 @@ MODEL_GATE_KB = 8388608
 # stops the Qwen app, wakes the screen and checks MemAvailable. The runs with this marker load no model.
 MARKER = sweep.MARKER
 TOOL_GATE_KB = 2097152
-LIB_ENV = f"LD_LIBRARY_PATH={PHONE}/lib ADSP_LIBRARY_PATH={PHONE}/lib"
 # The environment of the app (init_impl in llama_jni.cpp), as the stage bench-kv has it
 APP_ENV = "GGML_HEXAGON_OPFUSION=1 GGML_HEXAGON_OPFUSION_STATE=1"
 # The llama-bench flags of the stage bench-kv, variant b (Q8_0 K and V, the rotation as FWHT)
@@ -162,10 +162,12 @@ class Run:
 def runs() -> list[Run]:
     """The runs of the stage in the order of the command file."""
     out: list[Run] = []
-    # 1. The bit-exact check with the CPU reference, and test-backend-ops test mode
-    for key, env in (("old", MODELS["old"]), ("new", MODELS["new"]),
-                     ("nc32", MODELS["new"] + " GGML_HEXAGON_MM_CHUNKS=0,32")):
-        out.append(Run(f"bx-{key}", "mmcheck", f"mmcheck --cpu, {env}", f"{APP_ENV} {env} GGML_HEXAGON_PROFILE=1",
+    # 1. The bit-exact check with the CPU reference, and test-backend-ops test mode. bx-off has the fusion off:
+    # each MUL_MAT and each ADD is an op of its own.
+    for key, env in (("old", f"{APP_ENV} {MODELS['old']}"), ("new", f"{APP_ENV} {MODELS['new']}"),
+                     ("nc32", f"{APP_ENV} {MODELS['new']} GGML_HEXAGON_MM_CHUNKS=0,32"),
+                     ("off", f"GGML_HEXAGON_OPFUSION=0 {MODELS['new']}")):
+        out.append(Run(f"bx-{key}", "mmcheck", f"mmcheck --cpu, {env}", f"{env} GGML_HEXAGON_PROFILE=1",
                        "--cpu --threads 4", limit=100, model=key))
     out.append(Run("tbo-new", "tbo-test", "test-backend-ops test mode, the MUL_MAT cases of the 4B shapes, new model",
                    f"GGML_HEXAGON_OPFUSION=0 {MODELS['new']}", cases=tbo_cases(), limit=100, model="new"))
@@ -189,10 +191,11 @@ def runs() -> list[Run]:
                            f"{APP_ENV} {MODELS[model]}", "-p 512,1024 -n 0 -d 0,3072 -r 3", limit=110, model=model))
             out.append(Run(f"tg-{rnd}-{model}", "bench", f"llama-bench tg32 at d0, {model} model",
                            f"{APP_ENV} {MODELS[model]}", "-p 0 -n 32 -d 0 -r 3", limit=80, model=model))
-    # 5. The op split of one pp1024 graph (the warmup graph and the timed graph)
+    # 5. The op split of one pp1024 graph (the warmup graph and the timed graph). Without -v, llama-bench sets a log
+    # callback that drops the debug lines of ggml, thus it writes no profile line.
     for model in ("old", "new"):
         out.append(Run(f"prof-{model}", "prof", f"GGML_HEXAGON_PROFILE=1, llama-bench pp1024 at d0, {model} model",
-                       f"{APP_ENV} {MODELS[model]} GGML_HEXAGON_PROFILE=1", "-p 1024 -n 0 -d 0 -r 1", limit=90,
+                       f"{APP_ENV} {MODELS[model]} GGML_HEXAGON_PROFILE=1", "-p 1024 -n 0 -d 0 -r 1 -v", limit=90,
                        model=model))
     return out
 
@@ -210,6 +213,53 @@ def est_s(r: Run) -> float:
     return EST_S[r.kind]
 
 
+# The binary of each kind of run
+TOOL_OF = {"mmcheck": "bin/mmcheck", "tbo-test": "bin/test-backend-ops", "tbo-perf": "bin/test-backend-ops",
+           "bench": "bin/llama-bench", "prof": "bin/llama-bench"}
+
+
+@dataclass(frozen=True)
+class Target:
+    """The runs of one command file and their paths: the full stage (suffix "", each run), or the correctness
+    stage (suffix "-bx", the runs bx-*). Each target has its own phone directory, output directory, command file
+    and checksum file, thus the outputs of one target do not replace the outputs of the other."""
+    suffix: str
+    prefix: str
+
+    @property
+    def phone(self) -> str:
+        """The work directory on the phone."""
+        return PHONE + self.suffix
+
+    @property
+    def out(self) -> str:
+        """The output directory below build/mmsolve, on the laptop and on the box."""
+        return f"phone-out{self.suffix}"
+
+    @property
+    def commands(self) -> str:
+        """The command file below build/mmsolve."""
+        return f"phone-commands{self.suffix}.txt"
+
+    @property
+    def sums(self) -> str:
+        """The checksum file below build/mmsolve/phone, for the files that this target pushes."""
+        return f"SHA256SUMS{self.suffix}"
+
+    def runs(self) -> list[Run]:
+        """The runs of the target, in the order of the stage."""
+        return [r for r in runs() if r.key.startswith(self.prefix)]
+
+    def files(self) -> tuple[str, ...]:
+        """The files below build/mmsolve/phone that the runs of the target use: the gate, their binaries and
+        each library."""
+        tools = {TOOL_OF[r.kind] for r in self.runs()}
+        return tuple(f for f in PHONE_FILES if f == "bin/gate.sh" or f in tools or f.startswith("lib/"))
+
+
+TARGETS = {"all": Target("", ""), "bx": Target("-bx", "bx-")}
+
+
 # ---- The command file ----
 
 HEADER = """\
@@ -223,6 +273,7 @@ HEADER = """\
 # The runs ({n_runs}):
 #   bx-old, bx-new, bx-nc32  mmcheck --cpu: a hash of the HTP0 output of each 4B shape (MUL_MAT, MUL_MAT_NX, MUL_MAT+ADD)
 #                            at 5 to 1024 tokens, and the NMSE against the CPU. Old model, new model, request 0,32
+#   bx-off                   the same with the fusion off (each MUL_MAT and ADD alone), new model
 #   tbo-new                  test-backend-ops test mode, the MUL_MAT cases of the 4B shapes, new model
 #   op-R-old, op-R-new       test-backend-ops perf of each 4B shape at 512 and 1024 tokens, 2 rounds, profile on
 #   cs-...                   the chunk sweep (GGML_HEXAGON_MM_CHUNKS): ffn_down and 4096x2560 at 1024 tokens, and the
@@ -241,44 +292,73 @@ HEADER = """\
 # Then, on the box: build/mmsolve/stage.py table
 """
 
+HEADER_BX = """\
+# Phone stage "mmsolve-bx": the bit-exact check of the chunks of the HMX 2D matmul on HTP0 (the runs bx-* of the stage
+# mmsolve). The libraries are the files of build/mmsolve/phone: the patched llama.cpp tree of HEAD plus the patch {patch}
+# (sha256 {patch_sha}), with the preset, the flags and the LTO of scripts/build-native.sh (tools/stages/mmsolve/build.sh).
+#
+# The runs ({n_runs}): mmcheck --cpu gives a hash of the HTP0 output of each 4B shape at 5 to 1024 tokens (Q8_0 and the
+# F16 MTP block), and the NMSE and the largest error against the CPU backend of the phone. mmcheck puts the weights in a
+# buffer with GGML_BACKEND_BUFFER_USAGE_WEIGHTS, thus the backend repacks a Q8_0 weight as the model loader has it.
+#   bx-old    the old cost model (GGML_HEXAGON_MM_SOLVER=0), fusion on (MUL_MAT, MUL_MAT_NX, MUL_MAT+ADD)
+#   bx-new    the cost model of the kernel (GGML_HEXAGON_MM_SOLVER=1), fusion on
+#   bx-nc32   the request GGML_HEXAGON_MM_CHUNKS=0,32 (the narrowest n chunk with the largest m chunk), fusion on
+#   bx-off    the cost model of the kernel, fusion off (each MUL_MAT and ADD alone)
+# Each case of each run must give 0 values that are not finite and an NMSE of 1e-4 or less (the exit code 0), and the
+# hashes of bx-old, bx-new and bx-nc32 must be the same.
+# Each run: the thermal line, then bin/gate.sh (the Qwen app stopped, the screen on, thermal 0, no charger, MemAvailable
+# 2 GB), mmcheck under timeout -s KILL (100 s), the exit code and the conditions after the run, then the pgrep line. Each
+# run line names the 2B model file in an ls (no run loads a model), thus the runner treats it as a model run.
+#
+# Run from /home/grigory/airi/qwen-mobile on the laptop, in order. It is not a timing stage. Time: about
+# {tool_min:.0f} minutes of tool time, about {total_min:.0f} minutes with the gates.
+# Then, on the box: build/mmsolve/stage.py table --only bx
+"""
 
-def setup_lines() -> list[str]:
-    """The lines that copy the stage to the phone and check its files."""
-    bins = " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in PHONE_FILES if f.startswith("bin/"))
-    libs = " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in PHONE_FILES if f.startswith("lib/"))
-    tests = " ".join(f"{LAPTOP_STAGE}/phone/tests/{r.key}.txt" for r in runs() if r.cases)
-    return [
+
+def setup_lines(t: Target) -> list[str]:
+    """The lines that copy the files of a target to the phone and check them."""
+    files = t.files()
+    bins = " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in files if f.startswith("bin/"))
+    libs = " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in files if f.startswith("lib/"))
+    tests = " ".join(f"{LAPTOP_STAGE}/phone/tests/{r.key}.txt" for r in t.runs() if r.cases)
+    p = t.phone
+    lines = [
         f"mkdir -p {LAPTOP_STAGE} && rsync -a --delete {BOX}/phone/ {LAPTOP_STAGE}/phone/",
-        f"(cd {LAPTOP_STAGE}/phone && sha256sum -c SHA256SUMS)",
+        f"(cd {LAPTOP_STAGE}/phone && sha256sum -c {t.sums})",
         # No "models/Qwen3.5" in this line: the runner gates each line with that text as a model run.
         f"{ADB} shell 'ls -l {MODEL_DIR} | grep {MODEL}'",
-        f"{ADB} shell 'rm -rf {PHONE} && mkdir -p {PHONE}/bin {PHONE}/lib {PHONE}/tests {PHONE}/out'",
-        f"{ADB} push {bins} {PHONE}/bin/",
-        f"{ADB} push {libs} {PHONE}/lib/",
-        f"{ADB} push {tests} {PHONE}/tests/",
-        f"{ADB} push {LAPTOP_STAGE}/phone/SHA256SUMS {PHONE}/",
-        f"{ADB} shell 'cd {PHONE} && sha256sum -c SHA256SUMS | grep -c OK && chmod 755 {PHONE}/bin/*'",
+        f"{ADB} shell 'rm -rf {p} && mkdir -p {p}/bin {p}/lib {p}/tests {p}/out'",
+        f"{ADB} push {bins} {p}/bin/",
+        f"{ADB} push {libs} {p}/lib/",
+    ]
+    if tests:
+        lines.append(f"{ADB} push {tests} {p}/tests/")
+    return lines + [
+        f"{ADB} push {LAPTOP_STAGE}/phone/{t.sums} {p}/",
+        f"{ADB} shell 'cd {p} && sha256sum -c {t.sums} | grep -c OK && chmod 755 {p}/bin/*'",
         f"{ADB} shell 'echo gzip: $(command -v gzip) timeout: $(command -v timeout)'",
     ]
 
 
-def run_lines(r: Run) -> list[str]:
+def run_lines(r: Run, t: Target) -> list[str]:
     """The lines of one run: a title, the thermal line, the run and the pgrep line."""
-    stem = f"{PHONE}/out/{r.key}"
+    p = t.phone
+    stem = f"{p}/out/{r.key}"
     model_run = r.kind in ("bench", "prof")
     gate_kb = MODEL_GATE_KB if model_run else TOOL_GATE_KB
     marker = "" if model_run else f"{MARKER}; "
-    gate = f"{marker}sh {PHONE}/bin/gate.sh {gate_kb} > {stem}-gate.txt && {BEFORE} >> {stem}-gate.txt && "
+    gate = f"{marker}sh {p}/bin/gate.sh {gate_kb} > {stem}-gate.txt && {BEFORE} >> {stem}-gate.txt && "
     tail = f"echo \"rc=$?\" >> {stem}-gate.txt; {AFTER} >> {stem}-gate.txt; cat {stem}-gate.txt"
-    env = f"{LIB_ENV} {r.env}"
+    env = f"LD_LIBRARY_PATH={p}/lib ADSP_LIBRARY_PATH={p}/lib {r.env}"
     if r.kind == "mmcheck":
-        cmd = f"{PHONE}/bin/mmcheck {r.args}"
+        cmd = f"{p}/bin/mmcheck {r.args}"
     elif r.kind == "tbo-test":
-        cmd = f"{PHONE}/bin/test-backend-ops test -b HTP0 --test-file {PHONE}/tests/{r.key}.txt"
+        cmd = f"{p}/bin/test-backend-ops test -b HTP0 --test-file {p}/tests/{r.key}.txt"
     elif r.kind == "tbo-perf":
-        cmd = f"{PHONE}/bin/test-backend-ops perf -b HTP0 --test-file {PHONE}/tests/{r.key}.txt"
+        cmd = f"{p}/bin/test-backend-ops perf -b HTP0 --test-file {p}/tests/{r.key}.txt"
     else:
-        cmd = f"{PHONE}/bin/llama-bench -m {MODEL_DIR}/{MODEL} {BENCH_ARGS} {r.args}"
+        cmd = f"{p}/bin/llama-bench -m {MODEL_DIR}/{MODEL} {BENCH_ARGS} {r.args}"
     full = f"timeout -s KILL {r.limit} env {env} {cmd}"
     if "GGML_HEXAGON_PROFILE" in r.env:
         # One profile line for each op: gzip (when the phone has it) keeps the file small. The table reads a
@@ -292,18 +372,19 @@ def run_lines(r: Run) -> list[str]:
             f"{ADB} shell '{gate}{tool}{tail}'", PGREP]
 
 
-def output_lines() -> list[str]:
-    """The lines that pull the outputs, copy them to the box and remove the phone directory. The phone directory
-    goes only when the pull has each of its files."""
+def output_lines(t: Target) -> list[str]:
+    """The lines that pull the outputs of a target, copy them to the box and remove its phone directory. The phone
+    directory goes only when the pull has each of its files."""
+    p, out = t.phone, f"{LAPTOP_STAGE}/{t.out}"
     return [
         "#", "# ---- The outputs ----", "#", THERMAL,
-        f"{ADB} shell 'pgrep -x llama-bench; pgrep -x test-backend-op; ls {PHONE}/out | wc -l; du -sh {PHONE}/out'",
-        f"rm -rf {LAPTOP_STAGE}/phone-out",
-        f"{ADB} pull {PHONE}/out {LAPTOP_STAGE}/phone-out",
-        f"rsync -a --delete {LAPTOP_STAGE}/phone-out/ {BOX}/phone-out/",
-        f"test \"$(ls {LAPTOP_STAGE}/phone-out | wc -l)\" -eq "
-        f"\"$({ADB} shell 'ls {PHONE}/out | wc -l' | tr -d '\\r')\" "
-        f"&& {ADB} shell 'rm -rf {PHONE}' && echo removed {PHONE}",
+        f"{ADB} shell 'pgrep -x llama-bench; pgrep -x test-backend-op; pgrep -x mmcheck; ls {p}/out | wc -l; "
+        f"du -sh {p}/out'",
+        f"rm -rf {out}",
+        f"{ADB} pull {p}/out {out}",
+        f"rsync -a --delete {out}/ {BOX}/{t.out}/",
+        f"test \"$(ls {out} | wc -l)\" -eq \"$({ADB} shell 'ls {p}/out | wc -l' | tr -d '\\r')\" "
+        f"&& {ADB} shell 'rm -rf {p}' && echo removed {p}",
     ]
 
 
@@ -324,9 +405,10 @@ def check_points() -> None:
         print("  " + res.stdout.strip())
 
 
-def write_files() -> int:
-    """Write phone/tests, phone/SHA256SUMS and phone-commands.txt. The binaries and the libraries are in phone/
-    from build.sh."""
+def write_files(t: Target) -> int:
+    """Write phone/tests, the checksum file of the target and its command file. The binaries and the libraries are
+    in phone/ from build.sh. The test files of each run are written for each target, thus the full stage and the
+    correctness stage use one phone directory of the box."""
     ops = ggml_ops(REPO / "build/mmsolve/stage-src/ggml/include/ggml.h")
     phone = HERE / "phone"
     missing = [f for f in PHONE_FILES if not (phone / f).exists()]
@@ -337,28 +419,29 @@ def write_files() -> int:
     if tests.exists():
         shutil.rmtree(tests)
     tests.mkdir(parents=True)
-    all_runs = runs()
-    for r in all_runs:
+    for r in runs():
         names = [c.name for c in r.cases]
         if len(set(names)) != len(names):
             raise ValueError(f"the run {r.key} has a case name two times")
         if r.cases:
             (tests / f"{r.key}.txt").write_text("".join(sweep.line(c, ops) + "\n" for c in r.cases))
-    files = sorted(p for p in phone.rglob("*") if p.is_file() and p.name != "SHA256SUMS")
-    sums = [f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(phone)}" for p in files]
-    (phone / "SHA256SUMS").write_text("\n".join(sums) + "\n")
+    t_runs = t.runs()
+    files = list(t.files()) + [f"tests/{r.key}.txt" for r in t_runs if r.cases]
+    sums = [f"{hashlib.sha256((phone / f).read_bytes()).hexdigest()}  {f}" for f in files]
+    (phone / t.sums).write_text("\n".join(sums) + "\n")
     patch_line = (HERE / "patch.sha256").read_text().split() if (HERE / "patch.sha256").exists() else ["?", "?"]
-    tool = sum(est_s(r) for r in all_runs)
-    head = HEADER.format(patch=patch_line[1], patch_sha=patch_line[0][:16], n_runs=len(all_runs), tool_min=tool / 60,
-                         total_min=(tool + 12 * len(all_runs)) / 60)
-    lines = head.rstrip("\n").split("\n") + setup_lines()
-    for r in all_runs:
-        lines += run_lines(r)
-    lines += output_lines()
-    (HERE / "phone-commands.txt").write_text("\n".join(lines) + "\n")
-    for r in all_runs:
+    tool = sum(est_s(r) for r in t_runs)
+    head = (HEADER_BX if t.suffix else HEADER).format(
+        patch=patch_line[1], patch_sha=patch_line[0][:16], n_runs=len(t_runs), tool_min=tool / 60,
+        total_min=(tool + 12 * len(t_runs)) / 60)
+    lines = head.rstrip("\n").split("\n") + setup_lines(t)
+    for r in t_runs:
+        lines += run_lines(r, t)
+    lines += output_lines(t)
+    (HERE / t.commands).write_text("\n".join(lines) + "\n")
+    for r in t_runs:
         print(f"  {r.key:28s} {r.kind:9s} {len(r.cases):3d} cases  estimate {est_s(r):4.0f} s  limit {r.limit:3d} s")
-    print(f"phone-commands.txt: {len(lines)} lines, {len(all_runs)} runs, tool time about {tool / 60:.1f} min")
+    print(f"{t.commands}: {len(lines)} lines, {len(t_runs)} runs, tool time about {tool / 60:.1f} min")
     return 0
 
 
@@ -377,6 +460,7 @@ PROF_RE = re.compile(r"profile-op ([A-Z_0-9+]+)\|([^|]*)\|([^|]*)\|([^|]*)\|[^|]
                      r"start \d+ mhz ([\d.]+)")
 MMCHECK_RE = re.compile(r"^mmcheck case=(\S+) hash=(\S+) nonfinite=(\d+)(?: nmse=(\S+) maxerr=(\S+))? us=(\d+)( FAILED)?",
                         re.M)
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 TEST_RE = re.compile(r"^\s+[A-Z_]+\(name=([A-Za-z0-9_x]+),[^\n]*?\):\s*(?:\S+\s+)?(OK|FAIL|not supported)", re.M)
 
 
@@ -419,7 +503,8 @@ def read_run(root: Path, r: Run) -> RunOut:
             flags.append(f"screen {m.group(si)} keyguard {m.group(ki)} {label} the run")
     res = RunOut(r, ok, flags, caps)
     out_p = root / f"{r.key}.out"
-    res.out = out_p.read_text(errors="replace") if out_p.exists() else ""
+    # test-backend-ops writes its OK and FAIL with ANSI color codes
+    res.out = ANSI_RE.sub("", out_p.read_text(errors="replace")) if out_p.exists() else ""
     res.log = sweep.read_log(root, r.key)
     both = res.out + "\n" + res.log
     if r.kind == "tbo-perf":
@@ -486,42 +571,61 @@ def mmcheck_rows(o: RunOut) -> dict[str, dict]:
 
 
 def mmcheck_chunks(o: RunOut, name: str) -> str:
-    """The chunks of the HMX op of one mmcheck case, from the profile lines of its run: "mc x nc" or "-"."""
+    """The chunks of the HMX op of one mmcheck case, from the profile lines of its run: "mc x nc" or "-". An op
+    line matches by the weight type, the weight shape and the activation shape. The activation of a fused op
+    (MUL_MAT_NX, MUL_MAT+ADD) has more sources after it."""
     m = re.match(r"\w+?_(q8_0|f16)_(\d+)x(\d+)_m(\d+)_", name)
     if not m:
         return "-"
-    k, n, tokens = m.group(2), m.group(3), m.group(4)
+    wtype, k, n, tokens = m.group(1), m.group(2), m.group(3), m.group(4)
+    act = re.compile(rf" x {k}:{tokens}( x | -> )")
     got = set()
     for p in PROF_RE.finditer(o.log):
-        dims = p.group(3)
-        if dims.startswith(f"{k}:{n} x ") and f" x {k}:{tokens} -> " in dims:
+        dims, types = p.group(3), p.group(4)
+        if dims.startswith(f"{k}:{n} x ") and act.search(dims) and types.startswith(f"{wtype} x "):
             ch = CHUNK_RE.search(p.group(5))
             got.add(f"{ch.group(1)}x{ch.group(2)}" if ch else p.group(5).split()[0] if p.group(5) else "?")
     return ",".join(sorted(got)) or "-"
 
 
+BX_KEYS = ("bx-old", "bx-new", "bx-nc32", "bx-off")
+
+
 def bitexact_table(outs: dict[str, RunOut]) -> list[str]:
-    """The hashes of the three mmcheck runs, the NMSE against the CPU, and the chunks of each run."""
+    """The hashes of the mmcheck runs, the values that are not finite, the NMSE against the CPU, and the chunks of
+    each run. "same" compares bx-old, bx-new and bx-nc32 (the fusion on). "off" compares bx-off with bx-new: the
+    unfused ops can round differently from the fused ops, thus a difference there is information, not a failure.
+    A run with an exit code other than 0 stays in the table, thus the failed cases show."""
     lines = ["", "== 1. Bit-exact: the hash of the HTP0 output of each case (measured), the chunks of each run "
-             "(measured, from the profile lines), NMSE against the CPU of the new run =="]
-    runs_ = [outs.get(k) for k in ("bx-old", "bx-new", "bx-nc32")]
-    if not all(o and o.ok for o in runs_):
-        return lines + ["  one of bx-old, bx-new, bx-nc32 did not give a usable result"]
-    rows = [mmcheck_rows(o) for o in runs_]
-    equal = differ = 0
-    lines.append(f"  {'case':46s} {'same':5s} {'old chunks':>12s} {'new chunks':>12s} {'nc32 chunks':>12s} "
-                 f"{'nmse':>10s} {'maxerr':>9s}")
-    for name in rows[1]:
-        hashes = [r.get(name, {}).get("hash") for r in rows]
+             "(measured, from the profile lines), the NMSE against the CPU of the new run =="]
+    present = [k for k in BX_KEYS if k in outs and outs[k].out]
+    if not all(k in present for k in BX_KEYS[:3]):
+        return lines + ["  bx-old, bx-new and bx-nc32 did not all give an output"]
+    rows = {k: mmcheck_rows(outs[k]) for k in present}
+    equal = differ = off_equal = off_differ = failed = 0
+    lines.append(f"  {'case':46s} {'same':5s} {'off':4s} {'old chunks':>11s} {'new chunks':>11s} {'nc32 chunks':>11s} "
+                 f"{'off chunks':>11s} {'nonfin':>6s} {'nmse':>10s} {'maxerr':>9s}")
+    for name in rows["bx-new"]:
+        hashes = [rows[k].get(name, {}).get("hash") for k in BX_KEYS[:3]]
         same = all(h is not None and h == hashes[0] for h in hashes)
         equal += same
         differ += not same
-        new = rows[1][name]
-        lines.append(f"  {name:46s} {'yes' if same else 'NO':5s} {mmcheck_chunks(runs_[0], name):>12s} "
-                     f"{mmcheck_chunks(runs_[1], name):>12s} {mmcheck_chunks(runs_[2], name):>12s} "
-                     f"{new['nmse'] or '-':>10s} {new['maxerr'] or '-':>9s}"
-                     + ("  FAILED" if any(r.get(name, {}).get("failed") for r in rows) else ""))
-    lines.append(f"  {equal} cases with the same hash in the three runs, {differ} with a different hash")
+        off = "-"
+        if "bx-off" in rows:
+            off = "yes" if rows["bx-off"].get(name, {}).get("hash") == hashes[1] else "no"
+            off_equal += off == "yes"
+            off_differ += off == "no"
+        bad = any(rows[k].get(name, {}).get("failed", True) for k in present)
+        failed += bad
+        nonfin = max(rows[k].get(name, {}).get("nonfinite", 0) for k in present)
+        new = rows["bx-new"][name]
+        chunks = " ".join(f"{mmcheck_chunks(outs[k], name) if k in present else '-':>11s}" for k in BX_KEYS)
+        lines.append(f"  {name:46s} {'yes' if same else 'NO':5s} {off:4s} {chunks} {nonfin:6d} "
+                     f"{new['nmse'] or '-':>10s} {new['maxerr'] or '-':>9s}" + ("  FAILED" if bad else ""))
+    lines.append(f"  {equal} cases with the same hash in bx-old, bx-new and bx-nc32, {differ} with a different hash; "
+                 f"{failed} cases fail in one run or more")
+    if "bx-off" in rows:
+        lines.append(f"  bx-off against bx-new: {off_equal} cases with the same hash, {off_differ} with a different hash")
     return lines
 
 
@@ -707,14 +811,16 @@ def split_table(outs: dict[str, RunOut]) -> list[str]:
     return lines
 
 
-def table(root: Path) -> int:
-    """Print the tables."""
+def table(root: Path, t: Target) -> int:
+    """Print the tables of the runs of a target. The correctness stage has only the sections 0 and 1."""
     if not root.is_dir():
         print(f"stage.py: {root} is not a directory. Pull the outputs of the stage first.", file=sys.stderr)
         return 1
-    outs = {r.key: read_run(root, r) for r in runs() if (root / f"{r.key}-gate.txt").exists()}
-    for part in (conditions(outs), bitexact_table(outs), test_table(outs), op_table(outs), sweep_table(outs),
-                 bench_table(outs), split_table(outs)):
+    outs = {r.key: read_run(root, r) for r in t.runs() if (root / f"{r.key}-gate.txt").exists()}
+    parts = [conditions(outs), bitexact_table(outs)]
+    if not t.suffix:
+        parts += [test_table(outs), op_table(outs), sweep_table(outs), bench_table(outs), split_table(outs)]
+    for part in parts:
         print("\n".join(part))
     return 0
 
@@ -723,13 +829,18 @@ def main() -> int:
     """Run the subcommand of the command line."""
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("files", help="write phone/tests, phone/SHA256SUMS and phone-commands.txt")
-    t = sub.add_parser("table", help="print the tables from the pulled outputs")
-    t.add_argument("--root", type=Path, default=HERE / "phone-out")
+    f = sub.add_parser("files", help="write phone/tests, the checksum file and the command file of a target")
+    t = sub.add_parser("table", help="print the tables from the pulled outputs of a target")
+    for p in (f, t):
+        p.add_argument("--only", choices=sorted(k for k in TARGETS if k != "all"), default=None,
+                       help="the correctness stage: only the runs bx-* (phone-commands-bx.txt, phone-out-bx)")
+    t.add_argument("--root", type=Path, default=None, help="the output directory (preset: build/mmsolve/phone-out "
+                                                          "or phone-out-<only>)")
     a = ap.parse_args()
+    target = TARGETS[a.only or "all"]
     if a.cmd == "files":
-        return write_files()
-    return table(a.root)
+        return write_files(target)
+    return table(a.root or HERE / target.out, target)
 
 
 if __name__ == "__main__":

@@ -112,19 +112,30 @@ std::vector<float> get_values(const ggml_tensor * t) {
     return v;
 }
 
-// The tensors and the graph of one case on one backend.
+// The tensors and the graph of one case on one backend. The weights have their own context and buffer (wctx,
+// wbuf), as a model loader gives them: the Hexagon backend repacks a quantized weight into its tile layout
+// only in a buffer with the usage GGML_BACKEND_BUFFER_USAGE_WEIGHTS. In a buffer with no usage it copies the
+// bytes, and the HMX kernel then reads plain Q8_0 blocks as tiles.
 struct run_ctx {
-    ggml_context *        ctx = nullptr;
-    ggml_backend_buffer_t buf = nullptr;
-    ggml_cgraph *         gf  = nullptr;
+    ggml_context *        wctx = nullptr;
+    ggml_backend_buffer_t wbuf = nullptr;
+    ggml_context *        ctx  = nullptr;
+    ggml_backend_buffer_t buf  = nullptr;
+    ggml_cgraph *         gf   = nullptr;
     std::vector<ggml_tensor *> outs;
 
     ~run_ctx() {
         if (buf) {
             ggml_backend_buffer_free(buf);
         }
+        if (wbuf) {
+            ggml_backend_buffer_free(wbuf);
+        }
         if (ctx) {
             ggml_free(ctx);
+        }
+        if (wctx) {
+            ggml_free(wctx);
         }
     }
 };
@@ -145,18 +156,20 @@ inputs make_inputs(const shape & s, int64_t m) {
     return in;
 }
 
-// Build the graph of one case, give it its inputs, and compute it on the backend. Returns false when the
-// allocation or the compute fails.
+// Build the graph of one case, give it its inputs, and compute it on the backend. The function sets the usage
+// of the weight buffer before the first set_tensor of a weight. Returns false when an allocation or the
+// compute fails.
 bool run_case(ggml_backend_t be, const shape & s, int64_t m, const inputs & in, run_ctx & rc, double & us) {
+    ggml_init_params wp = { 4 * ggml_tensor_overhead(), nullptr, true };
     ggml_init_params ip = { 16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    rc.wctx             = ggml_init(wp);
     rc.ctx              = ggml_init(ip);
-    ggml_tensor * w     = ggml_new_tensor_2d(rc.ctx, s.type, s.k, s.n);
+    ggml_tensor * w     = ggml_new_tensor_2d(rc.wctx, s.type, s.k, s.n);
+    ggml_tensor * w2    = !strcmp(s.form, "nx") ? ggml_new_tensor_2d(rc.wctx, s.type, s.k, s.n) : nullptr;
     ggml_tensor * x     = ggml_new_tensor_2d(rc.ctx, GGML_TYPE_F32, s.k, m);
-    ggml_tensor * w2    = nullptr;
     ggml_tensor * r     = nullptr;
     rc.gf               = ggml_new_graph(rc.ctx);
-    if (!strcmp(s.form, "nx")) {
-        w2 = ggml_new_tensor_2d(rc.ctx, s.type, s.k, s.n);
+    if (w2) {
         rc.outs.push_back(ggml_mul_mat(rc.ctx, w, x));
         rc.outs.push_back(ggml_mul_mat(rc.ctx, w2, x));
     } else if (!strcmp(s.form, "add")) {
@@ -168,10 +181,12 @@ bool run_case(ggml_backend_t be, const shape & s, int64_t m, const inputs & in, 
     for (ggml_tensor * o : rc.outs) {
         ggml_build_forward_expand(rc.gf, o);
     }
-    rc.buf = ggml_backend_alloc_ctx_tensors(rc.ctx, be);
-    if (!rc.buf) {
+    rc.wbuf = ggml_backend_alloc_ctx_tensors(rc.wctx, be);
+    rc.buf  = ggml_backend_alloc_ctx_tensors(rc.ctx, be);
+    if (!rc.wbuf || !rc.buf) {
         return false;
     }
+    ggml_backend_buffer_set_usage(rc.wbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     set_values(w, in.w);
     if (w2) {
         set_values(w2, in.w2);
