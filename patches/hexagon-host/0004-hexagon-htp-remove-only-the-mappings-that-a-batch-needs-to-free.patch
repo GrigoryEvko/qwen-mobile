@@ -1,0 +1,343 @@
+hexagon: htp: remove only the mappings that a batch needs to free
+Fold-into: upstream/hexagon-htp
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+The defect
+
+The DSP maps each buffer of a batch into its VA (prep_op_bufs of htp/main.c).
+When the new mappings do not fit in max_vmem, it removed each mapping that the
+batch does not use. The 4B Q8_0 has 4275 MiB of weights in chunks of a maximum
+of 1 GiB (GGML_HEXAGON_MBUF), and max_vmem is 3158 MiB. A decode token runs in
+4 batches, and each batch removed and mapped 1 to 2.4 GiB. On the phone the
+prologues of the 4 batches took 220, 250, 283 and 538 us, 1.29 ms of each
+token. A batch of the 2B, which fits, has a prologue of 20 us. On the phone one
+HAP_mmap2 of 1 GiB takes about 17 us and one HAP_munmap2 about 35 us (tools/ddrbw
+mapcost), thus the calls explain only about 0.4 ms of the 1.29 ms. Each map and
+each removal also wrote a FARF(ALWAYS) line.
+
+The change
+
+The request of a batch gets a flags field (htp_opbatch_req, 32 bytes). With the
+flag HTP_OPBATCH_MMAP_LRU (the switch GGML_HEXAGON_MMAP_LRU, preset 1),
+evict_mmaps removes one mapping at a time, and it stops when the new mappings
+fit in max_vmem and in the table. It removes a mapping with the lowest batch
+number of its last use (htp_mmap.last_use). Among such mappings it removes the
+smallest one that frees sufficient bytes, else the largest one. The value 0 of
+the switch keeps the previous removal.
+
+The table has 32 slots and not 16, because more mappings stay. The mask of the
+table uses 1u << i, because 1 << 31 is an overflow of an int. The map and unmap
+lines are FARF(HIGH).
+
+The tests
+
+The fuzz target fuzz_mmap of tests/fuzz/hexhost copies the functions of the
+table from htp/main.c and runs them against a fake VA: a first-fit allocator
+with a capacity, thus a map can fail and the second pass runs. After each batch
+it compares the map and unmap calls and the table with a model of the policy of
+the flag. It also makes sure that each buffer of a batch has a mapping at its
+base, that the table holds a maximum of max_vmem bytes after the first pass,
+and that a removal before a second pass never takes a mapping of the batch. It
+ran 60 s in the configurations none, asan, ubsan, tsan and msan, each with the
+debug and the release profile, and it found nothing.
+
+An earlier host test ran the table of the series before this patch against the
+same fake VA. With the flag 0, the map and unmap events are the events of the
+previous code. On 8 tokens of the cycle of the 4 decode batches of the 4B, the
+policy does 44 maps and 38 removals, against 58 maps and 56 removals. With the
+costs of the calls above, the policy costs less on 32 of 121 random cycles,
+more on 4 (a maximum of 17 %), and the same on 85. Thus the policy is not better
+for each sequence, and the switch stays.
+
+The phone
+
+The stage quick ran the 4B Q8_0 in the app configuration. It measured this
+patch together with the next two patches and with a change of the rows of the
+pointwise unary ops, which is not in the series:
+
+- Against HEAD, tg32 at the depth 0 is +1.50 % and pp512 is +3.38 %. The next
+  phone batch measures the three patches without the row change.
+- The sum of the batch prologues of each decode token is 1265 us with HEAD,
+  1075 us with GGML_HEXAGON_MMAP_LRU=0 and 916 us with the preset value
+  (medians of 7 tokens, from the profile of the DSP).
+- The logits hashes of a prompt of 1024 tokens and 16 decode tokens are the
+  same with GGML_HEXAGON_MMAP_LRU=0 and with the preset value.
+
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 2c7c9de..384de91 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -142,6 +142,11 @@ static int opt_hostprof = 0;
+ // GGML_HEXAGON_GRAPHCACHE: the number of graphs whose op nodes and packed batch a session keeps
+ static int opt_graphcache = 8;
+ 
++// GGML_HEXAGON_MMAP_LRU: 1 = when the buffers of a batch do not fit in the VA limit of the DSP, the DSP
++// removes only the mappings that the batch needs to free, with the lowest batch number of last use first
++// (HTP_OPBATCH_MMAP_LRU), 0 = the DSP removes each mapping that the batch does not use
++static int opt_mmap_lru = 1;
++
+ static inline bool ggml_hexagon_is_fusion_enabled(int flag) {
+     if (opt_opfusion <= 0) return false;
+     if (opt_opfusion == 1) return true; // 1 enables all
+@@ -3427,6 +3432,7 @@ struct ggml_hexagon_opqueue {
+         req.n_bufs    = op_batch.n_bufs;
+         req.n_tensors = op_batch.n_tens;
+         req.n_ops     = op_batch.n_ops;
++        req.flags     = opt_mmap_lru ? HTP_OPBATCH_MMAP_LRU : 0;
+ 
+         op_cache[slot]   = op_batch.nodes;
+         start_usec[slot] = ggml_time_us();
+@@ -8289,6 +8295,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     const char * str_hostbuf  = getenv("GGML_HEXAGON_HOSTBUF");
+     const char * str_batchcache = getenv("GGML_HEXAGON_BATCHCACHE");
+     const char * str_graphcache = getenv("GGML_HEXAGON_GRAPHCACHE");
++    const char * str_mmap_lru   = getenv("GGML_HEXAGON_MMAP_LRU");
+     const char * str_hostprof   = getenv("LLAMA_HOSTPROF");
+ 
+     // Init Arch first since it affects other defaults
+@@ -8356,6 +8363,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf) != 0                 : opt_hostbuf;
+     opt_batchcache = str_batchcache ? atoi(str_batchcache)                : opt_batchcache;
+     opt_graphcache = str_graphcache ? atoi(str_graphcache)                : opt_graphcache;
++    opt_mmap_lru   = str_mmap_lru   ? atoi(str_mmap_lru)                  : opt_mmap_lru;
+     opt_hostprof   = str_hostprof   ? atoi(str_hostprof)                  : opt_hostprof;
+ 
+     if (opt_batchcache) {
+diff --git a/ggml/src/ggml-hexagon/htp/htp-ctx.h b/ggml/src/ggml-hexagon/htp/htp-ctx.h
+index 4aa04f3..fed787d 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-ctx.h
++++ b/ggml/src/ggml-hexagon/htp/htp-ctx.h
+@@ -17,7 +17,9 @@
+ #ifndef HTP_MAX_NTHREADS
+ #define HTP_MAX_NTHREADS 10
+ #endif
+-#define HTP_MAX_MMAPS    16
++// The size of the mapping table. prep_op_bufs keeps a mask of the table in a uint32_t, thus the
++// maximum is 32.
++#define HTP_MAX_MMAPS    32
+ 
+ #define HTP_MAX_DIRTY_RANGES 32
+ 
+@@ -26,7 +28,7 @@ struct htp_mmap {
+     uint64_t size;
+     uint64_t base;
+     uint32_t fd;
+-    uint32_t reserved;
++    uint32_t last_use;  // the low 32 bits of the sequence number of the last batch that used the mapping
+ };
+ 
+ struct htp_dirty_range {
+diff --git a/ggml/src/ggml-hexagon/htp/htp-ops.h b/ggml/src/ggml-hexagon/htp/htp-ops.h
+index 18741b1..1e84cb2 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-ops.h
++++ b/ggml/src/ggml-hexagon/htp/htp-ops.h
+@@ -225,12 +225,22 @@ struct htp_prof_desc {
+     uint32_t pmu[HTP_PROF_PMU_NCNT]; // PMU counters
+ };
+ 
++enum htp_opbatch_flags {
++    // When the mappings of a batch do not fit in the VA limit (max_vmem), the DSP removes mappings that the
++    // batch does not use. With this flag it removes first the mapping with the lowest batch number of its
++    // last use, and it stops when the new mappings fit in the VA limit and in the mapping table. Without
++    // this flag it removes each such mapping.
++    HTP_OPBATCH_MMAP_LRU = (1U << 0),
++};
++
+ struct htp_opbatch_req {
+     uint64_t seq;         // Sequence number
+     uint32_t n_bufs;      // Number of buffers
+     uint32_t n_tensors;   // Number of tensors
+     uint32_t n_ops;       // Number of ops
+     uint32_t n_traces;    // Number of trace descriptors per thread
++    uint32_t flags;       // HTP_OPBATCH_...
++    uint32_t reserved;    // Keeps the size a multiple of 8
+     // struct htp_buf_desc  bufs[];    -- dspqueue buf 0
+     // struct htp_tensor    tensors[]; -- dspqueue buf 0
+     // struct htp_op_desc   ops[];     -- dspqueue buf 0
+diff --git a/ggml/src/ggml-hexagon/htp/main.c b/ggml/src/ggml-hexagon/htp/main.c
+index 7000d69..6de782f 100644
+--- a/ggml/src/ggml-hexagon/htp/main.c
++++ b/ggml/src/ggml-hexagon/htp/main.c
+@@ -920,7 +920,7 @@ static inline bool reuse_buf(struct htp_context *ctx, uint32_t *m_reuse, struct
+         struct htp_mmap *m = ctx->mmap + i;
+         if (m->size && m->fd == b->fd) {
+             b->base   = m->base;
+-            *m_reuse |= (1 << i);
++            *m_reuse |= (1u << i);
+             return true;
+         }
+     }
+@@ -928,9 +928,11 @@ static inline bool reuse_buf(struct htp_context *ctx, uint32_t *m_reuse, struct
+     return false;
+ }
+ 
++// A decode token of a model that does not fit in max_vmem maps and removes buffers in each batch, thus
++// these two log lines are FARF(HIGH) and not FARF(ALWAYS)
+ static inline void drop_mmap(struct htp_context *ctx, struct htp_mmap *m) {
+     if (m->size) {
+-        FARF(ALWAYS, "unmap : fd %u base %p size %u", m->fd, (void*) m->base, (uint32_t) m->size);
++        FARF(HIGH, "unmap : fd %u base %p size %u", m->fd, (void*) m->base, (uint32_t) m->size);
+         htp_munmap((void *) m->base, m->size);
+         m->size = 0;
+         m->base = 0;
+@@ -938,7 +940,7 @@ static inline void drop_mmap(struct htp_context *ctx, struct htp_mmap *m) {
+     }
+ }
+ 
+-static inline bool mmap_buf(struct htp_context *ctx, struct htp_buf_desc *b) {
++static inline bool mmap_buf(struct htp_context *ctx, struct htp_buf_desc *b, uint32_t seq) {
+     if (b->base) return true; // already mapped
+ 
+     // find unused mapping
+@@ -951,11 +953,12 @@ static inline bool mmap_buf(struct htp_context *ctx, struct htp_buf_desc *b) {
+                 return false;
+             }
+ 
+-            m->base   = b->base = (uint64_t) va;
+-            m->fd     = b->fd;
+-            m->size   = b->size;
++            m->base     = b->base = (uint64_t) va;
++            m->fd       = b->fd;
++            m->size     = b->size;
++            m->last_use = seq;
+ 
+-            FARF(ALWAYS, "mmap : fd %u base %p size %u", m->fd, (void*) m->base, (uint32_t) m->size);
++            FARF(HIGH, "mmap : fd %u base %p size %u", m->fd, (void*) m->base, (uint32_t) m->size);
+             return true;
+         }
+     }
+@@ -964,11 +967,79 @@ static inline bool mmap_buf(struct htp_context *ctx, struct htp_buf_desc *b) {
+     return false;
+ }
+ 
+-static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uint32_t n_bufs) {
++// Removes mappings that the batch does not use, thus e_vmem more bytes fit in max_vmem. The bit i of
++// m_reuse is set when the batch uses the mapping i.
++//
++// Without lru, the function removes each mapping that the batch does not use, if e_vmem more bytes do not
++// fit. With lru, it removes one mapping at a time, and it stops when e_vmem more bytes and n_new more
++// mappings fit. It removes a mapping with the lowest batch number of its last use. Among such mappings it
++// removes the smallest one that frees sufficient bytes, else the largest one. The smallest sufficient
++// mapping keeps the most bytes mapped for the batches that follow, and the largest mapping needs the
++// fewest removals. On the phone one HAP_mmap2 of 1 GiB takes about 17 us and one HAP_munmap2 about
++// 35 us (tools/ddrbw mapcost). O(HTP_MAX_MMAPS^2).
++static void evict_mmaps(struct htp_context *ctx, uint32_t m_reuse, uint64_t e_vmem, uint32_t n_new, uint32_t seq,
++                        bool lru) {
++    uint64_t m_vmem = 0;
++    uint32_t n_maps = 0;
++    for (uint32_t i = 0; i < HTP_MAX_MMAPS; i++) {
++        if (ctx->mmap[i].size) {
++            m_vmem += ctx->mmap[i].size;
++            n_maps++;
++        }
++    }
++
++    FARF(HIGH, "prep-bufs : mmap-vmem %zu extra-vmem %zu max-vmem %zu : n-maps %u n-new %u lru %d",
++            (size_t) m_vmem, (size_t) e_vmem, (size_t) ctx->max_vmem, n_maps, n_new, (int) lru);
++
++    if (!lru) {
++        if ((m_vmem + e_vmem) > ctx->max_vmem) {
++            for (uint32_t i = 0; i < HTP_MAX_MMAPS; i++) {
++                if (!(m_reuse & (1u << i))) { drop_mmap(ctx, ctx->mmap + i); }
++            }
++        }
++        return;
++    }
++
++    while ((m_vmem + e_vmem) > ctx->max_vmem || (n_maps + n_new) > HTP_MAX_MMAPS) {
++        const uint64_t need = (m_vmem + e_vmem) > ctx->max_vmem ? (m_vmem + e_vmem) - ctx->max_vmem : 0;
++
++        uint32_t age = 0;
++        for (uint32_t i = 0; i < HTP_MAX_MMAPS; i++) {
++            const struct htp_mmap * m = ctx->mmap + i;
++            if (m->size && !(m_reuse & (1u << i)) && (uint32_t) (seq - m->last_use) > age) {
++                age = (uint32_t) (seq - m->last_use);
++            }
++        }
++
++        int fit = -1;  // the smallest mapping of that age that frees need bytes
++        int big = -1;  // the largest mapping of that age
++        for (uint32_t i = 0; i < HTP_MAX_MMAPS; i++) {
++            const struct htp_mmap * m = ctx->mmap + i;
++            if (!m->size || (m_reuse & (1u << i)) || (uint32_t) (seq - m->last_use) != age) {
++                continue;
++            }
++            if (m->size >= need && (fit < 0 || m->size < ctx->mmap[fit].size)) {
++                fit = (int) i;
++            }
++            if (big < 0 || m->size > ctx->mmap[big].size) {
++                big = (int) i;
++            }
++        }
++
++        const int victim = fit >= 0 ? fit : big;
++        if (victim < 0) {
++            break;  // each mapping is used by the batch: the second pass of prep_op_bufs removes them all
++        }
++        m_vmem -= ctx->mmap[victim].size;
++        n_maps--;
++        drop_mmap(ctx, ctx->mmap + victim);
++    }
++}
++
++static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uint32_t n_bufs, uint32_t seq, bool lru) {
+     uint32_t m_reuse = 0; // mmap reuse mask (index from ctx->mmap array)
+     uint32_t b_reuse = 0; // buf reuse count
+ 
+-    uint64_t m_vmem  = 0; // mapped vmem
+     uint64_t e_vmem  = 0; // extra  vmem
+ 
+     // See what we can reuse
+@@ -978,27 +1049,19 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
+         FARF(HIGH, "prep-buf #%u : pass0 fd %u base %p size %u flags 0x%x", i, b->fd, (void*) b->base, (uint32_t) b->size, b->flags);
+     }
+ 
+-    if (b_reuse == n_bufs) return; // all bufs reuse existing mappings
+-
+-    // See how much vmem we have mmaped right now
+-    for (uint32_t i=0; i<HTP_MAX_MMAPS; i++) { m_vmem += ctx->mmap[i].size; }
++    for (uint32_t i = 0; i < HTP_MAX_MMAPS; i++) {
++        if (m_reuse & (1u << i)) { ctx->mmap[i].last_use = seq; }
++    }
+ 
+-    FARF(HIGH, "prep-bufs : pass1 mmap-vmem %zu extra-vmem %zu max-vmem %zu : n-bufs %u b-reuse %u",
+-            (size_t) m_vmem, (size_t) e_vmem, (size_t) ctx->max_vmem, n_bufs, b_reuse);
++    if (b_reuse == n_bufs) return; // all bufs reuse existing mappings
+ 
+-    if ((m_vmem + e_vmem) > ctx->max_vmem) {
+-        // Drop unused mappings
+-        for (uint32_t i=0; i < HTP_MAX_MMAPS; i++) {
+-            bool used = m_reuse & (1<<i);
+-            if (!used) { drop_mmap(ctx, ctx->mmap + i); }
+-        }
+-    }
++    evict_mmaps(ctx, m_reuse, e_vmem, n_bufs - b_reuse, seq, lru);
+ 
+     // Create missing mappings (pass 1)
+     bool mmap_ok = true;
+     for (uint32_t i=0; i < n_bufs; i++) {
+         struct htp_buf_desc *b = bufs + i;
+-        if (!mmap_buf(ctx, b)) {
++        if (!mmap_buf(ctx, b, seq)) {
+             mmap_ok = false;
+             break;
+         }
+@@ -1013,7 +1076,7 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
+         for (uint32_t i=0; i < n_bufs; i++) {
+             struct htp_buf_desc *b = bufs + i;
+             b->base = 0;
+-            if (!mmap_buf(ctx, b)) {
++            if (!mmap_buf(ctx, b, seq)) {
+                 FARF(ERROR, "prep-bufs : mmap failed after defragmentation (fd %u size %u)", b->fd, (uint32_t) b->size);
+                 abort();
+             }
+@@ -1157,7 +1220,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
+     htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
+ 
+     htp_trace_event_start(&ctx->trace[0], HTP_TRACE_EVT_BUFF, 0);
+-    prep_op_bufs(ctx, bufs, n_bufs);
++    prep_op_bufs(ctx, bufs, n_bufs, (uint32_t) req->seq, (req->flags & HTP_OPBATCH_MMAP_LRU) != 0);
+     htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_BUFF, 0);
+ 
+     prep_tensors(ctx, bufs, tens, n_tens);

@@ -225,3 +225,9 @@ fuzz-ops/0019-hexagon-htp-store-only-the-columns-of-dst-in-the-hmx-mul-mat-id-ou
 memory/0007-hexagon-an-environment-switch-for-the-fwht-form-of-the-kv-cache-rotation.patch
 hexagon-fusion/0008-hexagon-fuse-the-gate-chains-of-the-qwen35-layers.patch
 spec-mtp/0001-common-the-mtp-drafter-stops-at-the-draft-length-of-the-call.patch
+
+# The DSP removes only the mappings that a batch needs to free. The batch cache replays a graph of more than one
+# DSP batch. The host makes the text of each profile line when it packs the batch.
+hexagon-host/0004-hexagon-htp-remove-only-the-mappings-that-a-batch-needs-to-free.patch
+hexagon-host/0005-hexagon-replay-the-packed-batches-of-a-graph-of-more-than-one-batch.patch
+hexagon-host/0006-hexagon-format-the-profile-line-of-an-op-when-the-host-packs-the-batch.patch

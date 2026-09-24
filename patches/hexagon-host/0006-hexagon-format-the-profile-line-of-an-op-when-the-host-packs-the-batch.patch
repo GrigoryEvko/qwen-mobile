@@ -1,0 +1,313 @@
+hexagon: format the profile line of an op when the host packs the batch
+Fold-into: patches/hexagon-host/0001-hexagon-host-timers-and-batch-cache.patch
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+The defect
+
+With GGML_HEXAGON_PROFILE the host writes one line for each op when the
+response of the DSP comes. The line gives the names, the dims, the types and
+the strides of the tensors of the op. The host read these values from the ggml
+tensors at the time of the response. Before the response, llama.cpp can build
+the next graph in the same memory, for example the graph of the next ubatch of
+a prompt. Then the line shows the names and the dims of the next graph.
+
+On the phone, the SCALE that clears the state cache_s showed the dims 0:1, but
+its kernel params were for a full row of 2 MiB. Such lines gave incorrect byte
+counts to the roofline analysis of tools/prof.
+
+The change
+
+The op batch makes the text of the line when it adds the op (add_op). When a
+fusion changes the last op (try_fuse), the op batch makes the text again. The
+batch keeps these texts in place of the op nodes, and the response adds the
+times to them. A replay of the batch cache uses the texts of its snapshot.
+Without the profile, the host makes no text. The format of the line does not
+change.
+
+The host does the same work as before, but at a different time. The times of
+the ops come from the DSP and do not change.
+
+The tests
+
+hexhost_graphs (tests/fuzz/hexhost/graphs) ran the image turn of the 4B Q8_0
+at 576 image tokens on the fake DSP, with GGML_HEXAGON_PROFILE=1 and
+GGML_HEXAGON_VERBOSE=1. The image prompt needs more than one ubatch. A script
+compared each profile line of an unfused op with the execute-op line that the
+host wrote when it added the op:
+
+- Without this patch, 6621 of 7761 lines differ. For example, an RMS_NORM
+  shows the dims 128:16:28:1 in place of 128:16:512:1.
+- With this patch, no line differs.
+
+The decode path and the MTP path of hexhost_graphs give no difference with and
+without this patch, because llama.cpp reads the logits before it builds the
+next graph.
+
+The test mode of tests/fuzz/hexhost gives 0 findings in the configurations
+none, asan, ubsan, tsan and msan, each with the debug and the release profile.
+The graph target sets the profile for one input of ten.
+
+The phone
+
+In the profile runs of the stage quick (a prompt of 1024 tokens in one ubatch,
+then 8 decode tokens), the dims of each line agree with the op. That run has no
+second ubatch, thus it does not show the defect.
+
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 1e1db98..0aeebf0 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -297,7 +297,21 @@ static const char * htp_event_name(uint16_t id) {
+     }
+ }
+ 
+-static void ggml_hexagon_dump_op_prof(const std::string &sess_name, const htp_opnode & node, const htp_prof_desc & pd) {
++// The text of the profile line of an op before its times: the op, the names, the dims, the types, the
++// strides and the kernel params. The op batch makes this text when it adds the op (add_op, try_fuse).
++// The response of the DSP comes later. Before the response, llama.cpp can build the next graph in the
++// same memory. A text made at the response can thus show the names and the dims of the next graph.
++static std::string ggml_hexagon_prof_line(const htp_opnode & node) {
++    htp_opformat fmt(node);
++    std::string  s = node.op_name();
++    for (const char * f : { fmt.names, fmt.dims, fmt.types, fmt.strides, fmt.kparams }) {
++        s += '|';
++        s += f;
++    }
++    return s;
++}
++
++static void ggml_hexagon_dump_op_prof(const std::string &sess_name, const std::string & line, const htp_prof_desc & pd) {
+     if (!opt_profile) return;
+ 
+     uint32_t op_usec = pd.usecs;
+@@ -311,10 +325,9 @@ static void ggml_hexagon_dump_op_prof(const std::string &sess_name, const htp_op
+                 pmu[0], pmu[1], pmu[2], pmu[3], pmu[4], pmu[5], pmu[6], pmu[7]);
+     }
+ 
+-    htp_opformat fmt(node);
+     float mhz = op_usec > 0 ? (float) op_cycles / op_usec : 0.0f;
+-    GGML_LOG_DEBUG("ggml-hex: %s profile-op %s|%s|%s|%s|%s|%s|usec %u cycles %u start %u mhz %.1f%s\n", sess_name.c_str(),
+-            node.op_name().c_str(), fmt.names, fmt.dims, fmt.types, fmt.strides, fmt.kparams, op_usec, op_cycles, pd.cycles_start, mhz, pmu_str);
++    GGML_LOG_DEBUG("ggml-hex: %s profile-op %s|usec %u cycles %u start %u mhz %.1f%s\n", sess_name.c_str(),
++            line.c_str(), op_usec, op_cycles, pd.cycles_start, mhz, pmu_str);
+ }
+ 
+ static void ggml_hexagon_dump_batch_prof(const std::string & sess_name, const htp_opbatch_rsp & rsp) {
+@@ -592,6 +605,9 @@ struct ggml_hexagon_hostprof {
+     }
+ };
+ 
++// The profile line texts of the ops of one batch (ggml_hexagon_prof_line), null without profiling
++using ggml_hexagon_prof_lines = std::shared_ptr<const std::vector<std::string>>;
++
+ // The packed batch of one graph_compute call, kept for a replay when the same graph runs again
+ // (GGML_HEXAGON_BATCHCACHE). The descriptors depend on the graph (its uid), on the data pointers
+ // of the tensors, on the op params, and on the slot index of the fused state ops. The replay checks
+@@ -604,8 +620,8 @@ struct ggml_hexagon_batch_snapshot {
+     std::vector<htp_op_desc>  ops;
+     size_t                    b_vmem = 0;
+ 
+-    std::shared_ptr<const std::vector<htp_opnode>> nodes;  // the op nodes for the profile dump, null without profiling
+-    std::shared_ptr<const htp_opnode>              last;   // the node of the last op, which a fusion of the next op reads
++    ggml_hexagon_prof_lines           lines;  // the profile line texts of the ops, null without profiling
++    std::shared_ptr<const htp_opnode> last;   // the node of the last op, which a fusion of the next op reads
+ 
+     std::vector<std::pair<const ggml_tensor *, uint16_t>> t_refs;   // each add_tensor call: the tensor and its index
+     std::vector<const ggml_tensor *>                      o_nodes;  // each op: the ggml node whose op params it copied
+@@ -626,7 +642,7 @@ struct ggml_hexagon_batch_snapshot {
+         std::vector<htp_op_desc>  ops;
+         size_t                    b_vmem = 0;
+ 
+-        std::shared_ptr<const std::vector<htp_opnode>>        nodes;
++        ggml_hexagon_prof_lines                               lines;
+         std::vector<std::pair<const ggml_tensor *, uint16_t>> t_refs;
+         std::vector<const ggml_tensor *>                      o_nodes;
+         std::vector<gdn_ref>                                  gdn;
+@@ -656,7 +672,7 @@ struct ggml_hexagon_batch_view {
+     uint32_t             n_ops  = 0;
+     size_t               b_vmem = 0;
+ 
+-    std::shared_ptr<const std::vector<htp_opnode>> nodes;  // for the profile dump, null without profiling
++    ggml_hexagon_prof_lines lines;  // the profile line texts of the ops, null without profiling
+ };
+ 
+ struct ggml_hexagon_session {
+@@ -2430,6 +2446,7 @@ struct ggml_hexagon_opbatch {
+     ggml_hexagon_session*            sess;
+ 
+     std::vector<htp_opnode>          ops;       // htp_opnode of ops
++    std::vector<std::string>         prof_lines; // the profile line text of each op, only with profiling
+ 
+     std::vector<htp_buf_desc>        h_bufs;    // htp buffer descriptors
+     std::vector<htp_tensor>          h_tens;    // htp tensor descriptors
+@@ -2480,7 +2497,8 @@ struct ggml_hexagon_opbatch {
+         h.tens.assign(h_tens.begin(), h_tens.begin() + n_tens);
+         h.ops.assign(h_ops.begin(), h_ops.begin() + n_ops);
+         h.b_vmem  = b_vmem;
+-        h.nodes   = opt_profile ? std::make_shared<const std::vector<htp_opnode>>(ops.begin(), ops.begin() + n_ops) : nullptr;
++        h.lines   = opt_profile ? std::make_shared<const std::vector<std::string>>(prof_lines.begin(), prof_lines.begin() + n_ops)
++                                : nullptr;
+         h.t_refs  = t_refs;
+         h.o_nodes = o_nodes;
+         h.gdn     = gdn_refs;
+@@ -2488,8 +2506,8 @@ struct ggml_hexagon_opbatch {
+         return h;
+     }
+ 
+-    // The descriptors that the queue sends. The op nodes go with them only for the profile dump.
+-    ggml_hexagon_batch_view view(std::shared_ptr<const std::vector<htp_opnode>> nodes) const {
++    // The descriptors that the queue sends. The profile line texts go with them only for the profile dump.
++    ggml_hexagon_batch_view view(ggml_hexagon_prof_lines lines) const {
+         ggml_hexagon_batch_view v;
+         v.bufs   = h_bufs.data();
+         v.tens   = h_tens.data();
+@@ -2498,7 +2516,7 @@ struct ggml_hexagon_opbatch {
+         v.n_tens = n_tens;
+         v.n_ops  = n_ops;
+         v.b_vmem = b_vmem;
+-        v.nodes  = std::move(nodes);
++        v.lines  = std::move(lines);
+         return v;
+     }
+ 
+@@ -2512,6 +2530,7 @@ struct ggml_hexagon_opbatch {
+         b_vmem_max = max_vmem;
+ 
+         ops.resize(n_ops_max);
++        prof_lines.resize(n_ops_max);
+ 
+         h_bufs.resize(n_bufs_max);
+         h_tens.resize(n_tens_max);
+@@ -2695,6 +2714,9 @@ struct ggml_hexagon_opbatch {
+         arrays_uid = 0;
+         ops[n] = node;
+         o_nodes.push_back(node.node);
++        if (opt_profile) {
++            prof_lines[n] = ggml_hexagon_prof_line(node);
++        }
+ 
+         htp_op_desc &o = h_ops[n];
+         memcpy(o.params,        node.node->op_params, sizeof(node.node->op_params));
+@@ -3402,6 +3424,9 @@ struct ggml_hexagon_opbatch {
+         if (fused) {
+             // The fusion changed the descriptor of the last op, thus the arrays hold no snapshot
+             arrays_uid = 0;
++            if (opt_profile) {
++                prof_lines[n_ops - 1] = ggml_hexagon_prof_line(ops[n_ops - 1]);
++            }
+         }
+         return fused;
+     }
+@@ -3420,9 +3445,7 @@ struct ggml_hexagon_opqueue {
+     size_t                      shm_blk_size;
+     size_t                      depth;
+ 
+-    using opvec = std::shared_ptr<const std::vector<htp_opnode>>;
+-
+-    std::vector<opvec>          op_cache;       // per batch op nodes, for the profile dump (null without profiling)
++    std::vector<ggml_hexagon_prof_lines> op_cache;  // per batch profile line texts, for the profile dump (null without profiling)
+     std::vector<uint64_t>       start_usec;     // per batch start time
+ 
+     ggml_hexagon_opqueue(ggml_hexagon_session *sess, size_t batch_size, size_t depth) : depth(depth) {
+@@ -3477,7 +3500,7 @@ struct ggml_hexagon_opqueue {
+         req.n_ops     = op_batch.n_ops;
+         req.flags     = opt_mmap_lru ? HTP_OPBATCH_MMAP_LRU : 0;
+ 
+-        op_cache[slot]   = op_batch.nodes;
++        op_cache[slot]   = op_batch.lines;
+         start_usec[slot] = ggml_time_us();
+ 
+         const size_t b_size = sizeof(htp_buf_desc)  * req.n_bufs;
+@@ -3557,8 +3580,8 @@ struct ggml_hexagon_opqueue {
+         uint8_t * p_ptr = m_ptr + (b_size + t_size + o_size);
+ 
+         if (rsp.n_ops > 0 && opt_profile && op_cache[slot]) {
+-            const auto & ops = *op_cache[slot];
+-            GGML_ASSERT(rsp.n_ops <= ops.size());
++            const auto & lines = *op_cache[slot];
++            GGML_ASSERT(rsp.n_ops <= lines.size());
+ 
+             const htp_prof_desc * pd = (const htp_prof_desc *) p_ptr;
+             const htp_trace_desc * trace_events = nullptr;
+@@ -3572,7 +3595,7 @@ struct ggml_hexagon_opqueue {
+ 
+             for (uint32_t i = 0; i < rsp.n_ops; i++) {
+                 if (opt_profile) {
+-                    ggml_hexagon_dump_op_prof(shm_buf->sess->name, ops[i], pd[i]);
++                    ggml_hexagon_dump_op_prof(shm_buf->sess->name, lines[i], pd[i]);
+                 }
+             }
+ 
+@@ -3705,18 +3728,19 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
+ 
+     op_batch->update_mdev_group(this->mdev.idx);
+ 
+-    // The op nodes travel with the batch only for the profile dump. A replayed batch shares the
+-    // nodes of its snapshot.
+-    std::shared_ptr<const std::vector<htp_opnode>> nodes;
++    // The profile line texts travel with the batch only for the profile dump. A replayed batch shares the
++    // texts of its snapshot.
++    ggml_hexagon_prof_lines lines;
+     if (opt_profile) {
+         const auto * entry = op_batch->arrays_uid ? graph_cache_find(op_batch->arrays_uid) : nullptr;
+-        if (entry && entry->snap.valid && entry->snap.nodes) {
+-            nodes = entry->snap.nodes;
++        if (entry && entry->snap.valid && entry->snap.lines) {
++            lines = entry->snap.lines;
+         } else {
+-            nodes = std::make_shared<const std::vector<htp_opnode>>(op_batch->ops.begin(), op_batch->ops.begin() + op_batch->n_ops);
++            lines = std::make_shared<const std::vector<std::string>>(op_batch->prof_lines.begin(),
++                                                                     op_batch->prof_lines.begin() + op_batch->n_ops);
+         }
+     }
+-    const ggml_hexagon_batch_view view = op_batch->view(std::move(nodes));
++    const ggml_hexagon_batch_view view = op_batch->view(std::move(lines));
+ 
+     if (!op_queue->push(req, dbuf, view, seq)) {
+         flush_pending(false);
+@@ -3815,7 +3839,8 @@ void ggml_hexagon_session::batch_snapshot(ggml_hexagon_graph_cache_entry & entry
+     s.tens.assign(b.h_tens.begin(), b.h_tens.begin() + b.n_tens);
+     s.ops.assign(b.h_ops.begin(),   b.h_ops.begin()  + b.n_ops);
+     s.b_vmem = b.b_vmem;
+-    s.nodes  = opt_profile ? std::make_shared<const std::vector<htp_opnode>>(b.ops.begin(), b.ops.begin() + b.n_ops) : nullptr;
++    s.lines  = opt_profile ? std::make_shared<const std::vector<std::string>>(b.prof_lines.begin(), b.prof_lines.begin() + b.n_ops)
++                           : nullptr;
+     s.last   = b.n_ops > 0 ? std::make_shared<const htp_opnode>(b.ops[b.n_ops - 1]) : nullptr;
+     s.t_refs  = b.t_refs;
+     s.o_nodes = b.o_nodes;
+@@ -3876,8 +3901,8 @@ void ggml_hexagon_session::batch_send_head(const ggml_hexagon_batch_snapshot::he
+     std::copy(h.bufs.begin(), h.bufs.end(), b.h_bufs.begin());
+     std::copy(h.tens.begin(), h.tens.end(), b.h_tens.begin());
+     std::copy(h.ops.begin(),  h.ops.end(),  b.h_ops.begin());
+-    if (h.nodes) {
+-        std::copy(h.nodes->begin(), h.nodes->end(), b.ops.begin());  // the profile dump of the batch
++    if (h.lines) {
++        std::copy(h.lines->begin(), h.lines->end(), b.prof_lines.begin());  // the profile dump of the batch
+     }
+     b.n_bufs     = (unsigned int) h.bufs.size();
+     b.n_tens     = (unsigned int) h.tens.size();
+@@ -3918,8 +3943,8 @@ bool ggml_hexagon_session::batch_replay(ggml_hexagon_graph_cache_entry & entry,
+         std::copy(s.bufs.begin(), s.bufs.end(), b.h_bufs.begin());
+         std::copy(s.tens.begin(), s.tens.end(), b.h_tens.begin());
+         std::copy(s.ops.begin(),  s.ops.end(),  b.h_ops.begin());
+-        if (s.nodes) {
+-            std::copy(s.nodes->begin(), s.nodes->end(), b.ops.begin());  // the profile dump of ops added after the replay
++        if (s.lines) {
++            std::copy(s.lines->begin(), s.lines->end(), b.prof_lines.begin());  // the profile dump of ops added after the replay
+         }
+         b.arrays_uid = uid;
+     } else {
+@@ -3934,9 +3959,9 @@ bool ggml_hexagon_session::batch_replay(ggml_hexagon_graph_cache_entry & entry,
+     b.n_ops  = (unsigned int) s.ops.size();
+     b.b_vmem = s.b_vmem;
+ 
+-    // A fusion of the next op changes the last op, and it reads the node of that op. Without the
+-    // profile the node array holds the nodes of the last packing, which can come from a different
+-    // graph, thus the replay sets the last node.
++    // A fusion of the next op changes the last op, and it reads the node of that op. The node array
++    // holds the nodes of the last packing, which can come from a different graph, thus the replay
++    // sets the last node.
+     if (s.last && b.n_ops > 0) {
+         b.ops[b.n_ops - 1] = *s.last;
+     }

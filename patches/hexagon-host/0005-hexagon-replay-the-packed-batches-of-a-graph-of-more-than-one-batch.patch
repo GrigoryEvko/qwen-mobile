@@ -1,0 +1,483 @@
+hexagon: replay the packed batches of a graph of more than one batch
+Fold-into: patches/hexagon-host/0001-hexagon-host-timers-and-batch-cache.patch
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+The defect
+
+The batch cache replays only a graph that fits in one DSP batch. A decode token
+of the 4B Q8_0 needs 4 batches, thus the host packs each token again. In a chat
+on the phone, the stage of the fixed costs measured a pack of 2.1 ms for each
+decode token, and the host times (LLAMA_HOSTPROF) show "replays 0".
+
+The change
+
+While the host packs a graph whose first batch is empty, flush_batch keeps a
+copy of each batch that it sends. Such a copy is a head of the snapshot, with
+its buffers in the sorted sequence of flush_batch. batch_snapshot keeps the
+heads and the last batch, when no batch holds the unfused ops of a state chain.
+batch_replay checks each batch as before: the data pointer and the buffer of
+each tensor, the op params, and the slot index of each fused state op. Then it
+sends each head, and it loads the last batch into the op batch, as for a graph
+of one batch.
+
+With GGML_HEXAGON_BATCHCACHE=2 the fresh packing runs before the replay sends a
+batch. flush_batch keeps the batches of the fresh packing (capture_hold) and
+does not send them. When a batch differs, the fresh packing goes out in place
+of the replay. The switch GGML_HEXAGON_BATCHCACHE_MULTI (preset 1) gives 0:
+only a graph of one batch has a replay.
+
+The tests
+
+The test mode of tests/fuzz/hexhost gives 0 findings in the configurations
+none, asan, ubsan, tsan and msan, each with the debug and the release profile.
+Its symbolic check compares the result of each step on the device with the
+meaning of the graph. The harness sets batch sizes of 1 to 1280 ops and a VA
+limit of 64 MiB, thus many graphs need more than one batch. On the regression
+inputs and a corpus of 503 inputs of 2 minutes of fuzzing, 287 replays had 1 to
+30 heads, and 69 of them ran with the compare of GGML_HEXAGON_BATCHCACHE=2. No
+compare found a difference, and the symbolic check found no violation.
+
+The phone
+
+The stage quick ran the 4B Q8_0 in the app configuration. It measured this
+patch together with the patches before and after it and with a change of the
+rows of the pointwise unary ops, which is not in the series:
+
+- Against HEAD, tg32 at the depth 0 is +1.50 % and pp512 is +3.38 %. The next
+  phone batch measures the three patches without the row change.
+- For each decode token after a prompt of 64 tokens (LLAMA_HOSTPROF, medians
+  of 21 tokens), the pack takes 199 us with the preset value and 2158 us with
+  GGML_HEXAGON_BATCHCACHE_MULTI=0, and 21 of 21 tokens are replays. The time
+  from the last response of a token to the first send of the next token is
+  983 us and 1592 us.
+- The logits hashes of a prompt of 1024 tokens and 16 decode tokens are the
+  same with GGML_HEXAGON_BATCHCACHE_MULTI=0 and with the preset value. A second
+  pass of the prompt into a cleared memory, which is a replay of the prompt
+  graph, gives the hashes of the first pass.
+
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 384de91..1e1db98 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -136,6 +136,10 @@ static int opt_fwht = 1;
+ // repeated graph when only the input data changed, 2 = replay and compare the replay with a fresh packing
+ static int opt_batchcache = 1;
+ 
++// GGML_HEXAGON_BATCHCACHE_MULTI: 1 = the batch cache also replays a graph that needs more than one DSP batch
++// (a decode token of the 4B needs 4), 0 = it replays only a graph of one batch
++static int opt_batchcache_multi = 1;
++
+ // LLAMA_HOSTPROF: print the host-side times of each token (the same variable as in llama-context.cpp)
+ static int opt_hostprof = 0;
+ 
+@@ -613,6 +617,23 @@ struct ggml_hexagon_batch_snapshot {
+     };
+     std::vector<gdn_ref> gdn;        // the fused state ops of the gated delta net layers
+ 
++    // A batch of the graph before its last batch (GGML_HEXAGON_BATCHCACHE_MULTI). The host sent it during the
++    // packing, thus it holds the descriptors as the host sent them, with the buffers in the sorted sequence.
++    // A replay sends each head, then keeps the last batch (the fields above) for the ops that follow.
++    struct head {
++        std::vector<htp_buf_desc> bufs;
++        std::vector<htp_tensor>   tens;
++        std::vector<htp_op_desc>  ops;
++        size_t                    b_vmem = 0;
++
++        std::shared_ptr<const std::vector<htp_opnode>>        nodes;
++        std::vector<std::pair<const ggml_tensor *, uint16_t>> t_refs;
++        std::vector<const ggml_tensor *>                      o_nodes;
++        std::vector<gdn_ref>                                  gdn;
++        bool                                                  has_alt = false;
++    };
++    std::vector<head> heads;
++
+     bool valid = false;
+ };
+ 
+@@ -676,6 +697,11 @@ struct ggml_hexagon_session {
+     uint64_t                                                     graph_cache_clock = 0;
+ 
+     ggml_hexagon_opbatch * verify_batch = nullptr;  // a fresh packing to compare with a replay (GGML_HEXAGON_BATCHCACHE=2)
++
++    // When capture is set, flush_batch adds a copy of each batch to it. With capture_hold it keeps the batch
++    // and does not send it (the verify packing of a graph of more than one batch).
++    std::vector<ggml_hexagon_batch_snapshot::head> * capture      = nullptr;
++    bool                                             capture_hold = false;
+     ggml_hexagon_hostprof  hp;                      // the host-side times of the current token (LLAMA_HOSTPROF)
+ 
+     // The slot index of each fused recurrent op of the graph in graph_compute, read from s_copy
+@@ -731,9 +757,11 @@ struct ggml_hexagon_session {
+     void flush_peers();
+     void flush_pending(bool all = true);
+ 
+-    void batch_snapshot(ggml_hexagon_graph_cache_entry & entry, uint64_t uid);
++    void batch_snapshot(ggml_hexagon_graph_cache_entry & entry, uint64_t uid,
++                        std::vector<ggml_hexagon_batch_snapshot::head> && heads);
+     bool batch_replay(ggml_hexagon_graph_cache_entry & entry, uint64_t uid);
+-    void batch_verify(ggml_hexagon_graph_cache_entry & entry, uint64_t uid);
++    bool batch_verify(ggml_hexagon_graph_cache_entry & entry, uint64_t uid);
++    void batch_send_head(const ggml_hexagon_batch_snapshot::head & h);
+     void hostprof_print();
+ 
+     bool clone_buffer(const ggml_hexagon_shared_buffer*);
+@@ -2445,6 +2473,21 @@ struct ggml_hexagon_opbatch {
+         has_alt = false;
+     }
+ 
++    // A copy of the batch for a snapshot of a graph of more than one batch (flush_batch)
++    ggml_hexagon_batch_snapshot::head head_copy() const {
++        ggml_hexagon_batch_snapshot::head h;
++        h.bufs.assign(h_bufs.begin(), h_bufs.begin() + n_bufs);
++        h.tens.assign(h_tens.begin(), h_tens.begin() + n_tens);
++        h.ops.assign(h_ops.begin(), h_ops.begin() + n_ops);
++        h.b_vmem  = b_vmem;
++        h.nodes   = opt_profile ? std::make_shared<const std::vector<htp_opnode>>(ops.begin(), ops.begin() + n_ops) : nullptr;
++        h.t_refs  = t_refs;
++        h.o_nodes = o_nodes;
++        h.gdn     = gdn_refs;
++        h.has_alt = has_alt;
++        return h;
++    }
++
+     // The descriptors that the queue sends. The op nodes go with them only for the profile dump.
+     ggml_hexagon_batch_view view(std::shared_ptr<const std::vector<htp_opnode>> nodes) const {
+         ggml_hexagon_batch_view v;
+@@ -3647,6 +3690,14 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
+ 
+     op_batch->sort_buffers();
+ 
++    if (capture) {
++        capture->push_back(op_batch->head_copy());
++        if (capture_hold) {
++            op_batch->reset();
++            return;
++        }
++    }
++
+     htp_opbatch_req req {};
+     dspqueue_buffer dbuf{};
+ 
+@@ -3750,12 +3801,15 @@ ggml_hexagon_graph_cache_entry & ggml_hexagon_session::graph_cache_insert(uint64
+     return entry;
+ }
+ 
+-// Keeps the packed batch of one graph for a replay. The caller made sure that the batch holds this
+-// graph and nothing else, and that no flush happened while the graph was packed.
+-void ggml_hexagon_session::batch_snapshot(ggml_hexagon_graph_cache_entry & entry, uint64_t uid) {
++// Keeps the packed batches of one graph for a replay: heads, the batches that the host sent while it packed
++// the graph (flush_batch copied them), and the last batch in op_batch. The caller made sure that the batches
++// hold this graph and nothing else.
++void ggml_hexagon_session::batch_snapshot(ggml_hexagon_graph_cache_entry & entry, uint64_t uid,
++                                          std::vector<ggml_hexagon_batch_snapshot::head> && heads) {
+     auto &       s = entry.snap;
+     const auto & b = *op_batch;
+ 
++    s.heads  = std::move(heads);
+     s.uid    = uid;
+     s.bufs.assign(b.h_bufs.begin(), b.h_bufs.begin() + b.n_bufs);
+     s.tens.assign(b.h_tens.begin(), b.h_tens.begin() + b.n_tens);
+@@ -3770,22 +3824,21 @@ void ggml_hexagon_session::batch_snapshot(ggml_hexagon_graph_cache_entry & entry
+ 
+     op_batch->arrays_uid = uid;
+ 
+-    HEX_VERBOSE("ggml-hex: %s batch-cache: kept graph %llu : n-bufs %u n-tensors %u n-ops %u refs %zu gdn %zu\n", c_name(),
+-                (unsigned long long) uid, b.n_bufs, b.n_tens, b.n_ops, s.t_refs.size(), s.gdn.size());
++    HEX_VERBOSE("ggml-hex: %s batch-cache: kept graph %llu : heads %zu, last batch n-bufs %u n-tensors %u n-ops %u refs %zu gdn %zu\n",
++                c_name(), (unsigned long long) uid, s.heads.size(), b.n_bufs, b.n_tens, b.n_ops, s.t_refs.size(), s.gdn.size());
+ }
+ 
+-// Loads the packed batch of the graph into the empty op batch, when the batch is still correct:
+-// the same data pointer for each tensor, the same op params, and a valid slot index for each fused
+-// state op. The descriptors then equal a fresh packing byte for byte (GGML_HEXAGON_BATCHCACHE=2 checks).
+-bool ggml_hexagon_session::batch_replay(ggml_hexagon_graph_cache_entry & entry, uint64_t uid) {
+-    auto & s = entry.snap;
+-    if (!s.valid || s.uid != uid) {
+-        return false;
+-    }
+-
+-    for (const auto & ref : s.t_refs) {
++// True when the descriptors of one batch of a snapshot are still correct: the same data pointer and
++// buffer for each tensor, the same op params, and a valid slot index for each fused state op. It writes
++// the slot index of the token into each fused state op. O(tensor references + ops).
++static bool ggml_hexagon_batch_refs_valid(const std::vector<std::pair<const ggml_tensor *, uint16_t>> & t_refs,
++                                          const std::vector<const ggml_tensor *> & o_nodes,
++                                          const std::vector<ggml_hexagon_batch_snapshot::gdn_ref> & gdn,
++                                          const std::vector<htp_buf_desc> & bufs, const std::vector<htp_tensor> & tens,
++                                          std::vector<htp_op_desc> & ops) {
++    for (const auto & ref : t_refs) {
+         const ggml_tensor * t = ref.first;
+-        const htp_tensor &  h = s.tens[ref.second];
++        const htp_tensor &  h = tens[ref.second];
+         if (!t->buffer) {
+             return false;
+         }
+@@ -3793,25 +3846,71 @@ bool ggml_hexagon_session::batch_replay(ggml_hexagon_graph_cache_entry & entry,
+         if ((uint64_t) ((const uint8_t *) t->data - sbuf->base()) != h.data) {
+             return false;
+         }
+-        if (s.bufs[h.bi].fd != (uint32_t) sbuf->fd()) {
++        if (bufs[h.bi].fd != (uint32_t) sbuf->fd()) {
+             return false;
+         }
+     }
+ 
+-    for (size_t i = 0; i < s.o_nodes.size(); i++) {
+-        if (s.o_nodes[i] && memcmp(s.o_nodes[i]->op_params, s.ops[i].params, sizeof(s.ops[i].params)) != 0) {
++    for (size_t i = 0; i < o_nodes.size(); i++) {
++        if (o_nodes[i] && memcmp(o_nodes[i]->op_params, ops[i].params, sizeof(ops[i].params)) != 0) {
+             return false;
+         }
+     }
+ 
+     // The slot index of a fused state op is a value of the token. When it is not valid, the unfused
+     // chain must run, thus the graph is packed again.
+-    for (const auto & g : s.gdn) {
++    for (const auto & g : gdn) {
+         int32_t slot = -1;
+         if (ggml_hexagon_gdn_slot_index_check(g.idx, g.states, &slot)) {
+             return false;
+         }
+-        s.ops[g.oi].kernel_params[0] = slot;
++        ops[g.oi].kernel_params[0] = slot;
++    }
++    return true;
++}
++
++// Sends one head of a snapshot: the op batch is empty, and the head holds its descriptors as the host sent
++// them the first time (sorted), thus flush_batch sends the same bytes.
++void ggml_hexagon_session::batch_send_head(const ggml_hexagon_batch_snapshot::head & h) {
++    auto & b = *op_batch;
++    std::copy(h.bufs.begin(), h.bufs.end(), b.h_bufs.begin());
++    std::copy(h.tens.begin(), h.tens.end(), b.h_tens.begin());
++    std::copy(h.ops.begin(),  h.ops.end(),  b.h_ops.begin());
++    if (h.nodes) {
++        std::copy(h.nodes->begin(), h.nodes->end(), b.ops.begin());  // the profile dump of the batch
++    }
++    b.n_bufs     = (unsigned int) h.bufs.size();
++    b.n_tens     = (unsigned int) h.tens.size();
++    b.n_ops      = (unsigned int) h.ops.size();
++    b.b_vmem     = h.b_vmem;
++    b.arrays_uid = 0;
++    flush_batch();
++}
++
++// Loads the packed batches of the graph, when each batch is still correct (ggml_hexagon_batch_refs_valid).
++// The descriptors then equal a fresh packing byte for byte (GGML_HEXAGON_BATCHCACHE=2 checks that before the
++// replay sends a batch). The replay sends each head and loads the last batch into the empty op batch.
++bool ggml_hexagon_session::batch_replay(ggml_hexagon_graph_cache_entry & entry, uint64_t uid) {
++    auto & s = entry.snap;
++    if (!s.valid || s.uid != uid) {
++        return false;
++    }
++
++    for (auto & h : s.heads) {
++        if (h.has_alt || !ggml_hexagon_batch_refs_valid(h.t_refs, h.o_nodes, h.gdn, h.bufs, h.tens, h.ops)) {
++            return false;
++        }
++    }
++    if (!ggml_hexagon_batch_refs_valid(s.t_refs, s.o_nodes, s.gdn, s.bufs, s.tens, s.ops)) {
++        return false;
++    }
++
++    if (opt_batchcache >= 2 && !batch_verify(entry, uid)) {
++        return true;  // the replay differs, and the fresh packing of batch_verify went out in its place
++    }
++
++    for (const auto & h : s.heads) {
++        batch_send_head(h);
+     }
+ 
+     auto & b = *op_batch;
+@@ -3852,61 +3951,92 @@ bool ggml_hexagon_session::batch_replay(ggml_hexagon_graph_cache_entry & entry,
+     return true;
+ }
+ 
+-// Packs the graph again into a second batch and compares the result with the replay
+-// (GGML_HEXAGON_BATCHCACHE=2). When the two differ, the fresh packing runs.
+-void ggml_hexagon_session::batch_verify(ggml_hexagon_graph_cache_entry & entry, uint64_t uid) {
++// The first difference of two batches of descriptors, or null when the two are equal. at gets the index.
++static const char * ggml_hexagon_batch_diff(const htp_buf_desc * b0, size_t nb0, const htp_tensor * t0, size_t nt0,
++                                            const htp_op_desc * o0, size_t no0, const htp_buf_desc * b1, size_t nb1,
++                                            const htp_tensor * t1, size_t nt1, const htp_op_desc * o1, size_t no1,
++                                            size_t * at) {
++    if (nb0 != nb1 || nt0 != nt1 || no0 != no1) {
++        return "the counts";
++    }
++    for (size_t i = 0; i < nb0; i++) {
++        if (memcmp(&b0[i], &b1[i], sizeof(htp_buf_desc)) != 0) { *at = i; return "buffer"; }
++    }
++    for (size_t i = 0; i < nt0; i++) {
++        if (memcmp(&t0[i], &t1[i], sizeof(htp_tensor)) != 0) { *at = i; return "tensor"; }
++    }
++    for (size_t i = 0; i < no0; i++) {
++        if (memcmp(&o0[i], &o1[i], sizeof(htp_op_desc)) != 0) { *at = i; return "op"; }
++    }
++    return nullptr;
++}
++
++// Packs the graph again (GGML_HEXAGON_BATCHCACHE=2), before the replay sends a batch, and compares each batch
++// with the snapshot. flush_batch keeps the batches of the fresh packing (capture_hold) and does not send them.
++// The heads of the two are sorted (flush_batch sorts), and the two last batches are not. Gives true when the
++// two are equal. Else the fresh packing goes out in place of the replay: each fresh head, then the fresh last
++// batch stays in op_batch. O(descriptors).
++bool ggml_hexagon_session::batch_verify(ggml_hexagon_graph_cache_entry & entry, uint64_t uid) {
+     if (!verify_batch) {
+         verify_batch = new ggml_hexagon_opbatch(this, opt_opbatch, this->max_vmem);
+     }
+ 
+-    const uint64_t seq_before = batch_req_seq;
++    const auto & s = entry.snap;
++    std::vector<ggml_hexagon_batch_snapshot::head> fresh;
+ 
++    capture      = &fresh;
++    capture_hold = true;
+     std::swap(op_batch, verify_batch);
+     for (const auto & node : entry.nodes) {
+         enqueue_op(node);
+     }
+     std::swap(op_batch, verify_batch);
++    capture      = nullptr;
++    capture_hold = false;
+ 
+-    auto & r = *op_batch;      // the replay
+-    auto & v = *verify_batch;  // the fresh packing
++    auto & v = *verify_batch;  // the last batch of the fresh packing
+ 
+     const char * diff = nullptr;
+     size_t       at   = 0;
+-
+-    if (batch_req_seq != seq_before) {
+-        diff = "the fresh packing did not fit in one batch";
+-    } else if (r.n_bufs != v.n_bufs || r.n_tens != v.n_tens || r.n_ops != v.n_ops) {
+-        diff = "the counts";
+-    } else {
+-        r.sort_buffers();
+-        v.sort_buffers();
+-        for (unsigned int i = 0; i < r.n_bufs && !diff; i++) {
+-            if (memcmp(&r.h_bufs[i], &v.h_bufs[i], sizeof(htp_buf_desc)) != 0) { diff = "buffer"; at = i; }
+-        }
+-        for (unsigned int i = 0; i < r.n_tens && !diff; i++) {
+-            if (memcmp(&r.h_tens[i], &v.h_tens[i], sizeof(htp_tensor)) != 0) { diff = "tensor"; at = i; }
+-        }
+-        for (unsigned int i = 0; i < r.n_ops && !diff; i++) {
+-            if (memcmp(&r.h_ops[i], &v.h_ops[i], sizeof(htp_op_desc)) != 0) { diff = "op"; at = i; }
++    size_t       part = 0;
++
++    if (fresh.size() != s.heads.size()) {
++        diff = "the batch count";
++    }
++    for (; !diff && part < fresh.size(); part++) {
++        const auto & h = s.heads[part];
++        const auto & f = fresh[part];
++        diff = ggml_hexagon_batch_diff(h.bufs.data(), h.bufs.size(), h.tens.data(), h.tens.size(), h.ops.data(),
++                                       h.ops.size(), f.bufs.data(), f.bufs.size(), f.tens.data(), f.tens.size(),
++                                       f.ops.data(), f.ops.size(), &at);
++        if (diff) {
++            break;
+         }
+     }
++    if (!diff) {
++        diff = ggml_hexagon_batch_diff(s.bufs.data(), s.bufs.size(), s.tens.data(), s.tens.size(), s.ops.data(),
++                                       s.ops.size(), v.h_bufs.data(), v.n_bufs, v.h_tens.data(), v.n_tens,
++                                       v.h_ops.data(), v.n_ops, &at);
++    }
+ 
+     if (!diff) {
+         hp.n_verified++;
+-        HEX_VERBOSE("ggml-hex: %s batch-cache verify: graph %llu : the replay equals the fresh packing (%u ops)\n",
+-                    c_name(), (unsigned long long) uid, r.n_ops);
++        HEX_VERBOSE("ggml-hex: %s batch-cache verify: graph %llu : the replay equals the fresh packing (%zu heads, %u ops in the last batch)\n",
++                    c_name(), (unsigned long long) uid, s.heads.size(), v.n_ops);
+         v.reset();
+-        return;
++        return true;
+     }
+ 
+-    GGML_LOG_ERROR("ggml-hex: %s batch-cache verify: graph %llu : the replay differs from the fresh packing at %s #%zu, the fresh packing runs\n",
+-                   c_name(), (unsigned long long) uid, diff, at);
++    GGML_LOG_ERROR("ggml-hex: %s batch-cache verify: graph %llu : the replay differs from the fresh packing at batch %zu %s #%zu, the fresh packing runs\n",
++                   c_name(), (unsigned long long) uid, part, diff, at);
+ 
+-    if (batch_req_seq == seq_before) {
+-        std::swap(op_batch, verify_batch);
++    entry.snap.valid = false;
++    for (const auto & f : fresh) {
++        batch_send_head(f);
+     }
++    std::swap(op_batch, verify_batch);
+     verify_batch->reset();
+-    entry.snap.valid = false;
++    return false;
+ }
+ 
+ void ggml_hexagon_session::hostprof_print() {
+@@ -6805,16 +6935,16 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+     ggml_hexagon_graph_cache_entry * entry = graph->uid != 0 ? sess->graph_cache_find(graph->uid) : nullptr;
+     const bool cache_hit = entry != nullptr;
+ 
+-    // The packed batch of the last run of this graph, when only the input data changed
++    // The packed batches of the last run of this graph, when only the input data changed
+     if (cache_hit && opt_batchcache && sess->op_batch->n_ops == 0 && sess->batch_replay(*entry, graph->uid)) {
+-        if (opt_batchcache >= 2) {
+-            sess->batch_verify(*entry, graph->uid);
+-        }
+         if (opt_hostprof) {
+             sess->hp.n_graphs++;
+             sess->hp.n_hits++;
+             sess->hp.n_replays++;
+             sess->hp.n_ops   += sess->op_batch->n_ops;
++            for (const auto & h : entry->snap.heads) {
++                sess->hp.n_ops += (uint32_t) h.ops.size();
++            }
+             sess->hp.pack_us += ggml_time_us() - t_start;
+         }
+         return sess->last_error > HTP_STATUS_OK ? GGML_STATUS_FAILED : GGML_STATUS_SUCCESS;
+@@ -6935,19 +7065,28 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+     const bool     batch_empty = sess->op_batch->n_ops == 0;
+     const uint64_t seq_before  = sess->batch_req_seq;
+ 
++    // The batches that the host sends while it packs the graph, for a snapshot of a graph of more than one
++    // batch. The first batch must hold only this graph.
++    std::vector<ggml_hexagon_batch_snapshot::head> heads;
++    const bool capture = opt_batchcache && opt_batchcache_multi && entry && batch_empty && sess->mdev.count == 1;
++    sess->capture      = capture ? &heads : nullptr;
++
+     sess->latch_gdn_slots(*nodes_ptr);
+     for (const auto & node : *nodes_ptr) {
+         sess->enqueue_op(node);
+     }
+     sess->gdn_slots.clear();
++    sess->capture = nullptr;
+ 
+     const bool one_batch = batch_empty && sess->batch_req_seq == seq_before && sess->op_batch->n_ops > 0;
++    const bool all_heads = capture && sess->batch_req_seq == seq_before + heads.size() &&
++                           std::none_of(heads.begin(), heads.end(), [](const auto & h) { return h.has_alt; });
+ 
+     if (opt_batchcache && entry) {
+-        // One batch that holds this graph, and nothing else, can be replayed. A multi-device group adds
++        // The batches that hold this graph, and nothing else, can be replayed. A multi-device group adds
+         // an op with a per-call fence, thus its batch is packed each time.
+-        if (one_batch && !sess->op_batch->has_alt && sess->mdev.count == 1) {
+-            sess->batch_snapshot(*entry, graph->uid);
++        if ((one_batch || (all_heads && sess->op_batch->n_ops > 0)) && !sess->op_batch->has_alt && sess->mdev.count == 1) {
++            sess->batch_snapshot(*entry, graph->uid, std::move(heads));
+         } else {
+             entry->snap.valid = false;
+         }
+@@ -8294,6 +8433,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     const char * str_optrace  = getenv("GGML_HEXAGON_OPTRACE");
+     const char * str_hostbuf  = getenv("GGML_HEXAGON_HOSTBUF");
+     const char * str_batchcache = getenv("GGML_HEXAGON_BATCHCACHE");
++    const char * str_batchcache_multi = getenv("GGML_HEXAGON_BATCHCACHE_MULTI");
+     const char * str_graphcache = getenv("GGML_HEXAGON_GRAPHCACHE");
+     const char * str_mmap_lru   = getenv("GGML_HEXAGON_MMAP_LRU");
+     const char * str_hostprof   = getenv("LLAMA_HOSTPROF");
+@@ -8362,6 +8502,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     opt_vmem      = str_vmem     ? strtoul(str_vmem, NULL, 0) * MiB       : opt_vmem;
+     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf) != 0                 : opt_hostbuf;
+     opt_batchcache = str_batchcache ? atoi(str_batchcache)                : opt_batchcache;
++    opt_batchcache_multi = str_batchcache_multi ? atoi(str_batchcache_multi) : opt_batchcache_multi;
+     opt_graphcache = str_graphcache ? atoi(str_graphcache)                : opt_graphcache;
+     opt_mmap_lru   = str_mmap_lru   ? atoi(str_mmap_lru)                  : opt_mmap_lru;
+     opt_hostprof   = str_hostprof   ? atoi(str_hostprof)                  : opt_hostprof;
