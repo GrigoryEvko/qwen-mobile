@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Summarize the TSV files of mm_range per weight class, context and role.
 
 Each row of a TSV file holds the statistics of one (context, weight, op, role) key. This script
