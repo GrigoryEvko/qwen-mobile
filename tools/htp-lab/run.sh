@@ -36,6 +36,12 @@
 #              Default: v79. A version other than v79 builds in out/build-<ARCH> and writes its
 #              results to out/<target>-<ARCH>-<tag>, thus the four versions of one target can
 #              exist side by side for a comparison.
+#   SIM_CORE   The simulated core (the option --m<SIM_CORE> of hexagon-sim). The preset value is the
+#              phone core of ARCH: v81na_2 for v81 (12 threads, 8 HVX contexts, 8 MB VTCM, the HMX of
+#              v79na_1), and ARCH for the others ("--mv79" is v79na_1, the core of the OnePlus 13).
+#              "--mv81" alone selects v81dgb_1: 2 MB VTCM, 4 HVX contexts and an HMX with no f16
+#              path. "hexagon-sim --help --mv81" lists the v81 cores. The report line "lab: core"
+#              gives the VTCM size and the HVX contexts of the core of each run.
 #   NO_BUILD   Set to 1 to skip the build step of "run" (for parallel runs of built programs)
 #   LAB_OUT    The output directory, relative to the repository. Default: tools/htp-lab/out.
 #              Each concurrent user of the lab needs its own, because the build directory and the
@@ -93,6 +99,7 @@ REPO_DIR="$(cd "${LAB_DIR}/../.." && pwd)"
 LLAMA_DIR="${LLAMA_DIR:-${REPO_DIR}/third_party/llama.cpp}"
 IMAGE="${IMAGE:-ghcr.io/snapdragon-toolchain/arm64-android:v0.7}"
 SIM_ARGS="${SIM_ARGS:-}"
+SIM_CORE="${SIM_CORE:-}"
 OUT_REL="${LAB_OUT:-tools/htp-lab/out}"
 PROPOSALS="${PROPOSALS:-}"
 LAB_TARGETS="${LAB_TARGETS:-}"
@@ -100,6 +107,16 @@ ARCH="${ARCH:-v79}"
 case "${ARCH}" in
     v73|v75|v79|v81) ;;
     *) echo "error: ARCH=${ARCH} is not one of v73, v75, v79, v81" >&2; exit 1 ;;
+esac
+if [ -z "${SIM_CORE}" ]; then
+    case "${ARCH}" in
+        v81) SIM_CORE=v81na_2 ;;
+        *)   SIM_CORE="${ARCH}" ;;
+    esac
+fi
+case "${SIM_CORE}" in
+    "${ARCH}"*) ;;
+    *) echo "error: SIM_CORE=${SIM_CORE} is not a core of ARCH=${ARCH}" >&2; exit 1 ;;
 esac
 PROFILE="${PROFILE:-}"
 case "${PROFILE}" in
@@ -152,14 +169,14 @@ LAB_TREE="$(tree_id)"
 LAB_PROPOSALS="$(proposal_ids)"
 
 usage() {
-    sed -n '2,83p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,89p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 in_container() {
     # Runs the given script text inside the container with the repository and llama.cpp mounted
     podman run --rm --userns=keep-id --security-opt label=disable \
         -v "${REPO_DIR}:/repo" -v "${LLAMA_DIR}:/llama" -w /repo \
-        -e "SIM_ARGS=${SIM_ARGS}" -e "LAB_TREE=${LAB_TREE}" -e "LAB_PROPOSALS=${LAB_PROPOSALS}" \
+        -e "SIM_ARGS=${SIM_ARGS}" -e "SIM_CORE=${SIM_CORE}" -e "LAB_TREE=${LAB_TREE}" -e "LAB_PROPOSALS=${LAB_PROPOSALS}" \
         -e "OUT_REL=${OUT_REL}" -e "PROPOSALS=${PROPOSALS}" -e "LAB_TARGETS=${LAB_TARGETS}" -e "ARCH=${ARCH}" \
         -e "PROFILE=${PROFILE}" -e "EXTRA_CFLAGS=${EXTRA_CFLAGS}" \
         "${IMAGE}" bash -c "$1"
@@ -223,14 +240,14 @@ run_target() {
     rm -rf "$dir"; mkdir -p "$dir"; cd "$dir"
     echo "== run $target-$tag: $*"
     # the source of the numbers, as the first lines of the output and thus of the report
-    echo "lab: tree ${LAB_TREE} arch ${ARCH}" > tree.txt
+    echo "lab: tree ${LAB_TREE} arch ${ARCH} core ${SIM_CORE}" > tree.txt
     case "$target" in *_after) echo "lab: proposals ${LAB_PROPOSALS}" >> tree.txt ;; esac
     if [ "${MODE:-timing}" = "functional" ]; then
-        { cat tree.txt; hexagon-sim --m${ARCH} $SIM_ARGS "$elf" -- "$@"; } 2>&1 | tee stdout.txt
+        { cat tree.txt; hexagon-sim --m${SIM_CORE} $SIM_ARGS "$elf" -- "$@"; } 2>&1 | tee stdout.txt
         grep "^lab:" stdout.txt > report.txt || true
         return 0
     fi
-    { cat tree.txt; hexagon-sim --m${ARCH} --timing --profile --packet_analyze pa.json --pmu_statsfile pmu.txt $SIM_ARGS \
+    { cat tree.txt; hexagon-sim --m${SIM_CORE} --timing --profile --packet_analyze pa.json --pmu_statsfile pmu.txt $SIM_ARGS \
         "$elf" -- "$@"; } 2>&1 | tee stdout.txt
     hexagon-profiler --packet_analyze --json=pa.json --elf="$elf" -o pa.html > /dev/null 2>&1 || true
     hexagon-nm -S -n "$elf" > symbols.txt
