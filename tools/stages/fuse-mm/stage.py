@@ -81,7 +81,8 @@ VARIANTS = {
 class Block:
     """One kind of run: the tool, its arguments, the variants in the order of an odd round, the round count,
     the time limit in seconds (the gate and the lines after the tool take about 6 s, thus a limit of 110 s
-    keeps a phone command under 120 s), the timing flag and the text."""
+    keeps a phone command under 120 s), the timing flag and the text. A tail block runs after the timing
+    blocks (the op profiles)."""
     key: str
     tool: str
     args: str
@@ -91,6 +92,7 @@ class Block:
     timing: bool
     text: str
     extra_env: str = ""
+    tail: bool = False
 
 
 BLOCKS = (
@@ -116,7 +118,22 @@ BLOCKS = (
     # LLAMA_HOSTPROF=1: the host times of each token, with the graph cache hits and the batch replays.
     Block("prof", "llama-bench", f"{BENCH_ARGS} -p 512,1024 -n 4 -r 1 -v", ("on", "off"), 1, 90, False,
           "op profile (GGML_HEXAGON_PROFILE=1, LLAMA_HOSTPROF=1, -v): ubatches of 512 and 1024 tokens and 4 decode "
-          "tokens", "GGML_HEXAGON_PROFILE=1 LLAMA_HOSTPROF=1"),
+          "tokens", "GGML_HEXAGON_PROFILE=1 LLAMA_HOSTPROF=1", True),
+    # The run set f16: the libraries of HEAD plus the patch of the F16 SwiGLU output (no fused op)
+    Block("ftbo", "test-backend-ops", "test -b HTP0 -o FFN_SWIGLU", ("f16",), 1, 110, False,
+          "test-backend-ops FFN_SWIGLU on HTP0 against the CPU"),
+    Block("fffn", "ffncheck", "", ("f16", "off"), 1, 100, False,
+          "ffncheck: the hash of the FFN block of the 4B for each token count"),
+    Block("fkld", "llama-perplexity", f"{KL_ARGS} -b 1 -ub 1", ("off", "f16"), 2, 108, False,
+          "llama-perplexity KL against the naive base, 1 chunk of 512, -b 1 (the decode path), 2 runs of each "
+          "variant for the determinism"),
+    Block("fp", "llama-bench", f"{BENCH_ARGS} -p 512,1024 -n 0 -d 0,3072 -r 3", ("f16", "off"), 3, 100, True,
+          "llama-bench pp512 and pp1024 at the depths 0 and 3072, 3 repetitions"),
+    Block("ft", "llama-bench", f"{BENCH_ARGS} -p 0 -n 32 -d 0,4096 -r 3", ("f16", "off"), 3, 100, True,
+          "llama-bench tg32 at the depths 0 and 4096, 3 repetitions"),
+    Block("fprof", "llama-bench", f"{BENCH_ARGS} -p 512,1024 -n 4 -r 1 -v", ("f16", "off"), 1, 90, False,
+          "op profile (GGML_HEXAGON_PROFILE=1, LLAMA_HOSTPROF=1, -v): ubatches of 512 and 1024 tokens and 4 decode "
+          "tokens", "GGML_HEXAGON_PROFILE=1 LLAMA_HOSTPROF=1", True),
     # The run set repack: the libraries of HEAD plus the patch that refuses a weight in the plain layout
     Block("plain", "ffncheck", "--plain --only ffn_", ("on",), 1, 100, False,
           "ffncheck --plain: the weights in a buffer with no WEIGHTS usage, the plain layout"),
@@ -130,8 +147,6 @@ BLOCKS = (
           "llama-perplexity KL against the naive base, 1 chunk of 512, -b 512"),
 )
 BLOCK = {b.key: b for b in BLOCKS}
-# The timing blocks run round by round: round 1 of p, round 1 of t, round 2 of p, ...
-TIMING_GROUP = ("p", "t")
 
 
 @dataclass(frozen=True)
@@ -165,6 +180,10 @@ SETS = {
                      "about 5 minutes of tools", "phone-repack",
                      "the patched llama.cpp tree of HEAD plus the patch build/fuse-mm/repack/*.patch and no fusion "
                      "patch (OUT=phone-repack)"),
+    "f16": RunSet(("ftbo", "fffn", "fkld", "fp", "ft", "fprof"), "phone-commands-f16.txt", "phone-out-f16",
+                  "the F16 SwiGLU output for ffn_down with no fused op: the timing against off, the op profile, "
+                  "and the decode KL two times for each variant", "about 25 minutes of tools", "phone-f16",
+                  "the patched llama.cpp tree of HEAD plus the patch build/fuse-mm/f16/*.patch only (OUT=phone-f16)"),
 }
 
 
@@ -182,21 +201,24 @@ class Run:
 
 
 def all_runs(keys: tuple = tuple(BLOCK)) -> list:
-    """The runs of the blocks keys in the order of the stage. A timing round runs the variants in the order of
-    the block in an odd round and in the reverse order in an even round. O(runs)."""
+    """The runs of the blocks keys in the order of the stage: the other blocks (each round of a block, the
+    variants in their order), then the timing blocks round by round (round 1 of each timing block, then round
+    2, ...), then the tail blocks. A timing round runs the variants in the order of the block in an odd round
+    and in the reverse order in an even round. O(runs)."""
+    sel = [b for b in BLOCKS if b.key in keys]
     out = []
-    for b in BLOCKS:
-        if b.key in keys and b.key not in TIMING_GROUP and b.key != "prof":
-            out += [Run(b, 1, v) for v in b.variants]
-    timing_keys = [k for k in TIMING_GROUP if k in keys]
-    for rnd in range(1, max((BLOCK[k].rounds for k in timing_keys), default=0) + 1):
-        for key in timing_keys:
-            b = BLOCK[key]
+    for b in sel:
+        if not b.timing and not b.tail:
+            out += [Run(b, rnd, v) for rnd in range(1, b.rounds + 1) for v in b.variants]
+    timing_blocks = [b for b in sel if b.timing]
+    for rnd in range(1, max((b.rounds for b in timing_blocks), default=0) + 1):
+        for b in timing_blocks:
             if rnd <= b.rounds:
                 order = b.variants if rnd % 2 else b.variants[::-1]
                 out += [Run(b, rnd, v) for v in order]
-    if "prof" in keys:
-        out += [Run(BLOCK["prof"], 1, v) for v in BLOCK["prof"].variants]
+    for b in sel:
+        if b.tail:
+            out += [Run(b, rnd, v) for rnd in range(1, b.rounds + 1) for v in b.variants]
     return out
 
 
@@ -258,7 +280,20 @@ RUN_TEXT = {
     "rmmid": "test-backend-ops -o MUL_MAT_ID: each case must pass",
     "rklp": ("llama-perplexity -b 512, 1 chunk, KL against naive-4B-q8.kld: the numbers of klp off of the set "
              "check (the same ops)"),
+    "ftbo": "test-backend-ops -o FFN_SWIGLU, f16: each case must pass",
+    "fffn": "ffncheck, f16 off: the hashes and the non-finite counts of each case must be equal",
+    "fkld": ("llama-perplexity -b 1 -ub 1, 1 chunk, KL against naive-4B-q8.kld, off f16 off f16: the two runs of "
+             "one variant tell if the decode path is deterministic, and f16 must equal off"),
+    "fp": "llama-bench pp512 and pp1024 at d0 and d3072, -r 3, f16 off, 3 rounds (the timing)",
+    "ft": "llama-bench tg32 at d0 and d4096, -r 3, f16 off, 3 rounds (the timing)",
+    "fprof": ("GGML_HEXAGON_PROFILE=1 llama-bench -v pp512, pp1024 and tg4, f16 off (the op split, "
+              "tools/prof/optable.py)"),
 }
+
+F16_VARIANTS_TEXT = """\
+# The variants: f16 (the preset values: the F16 SwiGLU output for ffn_down), off (GGML_HEXAGON_FUSE_F16_ACT=0, the
+# ops of HEAD). The variant f16 also sets GGML_HEXAGON_FUSE_SWIGLU=0 and _DECODE=0, which this build does not read.
+"""
 
 
 def setup_lines(phone: str) -> list:
@@ -306,9 +341,10 @@ def write_commands(name: str, path: Path) -> int:
     libs = textwrap.wrap(f"The libraries (tools/stages/fuse-mm/build.sh): {rs.libs}, built with the preset, the "
                          "flags and the LTO of scripts/build-native.sh. "
                          f"build/fuse-mm/{rs.phone}/patches.sha256 names the patches.", 114, break_on_hyphens=False)
-    fusion = any(k in FUSION_BLOCKS for k in rs.blocks)
+    fusion = any(k in FUSION_BLOCKS for k in rs.blocks) or name == "f16"
+    variants = F16_VARIANTS_TEXT if name == "f16" else (VARIANTS_TEXT if fusion else "")
     header = HEADER.format(name=name, text=rs.text, minutes=rs.minutes, n_runs=len(runs), out_dir=rs.out_dir,
-                           libs="\n".join(f"# {x}" for x in libs), variants=VARIANTS_TEXT if fusion else "",
+                           libs="\n".join(f"# {x}" for x in libs), variants=variants,
                            scope=("# The matmul fusions of HTP0 (the 4B Q8_0 only), with one library set and the "
                                   "environment switches of the fusions." if fusion else
                                   "# The tiled layout of the MUL_MAT weights of HTP0 (the 4B Q8_0 and the op tests)."),
@@ -383,7 +419,7 @@ def bench_values(res: Result) -> dict:
 def correctness(results: dict) -> list:
     """The pass counts of the op tests, the hash comparison of ffncheck and the KL comparison."""
     out = ["correctness"]
-    for key in ("tbo", "reg", "mm", "rmm", "rmmid"):
+    for key in ("tbo", "reg", "mm", "rmm", "rmmid", "ftbo"):
         for v in BLOCK[key].variants:
             res = results.get(f"{key}-1-{v}")
             if res is None:
@@ -392,21 +428,27 @@ def correctness(results: dict) -> list:
             passed = f"{m[-1][0]}/{m[-1][1]} passed" if m else "no pass count"
             fails = len(re.findall(r"\[(?:FAIL|ERR)\]|  FAIL", res.out))
             out.append(f"  {res.run.name}: {passed}, {fails} FAIL lines, {'ok' if res.ok else ', '.join(res.flags)}")
-    runs = {}
-    for v in BLOCK["ffn"].variants:
-        res = results.get(f"ffn-1-{v}")
-        if res is not None:
-            runs[v] = {m[0]: (m[1], m[2]) for m in FFN_RE.findall(res.out)}
-            if not res.ok:
-                out.append(f"  ffn-1-{v}: " + ", ".join(res.flags))
-    cases = sorted({c for r in runs.values() for c in r})
-    for c in cases:
-        row = {v: runs[v].get(c, ("-", "-")) for v in runs}
-        same = len(set(row.values())) == 1 and ("-", "-") not in row.values()
-        out.append(f"  ffncheck {c:13s} " + " ".join(f"{v}={h}/{n}" for v, (h, n) in row.items())
-                   + ("  equal" if same else "  DIFFERENT"))
+    for key in ("ffn", "fffn"):
+        runs = {}
+        for v in BLOCK[key].variants:
+            res = results.get(f"{key}-1-{v}")
+            if res is not None:
+                runs[v] = {m[0]: (m[1], m[2]) for m in FFN_RE.findall(res.out)}
+                if not res.ok:
+                    out.append(f"  {key}-1-{v}: " + ", ".join(res.flags))
+        cases = sorted({c for r in runs.values() for c in r})
+        for c in cases:
+            row = {v: runs[v].get(c, ("-", "-")) for v in runs}
+            same = len(set(row.values())) == 1 and ("-", "-") not in row.values()
+            out.append(f"  ffncheck {c:13s} " + " ".join(f"{v}={h}/{n}" for v, (h, n) in row.items())
+                       + ("  equal" if same else "  DIFFERENT"))
     res = results.get("ffncpu-1-on")
     if res is not None:
+        # The HMX path of HEAD gives an NMSE of about 1e-4 against the CPU for the FFN block (F16 activations
+        # and F16 output tiles), thus the 1e-4 bound of ffncheck --cpu is a check of the tool, and a case
+        # above it is not a defect of a patch when the hashes of the variants are equal.
+        out.append("  ffncheck --cpu (the HMX path of HEAD has an NMSE of about 1e-4 for the ffn cases; compare "
+                   "the hashes of the variants, not this bound)")
         for m in FFN_RE.findall(res.out):
             out.append(f"  ffncheck --cpu {m[0]:13s} nmse={m[3]} maxerr={m[4]} nonfinite={m[2]} hmax={m[5]} "
                        f"ymax={m[6]}")
@@ -424,14 +466,18 @@ def correctness(results: dict) -> list:
         bad = [m[0] for m in lines if m[2] != "0" and not m[0].startswith("big")]
         out.append(f"  ffncheck (repack set): {len(lines)} cases, non-finite in {bad or 'none'}, "
                    f"{'ok' if res.ok else ', '.join(res.flags)}")
-    for key in ("klp", "kld", "rklp"):
+    for key in ("klp", "kld", "rklp", "fkld"):
+        b = BLOCK[key]
         rows = {}
-        for v in BLOCK[key].variants:
-            res = results.get(f"{key}-1-{v}")
-            if res is None:
-                continue
-            text = res.out + res.log
-            rows[v] = {k: (re.search(re.escape(k) + r"\s*:\s*(.*)", text) or [None, "-"])[1].strip() for k in KL_KEYS}
+        for rnd in range(1, b.rounds + 1):
+            for v in b.variants:
+                res = results.get(f"{key}-{rnd}-{v}")
+                if res is None:
+                    continue
+                text = res.out + res.log
+                label = v if b.rounds == 1 else f"{v}#{rnd}"
+                rows[label] = {k: (re.search(re.escape(k) + r"\s*:\s*(.*)", text) or [None, "-"])[1].strip()
+                               for k in KL_KEYS}
         for k in KL_KEYS if rows else ():
             vals = [rows[v][k] for v in rows]
             out.append(f"  {key} {k:12s} " + " | ".join(f"{v} {rows[v][k]}" for v in rows)
@@ -444,8 +490,10 @@ def timing(results: dict, include_all: bool) -> list:
     the lowest and the highest round, and the count of rounds. O(runs)."""
     out = ["timing: t/s as the median of the rounds, the difference to off (the median of the ratios of the runs "
            "of one round), [the lowest and the highest round], n and the count of rounds"]
-    for key in TIMING_GROUP:
-        b = BLOCK[key]
+    for b in BLOCKS:
+        if not b.timing:
+            continue
+        key = b.key
         per: dict = {v: {} for v in b.variants}
         for rnd in range(1, b.rounds + 1):
             for v in b.variants:
@@ -453,6 +501,8 @@ def timing(results: dict, include_all: bool) -> list:
                 if res and res.ok and (include_all or not res.flags):
                     per[v][rnd] = bench_values(res)
         tests = sorted({t for v in per for r in per[v] for t in per[v][r]})
+        if tests:
+            out.append(f"  {key}:")
         for t in tests:
             label = f"pp{t[0]}" if t[0] else f"tg{t[1]}"
             cells = []
@@ -485,9 +535,9 @@ def table(root: Path, include_all: bool) -> int:
     for part in (correctness(results), timing(results, include_all)):
         print("\n".join(part))
         print()
-    if any(r.run.block.key == "prof" for r in results.values()):
-        print(f"the op split: tools/prof/optable.py ops {root}/prof-1-on.log --graphs 0 --by shape "
-              "(and prof-1-off.log)")
+    for r in results.values():
+        if r.run.block.tail:
+            print(f"the op split: tools/prof/optable.py ops {root}/{r.run.name}.log --graphs 0 --by shape")
     return 0
 
 
