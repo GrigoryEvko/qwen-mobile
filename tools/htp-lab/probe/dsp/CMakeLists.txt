@@ -41,6 +41,12 @@ if (NOT lab_match)
 endif()
 set(kernel_flags "${CMAKE_MATCH_1}")
 string(REPLACE "\${HEXAGON_ARCH}" "${HEXAGON_ARCH}" kernel_flags "${kernel_flags}")
+# The warning options of the lab do not change the generated code, thus the probe does not take them.
+string(REPLACE "\${LAB_WARNING_FLAGS}" "" kernel_flags "${kernel_flags}")
+if (kernel_flags MATCHES "\\$\\{")
+    message(FATAL_ERROR "isaprobe: LAB_C_FLAGS of ${LAB_CMAKE} has a variable that this file does not replace: "
+                        "${kernel_flags}. Replace it in tools/htp-lab/probe/dsp/CMakeLists.txt.")
+endif()
 separate_arguments(kernel_flags UNIX_COMMAND "${kernel_flags}")
 list(APPEND kernel_flags -fpic)
 set(CMAKE_C_FLAGS_RELEASE "")
