@@ -182,7 +182,7 @@ target_compile_options(hexhost_core PRIVATE -Wall -Wno-unused-function -Wno-unus
 
 # One libFuzzer target for each fuzz_*.cpp. tests/sanitizers/fuzz_death.h gives the death
 # callback that a TSan report cannot deadlock, and the crash file in FUZZ_ARTIFACT_DIR.
-foreach(name kparams graph repack envparse dirty)
+foreach(name kparams graph repack envparse dirty mmap)
     add_executable(fuzz_${name} fuzz_${name}.cpp)
     target_link_libraries(fuzz_${name} PRIVATE hexhost_core)
     target_include_directories(fuzz_${name} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../sanitizers")
@@ -208,3 +208,37 @@ configure_file("${HEX}/htp/htp-tensor.c" "${CMAKE_CURRENT_BINARY_DIR}/dsp/htp-te
 target_sources(fuzz_dirty PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/dsp/htp-tensor.c")
 target_include_directories(fuzz_dirty BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/stubs/dsp)
 set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/dsp/htp-tensor.c" PROPERTIES COMPILE_OPTIONS "-w")
+
+# The mapping table of the DSP (prep_op_bufs and its helpers of htp/main.c) runs on x86. main.c needs the
+# headers of the Hexagon SDK and the generated htp_iface.h, thus the configure step writes a copy of the
+# table code into dsp/htp-mmap.c: stubs/mmap/htp-mmap-host.h, HTP_MAX_MMAPS and struct htp_mmap of
+# htp/htp-ctx.h, a context with the table and max_vmem, the text of main.c from reuse_buf to the line before
+# prep_tensor, and stubs/mmap/htp-mmap-api.inc. fuzz_mmap.cpp gives htp_mmap and htp_munmap. When main.c or
+# htp-ctx.h no longer has these names, the configure step stops with an error. A change of main.c runs the
+# configure step again.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${HEX}/htp/main.c" "${HEX}/htp/htp-ctx.h")
+file(READ "${HEX}/htp/main.c" HTP_MAIN_C)
+file(READ "${HEX}/htp/htp-ctx.h" HTP_CTX_H)
+string(FIND "${HTP_MAIN_C}" "static inline bool reuse_buf(" MMAP_BEGIN)
+string(FIND "${HTP_MAIN_C}" "static void prep_tensor(" MMAP_END)
+string(REGEX MATCH "#define HTP_MAX_MMAPS[ \t]+[0-9]+" MMAP_SLOTS "${HTP_CTX_H}")
+string(REGEX MATCH "struct htp_mmap {[^}]*};" MMAP_STRUCT "${HTP_CTX_H}")
+if (MMAP_BEGIN LESS 0 OR MMAP_END LESS_EQUAL MMAP_BEGIN OR NOT MMAP_SLOTS OR NOT MMAP_STRUCT)
+    message(FATAL_ERROR "hexhost: fuzz_mmap does not find reuse_buf and prep_tensor in ${HEX}/htp/main.c, or "
+                        "HTP_MAX_MMAPS and struct htp_mmap in ${HEX}/htp/htp-ctx.h. Update the copy step of "
+                        "tests/fuzz/hexhost/CMakeLists.txt.")
+endif()
+math(EXPR MMAP_LEN "${MMAP_END} - ${MMAP_BEGIN}")
+string(SUBSTRING "${HTP_MAIN_C}" ${MMAP_BEGIN} ${MMAP_LEN} MMAP_CODE)
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/dsp/htp-mmap.c.new"
+     "// A copy of the mapping table of htp/main.c for fuzz_mmap (tests/fuzz/hexhost/CMakeLists.txt)\n"
+     "#include \"htp-mmap-host.h\"\n\n${MMAP_SLOTS}\n\n${MMAP_STRUCT}\n\n"
+     "struct htp_context {\n    struct htp_mmap mmap[HTP_MAX_MMAPS];\n    uint64_t        max_vmem;\n};\n\n"
+     "${MMAP_CODE}\n#include \"htp-mmap-api.inc\"\n")
+configure_file("${CMAKE_CURRENT_BINARY_DIR}/dsp/htp-mmap.c.new" "${CMAKE_CURRENT_BINARY_DIR}/dsp/htp-mmap.c" COPYONLY)
+target_sources(fuzz_mmap PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/dsp/htp-mmap.c")
+target_include_directories(fuzz_mmap BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/stubs/mmap
+                           ${CMAKE_CURRENT_SOURCE_DIR}/stubs/dsp)
+# main.c assigns NULL to the uint64_t base of a buffer descriptor, which the C of clang refuses by default
+set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/dsp/htp-mmap.c" PROPERTIES COMPILE_OPTIONS
+                            "-Wno-int-conversion;-Wno-unused-function")

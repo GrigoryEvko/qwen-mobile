@@ -6,7 +6,7 @@ set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$HERE/../../.." && pwd)
 AREA=hexhost
-ALL_TARGETS="kparams graph repack envparse dirty"
+ALL_TARGETS="kparams graph repack envparse dirty mmap"
 X86_CONFIGS="none asan ubsan tsan msan"
 PHONE_CONFIGS="none asan hwasan ubsan"
 ALL_PROFILES="debug release"
