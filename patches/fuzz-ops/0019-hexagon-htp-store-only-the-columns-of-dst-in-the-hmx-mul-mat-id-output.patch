@@ -1,0 +1,177 @@
+hexagon: htp: store only the columns of dst in the HMX MUL_MAT_ID output
+Fold-into: upstream/hexagon-htp
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+The HMX path of MUL_MAT_ID (hmx_mm_id_2d_f32 of htp/matmul-ops.c) computes the
+output of n weight rows, and n is ne[1] of the weight. For a repacked weight
+the host sends ne[1] rounded up to a multiple of 32. The output store
+(transfer_output_chunk_fp16_to_fp32_scattered of htp/hmx-mm-kernels-tiled.h)
+wrote all n columns into each row of dst, in vectors of 32 values. When ne[0]
+of dst is not a multiple of 32, the store wrote up to 31 values past the end
+of each row. These values went into the next row of dst, or past the end of
+dst for the last row. The host takes this path for a MUL_MAT_ID with more than
+4 tokens (HTP_MM_HMX_MIN_NROWS).
+
+The op fuzzer found the defect on HTP0 with the case MUL_MAT_ID
+w=q4_0[32,40,4] x=f32[32,4,10] used=4. The store wrote 96 bytes (24 values)
+past the end of dst. In the next rows of dst, 403 values were above the loose
+bound and 107 values were NaN.
+
+The patch fuzz-hexhost/0005 does not cover this defect. It changed the row
+count of the HVX tiled kernels, and the HMX path has a different store.
+
+This patch gives ne[0] of dst to hmx_mm_id_2d_f32 from its two callers
+(MUL_MAT_ID and the MUL_MAT_ID_NX fusion). The store writes full vectors to
+the last multiple of 32 in the columns of dst, then one partial store for the
+remaining columns. transfer_output_chunk_fp16_to_fp32_col_chunk of the HMX
+MUL_MAT path uses the same method. The MUL_MAT path does not change, and the
+models of the app (Qwen3.5 2B and 4B) have no MUL_MAT_ID.
+
+diff --git a/ggml/src/ggml-hexagon/htp/hmx-mm-kernels-tiled.h b/ggml/src/ggml-hexagon/htp/hmx-mm-kernels-tiled.h
+index d6d4058..48390a0 100644
+--- a/ggml/src/ggml-hexagon/htp/hmx-mm-kernels-tiled.h
++++ b/ggml/src/ggml-hexagon/htp/hmx-mm-kernels-tiled.h
+@@ -1354,6 +1354,9 @@ static void transfer_activation_chunk_fp32_to_fp16_gathered_flat(
+     }
+ }
+ 
++// n_cols is the column count of the tiles (the weight rows of the chunk, padded to a multiple of
++// 32). n_valid_cols is the column count of dst from the first column of the chunk: the stores stop
++// there, thus the padded weight rows never write past a row of dst.
+ static void transfer_output_chunk_fp16_to_fp32_scattered(
+             float *restrict dst,
+             const __fp16 *restrict vtcm_src,
+@@ -1361,6 +1364,7 @@ static void transfer_output_chunk_fp16_to_fp32_scattered(
+             uint32_t vtcm_start_row,
+             uint32_t n_rows,
+             uint32_t n_cols,
++            uint32_t n_valid_cols,
+             const struct mmid_row_mapping *matrix_rows,
+             uint32_t cur_a,
+             uint32_t mapping_stride,
+@@ -1370,6 +1374,10 @@ static void transfer_output_chunk_fp16_to_fp32_scattered(
+     assert(n_cols % HTP_MM_HMX_TILE_N_COLS == 0);
+     const size_t tile_row_stride = (n_cols / HTP_MM_HMX_TILE_N_COLS) * HTP_MM_HMX_TILE_N_ELMS;
+ 
++    const uint32_t n_store = n_valid_cols < n_cols ? n_valid_cols : n_cols;
++    const uint32_t n_full  = n_store & ~(uint32_t) (HTP_MM_HMX_TILE_N_COLS - 1);
++    const uint32_t n_tail  = n_store - n_full;
++
+     const HVX_Vector one = hvx_vec_splat_f16(1.0);
+ 
+     for (size_t r = 0; r < n_rows; r += 2) {
+@@ -1392,7 +1400,7 @@ static void transfer_output_chunk_fp16_to_fp32_scattered(
+         }
+ 
+         #pragma unroll(4)
+-        for (size_t c = 0; c < (size_t)n_cols; c += HTP_MM_HMX_TILE_N_COLS) {
++        for (size_t c = 0; c < (size_t)n_full; c += HTP_MM_HMX_TILE_N_COLS) {
+             const size_t c0 = c / HTP_MM_HMX_TILE_N_COLS;
+             const __fp16 *tile = row_base + c0 * HTP_MM_HMX_TILE_N_ELMS;
+             HVX_Vector v = ((const HVX_Vector *) tile)[r1];
+@@ -1403,5 +1411,16 @@ static void transfer_output_chunk_fp16_to_fp32_scattered(
+                 hvx_vmemu(output_row1 + c) = Q6_Vsf_equals_Vqf32(Q6_V_hi_W(vp));
+             }
+         }
++
++        if (n_tail) {
++            const __fp16 *tile = row_base + (n_full / HTP_MM_HMX_TILE_N_COLS) * HTP_MM_HMX_TILE_N_ELMS;
++            HVX_Vector v = ((const HVX_Vector *) tile)[r1];
++            HVX_VectorPair vp = Q6_Wqf32_vmpy_VhfVhf(v, one);
++
++            hvx_vec_store_u(output_row0 + n_full, n_tail * sizeof(float), Q6_Vsf_equals_Vqf32(Q6_V_lo_W(vp)));
++            if (output_row1) {
++                hvx_vec_store_u(output_row1 + n_full, n_tail * sizeof(float), Q6_Vsf_equals_Vqf32(Q6_V_hi_W(vp)));
++            }
++        }
+     }
+ }
+diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
+index 47f93ca..ee3a599 100644
+--- a/ggml/src/ggml-hexagon/htp/matmul-ops.c
++++ b/ggml/src/ggml-hexagon/htp/matmul-ops.c
+@@ -2277,6 +2277,7 @@ typedef struct {
+     uint32_t                        n_tot_chunks;
+     uint32_t                        n_chunks_per_task;
+     uint32_t                        n_cols;
++    uint32_t                        n_valid_cols;
+     uint32_t                        cur_a;
+     uint32_t                        mapping_stride;
+     size_t                          dst_nb1;
+@@ -2332,7 +2333,7 @@ static void transfer_output_chunk_scattered_worker_fn(unsigned int n, unsigned i
+     if (n_rows > 0) {
+         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_O_PROC, chunk_idx);
+         transfer_output_chunk_fp16_to_fp32_scattered(
+-            st->dst, st->vtcm_src, start_row, vtcm_start_row, n_rows, st->n_cols,
++            st->dst, st->vtcm_src, start_row, vtcm_start_row, n_rows, st->n_cols, st->n_valid_cols,
+             st->matrix_rows, st->cur_a, st->mapping_stride,
+             st->dst_nb1, st->dst_nb2, st->cne1);
+         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_O_PROC, chunk_idx);
+@@ -3441,6 +3442,7 @@ static void transfer_output_chunk_scattered_threaded(
+             int start_row,
+             int n_rows,
+             int n_cols,
++            int n_valid_cols,
+             const struct mmid_row_mapping *matrix_rows,
+             int cur_a,
+             int mapping_stride,
+@@ -3448,7 +3450,7 @@ static void transfer_output_chunk_scattered_threaded(
+             size_t dst_nb2,
+             int cne1,
+             int n_threads) {
+-    if (n_rows <= 0) return;
++    if (n_rows <= 0 || n_valid_cols <= 0) return;
+     int chunks_per_thread = hmx_ceil_div(n_rows, n_threads);
+     chunks_per_thread = hex_align_up(chunks_per_thread, 2);
+ 
+@@ -3461,6 +3463,7 @@ static void transfer_output_chunk_scattered_threaded(
+         .n_tot_chunks      = n_rows,
+         .n_chunks_per_task = chunks_per_thread,
+         .n_cols            = n_cols,
++        .n_valid_cols      = n_valid_cols,
+         .matrix_rows       = matrix_rows,
+         .cur_a             = cur_a,
+         .mapping_stride    = mapping_stride,
+@@ -3478,11 +3481,14 @@ static void transfer_output_chunk_scattered_threaded(
+     }
+ }
+ 
++// n is the weight row count, a multiple of 32 (ne[1] of a repacked weight is padded). n_valid is
++// ne[0] of dst: the columns past it are not stored.
+ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
+                                          float *restrict dst,
+                                          const float *activation,
+                                          const uint8_t *weight,
+                                          int m, int k, int n,
++                                         int n_valid,
+                                          int k_valid,
+                                          int ne11,
+                                          size_t act_nb1, size_t act_nb2,
+@@ -3628,7 +3634,7 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
+ 
+             // D: Output Store
+             transfer_output_chunk_scattered_threaded(
+-                ctx, dst + nc, vtcm_output, (int) mr, (int) n_rows, (int) n_cols,
++                ctx, dst + nc, vtcm_output, (int) mr, (int) n_rows, (int) n_cols, n_valid - (int) nc,
+                 matrix_rows, cur_a, mapping_stride, dst_nb1, dst_nb2, cne1, n_threads);
+         }
+     }
+@@ -3776,7 +3782,7 @@ static int hmx_mm_op_matmul_id(
+ 
+         int ret = hmx_mm_id_2d_f32(octx->ctx, (float*) dst->data, (float*) src1->data,
+                                    (const uint8_t *) src0->data + cur_a * nb02,
+-                                   cne1, ne00, ne01,
++                                   cne1, ne00, ne01, ne0,
+                                    ne10,
+                                    ne11,
+                                    nb11, nb12,
+@@ -3920,7 +3926,7 @@ static int hmx_mm_op_matmul_id_nx(
+ 
+             int ret = hmx_mm_id_2d_f32(octx->ctx, (float*) dst->data, (float*) act->data,
+                                        (const uint8_t *) src_w->data + cur_a * src_w->nb[2],
+-                                       cne1, src_w->ne[0], src_w->ne[1],
++                                       cne1, src_w->ne[0], src_w->ne[1], dst->ne[0],
+                                        act->ne[0],
+                                        act->ne[1],
+                                        act->nb[1], act->nb[2],
