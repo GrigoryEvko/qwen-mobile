@@ -13,7 +13,8 @@
 # With the screen off the kernel suspends the SoC while a run waits for the DSP: a decode token
 # then waits 0.3 to 1.2 s (on the global counter; CLOCK_MONOTONIC shows about 160 ms of it),
 # and the CPU clock caps fall. KEEP_SCREEN_STATE=1 skips the wake and the screen condition,
-# for a run that measures the screen-off state on purpose.
+# for a run that measures the screen-off state on purpose. ALLOW_CHARGER=1 skips the charger
+# condition, for a phone of a device farm, which always charges.
 #
 # The build recipes of the phone stages (tools/stages/*/build.sh, tools/memprobe/build-phone.sh)
 # copy this file to bin/gate.sh of the stage. tools/prof/run.py does the charger and thermal
@@ -54,8 +55,12 @@ if [ "$status" != "0" ]; then
     exit 1
 fi
 if [ "$ac$usb$wireless" != "000" ]; then
-    echo "gate: STOP, a charger is connected. Disconnect it."
-    exit 1
+    if [ "${ALLOW_CHARGER:-0}" = "1" ]; then
+        echo "gate: a charger is connected (ALLOW_CHARGER=1: a phone of a device farm, the numbers are not those of a phone on its battery)"
+    else
+        echo "gate: STOP, a charger is connected. Disconnect it."
+        exit 1
+    fi
 fi
 if [ -n "$busy" ]; then
     echo "gate: STOP, a measurement process runs (pid $busy). Kill it by its pid."
