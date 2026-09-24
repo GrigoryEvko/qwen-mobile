@@ -4,21 +4,22 @@
 # the patches (GGML_HEXAGON_GDN_CONV_DMA, GGML_HEXAGON_GDN_CHUNK, GGML_HEXAGON_GDN_QKNORM) give the old
 # and the new paths on the same libraries.
 #
-#   JOBS=24 tools/stages/gdnk/build.sh PATCH...
+#   JOBS=24 [GDNK_STAGE=build/gdnk] tools/stages/gdnk/build.sh PATCH...
 #
 # PATCH is a llama.cpp patch file that is not yet in patches/ (wip/gdnk/NNNN-*.patch, a path relative to
-# the root of the repository), applied in the order of the command line. build/gdnk/build.sh is a link to this file. The files of the stage go to
-# build/gdnk.
+# the root of the repository), applied in the order of the command line. build/gdnk/build.sh is a link
+# to this file. The files of the stage go to GDNK_STAGE (the preset value is build/gdnk). A second stage
+# directory keeps the files of a stage that the phone runs while a different set builds.
 #
 # The steps:
-#   1. tests/sanitizers/llama-copy.sh makes build/gdnk/src, the llama.cpp tree of HEAD (the pin plus
+#   1. tests/sanitizers/llama-copy.sh makes GDNK_STAGE/src, the llama.cpp tree of HEAD (the pin plus
 #      patches/series). git apply puts each PATCH on it, inside a git repository of its own: git apply
 #      in the repository around build/ skips the files below an ignored path and still exits 0.
 #   2. In the Snapdragon container, under the lock build/.container.lock, CMake configures the tree into
-#      build/gdnk/android with the preset, the flags (with -flto) and the build number and commit of
+#      GDNK_STAGE/android with the preset, the flags (with -flto) and the build number and commit of
 #      scripts/build-native.sh, and builds the libraries of the app (LLAMA_LIBS of scripts/lib.sh), the DSP
 #      library v79, llama-bench, llama-perplexity and test-backend-ops.
-#   3. The script copies the files of the stage into build/gdnk/phone and writes SHA256SUMS.
+#   3. The script copies the files of the stage into GDNK_STAGE/phone and writes SHA256SUMS.
 #
 # Time: about 15 minutes with JOBS=24 (the LTO links take most of it). Disk: about 2 GB.
 set -euo pipefail
@@ -31,7 +32,8 @@ for p in "$@"; do
     [[ -f $p ]] || die "no patch file $p"
 done
 
-readonly stage=build/gdnk
+readonly stage=${GDNK_STAGE:-build/gdnk}
+[[ $stage == build/* ]] || die "GDNK_STAGE must be a directory below build/, not $stage"
 readonly tree=$stage/src
 readonly bdir=$stage/android
 readonly out=$stage/phone

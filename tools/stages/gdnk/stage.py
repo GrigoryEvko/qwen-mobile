@@ -133,7 +133,8 @@ BLOCKS = {b.key: b for b in (
           "llama-bench pp512 and pp1024 at depth 0, 3 repetitions"),
     Block("g", "llama-bench", f"-m {MODEL} {BENCH_ARGS} -p 0 -n 32 -d 0,4096 -r 2", "abcd", 3, 105, MODEL_KB, "",
           "llama-bench tg32 at the depths 0 and 4096, 2 repetitions"),
-    Block("r", "llama-bench", f"-m {MODEL} {BENCH_ARGS} -p 1024 -n 8 -d 4096 -r 1", "abcd", 1, 105, MODEL_KB,
+    # -v: the backend writes the profile-op lines at the debug log level
+    Block("r", "llama-bench", f"-m {MODEL} {BENCH_ARGS} -p 1024 -n 8 -d 4096 -r 1 -v", "abcd", 1, 105, MODEL_KB,
           "GGML_HEXAGON_PROFILE=1", "op profile: 4 prefill ubatches to depth 4096, pp1024 and tg8 at depth 4096"),
 )}
 # The blocks of one group run round by round. The variants run in the order of the block in an odd
