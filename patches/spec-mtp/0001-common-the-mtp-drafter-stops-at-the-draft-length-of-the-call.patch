@@ -1,0 +1,55 @@
+common: the MTP drafter stops at the draft length of the call
+Fold-into: upstream/speculative
+
+The defect
+
+common_speculative_draft takes a draft length for each call (the n_max of
+common_speculative_draft_params). The draft-simple drafter stops at that length. The MTP drafter
+checks only the length of its configuration (params.n_max, 4 in the app). Thus each draft runs 4
+passes of the MTP block, and common_speculative_draft then cuts the result to the length of the call
+and discards the other tokens. The draft length policy of the app selects the length of each step
+from the measured acceptance. In a chat turn of 51 steps on the phone it asked for 1 token 44 times,
+and each of those steps ran 4 passes. One pass of the 4B Q8_0 on the NPU costs 17 to 21 ms with the
+full head.
+
+The change
+
+The MTP drafter also stops when the draft holds the length of the call, with the condition of the
+draft-simple drafter. A draft of n tokens runs n passes. Each pass reads only the passes before it,
+thus the draft of n tokens is the first n tokens of the longer draft. The verify batch and the
+accepted tokens stay the same.
+
+The test
+
+The scenario spec-limit of tests/fuzz/app (the tiny model with its MTP block) drafts with the limits
+4, 3, 2 and 1 from the same position, and each pass writes one cell of the draft context. With the
+change the drafts run 1, 2, 3 and 4 passes, and each draft is a prefix of the longest one. Without
+the change a draft with the limit 1 runs 4 passes, and the scenario fails. The scenarios spec-parity,
+spec-disable and spec-image pass. On the box CPU with the 4B Q8_0 (memprobe --turns --spec), each of
+61 drafts ran the passes that it asked for.
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+Files:
+    common/speculative.cpp
+
+How to apply, from the llama.cpp root:
+
+    git apply patches/spec-mtp/0001-common-the-mtp-drafter-stops-at-the-draft-length-of-the-call.patch
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 77dfe95..cd756d3 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1697,7 +1697,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+                 result.push_back(id);
+ 
+-                if (params.n_max <= (int) result.size()) {
++                // The limit of the call (dp.n_max) also stops the draft. common_speculative_draft cuts
++                // a longer draft to that limit, thus an MTP pass after it gives a token that goes away.
++                if ((params.n_max <= (int) result.size()) ||
++                    (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
+                     drafting[seq_id] = false;
+                     n_drafting--;
+                     continue;

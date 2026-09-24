@@ -224,3 +224,4 @@ memory/0006-hexagon-run-the-kv-cache-rotation-as-a-fast-walsh-hadamard-transform
 fuzz-ops/0019-hexagon-htp-store-only-the-columns-of-dst-in-the-hmx-mul-mat-id-output.patch
 memory/0007-hexagon-an-environment-switch-for-the-fwht-form-of-the-kv-cache-rotation.patch
 hexagon-fusion/0008-hexagon-fuse-the-gate-chains-of-the-qwen35-layers.patch
+spec-mtp/0001-common-the-mtp-drafter-stops-at-the-draft-length-of-the-call.patch
