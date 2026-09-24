@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
-"""The phone stage fak: the flash attention of HTP0 against the flash attention of HEAD, on one library set.
+"""The phone stages fak and fak2: the flash attention of HTP0 against the flash attention of HEAD, on one
+library set.
 
 Usage (tools/stages/fak/build.sh makes the binaries first and then runs "files"):
-    stage.py files                        write the test files, SHA256SUMS and phone-commands.txt
-    stage.py table [--root DIR] [--all]   print the tables from the pulled outputs (phone-out)
+    stage.py [--stage NAME] files                        write the test files, SHA256SUMS and phone-commands.txt
+    stage.py [--stage NAME] table [--root DIR] [--all]   print the tables from the pulled outputs (phone-out)
+
+NAME is fak (the preset) or fak2. The files of a stage are in build/NAME, and on the phone in
+/data/local/tmp/qwen/NAME.
+
+The stage fak (2026-09-24) runs each part of the flash attention. The stage fak2 is the probe after the
+fak data: in fak each real-model run of C, D and E stopped at the 110 s kill, and the op tests of T, R and E
+stopped at the first prefill case. The thread of the op had DMA transfers in flight on two queues at the
+same time (K, V and masks on the queue of thread 0, the next Q on the queue of thread 1). The DMA engine of
+a hardware thread follows one descriptor chain, thus a push to the second queue never starts. The
+candidate of fak2 uses one queue. fak2 has short time limits and saves the logcat lines of the DSP of each
+run (<run>.lc).
 
 The switch GGML_HEXAGON_FA_OPT holds the bits HTP_FA_OPT_* of htp/flash-attn-ops.h. One variant for
 each part (the patches land one at a time in this order: the chunk cost model, the tile softmax, the
@@ -47,8 +59,7 @@ it, and the thermal status after it is 0. --all also uses the runs with changed 
 the median of the rounds, and the difference to A is the median over the rounds of the ratio of the two
 runs of one round. The table only reads files: O(size of the outputs).
 
-This file is tools/stages/fak/stage.py, and build/fak/stage.py is a link to it. The files of the stage
-stay in build/fak.
+This file is tools/stages/fak/stage.py, and build/fak/stage.py is a link to it.
 """
 
 from __future__ import annotations
@@ -68,14 +79,18 @@ from dataclasses import dataclass
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
-HERE = REPO / "build/fak"
 
 # ---- The stage paths and the phone lines ----
 
-ADB = "adb -s 192.168.14.130:5555"
+# The paths of one stage: use_stage sets them from the stage name.
+STAGE = "fak"
+HERE = REPO / "build/fak"
 PHONE = "/data/local/tmp/qwen/fak"
 LAPTOP_STAGE = "build/fak"
 BOX = "grigory@10.10.20.200:airi/qwen-mobile/build/fak"
+LIB_ENV = ""
+
+ADB = "adb -s 192.168.14.130:5555"
 MODEL = "/data/local/tmp/qwen/models/Qwen3.5-4B-Q8_0.gguf"
 MODEL_KB = 8388608
 # The ls of a model file makes the laptop runner treat a line as a model run: it waits for the unlocked
@@ -89,9 +104,6 @@ WIKI = "/data/local/tmp/qwen/eval/wiki.test.raw"
 KVKL_DIR = "/data/local/tmp/qwen/memory/b/bases"
 KVKL_16K = f"{KVKL_DIR}/naive-4B-deqf32-c16384-s32-t64.kvb"
 KVKL_TEXT = f"{KVKL_DIR}/wiki.test.raw"
-# The environment of the app (init_impl in llama_jni.cpp) and the stage libraries.
-LIB_ENV = (f"LD_LIBRARY_PATH={PHONE}/lib ADSP_LIBRARY_PATH={PHONE}/lib "
-           "GGML_HEXAGON_OPFUSION=1 GGML_HEXAGON_OPFUSION_STATE=1")
 # The context of the app (load_impl in llama_jni.cpp): n_batch = n_ubatch = 1024, 4 threads, flash
 # attention on HTP0, the Q8_0 cache with the FWHT rotation (the flags of the variant b of bench-kv).
 BENCH_ARGS = "-dev HTP0 -ngl 99 -t 4 -fa on -b 1024 -ub 1024 -o jsonl"
@@ -100,7 +112,7 @@ STAGE_FILES = ("bin/gate.sh", "bin/llama-bench", "bin/llama-perplexity", "bin/te
                "lib/libggml-opencl.so", "lib/libggml.so", "lib/libllama-bench-impl.so",
                "lib/libllama-perplexity-impl.so", "lib/libllama-common.so", "lib/libllama.so", "lib/libmtmd.so")
 # The test files of test-backend-ops (phone/tests/<name>.txt, written by write_files)
-TEST_FILES = ("fa4b", "vit")
+TEST_FILES = ("fa4b", "fa4s", "fa4l", "vit", "faperf")
 THERMAL = f"{ADB} shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
 PGREP = (f"{ADB} shell 'pgrep -x llama-bench; pgrep -x llama-perplexi; pgrep -x test-backend-op; pgrep -x kvkl; "
          "echo pgrep-done'")
@@ -158,7 +170,7 @@ class Block:
 # thus the tool time of a run with -r 1 is about 11 s (p), 15 s (t) and 30 s (l). The estimates of q, f
 # and prof add the prefill and decode times of those runs. The op tests, the KL runs and kvkl have no
 # earlier measurement: their estimates are upper limits.
-BLOCKS = {b.key: b for b in (
+FAK_BLOCKS = {b.key: b for b in (
     Block("ops", "test-backend-ops test", "fa4b", "abtrse", 1, 100, "", False, OPS_KB,
           "test-backend-ops test -b HTP0, the FLASH_ATTN_EXT cases of the 4B shape and of its vision encoder "
           "(tests/fa4b.txt)"),
@@ -192,9 +204,87 @@ BLOCKS = {b.key: b for b in (
 # The blocks of one group run round by round: round 1 of each block, then round 2 of each block. The
 # variants run in the order of the block in an odd round and in the reverse order in an even round,
 # thus a slow drift of the clocks or the heat goes equally to each variant over two rounds.
-GROUPS = (("ops", "suite1", "suite2", "vit"), ("klp", "kld", "kl16"), ("p", "q", "t", "l", "f"), ("prof",))
-EST_S = {"ops": 40, "suite1": 50, "suite2": 50, "vit": 15, "klp": 40, "kld": 60, "kl16": 90, "p": 11, "q": 12,
-         "t": 15, "l": 30, "f": 37, "prof": 20}
+FAK_GROUPS = (("ops", "suite1", "suite2", "vit"), ("klp", "kld", "kl16"), ("p", "q", "t", "l", "f"), ("prof",))
+FAK_EST_S = {"ops": 40, "suite1": 50, "suite2": 50, "vit": 15, "klp": 40, "kld": 60, "kl16": 90, "p": 11, "q": 12,
+             "t": 15, "l": 30, "f": 37, "prof": 20}
+
+# The probe fak2: one round of each block, and time limits of about twice the tool time of the A runs of
+# fak (the op runs of A took less than 100 s, the llama-bench runs of A the estimates above). The op tests
+# run the small cases (fa4s) for each form and the large cases (fa4l) for A and E. faperf gives the time
+# of one FA op of the 4B shapes for A and the forms of the new kernel.
+FAK2_BLOCKS = {b.key: b for b in (
+    Block("ops", "test-backend-ops test", "fa4s", "atre", 1, 45, "", False, OPS_KB,
+          "test-backend-ops test -b HTP0, the small FLASH_ATTN_EXT cases of the 4B and of its encoder "
+          "(tests/fa4s.txt)"),
+    Block("opl", "test-backend-ops test", "fa4l", "ae", 1, 75, "", False, OPS_KB,
+          "test-backend-ops test -b HTP0, the large FLASH_ATTN_EXT cases of the 4B and of its encoder "
+          "(tests/fa4l.txt)"),
+    Block("vit", "test-backend-ops perf", "vit", "ace", 1, 40, "", False, OPS_KB,
+          "test-backend-ops perf -b HTP0, the FLASH_ATTN_EXT ops of the vision encoder (tests/vit.txt)"),
+    Block("faperf", "test-backend-ops perf", "faperf", "acde", 1, 60, "", False, OPS_KB,
+          "test-backend-ops perf -b HTP0, the FLASH_ATTN_EXT ops of the 4B (tests/faperf.txt)"),
+    FAK_BLOCKS["klp"],
+    Block("kld", "llama-perplexity",
+          f"-c 512 -b 1 -ub 1 --chunks 1 --kl-divergence-base {KLD_BASE} --kl-divergence",
+          "ae", 1, 100, "q8_0", False, MODEL_KB, "the decode KL (-b 1, 1 chunk) against the naive oracle"),
+    FAK_BLOCKS["kl16"],
+    Block("p", "llama-bench", "-p 512 -n 0 -d 0,4096 -r 1", "acd", 1, 40, "q8_0", False, MODEL_KB,
+          "llama-bench pp512 at the depths 0 and 4096, 1 repetition"),
+    Block("q", "llama-bench", "-p 1024 -n 0 -d 3072 -r 1", "ad", 1, 40, "q8_0", False, MODEL_KB,
+          "llama-bench pp1024 at the depth 3072 (one ubatch), 1 repetition"),
+    Block("t", "llama-bench", "-p 0 -n 32 -d 0,4096 -r 1", "ae", 1, 45, "q8_0", False, MODEL_KB,
+          "llama-bench tg32 at the depths 0 and 4096, 1 repetition"),
+    Block("l", "llama-bench", "-p 0 -n 32 -d 16384 -r 1", "ae", 1, 70, "q8_0", False, MODEL_KB,
+          "llama-bench tg32 at the depth 16384, 1 repetition"),
+    Block("f", "llama-bench", "-p 0 -n 32 -d 4096,16384 -r 1", "e", 1, 90, "f16", False, MODEL_KB,
+          "llama-bench tg32 with an F16 cache at the depths 4096 and 16384, 1 repetition (the release rule)"),
+    Block("prof", "llama-bench", "-p 1024 -n 8 -d 3072 -r 1 -v", "ace", 1, 60, "q8_0", True, MODEL_KB,
+          "GGML_HEXAGON_PROFILE=1 (with -v): one 1024-token ubatch at the depth 3072, then 8 decode tokens"),
+)}
+FAK2_GROUPS = (("ops", "opl", "vit", "faperf"), ("klp", "kld", "kl16"), ("p", "q", "t", "l", "f"), ("prof",))
+FAK2_EST_S = {"ops": 25, "opl": 50, "vit": 15, "faperf": 30, "klp": 40, "kld": 60, "kl16": 90, "p": 11, "q": 12,
+              "t": 15, "l": 30, "f": 37, "prof": 20}
+
+
+@dataclass(frozen=True)
+class StageDef:
+    """One stage: its blocks, their groups, the estimate of the tool time of each block (s), the column
+    order of the rate table, and the logcat flag (save the DSP lines of logcat after each run)."""
+    blocks: dict
+    groups: tuple
+    est_s: dict
+    table_keys: str
+    logcat: bool
+
+
+STAGES = {
+    "fak": StageDef(FAK_BLOCKS, FAK_GROUPS, FAK_EST_S, "abcde", False),
+    "fak2": StageDef(FAK2_BLOCKS, FAK2_GROUPS, FAK2_EST_S, "acde", True),
+}
+BLOCKS = FAK_BLOCKS
+GROUPS = FAK_GROUPS
+EST_S = FAK_EST_S
+LOGCAT = False
+
+
+def use_stage(name: str) -> None:
+    """Set the paths and the blocks of the stage name. O(1).
+
+    Raises:
+        KeyError: If the name is not in STAGES
+    """
+    global STAGE, HERE, PHONE, LAPTOP_STAGE, BOX, LIB_ENV, BLOCKS, GROUPS, EST_S, TABLE_KEYS, LOGCAT
+    sdef = STAGES[name]
+    STAGE = name
+    HERE = REPO / "build" / name
+    PHONE = f"/data/local/tmp/qwen/{name}"
+    LAPTOP_STAGE = f"build/{name}"
+    BOX = f"grigory@10.10.20.200:airi/qwen-mobile/build/{name}"
+    # The environment of the app (init_impl in llama_jni.cpp) and the stage libraries.
+    LIB_ENV = (f"LD_LIBRARY_PATH={PHONE}/lib ADSP_LIBRARY_PATH={PHONE}/lib "
+               "GGML_HEXAGON_OPFUSION=1 GGML_HEXAGON_OPFUSION_STATE=1")
+    BLOCKS, GROUPS, EST_S = sdef.blocks, sdef.groups, sdef.est_s
+    TABLE_KEYS, LOGCAT = sdef.table_keys, sdef.logcat
 
 
 @dataclass(frozen=True)
@@ -236,6 +326,18 @@ FA_SHAPES = {
     "q8_0": ((1, 512), (1, 4096), (1, 16384), (1, 5000), (4, 4096), (512, 512), (1000, 1000), (1024, 4096),
              (1024, 8192), (700, 3700)),
     "f16": ((1, 4096), (1, 16384), (512, 512), (1024, 4096)),
+}
+# The probe fak2 divides the cases of fa4b: the small cases (fa4s, the small encoder op) and the large
+# cases (fa4l, the large encoder op). faperf has the prefill ubatches of the 4B at the depths 0 to 3072 and
+# the decode tokens at 4096 and 16384.
+FA_SHAPES_SMALL = {
+    "q8_0": ((1, 512), (1, 4096), (1, 16384), (1, 5000), (4, 4096), (512, 512), (1000, 1000), (700, 3700)),
+    "f16": ((1, 4096), (1, 16384), (512, 512)),
+}
+FA_SHAPES_LARGE = {"q8_0": ((1024, 4096), (1024, 8192)), "f16": ((1024, 4096),)}
+FA_SHAPES_PERF = {
+    "q8_0": ((512, 512), (1024, 1024), (1024, 2048), (1024, 4096), (1, 4096), (1, 16384)),
+    "f16": ((1, 4096), (1, 16384)),
 }
 
 
@@ -295,7 +397,7 @@ def ggml_op_value(name: str) -> int:
     """The value of one ggml_op name in the stage tree.
 
     Raises:
-        FileNotFoundError: If build/fak/tree is not there (run build.sh on the box first)
+        FileNotFoundError: If build/NAME/tree is not there (run build.sh on the box first)
     """
     text = (HERE / "tree/ggml/include/ggml.h").read_text()
     body = text[text.index("enum ggml_op {"):]
@@ -307,28 +409,42 @@ def ggml_op_value(name: str) -> int:
 # ---- The command file ----
 
 HEADER = """\
-# Phone stage "fak": the flash attention of HTP0 (the chunk cost model, the tile softmax HTP_FA_KERNEL_HMX2, the
+# Phone stage "{stage}": the flash attention of HTP0 (the chunk cost model, the tile softmax HTP_FA_KERNEL_HMX2, the
 # resident K and V, the decode spans) against the flash attention of HEAD, on one library set. The switch
 # GGML_HEXAGON_FA_OPT selects the parts: A 0 (HEAD), B 1 (chunk model alone), T 2 (tile softmax alone), R 6 (tile
 # softmax with resident K and V), S 8 (decode spans alone), C 3 (B + T), D 7 (C + resident), E 15 (D + decode spans,
 # the preset). The op tests and the KL runs come first, thus a failure on the chip shows early and names its part.
 # The 4B Q8_0 model, the Q8_0 cache with the FWHT rotation, n_batch = n_ubatch = 1024, 4 threads, flash attention on
 # HTP0 (the flags of bench-kv variant b). The op tests also have the flash attention of the vision encoder.
-#
-# The libraries (build/fak/build.sh): the patched llama.cpp tree of HEAD (tests/sanitizers/llama-copy.sh) plus the
-# candidate patches of build/fak/patches, built with the preset and the flags of scripts/build-native.sh.
+#{note}
+# The libraries (STAGE={stage} tools/stages/fak/build.sh): the patched llama.cpp tree of HEAD
+# (tests/sanitizers/llama-copy.sh) plus the candidate patches of build/{stage}/patches, built with the preset and the
+# flags of scripts/build-native.sh.
 #
 # The runs ({n_runs}):
 {run_text}
 # Each run: the thermal line, then bin/gate.sh (the Qwen app stopped, the screen on, thermal 0, no charger,
 # MemAvailable, the caps), the tool under timeout -s KILL (110 s or less), the exit code and the conditions after
-# the run, then the pgrep line.
+# the run, then the pgrep line.{lc_note}
 #
 # Put this file into /tmp/phone-timing-stages.txt: it is a timing stage (unlocked phone, no charger).
 # Run from /home/grigory/airi/qwen-mobile on the laptop, in order. Time: about {tool_min:.0f} minutes of tool time plus
 # about 10 s of gate and checks for each run, about {total_min:.0f} minutes, plus the waits for thermal status 0.
-# Then, on the box: build/fak/stage.py table
+# Then, on the box: tools/stages/fak/stage.py --stage {stage} table
 """
+
+# The text of the header for each stage (after the first paragraph)
+STAGE_NOTES = {
+    "fak": "",
+    "fak2": """
+# The probe fak2 after the stage fak. In fak each real-model run of C, D and E stopped at the kill, and the op tests
+# of T, R and E stopped at the first prefill case: the thread of the op had DMA transfers in flight on two queues at
+# the same time (K, V and masks on the queue of thread 0, the next Q on the queue of thread 1), and the DMA engine of
+# a thread follows one chain. The candidate of this stage uses one queue. The short time limits stop a hang early.
+# The variant B (the chunk cost model alone) is not here: fak measured it slower than A (pp1024 d3072 -2.9 %, the
+# encoder op of 2688 patches 1.56 times the time of A).
+#""",
+}
 
 
 def setup_lines() -> list[str]:
@@ -344,7 +460,7 @@ def setup_lines() -> list[str]:
         f"{ADB} shell 'rm -rf {PHONE} && mkdir -p {PHONE}/bin {PHONE}/lib {PHONE}/tests {PHONE}/out'",
         f"{ADB} push {bins} {PHONE}/bin/",
         f"{ADB} push {libs} {PHONE}/lib/",
-        f"{ADB} push {LAPTOP_STAGE}/phone/tests/fa4b.txt {LAPTOP_STAGE}/phone/tests/vit.txt {PHONE}/tests/",
+        f"{ADB} push " + " ".join(f"{LAPTOP_STAGE}/phone/tests/{name}.txt" for name in TEST_FILES) + f" {PHONE}/tests/",
         f"{ADB} push {LAPTOP_STAGE}/phone/SHA256SUMS {PHONE}/",
         f"{ADB} shell 'cd {PHONE} && sha256sum -c SHA256SUMS | grep -c OK && chmod 755 {PHONE}/bin/*'",
         f"{ADB} shell 'echo gzip: $(command -v gzip) timeout: $(command -v timeout)'",
@@ -378,8 +494,13 @@ def run_lines(run: Run) -> list[str]:
                 f"timeout -s KILL {b.limit} env {env} {cmd} 2>&1 > {stem}.out | $Z > {stem}.log.z; }}; ")
     else:
         tool = f"{{ timeout -s KILL {b.limit} env {env} {cmd} > {stem}.out 2> {stem}.log; }}; "
+    # The logcat lines of the DSP session and of FastRPC during the run, for a stage with LOGCAT.
+    lc_clear = "logcat -c; " if LOGCAT else ""
+    lc_save = (f"logcat -d 2>/dev/null | grep -iE \"adsprpc|fastrpc|cdsp|htp|hexagon|qurt|dspqueue\" | tail -n 80 "
+               f"> {stem}.lc; ") if LOGCAT else ""
     shell = (f"{prefix}sh {PHONE}/bin/gate.sh {b.gate_kb} > {stem}-gate.txt && {BEFORE} >> {stem}-gate.txt && "
-             f"{tool}echo \"rc=$?\" >> {stem}-gate.txt; {AFTER} >> {stem}-gate.txt; cat {stem}-gate.txt")
+             f"{lc_clear}{tool}echo \"rc=$?\" >> {stem}-gate.txt; {lc_save}{AFTER} >> {stem}-gate.txt; "
+             f"cat {stem}-gate.txt")
     title = "REAL-MODEL Qwen3.5-4B-Q8_0" if b.gate_kb == MODEL_KB else "OPS"
     return ["#", f"# {title}: {run.name}, {b.text}, {v.key.upper()}: GGML_HEXAGON_FA_OPT={v.opt} ({v.text})",
             THERMAL, f"{ADB} shell '{shell}'", PGREP]
@@ -420,7 +541,7 @@ def missing_needed(phone: Path) -> list[str]:
 
 
 def write_files() -> int:
-    """Write phone/tests/fa4b.txt, phone/SHA256SUMS and phone-commands.txt. The binaries and the
+    """Write the test files of phone/tests, phone/SHA256SUMS and phone-commands.txt. The binaries and the
     libraries of phone/ come from build.sh. The function stops when a file of STAGE_FILES is missing, or
     when a program or a library needs a llama, ggml or mtmd library that phone/lib does not have."""
     phone = HERE / "phone"
@@ -435,9 +556,15 @@ def write_files() -> int:
     (phone / "tests").mkdir(parents=True, exist_ok=True)
     op_fa = ggml_op_value("GGML_OP_FLASH_ATTN_EXT")
     vit = [vit_line(op_fa, n) for n in VIT_POS]
-    lines = [fa_line(op_fa, t, n, kv) for t, shapes in FA_SHAPES.items() for n, kv in shapes] + vit
-    (phone / "tests/fa4b.txt").write_text("\n".join(lines) + "\n")
-    (phone / "tests/vit.txt").write_text("\n".join(vit) + "\n")
+
+    def cases(shapes: dict) -> list[str]:
+        return [fa_line(op_fa, t, n, kv) for t, pairs in shapes.items() for n, kv in pairs]
+
+    tests = {"fa4b": cases(FA_SHAPES) + vit, "fa4s": cases(FA_SHAPES_SMALL) + vit[:1],
+             "fa4l": cases(FA_SHAPES_LARGE) + vit[1:], "vit": vit, "faperf": cases(FA_SHAPES_PERF)}
+    assert set(tests) == set(TEST_FILES)
+    for name, lines in tests.items():
+        (phone / f"tests/{name}.txt").write_text("\n".join(lines) + "\n")
     files = sorted(p for p in phone.rglob("*") if p.is_file() and p.name != "SHA256SUMS")
     sums = [f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(phone)}" for p in files]
     (phone / "SHA256SUMS").write_text("\n".join(sums) + "\n")
@@ -446,8 +573,10 @@ def write_files() -> int:
     tool = sum(EST_S[r.block.key] for r in runs)
     run_text = "\n".join(f"#   {b.key:7s} {b.text}; {', '.join(x.upper() for x in b.variants)}; {b.rounds} round(s)"
                          for b in BLOCKS.values())
-    head = HEADER.format(n_runs=len(runs), run_text=run_text, tool_min=tool / 60,
-                         total_min=(tool + 10 * len(runs)) / 60)
+    lc_note = ("\n# With logcat: logcat -c before the tool, then the DSP lines of logcat -d into <run>.lc (the outputs\n"
+               "# have four files for each run).") if LOGCAT else ""
+    head = HEADER.format(stage=STAGE, note=STAGE_NOTES[STAGE], lc_note=lc_note, n_runs=len(runs), run_text=run_text,
+                         tool_min=tool / 60, total_min=(tool + 10 * len(runs)) / 60)
     out = head.rstrip("\n").split("\n") + setup_lines()
     for run in runs:
         out += run_lines(run)
@@ -482,6 +611,7 @@ class Result:
     caps: str
     out: str
     log: str
+    lc: str = ""  # the DSP lines of logcat (<run>.lc), empty without LOGCAT
 
     def bench(self) -> dict[tuple[int, int, int], float]:
         """The llama-bench rates: (n_prompt, n_gen, n_depth) -> the median of the samples in t/s."""
@@ -525,7 +655,8 @@ def read_result(root: Path, run: Run) -> Result:
         flags.append(f"caps {caps} -> {after.group(2)}/{after.group(3)}")
     if after and after.group(1) not in ("", "0"):
         flags.append(f"thermal {after.group(1)} after the run")
-    return Result(run, ok, flags, caps, read_text(root / f"{run.name}.out"), read_text(root / f"{run.name}.log"))
+    return Result(run, ok, flags, caps, read_text(root / f"{run.name}.out"), read_text(root / f"{run.name}.log"),
+                  read_text(root / f"{run.name}.lc"))
 
 
 def usable(res: Result | None, include_all: bool) -> bool:
@@ -537,7 +668,7 @@ def op_table(results: dict[str, Result]) -> list[str]:
     """The test-backend-ops runs: the passed count, and each failed case with its error. A failed case of
     both A and E is a failure that HEAD has too."""
     out = ["== 1. test-backend-ops FLASH_ATTN_EXT on HTP0 against the CPU (the error is the NMSE of test-backend-ops) =="]
-    for key in ("ops", "suite1", "suite2"):
+    for key in [k for k, b in BLOCKS.items() if b.tool == "test-backend-ops test"]:
         fails_of: dict[str, dict[str, str]] = {}
         for v in BLOCKS[key].variants:
             res = results.get(f"{key}-1-{v}")
@@ -548,7 +679,11 @@ def op_table(results: dict[str, Result]) -> list[str]:
             passed = TEST_RE.findall(text)
             fails = {c: err or "?" for err, c, st in CASE_RE.findall(text) if st == "FAIL"}
             fails_of[v] = fails
-            summary = ", ".join(f"{a}/{b}" for a, b in passed) or "no summary line"
+            # A killed run has no summary line. The tool writes the name of a case after the case, thus the last
+            # name is the last case that ended, and the run stopped in the case after it.
+            names = CASE_NAME_RE.findall(text)
+            summary = (", ".join(f"{a}/{b}" for a, b in passed) or
+                       f"no summary line, the last case that ended: {names[-1] if names else 'none'}")
             out.append(f"  {key:7s} {v.upper()}: passed {summary}; {len(fails)} FAIL"
                        + (f"; flags: {', '.join(res.flags)}" if res.flags else ""))
         for v in fails_of:
@@ -563,31 +698,33 @@ def op_table(results: dict[str, Result]) -> list[str]:
 
 
 PERF_RE = re.compile(r"FLASH_ATTN_EXT\(name=(\w+),.*?\):\s+(\d+) runs -\s+([\d.]+) us/run")
+CASE_NAME_RE = re.compile(r"FLASH_ATTN_EXT\(name=(\w+)")
 
 
-def vit_table(results: dict[str, Result]) -> list[str]:
-    """The perf runs of the vision encoder ops: the us of one op for each variant, and the ratio to A."""
-    out = ["", "== 1b. The FLASH_ATTN_EXT ops of the vision encoder (test-backend-ops perf): us of one op, the ratio to A =="]
-    us: dict[str, dict[str, float]] = {}
-    for v in BLOCKS["vit"].variants:
-        res = results.get(f"vit-1-{v}")
-        if res is None or not res.ok:
-            out.append(f"  vit-1-{v}: no usable run")
-            continue
-        for name, _, val in PERF_RE.findall(ANSI_RE.sub("", res.out)):
-            us.setdefault(name, {})[v] = float(val)
-    for name, per in us.items():
-        base = per.get("a")
-        cells = [f"{v.upper()} {per[v]:9.1f}" + (f" ({per[v] / base:.3f})" if base and v != "a" else "")
-                 for v in BLOCKS["vit"].variants if v in per]
-        out.append(f"  {name:16s} " + " | ".join(cells))
+def perf_table(results: dict[str, Result]) -> list[str]:
+    """The perf runs (the encoder ops, the 4B ops): the us of one op for each variant, and the ratio to A."""
+    out = ["", "== 1b. FLASH_ATTN_EXT ops (test-backend-ops perf): us of one op, the ratio to A =="]
+    for key in [k for k, b in BLOCKS.items() if b.tool == "test-backend-ops perf"]:
+        us: dict[str, dict[str, float]] = {}
+        for v in BLOCKS[key].variants:
+            res = results.get(f"{key}-1-{v}")
+            if res is None or not res.ok:
+                out.append(f"  {key}-1-{v}: no usable run" + (f"; flags: {', '.join(res.flags)}" if res else ""))
+                continue
+            for name, _, val in PERF_RE.findall(ANSI_RE.sub("", res.out)):
+                us.setdefault(name, {})[v] = float(val)
+        for name, per in us.items():
+            base = per.get("a")
+            cells = [f"{v.upper()} {per[v]:9.1f}" + (f" ({per[v] / base:.3f})" if base and v != "a" else "")
+                     for v in BLOCKS[key].variants if v in per]
+            out.append(f"  {name:22s} " + " | ".join(cells))
     return out
 
 
 def kl_table(results: dict[str, Result]) -> list[str]:
     """The KL runs: the mean KL, its error, the maximum and the top-1 share, and the kvkl summary lines."""
     out = ["", "== 2. KL against the naive oracle (4B Q8_0, Q8_0 cache) =="]
-    for key in ("klp", "kld"):
+    for key in [k for k in ("klp", "kld") if k in BLOCKS]:
         for v in BLOCKS[key].variants:
             res = results.get(f"{key}-1-{v}")
             if res is None:
@@ -598,7 +735,7 @@ def kl_table(results: dict[str, Result]) -> list[str]:
             cell = (f"mean {m.group(1)} ± {m.group(2)}, max {mx.group(1) if mx else '?'}, top-1 "
                     f"{top.group(1) if top else '?'} %") if m else "no KLD line"
             out.append(f"  {key:5s} {v.upper()}: {cell}" + (f"; flags: {', '.join(res.flags)}" if res.flags else ""))
-    for v in BLOCKS["kl16"].variants:
+    for v in BLOCKS["kl16"].variants if "kl16" in BLOCKS else "":
         res = results.get(f"kl16-1-{v}")
         rows = [ln for ln in (res.out.splitlines() if res else []) if re.match(r"^(decode|all)\b", ln)]
         out.append(f"  kl16  {v.upper()}: " + (" | ".join(rows) if rows else "no summary line")
@@ -630,7 +767,7 @@ def rate_table(results: dict[str, Result], include_all: bool) -> list[str]:
     out = ["", "== 3. Rates (t/s): the median of the rounds, the difference to A (the median of the paired ratios), "
                "[the lowest and the highest round] and the round count ==",
            f"  {'measurement':24s}| " + " | ".join(f"{k.upper()} {VARIANTS[k].opt:<2d}{'':27s}" for k in TABLE_KEYS)]
-    for text, key, bkey in ROWS:
+    for text, key, bkey in [row for row in ROWS if row[1] in BLOCKS]:
         block = BLOCKS[key]
         per: dict[str, dict[int, float]] = {k: {} for k in block.variants}
         for rnd in range(1, block.rounds + 1):
@@ -656,7 +793,9 @@ def rate_table(results: dict[str, Result], include_all: bool) -> list[str]:
     # The release rule: the Q8_0 decode of E against the F16 decode of E, per round.
     for depth, qkey in ((4096, "t"), (16384, "l")):
         ratios = []
-        for rnd in range(1, 4):
+        if qkey not in BLOCKS or "f" not in BLOCKS:
+            continue
+        for rnd in range(1, BLOCKS["f"].rounds + 1):
             q = results.get(f"{qkey}-{rnd}-e")
             f = results.get(f"f-{rnd}-e")
             if usable(q, include_all) and usable(f, include_all):
@@ -689,7 +828,7 @@ def prof_table(results: dict[str, Result]) -> list[str]:
     8 decode tokens (1 query, 3073 to 3080 KV rows at d3072)."""
     out = ["", "== 4. The FA ops of the profile runs (GGML_HEXAGON_PROFILE=1): queries x KV rows, ops, the median us of "
                "one op, the kernel =="]
-    for k in BLOCKS["prof"].variants:
+    for k in BLOCKS["prof"].variants if "prof" in BLOCKS else "":
         res = results.get(f"prof-1-{k}")
         if res is None or not res.ok:
             out.append(f"  {k.upper()}: no usable run")
@@ -736,6 +875,10 @@ def checks(results: dict[str, Result]) -> list[str]:
     for r in got:
         if r.flags:
             out.append(f"  {r.run.name}: " + ", ".join(r.flags))
+        # The first logcat line of the DSP that tells of an error, for a stage with LOGCAT
+        bad = [ln for ln in r.lc.splitlines() if re.search(r"(?i)error|fatal|crash|exception|died|fail|abort", ln)]
+        if bad:
+            out.append(f"  {r.run.name}: logcat: {len(bad)} error lines, the first: {bad[0].strip()[:200]}")
         if r.ok and r.run.variant.opt != 15 and f"options 0x{r.run.variant.opt:x}" not in r.log \
                 and not r.run.block.tool.startswith("test-backend-ops") and not r.run.block.profile:
             out.append(f"  {r.run.name}: the log has no line of GGML_HEXAGON_FA_OPT={r.run.variant.opt}")
@@ -748,7 +891,7 @@ def table(root: Path, include_all: bool) -> int:
         print(f"stage.py: {root} is not a directory. Pull the outputs of the stage first.", file=sys.stderr)
         return 1
     results = {r.name: read_result(root, r) for r in all_runs() if (root / f"{r.name}-gate.txt").exists()}
-    for part in (checks(results), op_table(results), vit_table(results), kl_table(results),
+    for part in (checks(results), op_table(results), perf_table(results), kl_table(results),
                  rate_table(results, include_all), prof_table(results)):
         print("\n".join(part))
     return 0
@@ -757,15 +900,17 @@ def table(root: Path, include_all: bool) -> int:
 def main() -> int:
     """Run the subcommand of the command line."""
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--stage", default="fak", choices=sorted(STAGES), help="the stage (build/NAME)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("files", help="write the test files, SHA256SUMS and the phone command file")
     t = sub.add_parser("table", help="print the tables from the pulled logs")
-    t.add_argument("--root", type=Path, default=HERE / "phone-out")
+    t.add_argument("--root", type=Path, default=None, help="the pulled outputs (default build/NAME/phone-out)")
     t.add_argument("--all", action="store_true", help="also use the runs with changed caps or heat")
     a = ap.parse_args()
+    use_stage(a.stage)
     if a.cmd == "files":
         return write_files()
-    return table(a.root, a.all)
+    return table(a.root or HERE / "phone-out", a.all)
 
 
 if __name__ == "__main__":

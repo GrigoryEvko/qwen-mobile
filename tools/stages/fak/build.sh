@@ -1,32 +1,34 @@
 #!/usr/bin/env bash
-# Build the phone stage "fak": the flash attention of HTP0 (the chunk cost model, the tile-layout
+# Build the phone stage "fak" or "fak2": the flash attention of HTP0 (the chunk cost model, the tile-layout
 # kernel, the resident K and V and the decode spans) against the flash attention of HEAD, on one
 # library set. The switch GGML_HEXAGON_FA_OPT (patches/hexagon-fa) selects the parts at run time.
 #
-#   JOBS=24 tools/stages/fak/build.sh
+#   JOBS=24 [STAGE=fak2] tools/stages/fak/build.sh
 #
-# build/fak/build.sh is a link to this file. The files of the stage go to build/fak.
+# STAGE names the stage of stage.py (fak, the preset, or fak2). The files of the stage go to build/STAGE, and
+# the candidate patches come from build/STAGE/patches. build/fak/build.sh is a link to this file.
 #
 # The steps:
-#   1. tests/sanitizers/llama-copy.sh makes build/fak/tree, the llama.cpp tree of HEAD (the pin plus
-#      patches/series). Then git apply puts each patch of build/fak/patches (the candidate patches,
+#   1. tests/sanitizers/llama-copy.sh makes build/STAGE/tree, the llama.cpp tree of HEAD (the pin plus
+#      patches/series). Then git apply puts each patch of build/STAGE/patches (the candidate patches,
 #      in the order of their names) on the tree. A candidate that is in patches/series already is
-#      not in build/fak/patches.
+#      not in build/STAGE/patches.
 #   2. In the Snapdragon container, under the lock build/.container.lock, CMake configures the tree
-#      into build/fak/android with the preset, the compiler flags (with -flto) and the build number
+#      into build/STAGE/android with the preset, the compiler flags (with -flto) and the build number
 #      and commit of scripts/build-native.sh. It builds the libraries of the app (LLAMA_LIBS of
 #      scripts/lib.sh), the DSP library v79, llama-bench, llama-perplexity and test-backend-ops. The
 #      NDK clang++ compiles tools/memprobe/kvkl.cpp, as tools/memprobe/build-phone.sh does.
-#   3. The script copies the files of the stage into build/fak/phone, and stage.py files writes the
-#      test files, SHA256SUMS and build/fak/phone-commands.txt.
+#   3. The script copies the files of the stage into build/STAGE/phone, and stage.py files writes the
+#      test files, SHA256SUMS and build/STAGE/phone-commands.txt.
 #
 # Time: about 15 minutes with JOBS=24 (the LTO links take most of it). Disk: about 2 GB.
 set -euo pipefail
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../../scripts/lib.sh"
 JOBS=${JOBS:-24}
+STAGE=${STAGE:-fak}
 cd "$REPO_ROOT"
 
-readonly stage=build/fak
+readonly stage=build/$STAGE
 readonly tree=$stage/tree
 readonly bdir=$stage/android
 readonly out=$stage/phone
@@ -40,7 +42,7 @@ git -C "$tree" init -q
 shopt -s nullglob
 for p in "$stage"/patches/*.patch; do
     git -C "$tree" apply --whitespace=nowarn "$REPO_ROOT/$p" || die "$p does not apply to $tree"
-    echo "fak: applied $p"
+    echo "$STAGE: applied $p"
 done
 shopt -u nullglob
 rm -rf "$tree/.git"
@@ -49,7 +51,7 @@ cp -f android/snapdragon/CMakeUserPresets.json "$tree/CMakeUserPresets.json"
 # 2. The build.
 mkdir -p "$bdir"
 SOURCE_DATE_EPOCH=$(source_date_epoch)
-echo "fak: SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH JOBS=$JOBS"
+echo "$STAGE: SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH JOBS=$JOBS"
 (
     flock 9
     container_run \
@@ -100,4 +102,4 @@ for tool in llama-bench llama-perplexity test-backend-ops kvkl; do
     [[ -f $impl ]] && cp -f "$impl" "$out/lib/"
 done
 cp -f tools/phone/gate.sh "$out/bin/"
-tools/stages/fak/stage.py files
+tools/stages/fak/stage.py --stage "$STAGE" files
