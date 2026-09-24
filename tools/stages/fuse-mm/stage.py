@@ -37,6 +37,7 @@ import os
 import re
 import statistics
 import sys
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -111,10 +112,22 @@ BLOCKS = (
           "llama-bench pp512 and pp1024 at the depths 0 and 3072, 3 repetitions"),
     Block("t", "llama-bench", f"{BENCH_ARGS} -p 0 -n 32 -d 0,4096 -r 3", ("on", "off"), 3, 100, True,
           "llama-bench tg32 at the depths 0 and 4096, 3 repetitions"),
-    # -v: the backend writes the profile-op lines of tools/prof/optable.py only in the verbose mode
+    # -v: the backend writes the profile-op lines of tools/prof/optable.py only in the verbose mode.
+    # LLAMA_HOSTPROF=1: the host times of each token, with the graph cache hits and the batch replays.
     Block("prof", "llama-bench", f"{BENCH_ARGS} -p 512,1024 -n 4 -r 1 -v", ("on", "off"), 1, 90, False,
-          "op profile (GGML_HEXAGON_PROFILE=1, -v): ubatches of 512 and 1024 tokens and 4 decode tokens",
-          "GGML_HEXAGON_PROFILE=1"),
+          "op profile (GGML_HEXAGON_PROFILE=1, LLAMA_HOSTPROF=1, -v): ubatches of 512 and 1024 tokens and 4 decode "
+          "tokens", "GGML_HEXAGON_PROFILE=1 LLAMA_HOSTPROF=1"),
+    # The run set repack: the libraries of HEAD plus the patch that refuses a weight in the plain layout
+    Block("plain", "ffncheck", "--plain --only ffn_", ("on",), 1, 100, False,
+          "ffncheck --plain: the weights in a buffer with no WEIGHTS usage, the plain layout"),
+    Block("rffn", "ffncheck", "", ("on",), 1, 100, False,
+          "ffncheck: the weights in a buffer of the WEIGHTS usage, the tiled layout"),
+    Block("rmm", "test-backend-ops", "test -b HTP0 -o MUL_MAT", ("on",), 1, 110, False,
+          "test-backend-ops MUL_MAT on HTP0 (each tiled weight type)"),
+    Block("rmmid", "test-backend-ops", "test -b HTP0 -o MUL_MAT_ID", ("on",), 1, 110, False,
+          "test-backend-ops MUL_MAT_ID on HTP0 (each tiled weight type)"),
+    Block("rklp", "llama-perplexity", f"{KL_ARGS} -b 512", ("on",), 1, 90, False,
+          "llama-perplexity KL against the naive base, 1 chunk of 512, -b 512"),
 )
 BLOCK = {b.key: b for b in BLOCKS}
 # The timing blocks run round by round: round 1 of p, round 1 of t, round 2 of p, ...
@@ -123,16 +136,21 @@ TIMING_GROUP = ("p", "t")
 
 @dataclass(frozen=True)
 class RunSet:
-    """The blocks of one phone stage, its command file and the directory of its outputs."""
+    """The blocks of one phone stage, its command file, the directory of its outputs, the directory of its
+    stage files (build.sh OUT) and the text about its libraries."""
     blocks: tuple
     commands: str
     out_dir: str
     text: str
     minutes: str
+    phone: str = "phone"
+    libs: str = ("the patched llama.cpp tree of HEAD (tests/sanitizers/llama-copy.sh) plus build/fuse-mm/patches/0001 "
+                 "(MUL_MAT_NX_SWIGLU) and 0002 (the F16 SwiGLU output for the HMX MUL_MAT)")
 
 
+FUSION_BLOCKS = ("tbo", "reg", "mm", "ffn", "ffncpu", "klp", "kld", "p", "t", "prof")
 SETS = {
-    "full": RunSet(tuple(b.key for b in BLOCKS), "phone-commands.txt", "phone-out",
+    "full": RunSet(FUSION_BLOCKS, "phone-commands.txt", "phone-out",
                    "the op tests, ffncheck, the KL runs, the timing and the op profile",
                    "about 23 minutes of tools"),
     "check": RunSet(("tbo", "ffn", "ffncpu", "klp", "kld"), "phone-commands-check.txt", "phone-out-check",
@@ -140,7 +158,13 @@ SETS = {
                     "the WEIGHTS usage) and the KL runs",
                     "about 8 minutes of tools"),
     "prof": RunSet(("prof",), "phone-commands-prof.txt", "phone-out-prof",
-                   "the op profile only: pp512, pp1024 and tg4, on and off", "about 2 minutes of tools"),
+                   "the op profile only: pp512, pp1024 and tg4, on and off", "about 2 minutes of tools",
+                   "phone-prof"),
+    "repack": RunSet(("plain", "rffn", "rmm", "rmmid", "rklp"), "phone-commands-repack.txt", "phone-out-repack",
+                     "the patch that refuses a MUL_MAT weight of a tiled type in the plain layout",
+                     "about 5 minutes of tools", "phone-repack",
+                     "the patched llama.cpp tree of HEAD plus the patch build/fuse-mm/repack/*.patch and no fusion "
+                     "patch (OUT=phone-repack)"),
 }
 
 
@@ -191,15 +215,11 @@ def run_lines(run: Run) -> list:
 
 HEADER = """\
 # Phone stage "fuse-mm", run set "{name}": {text}.
-# The matmul fusions of HTP0 (the 4B Q8_0 only), with one library set and the environment switches of the fusions.
+{scope}
 #
-# The libraries (tools/stages/fuse-mm/build.sh): the patched llama.cpp tree of HEAD (tests/sanitizers/llama-copy.sh)
-# plus build/fuse-mm/patches/0001 (MUL_MAT_NX_SWIGLU) and 0002 (the F16 SwiGLU output for the HMX MUL_MAT), built
-# with the preset, the flags and the LTO of scripts/build-native.sh. build/fuse-mm/patches.sha256 names the patches.
+{libs}
 #
-# The variants: on (the preset values), sw (GGML_HEXAGON_FUSE_F16_ACT=0), f16 (GGML_HEXAGON_FUSE_SWIGLU=0 and
-# GGML_HEXAGON_FUSE_SWIGLU_DECODE=0), off (the three switches 0, the ops of HEAD).
-# All runs have GGML_HEXAGON_OPFUSION=1 GGML_HEXAGON_OPFUSION_STATE=1 (the app) unless the variant changes it.
+{variants}# All runs have GGML_HEXAGON_OPFUSION=1 GGML_HEXAGON_OPFUSION_STATE=1 (the app) unless the variant changes it.
 #
 # The runs:
 {runs}
@@ -211,6 +231,11 @@ HEADER = """\
 # Run from /home/grigory/airi/qwen-mobile on the laptop, in order. Time: {minutes} plus about 8 s of gate and
 # checks for each of the {n_runs} runs, plus the waits for thermal status 0. Then, on the box:
 #   tools/stages/fuse-mm/stage.py table --root build/fuse-mm/{out_dir}
+"""
+
+VARIANTS_TEXT = """\
+# The variants: on (the preset values), sw (GGML_HEXAGON_FUSE_F16_ACT=0), f16 (GGML_HEXAGON_FUSE_SWIGLU=0 and
+# GGML_HEXAGON_FUSE_SWIGLU_DECODE=0), off (the three switches 0, the ops of HEAD).
 """
 
 RUN_TEXT = {
@@ -226,22 +251,31 @@ RUN_TEXT = {
     "t": "llama-bench tg32 at d0 and d4096, -r 3, on off, 3 rounds (the timing)",
     "prof": ("GGML_HEXAGON_PROFILE=1 llama-bench -v pp512, pp1024 and tg4, on off (the op split, "
              "tools/prof/optable.py)"),
+    "plain": ("ffncheck --plain --only ffn_: supports_op must refuse a MUL_MAT and graph_compute must fail for "
+              "each case (supports=no compute=failed)"),
+    "rffn": "ffncheck with the WEIGHTS usage: each case must be finite",
+    "rmm": "test-backend-ops -o MUL_MAT: each case must pass, with the pass count of mm in phone-out (673)",
+    "rmmid": "test-backend-ops -o MUL_MAT_ID: each case must pass",
+    "rklp": ("llama-perplexity -b 512, 1 chunk, KL against naive-4B-q8.kld: the numbers of klp off of the set "
+             "check (the same ops)"),
 }
 
 
-def setup_lines() -> list:
-    """The lines that copy the stage to the phone and check its files. The push lines take each file of bin/
-    and lib/, and sha256sum -c on the phone makes sure that each file of SHA256SUMS is there."""
+def setup_lines(phone: str) -> list:
+    """The lines that copy the stage files of build/fuse-mm/<phone> to the phone and check them. The push lines
+    take each file of bin/ and lib/, and sha256sum -c on the phone makes sure that each file of SHA256SUMS is
+    there."""
+    local = f"{LAPTOP_STAGE}/{phone}"
     return [
-        f"mkdir -p {LAPTOP_STAGE} && rsync -a --delete {BOX}/phone/ {LAPTOP_STAGE}/phone/",
-        f"(cd {LAPTOP_STAGE}/phone && sha256sum -c SHA256SUMS)",
+        f"mkdir -p {LAPTOP_STAGE} && rsync -a --delete {BOX}/{phone}/ {local}/",
+        f"(cd {local} && sha256sum -c SHA256SUMS)",
         # No "models/Qwen3.5" in this line: the runner gates each line with that text as a model run.
         f"{ADB} shell 'ls -l /data/local/tmp/qwen/models | grep -E \"Qwen3.5-4B-Q8_0.gguf\"; "
         f"ls -l {EVAL}/wiki.test.raw {EVAL}/naive-4B-q8.kld'",
         f"{ADB} shell 'rm -rf {PHONE} && mkdir -p {PHONE}/bin {PHONE}/lib {PHONE}/out'",
-        f"{ADB} push {LAPTOP_STAGE}/phone/bin/* {PHONE}/bin/",
-        f"{ADB} push {LAPTOP_STAGE}/phone/lib/* {PHONE}/lib/",
-        f"{ADB} push {LAPTOP_STAGE}/phone/SHA256SUMS {PHONE}/",
+        f"{ADB} push {local}/bin/* {PHONE}/bin/",
+        f"{ADB} push {local}/lib/* {PHONE}/lib/",
+        f"{ADB} push {local}/SHA256SUMS {PHONE}/",
         f"{ADB} shell 'cd {PHONE} && sha256sum -c SHA256SUMS | grep -c OK && sha256sum -c SHA256SUMS > /dev/null "
         f"&& echo \"stage files: all present\"; chmod 755 {PHONE}/bin/*'",
     ]
@@ -269,9 +303,17 @@ def write_commands(name: str, path: Path) -> int:
     """Write the command file of the run set name and return its line count."""
     rs = SETS[name]
     runs = all_runs(rs.blocks)
+    libs = textwrap.wrap(f"The libraries (tools/stages/fuse-mm/build.sh): {rs.libs}, built with the preset, the "
+                         "flags and the LTO of scripts/build-native.sh. "
+                         f"build/fuse-mm/{rs.phone}/patches.sha256 names the patches.", 114, break_on_hyphens=False)
+    fusion = any(k in FUSION_BLOCKS for k in rs.blocks)
     header = HEADER.format(name=name, text=rs.text, minutes=rs.minutes, n_runs=len(runs), out_dir=rs.out_dir,
+                           libs="\n".join(f"# {x}" for x in libs), variants=VARIANTS_TEXT if fusion else "",
+                           scope=("# The matmul fusions of HTP0 (the 4B Q8_0 only), with one library set and the "
+                                  "environment switches of the fusions." if fusion else
+                                  "# The tiled layout of the MUL_MAT weights of HTP0 (the 4B Q8_0 and the op tests)."),
                            runs="\n".join(f"#   {k:7s} {RUN_TEXT[k]}" for k in rs.blocks))
-    lines = header.rstrip("\n").split("\n") + setup_lines()
+    lines = header.rstrip("\n").split("\n") + setup_lines(rs.phone)
     lines += ["#", f"# ==== Qwen3.5-4B-Q8_0: {len(runs)} runs ===="]
     for run in runs:
         lines += run_lines(run)
@@ -287,6 +329,7 @@ AFTER_RE = re.compile(r"after: thermal=(\d*) cap0=(\d*) cap7=(\d*) battery=(\d*)
 TBO_RE = re.compile(r"(\d+)/(\d+) tests passed")
 FFN_RE = re.compile(r"^ffncheck case=(\S+) hash=(\w+) nonfinite=(\d+)"
                     r"(?: nmse=(\S+) maxerr=(\S+)(?: hmax=(\S+) ymax=(\S+))?)?", re.M)
+PLAIN_RE = re.compile(r"^ffncheck case=(\S+) plain supports=(yes|no\(.*?\)) compute=(\w+)", re.M)
 KL_KEYS = ("Mean    KLD", "Maximum KLD", "Same top p", "Mean PPL(Q)", "RMS Δp")
 
 
@@ -340,7 +383,7 @@ def bench_values(res: Result) -> dict:
 def correctness(results: dict) -> list:
     """The pass counts of the op tests, the hash comparison of ffncheck and the KL comparison."""
     out = ["correctness"]
-    for key in ("tbo", "reg", "mm"):
+    for key in ("tbo", "reg", "mm", "rmm", "rmmid"):
         for v in BLOCK[key].variants:
             res = results.get(f"{key}-1-{v}")
             if res is None:
@@ -367,7 +410,21 @@ def correctness(results: dict) -> list:
         for m in FFN_RE.findall(res.out):
             out.append(f"  ffncheck --cpu {m[0]:13s} nmse={m[3]} maxerr={m[4]} nonfinite={m[2]} hmax={m[5]} "
                        f"ymax={m[6]}")
-    for key in ("klp", "kld"):
+    res = results.get("plain-1-on")
+    if res is not None:
+        lines = PLAIN_RE.findall(res.out)
+        good = sum(1 for m in lines if m[1].startswith("no") and m[2] == "failed")
+        out.append(f"  ffncheck --plain: {good}/{len(lines)} cases refused (supports=no, compute=failed), "
+                   f"{'ok' if res.ok else ', '.join(res.flags)}")
+        out += [f"    {m[0]} supports={m[1]} compute={m[2]}" for m in lines if not (m[1].startswith("no") and
+                                                                                   m[2] == "failed")]
+    res = results.get("rffn-1-on")
+    if res is not None:
+        lines = FFN_RE.findall(res.out)
+        bad = [m[0] for m in lines if m[2] != "0" and not m[0].startswith("big")]
+        out.append(f"  ffncheck (repack set): {len(lines)} cases, non-finite in {bad or 'none'}, "
+                   f"{'ok' if res.ok else ', '.join(res.flags)}")
+    for key in ("klp", "kld", "rklp"):
         rows = {}
         for v in BLOCK[key].variants:
             res = results.get(f"{key}-1-{v}")

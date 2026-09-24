@@ -22,8 +22,12 @@
 // The forms bigh and bigy make sure that the fusions give the bytes of the unfused ops also for the values that
 // the F16 conversions cannot hold. Thus a non-finite output value is not a failure for these two forms.
 //
-// Usage: ffncheck [--dev NAME] [--cpu] [--threads N] [--only SUBSTRING]
+// Usage: ffncheck [--dev NAME] [--cpu | --plain] [--threads N] [--only SUBSTRING]
 //   --dev NAME  the device under test, HTP0 as the preset. "--dev CPU" gives a test of the program on the host.
+//   --plain     the weights stay in a buffer with no WEIGHTS usage, thus the Hexagon backend keeps the plain
+//               layout of ggml. The correct result: supports_op refuses a MUL_MAT and graph_compute fails.
+//               The line of a case is "ffncheck case=<name> plain supports=<yes|no(op)> compute=<ok|failed>",
+//               and a case fails when supports_op accepts each op or when the graph computes.
 // Output: one line for each case,
 //   ffncheck case=<name> hash=<16 hex digits> nonfinite=<n> [nmse=<x> maxerr=<y> hmax=<a> ymax=<b>] us=<t>
 // and at the end "ffncheck done cases=<n> failed=<n>". A case fails when an op is not supported, when the
@@ -169,8 +173,8 @@ struct run_ctx {
 // Builds the graph of one case, gives it its inputs, and computes it on the backend. keep_h makes h an output
 // (the CPU reference only, because an output h changes the fusions). Returns an empty string on success, and
 // the cause of the failure otherwise.
-std::string run_case(ggml_backend_t be, const form & f, const form_weights & w, int64_t m, bool keep_h, run_ctx & rc,
-                     double & us) {
+std::string run_case(ggml_backend_t be, const form & f, const form_weights & w, int64_t m, bool keep_h, bool plain,
+                     run_ctx & rc, double & us, std::string & refused) {
     const ggml_init_params ipw = { 8 * ggml_tensor_overhead(), nullptr, true };
     const ggml_init_params ip  = { 32 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
     rc.ctx_w                   = ggml_init(ipw);
@@ -204,7 +208,9 @@ std::string run_case(ggml_backend_t be, const form & f, const form_weights & w, 
     if (!rc.buf_w || !rc.buf) {
         return "the allocation failed";
     }
-    ggml_backend_buffer_set_usage(rc.buf_w, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    if (!plain) {
+        ggml_backend_buffer_set_usage(rc.buf_w, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
 
     set_bytes(w_norm, w.norm);
     set_bytes(w_gate, w.gate);
@@ -213,11 +219,18 @@ std::string run_case(ggml_backend_t be, const form & f, const form_weights & w, 
     // The seed of x depends on the token count only
     set_bytes(x, uniform((size_t) (N_EMBD * m), 15 + (uint32_t) m, -2.0f, 2.0f));
 
-    // After the tensor_set calls: the Hexagon backend marks the tiled weights in set_tensor
+    // After the tensor_set calls: the Hexagon backend marks the tiled weights in set_tensor. In the plain mode
+    // the program keeps the first refused op and computes the graph also, for the check of graph_compute.
     for (int i = 0; i < ggml_graph_n_nodes(rc.gf); i++) {
         const ggml_tensor * node = ggml_graph_node(rc.gf, i);
         if (!ggml_backend_supports_op(be, node)) {
-            return std::string("the backend does not support the op ") + ggml_op_desc(node) + " of " + node->name;
+            const std::string what = std::string(ggml_op_desc(node)) + " of " + node->name;
+            if (!plain) {
+                return "the backend does not support the op " + what;
+            }
+            if (refused.empty()) {
+                refused = what;
+            }
         }
     }
 
@@ -232,11 +245,14 @@ std::string run_case(ggml_backend_t be, const form & f, const form_weights & w, 
 int main(int argc, char ** argv) {
     std::string dev_name = "HTP0";
     bool        cpu      = false;
+    bool        plain    = false;
     int         threads  = 4;
     std::string only;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--cpu")) {
             cpu = true;
+        } else if (!strcmp(argv[i], "--plain")) {
+            plain = true;
         } else if (!strcmp(argv[i], "--dev") && i + 1 < argc) {
             dev_name = argv[++i];
         } else if (!strcmp(argv[i], "--threads") && i + 1 < argc) {
@@ -244,9 +260,13 @@ int main(int argc, char ** argv) {
         } else if (!strcmp(argv[i], "--only") && i + 1 < argc) {
             only = argv[++i];
         } else {
-            fprintf(stderr, "usage: ffncheck [--dev NAME] [--cpu] [--threads N] [--only SUBSTRING]\n");
+            fprintf(stderr, "usage: ffncheck [--dev NAME] [--cpu | --plain] [--threads N] [--only SUBSTRING]\n");
             return 2;
         }
+    }
+    if (cpu && plain) {
+        fprintf(stderr, "ffncheck: --plain has no CPU reference. Give --cpu or --plain.\n");
+        return 2;
     }
 
     ggml_backend_dev_t dev = ggml_backend_dev_by_name(dev_name.c_str());
@@ -284,8 +304,29 @@ int main(int argc, char ** argv) {
             }
             n_cases++;
             run_ctx           rc;
-            double            us  = 0.0;
-            const std::string err = run_case(be, f, w, m, false, rc, us);
+            double            us = 0.0;
+            std::string       refused;
+            const std::string err = run_case(be, f, w, m, false, plain, rc, us, refused);
+            if (plain) {
+                // Correct: supports_op refuses a MUL_MAT and graph_compute fails. A computed graph reads the plain
+                // bytes as tiled data, thus its values are not correct.
+                const bool computed = err.empty();
+                const bool ok       = !refused.empty() && !computed;
+                std::string values;
+                if (computed) {
+                    size_t nonfinite = 0;
+                    for (float v : get_values(rc.out)) {
+                        nonfinite += !std::isfinite(v);
+                    }
+                    values = " nonfinite=" + std::to_string(nonfinite);
+                }
+                printf("ffncheck case=%s plain supports=%s compute=%s%s%s\n", name,
+                       refused.empty() ? "yes" : ("no(" + refused + ")").c_str(), computed ? "ok" : "failed",
+                       values.c_str(), ok ? "" : " FAILED");
+                fflush(stdout);
+                n_failed += !ok;
+                continue;
+            }
             if (!err.empty()) {
                 printf("ffncheck case=%s FAILED: %s on %s\n", name, err.c_str(), dev_name.c_str());
                 fflush(stdout);
@@ -302,7 +343,8 @@ int main(int argc, char ** argv) {
             if (cpu_be) {
                 run_ctx           cr;
                 double            cpu_us  = 0.0;
-                const std::string cpu_err = run_case(cpu_be, f, w, m, true, cr, cpu_us);
+                std::string       cpu_refused;
+                const std::string cpu_err = run_case(cpu_be, f, w, m, true, false, cr, cpu_us, cpu_refused);
                 if (!cpu_err.empty()) {
                     ref_text = " cpu=FAILED(" + cpu_err + ")";
                     bad      = true;

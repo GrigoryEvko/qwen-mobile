@@ -2,10 +2,12 @@
 # Build the phone stage "fuse-mm": the libraries of the app from a private tree of HEAD plus the matmul
 # fusion patches, and the tools of the stage against them.
 #
-#   JOBS=24 PATCHES="P1 P2" tools/stages/fuse-mm/build.sh
+#   JOBS=24 PATCHES="P1 P2" OUT=phone tools/stages/fuse-mm/build.sh
 #
 #   PATCHES  The patch files to apply after patches/series, in this order. The preset value is each
 #            file of build/fuse-mm/patches, sorted by name. A patch that the series holds is not given.
+#   OUT      The directory of the stage files in build/fuse-mm, phone as the preset. A run set of stage.py
+#            names its directory (the set repack has phone-repack).
 #
 # The steps:
 #   1. tests/sanitizers/llama-copy.sh makes build/fuse-mm/src, the llama.cpp tree of HEAD (the pin
@@ -15,8 +17,8 @@
 #      commit of scripts/build-native.sh. It builds the libraries of the app (LLAMA_LIBS of
 #      scripts/lib.sh), the DSP library v79, llama-bench, llama-perplexity and test-backend-ops. The NDK
 #      clang++ compiles tools/stages/fuse-mm/ffncheck.cpp.
-#   3. The script copies the files of the stage into build/fuse-mm/phone and writes SHA256SUMS and
-#      patches.sha256 (the patch files of the build). It stops if a program or a library of the stage
+#   3. The script copies the files of the stage into build/fuse-mm/$OUT and writes SHA256SUMS and
+#      patches.sha256 (the patch files of the build) there. It stops if a program or a library of the stage
 #      needs a llama or ggml library (readelf, NEEDED) that is not in phone/lib.
 #
 # The switches of the fusions (GGML_HEXAGON_FUSE_SWIGLU, _SWIGLU_DECODE, _F16_ACT) are environment
@@ -31,7 +33,8 @@ cd "$REPO_ROOT"
 readonly stage=build/fuse-mm
 readonly tree=$stage/src
 readonly bdir=$stage/android
-readonly out=$stage/phone
+readonly out=$stage/${OUT:-phone}
+[[ ${OUT:-phone} =~ ^[A-Za-z0-9._-]+$ ]] || die "OUT must be one directory name, not ${OUT}"
 readonly repro="-ffile-prefix-map=/workspace=. -fdebug-prefix-map=/workspace=. -Werror=date-time"
 readonly remap="-ffile-prefix-map=/workspace/$tree=./third_party/llama.cpp -ffile-prefix-map=/workspace/$bdir=./build/native/llama"
 
@@ -40,13 +43,13 @@ patches=${PATCHES:-$(ls "$stage"/patches/*.patch 2> /dev/null || true)}
 # 1. The tree.
 mkdir -p "$stage"
 tests/sanitizers/llama-copy.sh "$tree"
-rm -f "$stage/patches.sha256"
 # patch and not git apply: git apply in the repository skips the files below an ignored path (build/)
 # and still exits 0.
+patch_sums=""
 for p in $patches; do
     patch -p1 -N --dry-run --silent -d "$tree" < "$p" > /dev/null || die "$p does not apply to $tree"
     patch -p1 -N --silent --no-backup-if-mismatch -d "$tree" < "$p" || die "patch failed in $tree"
-    printf '%s  %s\n' "$(sha256sum < "$p" | cut -d' ' -f1)" "$(basename "$p")" >> "$stage/patches.sha256"
+    patch_sums+="$(sha256sum < "$p" | cut -d' ' -f1)  $(basename "$p")"$'\n'
 done
 cp -f android/snapdragon/CMakeUserPresets.json "$tree/CMakeUserPresets.json"
 
@@ -112,5 +115,6 @@ for elf in "$out"/bin/* "$out"/lib/*.so; do
 done
 cp -f tools/phone/gate.sh "$out/bin/"
 (cd "$out" && sha256sum bin/* lib/* > SHA256SUMS)
+printf '%s' "$patch_sums" > "$out/patches.sha256"
 cat "$out/SHA256SUMS"
-cat "$stage/patches.sha256" 2> /dev/null || echo "fuse-mm: no patch after the series"
+[[ -s $out/patches.sha256 ]] && cat "$out/patches.sha256" || echo "fuse-mm: no patch after the series"
