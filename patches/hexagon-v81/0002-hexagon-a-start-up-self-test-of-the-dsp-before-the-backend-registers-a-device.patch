@@ -1,0 +1,705 @@
+hexagon: a start-up self-test of the DSP before the backend registers a device
+Fold-into: hexagon-arch/0001
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+A DSP library can run with no fault and give incorrect values. A v81 library
+on v79 silicon gives inf and NaN from each f32 to f16 conversion. Three
+kernels that passed the simulator gave incorrect values on v79 silicon. No
+silicon of this project verified the v81 library, thus a v81 phone has no
+other protection against incorrect values with no error.
+
+The new file htp-canary.h holds the self-test (the canary). The backend runs
+it one time, in ggml_backend_hexagon_reg after ggml_hexagon_init, on the
+first device, because all devices use the same chip and library. It opens
+the DSP session of the device and runs one graph on the op path of the
+model:
+  - cpy: CPY f32 -> f16 of 4133 values (ties at each exponent, the subnormal
+    range, the overflow edge, the signed zeros, the infinities). The bits of
+    a nonzero value must be the round to nearest even of the CPU. A NaN gives
+    any NaN. A zero gives a zero or an f16 subnormal.
+  - q8_gemv: MUL_MAT of a Q8_0 weight in a buffer of the WEIGHTS usage (96
+    rows of 512) with one f32 row whose upper 8 blocks are zero, the HVX
+    matvec of the decode. The host quantizes the row with
+    quantize_row_q8_0_ref and sums the block products in double. The
+    tolerance is 1e-5 of the sum of the magnitudes.
+  - q8_zero: the same weight with a row of zeros. Each output must be 0 or
+    have a magnitude of at most 1e-6.
+  - gdn_step: GATED_DELTA_NET of one token, 6 heads of 128, the gates -0.05,
+    -1, -6, -88, -1 and -1, the betas 0.9, 0.5, 0.1, 0.7, 0 and 0.5.
+    exp(-88) is below the normal f32 range, thus the check finds an exponent
+    that wraps. The beta 0 gives a qfloat product by an exact zero before the
+    adds of the state update. The reference is the CPU op in double. The
+    tolerance is 5e-5 of the sum of the magnitudes.
+  - f16_mm: MUL_MAT of an F16 weight (64 rows of 256) with 32 f32 rows, the
+    HMX path of the prefill. The tolerance is 2e-3 of the sum of the
+    magnitudes (the HMX output is f16).
+The zero products: on v79 silicon a qfloat product by an exact zero is not
+zero (0.5 x 0 gives 2^-22 as f32), where the simulator gives 0. The v79
+silicon runs the model with a KL at the floor, thus the canary permits a
+residue of that size and reports it ("zero residue"). A larger residue
+fails.
+
+The canary uses graph_compute_async and a synchronize that returns the DSP
+status: the synchronize of the backend interface stops the process on an
+error status. It catches the exceptions of the session open and of the
+buffers. On a failure the registry releases each device and registers no
+device, with one error line that gives the first value outside its bound.
+The application then uses its other backends. After a pass the first device
+keeps its DSP session, thus the model load does not open it again. One info
+line gives the result of each check, the open time and the op time.
+
+The switch GGML_HEXAGON_CANARY: 1 is the preset value, 0 skips the canary,
+2 runs it and then reports a failure (a test of the path with no device).
+ggml_hexagon_init has no canary, thus the fuzz targets of the host that call
+it with the fake DSP do not run it.
+
+The phone stage v81 (tools/stages/v81, the OnePlus 13, v79, 2026-09-25):
+  - The canary passes in each of 3 runs: cpy 0 of 4133 differ, the zero
+    residue is 0 in the cpy and in q8_zero, q8_gemv 0.0121 of its bound,
+    gdn_step 0.00366 of its bound, f16_mm 0.0379 of its bound. The session
+    open takes 42 to 52 ms and the ops 3.7 to 5.9 ms.
+  - The load (the registry and the first open of the device) takes 88.1 ms
+    with the canary and 74.7 ms without it (the medians of 3 alternated
+    runs each), thus the canary adds 13.4 ms. The session that the canary
+    opens is the session of the model.
+  - GGML_HEXAGON_CANARY=2 gives no HTP device and the error line.
+No v81 silicon verified this patch.
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 4a17422..6c3a867 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -63,6 +63,7 @@
+ #include "htp/rope-ops.h"
+ #include "htp_iface.h"
+ #include "htp-drv.h"
++#include "htp-canary.h"
+ 
+ using intvec  = std::vector<int>;
+ using uintvec = std::vector<unsigned int>;
+@@ -8312,6 +8313,50 @@ ggml_hexagon_registry::~ggml_hexagon_registry() {
+     }
+ }
+ 
++// Waits for the pending ops of the canary backend. Returns false when the DSP gave an error status.
++// The synchronize of the backend interface stops the process on such a status.
++static bool ggml_hexagon_canary_sync(ggml_backend_t backend) {
++    auto sess = static_cast<ggml_hexagon_session *>(backend->context);
++    sess->flush_sync();
++    return sess->last_error <= HTP_STATUS_OK;
++}
++
++// Runs the start-up self-test (htp-canary.h) on the first device. All devices use the same chip and
++// the same DSP library, thus one run decides for all of them. On a failure the registry releases each
++// device and the backend registers no device. The first device keeps its session after a pass.
++static void ggml_hexagon_canary_gate(ggml_hexagon_registry * hreg) {
++    if (opt_canary == 0 || opt_ndev == 0 || hreg->devices[0].context == nullptr) {
++        return;
++    }
++
++    ggml_hexagon_canary_report rep;
++    try {
++        ggml_hexagon_canary_run(&hreg->devices[0], ggml_hexagon_canary_sync, rep);
++    } catch (const std::exception & e) {
++        rep.ok     = false;
++        rep.reason = std::string("the DSP session or its buffers fail: ") + e.what();
++    }
++    if (rep.ok && opt_canary == 2) {
++        rep.ok     = false;
++        rep.reason = "GGML_HEXAGON_CANARY=2 reports a failure after the checks";
++    }
++
++    if (rep.ok) {
++        GGML_LOG_INFO("ggml-hex: canary pass on v%d: %s; open %.1f ms, ops %.1f ms\n", opt_arch, rep.detail.c_str(),
++                      rep.ms_open, rep.ms_ops);
++        return;
++    }
++
++    GGML_LOG_ERROR("ggml-hex: canary FAIL on v%d, no HTP device: %s (%s; open %.1f ms, ops %.1f ms). "
++                   "Set GGML_HEXAGON_CANARY=0 to skip the check.\n",
++                   opt_arch, rep.reason.c_str(), rep.detail.c_str(), rep.ms_open, rep.ms_ops);
++    for (size_t i = 0; i < opt_ndev; i++) {
++        delete static_cast<ggml_backend_hexagon_device_context *>(hreg->devices[i].context);
++        hreg->devices[i].context = nullptr;
++    }
++    opt_ndev = 0;
++}
++
+ static const char * ggml_backend_hexagon_reg_get_name(ggml_backend_reg_t reg) {
+     return "HTP";
+     GGML_UNUSED(reg);
+@@ -8684,6 +8729,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     const char * str_mmap_lru   = getenv("GGML_HEXAGON_MMAP_LRU");
+     const char * str_unary_flat = getenv("GGML_HEXAGON_UNARY_FLAT");
+     const char * str_hostprof   = getenv("LLAMA_HOSTPROF");
++    const char * str_canary     = getenv("GGML_HEXAGON_CANARY");
+ 
+     ggml_hexagon_mm_fusion_read_env();
+ 
+@@ -8737,6 +8783,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     opt_oppoll    = str_oppoll   ? strtoul(str_oppoll,  NULL, 0)          : opt_oppoll;
+     opt_opfusion  = str_opfusion ? atoi(str_opfusion)                     : opt_opfusion;
+     opt_multirow  = str_multirow ? atoi(str_multirow)                     : opt_multirow;
++    opt_canary    = str_canary   ? atoi(str_canary)                       : opt_canary;
+     opt_opfusion_state = str_opfusion_state ? atoi(str_opfusion_state)    : opt_opfusion_state;
+     opt_gdn_chunk = str_gdn_chunk ? atoi(str_gdn_chunk)                   : opt_gdn_chunk;
+     opt_fwht      = str_fwht     ? atoi(str_fwht)                         : opt_fwht;
+@@ -9051,6 +9098,7 @@ ggml_backend_reg_t ggml_backend_hexagon_reg(void) {
+             }
+ 
+             ggml_hexagon_init(&reg);
++            ggml_hexagon_canary_gate(static_cast<ggml_hexagon_registry *>(reg.context));
+         }
+ 
+         initialized = true;
+diff --git a/ggml/src/ggml-hexagon/htp-canary.h b/ggml/src/ggml-hexagon/htp-canary.h
+new file mode 100644
+index 0000000..3485967
+--- /dev/null
++++ b/ggml/src/ggml-hexagon/htp-canary.h
+@@ -0,0 +1,545 @@
++#ifndef HTP_CANARY_H
++#define HTP_CANARY_H
++
++// The start-up self-test (canary) of the Hexagon backend.
++//
++// Why: a DSP library can run with no fault and give incorrect values. A v81 library on v79 silicon
++// gives inf and NaN from each f32 to f16 conversion, and three kernels that passed the simulator gave
++// incorrect values on v79 silicon (a qfloat underflow that wraps the exponent, qfloat adds with no
++// conversion between them, a rounding of the unary row groups). A chip that no silicon of this project
++// verified (v81) has no other protection. Thus, before the backend registers a device, it runs a
++// small fixed set of ops on the DSP through the op path of the model, and it compares each output with
++// a reference that the host computes. On a mismatch the backend registers no HTP device, and the
++// application uses its other backends.
++//
++// The checks, each on fixed inputs from an integer generator:
++//   cpy       CPY f32 -> f16 of 4133 values: ties at each exponent, the subnormal range, the overflow
++//             edge, the signed zeros and the infinities. The f16 bits of each nonzero value must be the
++//             round to nearest even of the value (the conversion of the CPU backend). A NaN gives any
++//             NaN. A zero must give a zero or an f16 subnormal (refer to the zero products below).
++//   q8_gemv   MUL_MAT of a Q8_0 weight (96 rows of 512) with one f32 row whose blocks 8 thru 15 are
++//             zero: the HVX matvec of the decode, with the activation quantizer. The reference
++//             quantizes the row with quantize_row_q8_0_ref and sums the products of the blocks in
++//             double. A zero block gives a zero scale, thus a qfloat product by an exact zero.
++//   q8_zero   the same weight with a row of zeros. Each output must be 0 or have a magnitude of at
++//             most 1e-6.
++//   gdn_step  GATED_DELTA_NET of one token (the state step of the decode), 6 heads of 128 with the
++//             gates -0.05, -1, -6, -88, -1 and -1, and the betas 0.9, 0.5, 0.1, 0.7, 0 and 0.5.
++//             exp(-88) is below the normal f32 range, thus the check finds an exponent that wraps.
++//             The beta 0 gives a product by an exact zero before the qfloat adds of the state update.
++//             The reference is the CPU op in double.
++//   f16_mm    MUL_MAT of an F16 weight (64 rows of 256) with 32 f32 rows: the HMX path of the
++//             prefill, which converts the activations to f16. The reference is the sum of the f16
++//             products in double.
++//
++// The zero products. On v79 silicon a qfloat product by an exact zero is not zero: 0.5 x 0 gives the
++// qf32 word 0x00000080 (2^-22 as f32), and (0.5 x 0) + (0.5 x 3) gives 1.5 + 3 ulp. The simulator
++// gives exact zeros. The v79 silicon runs the model with a KL at the floor, thus a residue of this
++// size passes, and the report gives its size ("zero residue"). A larger residue fails.
++//
++// The tolerances. Each output value v with the reference r and the sum s of the magnitudes of its
++// terms must obey |v - r| <= tol * s + 1e-30. q8_gemv: tol 1e-5 (the DSP sums 16 f32 block terms).
++// gdn_step: tol 5e-5 (dots of 128 terms in qfloat, and the exp of the C library of the DSP).
++// f16_mm: tol 2e-3 (the HMX output is f16, and the f16 rounding of one value is 4.9e-4 of it). A
++// value that is not finite where the reference is finite fails. These bounds find inf, NaN, zeros,
++// a wrapped exponent and a wrong rounding mode, and they stay above the rounding of a correct kernel.
++//
++// The switch GGML_HEXAGON_CANARY: 1 (the preset value) runs the checks, 0 skips them, 2 runs them and
++// then reports a failure (a test of the path that registers no device).
++
++#include <chrono>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "ggml.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include "ggml-impl.h"
++#include "ggml-quants.h"
++
++static int opt_canary = 1;  // GGML_HEXAGON_CANARY
++
++// The result of the canary: the verdict, the first check that failed, and one item for each check.
++struct ggml_hexagon_canary_report {
++    bool        ok      = false;
++    std::string reason;          // empty when ok
++    std::string detail;          // "name: result" items
++    double      ms_open = 0.0;   // the open of the backend (the DSP session when it is new)
++    double      ms_ops  = 0.0;   // the allocation, the uploads, the compute and the downloads
++};
++
++// A 32-bit xorshift generator: the same sequence on each host.
++struct ggml_hexagon_canary_rng {
++    uint32_t s;
++
++    uint32_t next() {
++        s ^= s << 13;
++        s ^= s >> 17;
++        s ^= s << 5;
++        return s;
++    }
++
++    // A value in [lo, hi)
++    float uniform(float lo, float hi) { return lo + (hi - lo) * (float) (next() >> 8) * (1.0f / 16777216.0f); }
++};
++
++// The f16 bits of the f32 value with the bits w: round to nearest even, the sign of a zero kept, an
++// Inf kept, and a NaN gives the quiet NaN 0x7e00 with the sign. Integer arithmetic only.
++static uint16_t ggml_hexagon_canary_f16(uint32_t w) {
++    const uint32_t sign = (w >> 16) & 0x8000u;
++    const uint32_t a    = w & 0x7fffffffu;
++    if (a > 0x7f800000u) {
++        return (uint16_t) (sign | 0x7e00u);
++    }
++    if (a >= 0x477ff000u) {
++        return (uint16_t) (sign | 0x7c00u);
++    }
++    if (a >= 0x38800000u) {
++        const uint32_t v   = a - 0x38000000u;
++        const uint32_t odd = (v >> 13) & 1u;
++        return (uint16_t) (sign | ((v + 0x0fffu + odd) >> 13));
++    }
++    const uint32_t e  = a >> 23;
++    const uint32_t m  = (a & 0x007fffffu) | (e ? 0x00800000u : 0u);
++    const uint32_t sh = 126u - (e ? e : 1u);
++    if (sh > 24u) {
++        return (uint16_t) sign;
++    }
++    const uint32_t q    = m >> sh;
++    const uint32_t rest = m & ((1u << sh) - 1u);
++    const uint32_t half = 1u << (sh - 1u);
++    const uint32_t up   = rest > half || (rest == half && (q & 1u));
++    return (uint16_t) (sign | (q + up));
++}
++
++// The f32 bits of the cpy check: the special values, then a sweep of each exponent of the f16 range
++// with ties, the neighbors of ties and random tails. O(n).
++static std::vector<uint32_t> ggml_hexagon_canary_cpy_bits(size_t n) {
++    static const uint32_t specials[] = {
++        0x00000000u, 0x80000000u, 0x7f800000u, 0xff800000u, 0x7fc00000u, 0xffc00000u, 0x7f800001u,
++        0x3f800000u, 0x3f801000u, 0x3f803000u, 0xbf801000u, 0x3f800fffu, 0x3f801001u,
++        0x477fe000u, 0x477fefffu, 0x477ff000u, 0xc77ff000u, 0x477ff001u, 0x7f7fffffu, 0xff7fffffu,
++        0x33000000u, 0xb3000000u, 0x33000001u, 0x32ffffffu, 0x33800000u, 0x33c00000u, 0x00000001u,
++        0x80000001u, 0x38800000u, 0x387fe000u, 0x387ff000u, 0x387fefffu, 0x387ff001u,
++    };
++    std::vector<uint32_t>   bits(std::begin(specials), std::end(specials));
++    ggml_hexagon_canary_rng rng{ 0x2545f491u };
++    static const uint32_t   tails[3] = { 0x1000u, 0x0fffu, 0x1001u };
++    for (size_t i = 0; bits.size() < n; i++) {
++        const uint32_t e    = 102u + (uint32_t) (i % 42u);       // 2^-25 thru 2^16
++        const uint32_t sign = (uint32_t) ((i / 42u) & 1u) << 31;
++        const uint32_t head = (rng.next() >> 22) << 13;         // 10 bits
++        const uint32_t kind = (uint32_t) ((i / 84u) % 4u);
++        const uint32_t tail = kind < 3 ? tails[kind] : (rng.next() & 0x1fffu);
++        bits.push_back(sign | (e << 23) | head | tail);
++    }
++    return bits;
++}
++
++// The first value of an output that is outside its bound, as a text; empty when all values are in it.
++// got, ref and mag have n values. The worst ratio |v - r| / (tol * s) goes to worst. O(n).
++static std::string ggml_hexagon_canary_compare(const char * name, const float * got, const double * ref,
++                                               const double * mag, size_t n, double tol, double * worst) {
++    std::string first;
++    *worst = 0.0;
++    for (size_t i = 0; i < n; i++) {
++        const double bound = tol * mag[i] + 1e-30;
++        const double err   = std::isfinite(got[i]) ? std::fabs((double) got[i] - ref[i]) : INFINITY;
++        const double ratio = err / bound;
++        if (ratio > *worst) {
++            *worst = ratio;
++        }
++        if (ratio > 1.0 && first.empty()) {
++            char buf[192];
++            snprintf(buf, sizeof(buf), "%s: value %zu is %.9g, the reference is %.9g (bound %.3g)", name, i,
++                     (double) got[i], ref[i], bound);
++            first = buf;
++        }
++    }
++    return first;
++}
++
++// The tensors of the canary in one graph. The weights have their own buffer with the usage
++// GGML_BACKEND_BUFFER_USAGE_WEIGHTS, as a model loader gives them: the backend repacks a Q8_0 weight
++// only in such a buffer.
++struct ggml_hexagon_canary_graph {
++    ggml_context *        wctx = nullptr;
++    ggml_context *        ctx  = nullptr;
++    ggml_backend_buffer_t wbuf = nullptr;
++    ggml_backend_buffer_t buf  = nullptr;
++
++    ~ggml_hexagon_canary_graph() {
++        if (buf) {
++            ggml_backend_buffer_free(buf);
++        }
++        if (wbuf) {
++            ggml_backend_buffer_free(wbuf);
++        }
++        if (ctx) {
++            ggml_free(ctx);
++        }
++        if (wctx) {
++            ggml_free(wctx);
++        }
++    }
++};
++
++// Runs the checks on the device dev and fills the report. The device keeps its DSP session after the
++// run, thus the model that loads next does not open it again. sync_ok waits for the ops of the backend
++// and tells if the DSP gave no error status: the synchronize of the backend interface stops the process
++// on such a status, and the canary must report it. The caller catches the exceptions of the session
++// open and of the buffer allocation. The time is O(1): fixed shapes, about 0.4 MB of tensors.
++static void ggml_hexagon_canary_run(ggml_backend_dev_t dev, bool (*sync_ok)(ggml_backend_t),
++                                    ggml_hexagon_canary_report & rep) {
++    using clock = std::chrono::steady_clock;
++    const auto t0 = clock::now();
++
++    std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> backend(ggml_backend_dev_init(dev, nullptr),
++                                                                       &ggml_backend_free);
++    ggml_backend_t be = backend.get();
++    if (!be) {
++        rep.reason = "the device gives no backend";
++        return;
++    }
++    const auto t1 = clock::now();
++    rep.ms_open   = std::chrono::duration<double, std::milli>(t1 - t0).count();
++
++    // The shapes
++    const int64_t n_cpy = 4133;                     // not a multiple of the vector, thus a tail
++    const int64_t qk = 512, qn = 96;                // the Q8_0 matvec
++    const int64_t S = 128, H = 6, Hk = 2;           // the gated delta net
++    const int64_t fk = 256, fn = 64, fm = 32;       // the F16 matmul
++
++    ggml_hexagon_canary_graph g;
++    const ggml_init_params wp = { 4 * ggml_tensor_overhead(), nullptr, true };
++    const ggml_init_params ip = { 32 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
++    g.wctx = ggml_init(wp);
++    g.ctx  = ggml_init(ip);
++    if (!g.wctx || !g.ctx) {
++        rep.reason = "no memory for the contexts";
++        return;
++    }
++
++    ggml_tensor * cpy_x = ggml_new_tensor_1d(g.ctx, GGML_TYPE_F32, n_cpy);
++    ggml_tensor * cpy_y = ggml_new_tensor_1d(g.ctx, GGML_TYPE_F16, n_cpy);
++    ggml_tensor * cpy_o = ggml_cpy(g.ctx, cpy_x, cpy_y);
++
++    ggml_tensor * q8_w = ggml_new_tensor_2d(g.wctx, GGML_TYPE_Q8_0, qk, qn);
++    ggml_tensor * q8_x = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, qk, 1);
++    ggml_tensor * q8_o = ggml_mul_mat(g.ctx, q8_w, q8_x);
++    ggml_tensor * q8_z = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, qk, 1);
++    ggml_tensor * q8_zo = ggml_mul_mat(g.ctx, q8_w, q8_z);
++
++    ggml_tensor * gq  = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, S, Hk, 1, 1);
++    ggml_tensor * gk  = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, S, Hk, 1, 1);
++    ggml_tensor * gv  = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, S, H, 1, 1);
++    ggml_tensor * gg  = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, 1, H, 1, 1);
++    ggml_tensor * gb  = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, 1, H, 1, 1);
++    ggml_tensor * gs  = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, S, S, H, 1);
++    ggml_tensor * g_o = ggml_gated_delta_net(g.ctx, gq, gk, gv, gg, gb, gs, 1);
++
++    ggml_tensor * f_w = ggml_new_tensor_2d(g.wctx, GGML_TYPE_F16, fk, fn);
++    ggml_tensor * f_x = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, fk, fm);
++    ggml_tensor * f_o = ggml_mul_mat(g.ctx, f_w, f_x);
++
++    struct check {
++        const char *  name;
++        ggml_tensor * out;
++        bool          run;
++    };
++    check checks[] = {
++        { "cpy", cpy_o, false },       { "q8_gemv", q8_o, false }, { "q8_zero", q8_zo, false },
++        { "gdn_step", g_o, false },    { "f16_mm", f_o, false },
++    };
++
++    ggml_cgraph * gf = ggml_new_graph(g.ctx);
++    for (check & c : checks) {
++        c.run = ggml_backend_dev_supports_op(dev, c.out);
++        if (c.run) {
++            ggml_build_forward_expand(gf, c.out);
++        } else {
++            rep.detail += std::string(c.name) + ": not supported, not checked; ";
++        }
++    }
++
++    g.wbuf = ggml_backend_alloc_ctx_tensors(g.wctx, be);
++    g.buf  = ggml_backend_alloc_ctx_tensors(g.ctx, be);
++    if (!g.wbuf || !g.buf) {
++        rep.reason = "the DSP buffers do not allocate";
++        return;
++    }
++    ggml_backend_buffer_set_usage(g.wbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++
++    ggml_hexagon_canary_rng rng{ 0x9e3779b9u };
++
++    // cpy
++    const std::vector<uint32_t> cbits = ggml_hexagon_canary_cpy_bits((size_t) n_cpy);
++    ggml_backend_tensor_set(cpy_x, cbits.data(), 0, cbits.size() * sizeof(uint32_t));
++
++    // q8_gemv: the weight is quantized by the CPU reference, as the model file gives it
++    std::vector<float> wq((size_t) (qk * qn));
++    for (float & v : wq) {
++        v = rng.uniform(-1.0f, 1.0f);
++    }
++    std::vector<uint8_t> wq8(ggml_row_size(GGML_TYPE_Q8_0, qk) * (size_t) qn);
++    ggml_quantize_chunk(GGML_TYPE_Q8_0, wq.data(), wq8.data(), 0, qn, qk, nullptr);
++    ggml_backend_tensor_set(q8_w, wq8.data(), 0, wq8.size());
++    std::vector<float> xq((size_t) qk);
++    for (size_t i = 0; i < xq.size(); i++) {
++        // blocks 8 thru 15 are zero: a zero scale, thus a qfloat product by an exact zero
++        xq[i] = i < xq.size() / 2 ? rng.uniform(-1.0f, 1.0f) : 0.0f;
++    }
++    ggml_backend_tensor_set(q8_x, xq.data(), 0, xq.size() * sizeof(float));
++    const std::vector<float> zq((size_t) qk, 0.0f);
++    ggml_backend_tensor_set(q8_z, zq.data(), 0, zq.size() * sizeof(float));
++
++    // gdn_step: q and k of unit length, as the L2 norm of the model gives them
++    auto unit_rows = [&](int64_t rows) {
++        std::vector<float> v((size_t) (S * rows));
++        for (int64_t r = 0; r < rows; r++) {
++            double n2 = 0.0;
++            for (int64_t i = 0; i < S; i++) {
++                v[(size_t) (r * S + i)] = rng.uniform(-1.0f, 1.0f);
++                n2 += (double) v[(size_t) (r * S + i)] * v[(size_t) (r * S + i)];
++            }
++            const float inv = (float) (1.0 / std::sqrt(n2));
++            for (int64_t i = 0; i < S; i++) {
++                v[(size_t) (r * S + i)] *= inv;
++            }
++        }
++        return v;
++    };
++    const std::vector<float> vq = unit_rows(Hk);
++    const std::vector<float> vk = unit_rows(Hk);
++    std::vector<float>       vv((size_t) (S * H));
++    for (float & v : vv) {
++        v = rng.uniform(-1.0f, 1.0f);
++    }
++    const float        gate[H] = { -0.05f, -1.0f, -6.0f, -88.0f, -1.0f, -1.0f };
++    const float        beta[H] = { 0.9f, 0.5f, 0.1f, 0.7f, 0.0f, 0.5f };
++    std::vector<float> vs((size_t) (S * S * H));
++    for (float & v : vs) {
++        v = rng.uniform(-0.1f, 0.1f);
++    }
++    ggml_backend_tensor_set(gq, vq.data(), 0, vq.size() * sizeof(float));
++    ggml_backend_tensor_set(gk, vk.data(), 0, vk.size() * sizeof(float));
++    ggml_backend_tensor_set(gv, vv.data(), 0, vv.size() * sizeof(float));
++    ggml_backend_tensor_set(gg, gate, 0, sizeof(gate));
++    ggml_backend_tensor_set(gb, beta, 0, sizeof(beta));
++    ggml_backend_tensor_set(gs, vs.data(), 0, vs.size() * sizeof(float));
++
++    // f16_mm
++    std::vector<float> wf((size_t) (fk * fn));
++    for (float & v : wf) {
++        v = rng.uniform(-1.0f, 1.0f);
++    }
++    std::vector<ggml_fp16_t> wf16(wf.size());
++    ggml_fp32_to_fp16_row(wf.data(), wf16.data(), (int64_t) wf.size());
++    ggml_backend_tensor_set(f_w, wf16.data(), 0, wf16.size() * sizeof(ggml_fp16_t));
++    std::vector<float> xf((size_t) (fk * fm));
++    for (float & v : xf) {
++        v = rng.uniform(-1.0f, 1.0f);
++    }
++    ggml_backend_tensor_set(f_x, xf.data(), 0, xf.size() * sizeof(float));
++
++    const bool computed = ggml_backend_graph_compute_async(be, gf) == GGML_STATUS_SUCCESS && sync_ok(be);
++
++    std::vector<uint16_t> cpy_got((size_t) n_cpy);
++    std::vector<float>    q8_got((size_t) qn);
++    std::vector<float>    q8z_got((size_t) qn);
++    std::vector<float>    g_got((size_t) ggml_nelements(g_o));
++    std::vector<float>    f_got((size_t) (fn * fm));
++    if (computed) {
++        if (checks[0].run) {
++            ggml_backend_tensor_get(cpy_y, cpy_got.data(), 0, cpy_got.size() * sizeof(uint16_t));
++        }
++        if (checks[1].run) {
++            ggml_backend_tensor_get(q8_o, q8_got.data(), 0, q8_got.size() * sizeof(float));
++        }
++        if (checks[2].run) {
++            ggml_backend_tensor_get(q8_zo, q8z_got.data(), 0, q8z_got.size() * sizeof(float));
++        }
++        if (checks[3].run) {
++            ggml_backend_tensor_get(g_o, g_got.data(), 0, g_got.size() * sizeof(float));
++        }
++        if (checks[4].run) {
++            ggml_backend_tensor_get(f_o, f_got.data(), 0, f_got.size() * sizeof(float));
++        }
++    }
++    rep.ms_ops = std::chrono::duration<double, std::milli>(clock::now() - t1).count();
++    if (!computed) {
++        rep.reason = "the graph compute fails, or the DSP gives an error status";
++        return;
++    }
++
++    std::string first;
++    char        item[160];
++
++    // cpy: bits, a NaN gives any NaN, and a zero gives a zero or an f16 subnormal (the zero residue)
++    if (checks[0].run) {
++        size_t   n_bad = 0, n_zero_residue = 0;
++        uint16_t worst_residue = 0;
++        for (size_t i = 0; i < cbits.size(); i++) {
++            const uint16_t want  = ggml_hexagon_canary_f16(cbits[i]);
++            const bool     nan_w = (want & 0x7c00u) == 0x7c00u && (want & 0x3ffu);
++            const bool     nan_g = (cpy_got[i] & 0x7c00u) == 0x7c00u && (cpy_got[i] & 0x3ffu);
++            const bool     zero  = (cbits[i] & 0x7fffffffu) == 0;
++            if (zero && (cpy_got[i] & 0x7c00u) == 0) {
++                const uint16_t mag = cpy_got[i] & 0x3ffu;
++                n_zero_residue += mag != 0;
++                worst_residue = mag > worst_residue ? mag : worst_residue;
++                continue;
++            }
++            if (nan_w ? !nan_g : cpy_got[i] != want) {
++                if (n_bad == 0 && first.empty()) {
++                    snprintf(item, sizeof(item), "cpy: f32 0x%08x gives f16 0x%04x, the reference is 0x%04x",
++                             (unsigned) cbits[i], (unsigned) cpy_got[i], (unsigned) want);
++                    first = item;
++                }
++                n_bad++;
++            }
++        }
++        snprintf(item, sizeof(item), "cpy: %zu of %zu differ, zero residue in %zu zeros (largest f16 0x%04x); ", n_bad,
++                 cbits.size(), n_zero_residue, (unsigned) worst_residue);
++        rep.detail += item;
++    }
++
++    // q8_gemv: the activation blocks of quantize_row_q8_0_ref, the block sums in double
++    if (checks[1].run) {
++        const int64_t           nb = qk / QK8_0;
++        std::vector<block_q8_0> xb((size_t) nb);
++        quantize_row_q8_0_ref(xq.data(), xb.data(), qk);
++        std::vector<double> ref((size_t) qn), mag((size_t) qn);
++        for (int64_t r = 0; r < qn; r++) {
++            const block_q8_0 * wb = (const block_q8_0 *) (wq8.data() + (size_t) r * ggml_row_size(GGML_TYPE_Q8_0, qk));
++            double sum = 0.0, abs_sum = 0.0;
++            for (int64_t b = 0; b < nb; b++) {
++                int32_t sumi = 0;
++                for (int j = 0; j < QK8_0; j++) {
++                    sumi += (int32_t) wb[b].qs[j] * (int32_t) xb[(size_t) b].qs[j];
++                }
++                const double term = (double) sumi * (double) GGML_FP16_TO_FP32(wb[b].d) *
++                                    (double) GGML_FP16_TO_FP32(xb[(size_t) b].d);
++                sum += term;
++                abs_sum += std::fabs(term);
++            }
++            ref[(size_t) r] = sum;
++            mag[(size_t) r] = abs_sum;
++        }
++        double      worst = 0.0;
++        std::string f = ggml_hexagon_canary_compare("q8_gemv", q8_got.data(), ref.data(), mag.data(), (size_t) qn, 1e-5,
++                                                    &worst);
++        if (first.empty()) {
++            first = f;
++        }
++        snprintf(item, sizeof(item), "q8_gemv: worst %.3g of the bound; ", worst);
++        rep.detail += item;
++    }
++
++    // q8_zero: a row of zeros gives 0, or a zero residue of at most 1e-6
++    if (checks[2].run) {
++        double worst = 0.0;
++        size_t i_worst = 0;
++        for (size_t i = 0; i < q8z_got.size(); i++) {
++            const double a = std::isfinite(q8z_got[i]) ? std::fabs((double) q8z_got[i]) : INFINITY;
++            if (a > worst) {
++                worst   = a;
++                i_worst = i;
++            }
++        }
++        if (worst > 1e-6 && first.empty()) {
++            snprintf(item, sizeof(item), "q8_zero: value %zu is %.9g for a row of zeros (bound 1e-6)", i_worst,
++                     (double) q8z_got[i_worst]);
++            first = item;
++        }
++        snprintf(item, sizeof(item), "q8_zero: zero residue %.3g; ", worst);
++        rep.detail += item;
++    }
++
++    // gdn_step: the CPU op in double. The state M[j][i] = S[i][j] is at s[j * S + i] of each head.
++    if (checks[3].run) {
++        const size_t        n_attn = (size_t) (S * H);
++        std::vector<double> ref(g_got.size()), mag(g_got.size());
++        const double        scale = 1.0 / std::sqrt((double) S);
++        for (int64_t h = 0; h < H; h++) {
++            const float * q  = vq.data() + (size_t) ((h % Hk) * S);
++            const float * k  = vk.data() + (size_t) ((h % Hk) * S);
++            const float * v  = vv.data() + (size_t) (h * S);
++            const double  eg = std::exp((double) gate[h]);
++            std::vector<double> m((size_t) (S * S)), m_abs((size_t) (S * S));
++            for (int64_t i = 0; i < S * S; i++) {
++                m[(size_t) i]     = (double) vs[(size_t) (h * S * S + i)] * eg;
++                m_abs[(size_t) i] = std::fabs(m[(size_t) i]);
++            }
++            for (int64_t j = 0; j < S; j++) {
++                double dot = 0.0, dot_abs = 0.0;
++                for (int64_t i = 0; i < S; i++) {
++                    dot += m[(size_t) (j * S + i)] * k[i];
++                    dot_abs += m_abs[(size_t) (j * S + i)] * std::fabs(k[i]);
++                }
++                const double delta     = ((double) v[j] - dot) * beta[h];
++                const double delta_abs = (std::fabs((double) v[j]) + dot_abs) * beta[h];
++                for (int64_t i = 0; i < S; i++) {
++                    m[(size_t) (j * S + i)] += delta * k[i];
++                    m_abs[(size_t) (j * S + i)] += delta_abs * std::fabs(k[i]);
++                }
++                double out = 0.0, out_abs = 0.0;
++                for (int64_t i = 0; i < S; i++) {
++                    out += m[(size_t) (j * S + i)] * q[i];
++                    out_abs += m_abs[(size_t) (j * S + i)] * std::fabs(q[i]);
++                }
++                ref[(size_t) (h * S + j)] = out * scale;
++                mag[(size_t) (h * S + j)] = out_abs * scale;
++            }
++            for (int64_t i = 0; i < S * S; i++) {
++                ref[n_attn + (size_t) (h * S * S + i)] = m[(size_t) i];
++                mag[n_attn + (size_t) (h * S * S + i)] = m_abs[(size_t) i];
++            }
++        }
++        double      worst = 0.0;
++        std::string f = ggml_hexagon_canary_compare("gdn_step", g_got.data(), ref.data(), mag.data(), g_got.size(),
++                                                    5e-5, &worst);
++        if (first.empty()) {
++            first = f;
++        }
++        snprintf(item, sizeof(item), "gdn_step: worst %.3g of the bound; ", worst);
++        rep.detail += item;
++    }
++
++    // f16_mm: the f16 values of the activations times the f16 weights, summed in double
++    if (checks[4].run) {
++        std::vector<double> ref((size_t) (fn * fm)), mag((size_t) (fn * fm));
++        for (int64_t r = 0; r < fm; r++) {
++            for (int64_t c = 0; c < fn; c++) {
++                double sum = 0.0, abs_sum = 0.0;
++                for (int64_t i = 0; i < fk; i++) {
++                    uint32_t xbits;
++                    memcpy(&xbits, &xf[(size_t) (r * fk + i)], sizeof(xbits));
++                    const double x16 = (double) GGML_FP16_TO_FP32(ggml_hexagon_canary_f16(xbits));
++                    const double t   = x16 * (double) GGML_FP16_TO_FP32(wf16[(size_t) (c * fk + i)]);
++                    sum += t;
++                    abs_sum += std::fabs(t);
++                }
++                ref[(size_t) (r * fn + c)] = sum;
++                mag[(size_t) (r * fn + c)] = abs_sum;
++            }
++        }
++        double      worst = 0.0;
++        std::string f = ggml_hexagon_canary_compare("f16_mm", f_got.data(), ref.data(), mag.data(), f_got.size(),
++                                                    2e-3, &worst);
++        if (first.empty()) {
++            first = f;
++        }
++        snprintf(item, sizeof(item), "f16_mm: worst %.3g of the bound", worst);
++        rep.detail += item;
++    }
++
++    rep.reason = first;
++    rep.ok     = first.empty();
++}
++
++#endif  // HTP_CANARY_H
