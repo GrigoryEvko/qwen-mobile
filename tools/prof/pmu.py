@@ -16,9 +16,14 @@ Usage:
     tools/prof/pmu.py env stalls
     tools/prof/pmu.py env bandwidth --pass 2
 
-Event ids are the raw hardware ids. Every id below is quoted from the V79
-Programmer Reference Manual chapter 10 or from the SDK event headers. Ids that
-we have not confirmed are in NEEDS_ID and deliberately carry no number.
+Event ids are the raw hardware ids. The ids of the core, HVX, AXI and DMA events
+agree with the V79 column of the table in libitrace.so of the Hexagon SDK
+6.6.0.0, which maps the names of libs/itrace/inc/itrace_dsp_events_pmu.h to raw
+ids (the header values are not raw ids). The HMX ids come from the enum
+_PMU_EVENTS_ENUM_ of libhexagonissv79.so (Hexagon Tools 19.0.07). The phone
+stage pmu of 2026-09-24 (tools/stages/pmu) confirmed each HMX id in EVENTS: it
+counts on the ops that use the HMX and it is 0 on all other ops. The HMX ids of
+NEEDS_ID counted 0 on all ops, thus they are not confirmed.
 """
 
 from __future__ import annotations
@@ -44,9 +49,19 @@ EVENTS: dict[str, tuple[int, str]] = {
     "DU_CACHE_MISS_PVIEW_CYCLES": (0xE9, "a D-cache cacheable miss"),
     "DU_BUSY_OTHER_PVIEW_CYCLES": (0xEA, "a DU replay, a DU bubble or a DTLB miss"),
     "CU_BUSY_PVIEW_CYCLES": (0xEB, "a register interlock, a port conflict or a timing class"),
-    "COPROC_BUSY_PVIEW_CYCLES": (0xED, "the coprocessor is busy"),
+    "DU_CONFLICT_PVIEW_CYCLES": (0xEC, "a DU resource conflict"),
+    # The coprocessor of the core is the HVX (the SDK names the HVX contexts "coprocessor" contexts).
+    "COPROC_BUSY_PVIEW_CYCLES": (0xED, "the coprocessor (HVX) is busy"),
     "DU_UNCACHED_PVIEW_CYCLES": (0xEE, "a D-cache uncacheable access"),
     "SYSTEM_BUSY_PVIEW_CYCLES": (0xEF, "DMA synchronization, a full ETM or a busy AXI bus"),
+    # The cycles with a commit. The 11 reasons above plus these four give about 2 for each cycle of an op
+    # on the phone (two clusters). The sum is less when two clusters commit in the same cycle.
+    "CYCLES_1_PACKET_COMMITTED": (0x300, "cycles with one packet committed"),
+    "CYCLES_2_PACKET_COMMITTED": (0x301, "cycles with two packets committed"),
+    "CYCLES_3_PACKET_COMMITTED": (0x302, "cycles with three packets committed"),
+    "CYCLES_4_PACKET_COMMITTED": (0x303, "cycles with four packets committed"),
+    # CYCLES_1..5_THREAD_RUNNING (0x3B, 0x3C, 0x3D, 0x3E, 0x0A) count 0 on the phone. Only this one counts.
+    "CYCLES_6_THREAD_RUNNING": (0x0B, "cycles with 6 threads not in wait or stop"),
 
     # HVX occupancy and its ordering interlocks.
     "HVX_ACTIVE": (0x100, "the vector FIFO is not empty"),
@@ -85,27 +100,62 @@ EVENTS: dict[str, tuple[int, str]] = {
     "L2FETCH_ACCESS": (0x7E, "accesses from the L2 prefetch engine"),
     "L2FETCH_MISS": (0x7F, "L2 prefetch accesses that missed"),
     "UDMA_ACTIVE": (0x240, "cycles with the user DMA not idle"),
+    "UDMA_DMPOLL_CYCLES": (0x245, "cycles of the DMA command dmpoll (a thread polls the DMA)"),
+    "UDMA_NONCOHERENT_RD_CYCLES": (0x262, "cycles the DMA waits for a read that bypasses the caches"),
+    "UDMA_RD_BUFFER_LEVEL_FULL": (0x269, "cycles with the DMA read buffer fully allocated"),
     "L2_UDMA_BYPASS_RD": (0x256, "user DMA reads that bypass the cache hierarchy"),
     "ICACHE_DEMAND_MISS": (0x12, "I-cache demand misses"),
     "DU_BANK_CONFLICT_REPLAY": (0xA1, "replays from a dual access to one bank"),
+
+    # The HMX. Each id counts on the ops that use the HMX (the hmx-tiled and hmx-pipe kernels and the
+    # chunked delta rule) and is 0 on all other ops (stage pmu, 2026-09-24).
+    # One MAC count (HMXMAC_FLT or HMXMAC_FLT_PARTIAL) is 8 x 32 x 32 MACs, 16384 FLOPs. HMXMAC_FLT_PARTIAL
+    # holds about 98 % of the MAC counts of the f16 kernels. HMX_CLK over HMX_ACTIVE times the core clock
+    # gives the HMX clock while the HMX is active: 1210 MHz at the start of a prefill, about 750 MHz after
+    # 4 ubatches of 1024 tokens.
+    "HMX_ACTIVE": (0x200, "cycles the HMX is active (core clock)"),
+    "HMX_CVT_FULL": (0x201, "the HMX convert FIFO is full"),
+    "HMX_MAC_FULL": (0x202, "the HMX MAC FIFO is full"),
+    "HMX_CVT": (0x204, "HMX convert"),
+    "HMX_MAC": (0x205, "HMX MAC"),
+    "HMX_PKT_THREAD": (0x206, "HMX packets by thread"),
+    "HMX_MXFIFO_FULL": (0x207, "the HMX instruction FIFO is full"),
+    "HMXMAC_ACT_OUTSTANDING": (0x209, "MAC stall: the activation read is not complete"),
+    "HMXMAC_WGT_OUTSTANDING": (0x20A, "MAC stall: the weight read is not complete"),
+    "HMXMAC_POWER_OVER": (0x20D, "MAC throttle for power"),
+    "HMXMAC_FLT_PARTIAL": (0x20F, "MAC float cycles (partial)"),
+    "HMXMAC_FLT": (0x212, "MAC float cycles"),
+    "HMX_CLK": (0x214, "HMX clock cycles"),
+    "HMXMAC_ORDER": (0x228, "MAC order stall"),
+    "HMXRDACT_PARTIAL": (0x230, "partial activation reads from VTCM"),
+    "HMXRDWGT_PARTIAL": (0x231, "partial weight reads from VTCM"),
+    "HMXRDACT_ACT": (0x232, "activation reads from VTCM"),
+    "HMXRDWGT_WGT": (0x233, "weight reads from VTCM"),
+    "HMXRDWGT_SCALE": (0x234, "scale reads from VTCM"),
+    "HMXWR_OUTSTANDING": (0x237, "HMX write to VTCM not complete"),
+    "HMXWR": (0x23B, "HMX writes to VTCM"),
+    "HMX_MXFIFO_EMPTY": (0x291, "the HMX instruction FIFO is empty"),
+    "HMX_LIMITS_THROTTLE_TLMH": (0x292, "HMX throttle by the thread limits management"),
+    "HMX_DPM_AVG_COMPRESSED": (0x294, "the digital power meter of the HMX"),
+    "HMX_POWERLIMITS_OVER": (0x295, "HMX over the power limits"),
 }
 
-# The coprocessor family that the Snapdragon Profiler NPU plugin collects. The
-# names are quoted from the plugin binary. Their raw ids are NOT confirmed, thus
-# they carry no number here and must be discovered before use. One member of the
-# family, COPROC_BUSY_PVIEW_CYCLES, is confirmed at 0xED and is in EVENTS above.
-# This family is the only HMX instrumentation on V79: the simulator runs HMX
-# functionally and never retires it in timing mode.
-NEEDS_ID: dict[str, str] = {
-    "PMU_COPROC_IDLE": "cycles the coprocessor was idle, with an empty queue and pipeline",
-    "PMU_COPROC_CYCLES_RUNNING": "cycles the coprocessor was running",
-    "PMU_COPROC_PKT_EXEC": "packets the coprocessor executed",
-    "PMU_COPROC_PKT_THREAD": "coprocessor packets by thread",
-    "PMU_COPROC_FIFO_DISPATCH": "dispatches into the coprocessor FIFO",
-    "PMU_COPROC_FIFO_FULL_REPLAY": "replays because the queue to the coprocessor was full",
-    "PMU_COPROC_REPLAY": "coprocessor replays",
-    "PMU_COPROC_VEXTRACT_STALL": "stalls on a vector extract",
-    "PMU_COPROC_AXISLAVE_ACCESS": "coprocessor memory accessed by the AXI slave",
+# HMX events of the simulator enum that counted 0 on all ops of the stage pmu of 2026-09-24, thus their ids
+# are candidates, not confirmed: name -> (candidate raw id, description). The f16 kernels do no fixed-point
+# MACs, thus 0 is the expected count for the FXP pair.
+#
+# The 9 PMU_COPROC_* names of the Snapdragon Profiler NPU plugin that this table had before are NOT HMX
+# events. They are the HVX coprocessor events of V60 to V62: the plugin programs their ids 0xF0 to 0xFC only
+# below V65 or on a DSP that is not a compute DSP. On V79 the ids 0xF0 to 0xFD count the even AXI master,
+# and the family is COPROC0..3_* (one for each HVX context) at 0x180 to 0x18F.
+NEEDS_ID: dict[str, tuple[int, str]] = {
+    "HMX_DROP": (0x203, "HMX drop"),
+    "HMXMAC_MULT_DROP": (0x20B, "MAC multiply drop"),
+    "HMXMAC_FXP_PARTIAL": (0x20E, "MAC fixed-point cycles (partial)"),
+    "HMXMAC_DRAIN_PARTIAL": (0x210, "MAC drain cycles (partial)"),
+    "HMXMAC_FXP": (0x211, "MAC fixed-point cycles"),
+    "HMXMAC_DRAIN": (0x213, "MAC drain cycles"),
+    "HMX_LIMITS_THROTTLE_LMH": (0x293, "HMX throttle by the limits management"),
 }
 
 # Named sets, in the style of an Nsight Compute section. Each pass holds at most
@@ -152,6 +202,30 @@ SETS: dict[str, tuple[str, list[list[str]]]] = {
           "L2FETCH_MISS", "L2_DU_READ_MISS", "DU_CACHE_MISS_PVIEW_CYCLES",
           "HVX_LD_L2_OUTSTANDING"]],
     ),
+    "topdown": (
+        "all 11 top-down stall reasons and the cycles with a commit, thus the shares close "
+        "(the set stalls has 6 of the 11 reasons). Two passes.",
+        [["THREAD_IDLE_PVIEW_CYCLES", "ARCH_LOCK_PVIEW_CYCLES", "REDIRECT_PVIEW_CYCLES",
+          "IU_NO_PKT_PVIEW_CYCLES", "DU_CACHE_MISS_PVIEW_CYCLES", "DU_BUSY_OTHER_PVIEW_CYCLES",
+          "CU_BUSY_PVIEW_CYCLES", "DU_CONFLICT_PVIEW_CYCLES"],
+         ["COPROC_BUSY_PVIEW_CYCLES", "DU_UNCACHED_PVIEW_CYCLES", "SYSTEM_BUSY_PVIEW_CYCLES",
+          "CYCLES_1_PACKET_COMMITTED", "CYCLES_2_PACKET_COMMITTED", "CYCLES_3_PACKET_COMMITTED",
+          "CYCLES_4_PACKET_COMMITTED", "COMMITTED_PKT_ANY"]],
+    ),
+    "hmx": (
+        "the HMX: activity, clock, MAC cycles and the reasons the MAC does not compute "
+        "(power, the instruction FIFO, the VTCM reads), and the power limits. Two passes.",
+        [["HMX_ACTIVE", "HMX_CLK", "HMXMAC_FLT", "HMXMAC_FLT_PARTIAL", "HMXMAC_POWER_OVER",
+          "HMX_MXFIFO_FULL", "HMX_MXFIFO_EMPTY", "HMX_POWERLIMITS_OVER"],
+         ["HMX_ACTIVE", "HMXMAC_ACT_OUTSTANDING", "HMXMAC_WGT_OUTSTANDING", "HMX_LIMITS_THROTTLE_TLMH",
+          "HMX_DPM_AVG_COMPRESSED", "HMX_MAC_FULL", "HMXRDACT_PARTIAL", "HMXRDWGT_PARTIAL"]],
+    ),
+    "dma-wait": (
+        "where the DMA and the threads wait: dmpoll, the read that bypasses the caches, the "
+        "full read buffer. A decode stall event of 3 ms shows as dmpoll and a DDR read wait.",
+        [["UDMA_ACTIVE", "UDMA_DMPOLL_CYCLES", "UDMA_NONCOHERENT_RD_CYCLES", "UDMA_RD_BUFFER_LEVEL_FULL",
+          "L2_UDMA_BYPASS_RD", "SYSTEM_BUSY_PVIEW_CYCLES", "DU_CACHE_MISS_PVIEW_CYCLES", "COMMITTED_PKT_ANY"]],
+    ),
 }
 
 
@@ -186,8 +260,8 @@ def cmd_list(_: argparse.Namespace) -> int:
     for name, (why, passes) in SETS.items():
         print(f"{name:<{width}}  {len(passes)} pass(es)  {why}")
     print()
-    print(f"{len(NEEDS_ID)} coprocessor events are named but have no confirmed id yet.")
-    print("They are the only HMX instrumentation on V79. Run 'pmu.py todo' for the list.")
+    print(f"{len(NEEDS_ID)} HMX events have a candidate id that counted 0 on the 4B, thus it is not confirmed.")
+    print("Run 'pmu.py todo' for the list.")
     return 0
 
 
@@ -228,7 +302,7 @@ def cmd_env(a: argparse.Namespace) -> int:
 
 
 def cmd_todo(_: argparse.Namespace) -> int:
-    """Print the coprocessor events whose raw id is still unknown.
+    """Print the HMX events whose candidate id is not confirmed.
 
     Args:
         _: The parsed arguments, unused
@@ -236,12 +310,13 @@ def cmd_todo(_: argparse.Namespace) -> int:
     Returns:
         The exit status
     """
-    print("Named by the Snapdragon Profiler NPU plugin, raw id not yet confirmed.")
-    print("COPROC_BUSY_PVIEW_CYCLES is confirmed at 0xed and is already usable.")
+    print("HMX events of the simulator enum (libhexagonissv79.so) that counted 0 on all ops of the")
+    print("4B Q8_0 (stage pmu, 2026-09-24). A workload with that work (for example an int8 HMX kernel")
+    print("for the FXP pair) can confirm them. The confirmed HMX ids are in EVENTS and in the set hmx.")
     print()
     width = max(len(k) for k in NEEDS_ID)
-    for n, desc in NEEDS_ID.items():
-        print(f"  {n:<{width}}  {desc}")
+    for n, (eid, desc) in NEEDS_ID.items():
+        print(f"  0x{eid:03x}  {n:<{width}}  {desc}")
     return 0
 
 
