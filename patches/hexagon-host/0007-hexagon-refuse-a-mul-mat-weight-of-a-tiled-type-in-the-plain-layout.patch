@@ -1,0 +1,150 @@
+hexagon: refuse a MUL_MAT weight of a tiled type in the plain layout
+Fold-into: upstream/hexagon-host
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+
+The DSP kernels read each MUL_MAT and MUL_MAT_ID weight of the types Q4_0,
+Q4_1, Q8_0, IQ4_NL, MXFP4, Q4_K and Q6_K as tiled data. set_tensor puts a
+weight into the tiled layout only in one of two conditions:
+  - The buffer of the weight has the usage GGML_BACKEND_BUFFER_USAGE_WEIGHTS.
+  - supports_op saw the op before the allocation of the weight
+    (needs_repack, which gives the REPACK flag in init_tensor).
+The model loader of llama.cpp sets the WEIGHTS usage (src/llama-model.cpp),
+and test-backend-ops sets it or calls supports_op before the allocation. A
+different caller can put a weight into a Hexagon buffer with neither. Then
+the weight keeps the plain layout of ggml, supports_op accepts its MUL_MAT,
+and the DSP computes incorrect values with no error.
+
+On the phone, the stage tools ffncheck and mmcheck put all their tensors
+into one buffer of ggml_backend_alloc_ctx_tensors. Each Q8_0 case gave
+non-finite outputs (for example 2560 of 2560 values for one token of the
+FFN block of the 4B), and each F16 case was correct.
+
+This patch adds ggml_hexagon_weight_is_plain. The function is true for a
+weight of a tiled type that has data in a Hexagon buffer, when the buffer
+has no WEIGHTS usage and neither the weight nor the tensor that it is a view
+of has the REPACK flag.
+  - supports_op refuses a MUL_MAT or a MUL_MAT_ID of such a weight.
+  - graph_compute stops with GGML_STATUS_FAILED for such a weight, for a
+    caller that computes a graph with no supports_op call. The error
+    message tells the caller to set the WEIGHTS usage before the first
+    ggml_backend_tensor_set.
+A weight with no data has no layout yet, and the function is false for it.
+The model loader asks supports_op with a buffer of size 0 on the weight
+(weight_buft_supported), and the memory-fit pass gives the weights a
+buffer of size 0. A first form of this patch did not have this condition:
+the loader then put each Q8_0 weight of the 2B and the 4B on the CPU.
+
+The tests on the host, with the fake DSP of the hexhost harness:
+  - hexhost_graphs on the 2B and the 4B Q8_0: decode, decode with 4
+    recurrent state snapshots, prefill 512, prefill 1024, the MTP draft,
+    and the image turn at 576 and 768 tokens. Each path runs with the F16
+    cache, with the Q8_0 cache and flash attention, and with a Q8_0 K
+    cache without flash attention (llama.cpp needs flash attention for a
+    quantized V). The 42 runs give the same supports_op decisions and the
+    same DSP ops with and without this patch, and graph_compute stops in
+    none of them.
+  - fuzz_repack puts the bytes of each input also into a weight in a
+    buffer with no WEIGHTS usage. supports_op must refuse its MUL_MAT, and
+    graph_compute must not send it. Without this patch, the regression
+    inputs plain-weight-q8_0.bin and plain-weight-q4_k.bin stop with the
+    violation repack-plain-weight. With this patch, they pass, also in the
+    debug builds with ASan and with UBSan, and 60 s of fuzzing (about 250000
+    inputs) finds no violation.
+
+The tests on the phone (HTP0, v79), with HEAD plus this patch:
+  - ffncheck --plain (the 8 FFN cases of the 4B with the weights in a
+    buffer with no WEIGHTS usage): in each case supports_op refuses the
+    MUL_MAT, and graph_compute stops with the error message. Without this
+    patch, the same method gave non-finite outputs.
+  - ffncheck with the WEIGHTS usage: the 18 hashes of HEAD.
+  - test-backend-ops MUL_MAT 673/673 and MUL_MAT_ID 388/388, with the same
+    1057 cases "not supported" as HEAD.
+  - llama-perplexity -b 512 on the 4B Q8_0: the KL numbers of HEAD (mean
+    KLD 0.000484).
+
+The patch adds no work to a graph that the graph cache holds. For a new
+graph, graph_compute reads each node one more time. O(nodes).
+
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 865df3e..ef719b7 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -5913,6 +5913,33 @@ static bool ggml_hexagon_is_fwht(const struct ggml_tensor * t) {
+     return (n == 128 || n == 256) && ggml_nelements(src1) <= GGML_HEXAGON_FWHT_MAX_VALUES;
+ }
+ 
++// True when w, the weight of a MUL_MAT or a MUL_MAT_ID, has a type of the tiled layout
++// (ggml_hexagon_is_repack_type) but holds the plain layout of ggml in a Hexagon buffer. set_tensor puts
++// a weight into the tiled layout only in two conditions: its buffer has the usage
++// GGML_BACKEND_BUFFER_USAGE_WEIGHTS, or supports_op saw the op before the allocation of the weight
++// (needs_repack, which gives the REPACK flag in init_tensor). The DSP reads each such weight as tiled
++// data, thus a weight in the plain layout gives incorrect values and no error. The REPACK flag can be on
++// the weight or on the tensor that it is a view of. A weight with no data has no layout yet: the model
++// loader of llama.cpp asks supports_op with a buffer of size 0 on the weight (weight_buft_supported).
++// O(1).
++static bool ggml_hexagon_weight_is_plain(const struct ggml_tensor * w) {
++    const struct ggml_tensor * base = w->view_src ? w->view_src : w;
++    if (!ggml_hexagon_is_repack_type(w->type) || !base->buffer || !base->data ||
++        !ggml_backend_buffer_is_hexagon(base->buffer)) {
++        return false;
++    }
++    if (ggml_backend_buffer_get_usage(base->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
++        return false;
++    }
++    for (const struct ggml_tensor * t : { w, base }) {
++        const auto * extra = (const struct ggml_hexagon_tensor_extra *) t->extra;
++        if (extra && (extra->flags & GGML_HEXAGON_TENSOR_REPACK) != 0) {
++            return false;
++        }
++    }
++    return true;
++}
++
+ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * sess, const struct ggml_tensor * dst) {
+     const struct ggml_tensor * src0 = dst->src[0];
+     const struct ggml_tensor * src1 = dst->src[1];
+@@ -5948,6 +5975,10 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
+ 
+             if (!src0->buffer) {
+                 sess->needs_repack.insert(src0);
++            } else if (ggml_hexagon_weight_is_plain(src0)) {
++                HEX_VERBOSE("ggml-hex: %s MUL_MAT %s: the weight %s has the plain layout, not the tiled layout\n",
++                            sess->c_name(), dst->name, src0->name);
++                return false;
+             }
+             break;
+ 
+@@ -6010,6 +6041,10 @@ static bool ggml_hexagon_supported_mul_mat_id(const struct ggml_hexagon_session
+ 
+             if (!src0->buffer) {
+                 sess->needs_repack.insert(src0);
++            } else if (ggml_hexagon_weight_is_plain(src0)) {
++                HEX_VERBOSE("ggml-hex: %s MUL_MAT_ID %s: the weight %s has the plain layout, not the tiled layout\n",
++                            sess->c_name(), op->name, src0->name);
++                return false;
+             }
+             break;
+ 
+@@ -7028,6 +7063,21 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+     if (cache_hit) {
+         nodes_ptr = &entry->nodes;
+     } else {
++        // supports_op refuses a weight in the plain layout. A caller that computes a graph with no
++        // supports_op call gets this error, and not incorrect values. O(nodes).
++        for (int i = 0; i < graph->n_nodes; i++) {
++            const ggml_tensor * n = graph->nodes[i];
++            if ((n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) && !ggml_hexagon_is_fwht(n) &&
++                ggml_hexagon_weight_is_plain(n->src[0])) {
++                GGML_LOG_ERROR("ggml-hex: %s: the weight %s of %s (%s) has the plain layout, but the HTP kernels read "
++                               "the tiled layout. Set the usage GGML_BACKEND_BUFFER_USAGE_WEIGHTS on the buffer of the "
++                               "weight before the first ggml_backend_tensor_set, as the model loader of llama.cpp "
++                               "does.\n",
++                               sess->c_name(), n->src[0]->name, n->name, ggml_op_desc(n));
++                return GGML_STATUS_FAILED;
++            }
++        }
++
+         // Tag fusable tensors in graph
+         for (int i = 0; i < graph->n_nodes; i++) {
+             auto * extra = (ggml_hexagon_tensor_extra *) graph->nodes[i]->extra;

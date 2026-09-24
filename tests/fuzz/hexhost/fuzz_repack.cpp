@@ -8,7 +8,9 @@
 // reads the tensor back. The invariants: no access outside the buffer
 // (AddressSanitizer checks the tile writes against get_alloc_size), and the
 // read back of a lossless type (Q4_0, Q4_1, Q8_0, IQ4_NL, MXFP4) gives the
-// bytes that the harness wrote.
+// bytes that the harness wrote. Then the same bytes go into a 2D weight in a
+// buffer with no WEIGHTS usage, which keeps the plain layout: supports_op must
+// refuse a MUL_MAT of that weight, and graph_compute must not send it.
 
 #include "fake_dsp.h"
 #include "fuzz_death.h"
@@ -144,6 +146,39 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
                 }
             }
             ggml_backend_buffer_free(buf);
+
+            // The same bytes as a 2D weight in a buffer with no WEIGHTS usage: set_tensor keeps the plain
+            // layout of ggml. The DSP reads each weight of a repack type as tiled data, thus supports_op
+            // must refuse a MUL_MAT of this weight, and graph_compute must not send it.
+            ggml_init_params pp = { ggml_tensor_overhead() * 4 + ggml_graph_overhead(), nullptr, true };
+            ggml_context *   pc = ggml_init(pp);
+            ggml_tensor *    pw = ggml_new_tensor_2d(pc, t, ne0, ne1);
+            ggml_tensor *    px = ggml_new_tensor_2d(pc, GGML_TYPE_F32, ne0, 1);
+            ggml_tensor *    mm = ggml_mul_mat(pc, pw, px);
+            ggml_backend_buffer_t pb = ggml_backend_alloc_ctx_tensors_from_buft(pc, hexhost::device_buft(dev));
+            ggml_backend_t        be = ggml_backend_dev_init(hexhost::device_dev(dev), nullptr);
+            if (pb && be) {
+                ggml_backend_tensor_set(pw, in.data(), 0, ggml_nbytes(pw));
+                if (hexhost::supports_op(dev, mm)) {
+                    fakedsp::violation("repack-plain-weight", "type %s %lldx%lld: supports_op accepts a MUL_MAT whose "
+                                       "weight has the plain layout (a buffer with no WEIGHTS usage)",
+                                       ggml_type_name(t), (long long) ne0, (long long) ne1);
+                }
+                ggml_cgraph * gf = ggml_new_graph(pc);
+                ggml_build_forward_expand(gf, mm);
+                if (ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS) {
+                    fakedsp::violation("repack-plain-weight-compute", "type %s %lldx%lld: graph_compute sends a MUL_MAT "
+                                       "whose weight has the plain layout", ggml_type_name(t), (long long) ne0,
+                                       (long long) ne1);
+                }
+            }
+            if (be) {
+                ggml_backend_free(be);
+            }
+            if (pb) {
+                ggml_backend_buffer_free(pb);
+            }
+            ggml_free(pc);
         }
         ggml_free(ctx);
     }

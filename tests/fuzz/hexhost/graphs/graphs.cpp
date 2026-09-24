@@ -478,6 +478,29 @@ int main(int argc, char ** argv) {
     // The app keeps as many recurrent state snapshots as the longest draft (4)
     const char * rs_seq = getenv("HEXHOST_RS_SEQ");
     cp.n_rs_seq = mtp ? 4 : (rs_seq ? (uint32_t) atoi(rs_seq) : 0);
+    // HEXHOST_BATCH=N: n_batch = n_ubatch = N, and a context of N tokens or more (the app has 1024).
+    // HEXHOST_KV=TYPE: the type of K and V (q8_0 in the app). HEXHOST_KV_V=TYPE: a different type of V
+    // (llama.cpp needs flash attention for a quantized V). HEXHOST_FA=on or off: flash attention.
+    if (const char * b = getenv("HEXHOST_BATCH")) {
+        cp.n_batch  = (uint32_t) atoi(b);
+        cp.n_ubatch = cp.n_batch;
+        cp.n_ctx    = std::max(cp.n_ctx, cp.n_batch);
+    }
+    for (const char * var : { "HEXHOST_KV", "HEXHOST_KV_V" }) {
+        const char * kv = getenv(var);
+        for (int t = 0; kv && t < GGML_TYPE_COUNT; t++) {
+            const char * name = ggml_type_name((ggml_type) t);
+            if (name && !strcmp(name, kv)) {
+                if (!strcmp(var, "HEXHOST_KV")) {
+                    cp.type_k = (ggml_type) t;
+                }
+                cp.type_v = (ggml_type) t;
+            }
+        }
+    }
+    if (const char * fa = getenv("HEXHOST_FA")) {
+        cp.flash_attn_type = !strcmp(fa, "on") ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    }
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) {
         fprintf(stderr, "hexhost_graphs: cannot make a context\n");
