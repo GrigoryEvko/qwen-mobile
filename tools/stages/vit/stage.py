@@ -55,7 +55,8 @@ STAGE_ROOT = Path(os.path.relpath(REPO / "build/vit"))
 BASE_ENV = "GGML_HEXAGON_OPFUSION=1 GGML_HEXAGON_OPFUSION_STATE=1"
 PROFILE_ENV = "GGML_HEXAGON_PROFILE=1 LLAMA_HOSTPROF=1"
 THERMAL = f"{ADB} shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
-PGREP = f"{ADB} shell 'pgrep -x vitprobe; echo pgrep-done'"
+# The kernel keeps 15 characters of a process name: test-backend-ops is test-backend-op
+PGREP = f"{ADB} shell 'pgrep -x vitprobe; pgrep -x llama-bench; pgrep -x test-backend-op; echo pgrep-done'"
 NSP = ('$(for z in /sys/class/thermal/thermal_zone*; do case "$(cat $z/type 2>/dev/null)" in (nsp*) '
        'cat $z/temp 2>/dev/null;; esac; done | sort -n | tail -n 1)')
 BEFORE = f'echo "before: nsp={NSP}"'
@@ -67,18 +68,21 @@ AFTER = ('echo "after: thermal=$(dumpsys thermalservice | grep "Thermal Status" 
 CAP_MIN_KHZ = 3000000
 # The tensors of the dump runs: the output of layers 0, 1, 5, 11, 17 and 23, and the stages of layer 0.
 DUMP_RE = "(layer_out-(0|1|5|11|17|23)|ln1-0|QKcur_rope-0|kqv_out-0|attn_out-0|ffn_inp-0|ffn_out-0)"
-STAGE_FILES = ("bin/gate.sh", "bin/vitprobe", "bin/test-backend-ops", "lib/libggml-base.so", "lib/libggml-cpu.so",
-               "lib/libggml-hexagon.so", "lib/libggml-htp-v79.so", "lib/libggml-opencl.so", "lib/libggml.so",
-               "lib/libllama-common.so", "lib/libllama.so", "lib/libmtmd.so")
+# The llama-bench runs of the text model: the flags of the app (4 threads, the Q8_0 cache, flash attention)
+BENCH_ARGS = "-dev HTP0 -ngl 99 -t 4 -ctk q8_0 -ctv q8_0 -fa 1 -p 512 -n 32 -r 3"
+BENCH_GATE_KB = 8388608
+# The switch of the plans of the vision encoder (htp-vit-fusion.h). The HEAD libraries ignore it.
+VIT_OFF = "GGML_HEXAGON_FUSE_VIT=0"
 
 
 @dataclass(frozen=True)
 class Variant:
-    """One kind of run: the image, the token budget, the device, the reps, the extra arguments and environment."""
+    """One kind of run: the tool (vit: vitprobe, tbo: test-backend-ops, bench: llama-bench), the image, the token
+    budget, the device, the reps, the extra arguments and environment."""
     key: str
     text: str
-    image: str
-    tokens: int
+    image: str = "photo"
+    tokens: int = 0
     dev: str = "HTP0"
     reps: int = 5
     env: str = ""
@@ -87,15 +91,19 @@ class Variant:
     dump: bool = False
     timing: bool = True
     limit: int = 100
+    tool: str = "vit"
 
 
 @dataclass(frozen=True)
 class Stage:
-    """A phone stage: its header text, its library sets (key -> directory in build/vit) and its runs in order."""
+    """A phone stage: its header text, its library sets (key -> directory in build/vit), its runs in order, and the
+    set whose bin/ holds llama-bench (the bench of each set runs that binary with the libraries of its set)."""
     name: str
     text: str
     sets: dict
     runs: list = field(default_factory=list)
+    tools_set: str = ""
+    minutes: int = 5   # the tool time of the runs, for the header
 
 
 V = {v.key: v for v in (
@@ -110,6 +118,18 @@ V = {v.key: v for v in (
     Variant("d256", "the tensor dump, 256 tokens, 1 encode", "photo", 256, reps=1, dump=True, embd=False,
             timing=False),
     Variant("u768", "the older test photo, 768 tokens, 2 encodes", "user", 768, reps=2, timing=False),
+    Variant("x768", "768 tokens with the vision plans off (GGML_HEXAGON_FUSE_VIT=0)", "photo", 768, env=VIT_OFF),
+    Variant("x256", "256 tokens with the vision plans off", "photo", 256, env=VIT_OFF),
+    Variant("ov", "test-backend-ops test -o VIT_BLOCK (the fused chains of the encoder)", tool="tbo",
+            args="-o VIT_BLOCK", timing=False, embd=False),
+    Variant("ov0", "test-backend-ops test -o VIT_BLOCK with the vision plans off", tool="tbo", args="-o VIT_BLOCK",
+            env=VIT_OFF, timing=False, embd=False),
+    Variant("on", "test-backend-ops test -o NORM,GELU,FFN_SWIGLU", tool="tbo", args="-o NORM,GELU,FFN_SWIGLU",
+            timing=False, embd=False),
+    Variant("or", "test-backend-ops test -o ROPE", tool="tbo", args="-o ROPE", timing=False, embd=False),
+    Variant("oc", "test-backend-ops test -o CPY", tool="tbo", args="-o CPY", timing=False, embd=False),
+    Variant("b", "llama-bench of the 4B Q8_0 text model, pp512 and tg32, 3 reps", tool="bench", timing=True,
+            embd=False, limit=110),
 )}
 
 
@@ -129,6 +149,13 @@ STAGES = {s.name: s for s in (
           "embeddings, and a tensor dump", {"h": "phone-head"},
           runs_ab("h", ["t768", "t256"], 2) + [("h", "p768", 1), ("h", "p256", 1), ("h", "u768", 1),
                                               ("h", "d256", 1), ("h", "c768", 1)]),
+    Stage("vit2", "the fused LayerNorm, the fused attention input and the F16 activations of the encoder "
+          "(candidate a) against HEAD: the op tests, the encoder speed and embeddings, the op profile, the text bench",
+          {"h": "phone-head", "a": "phone-a"},
+          [("a", "ov", 1), ("a", "ov0", 1), ("a", "on", 1), ("a", "or", 1), ("a", "oc", 1)] +
+          runs_ab("ha", ["t768", "t256"], 2) + [("a", "x768", 1), ("a", "x256", 1)] +
+          [("a", "p768", 1), ("a", "u768", 1)] + runs_ab("ha", ["b"], 2),
+          tools_set="a", minutes=15),
 )}
 
 
@@ -148,21 +175,34 @@ def run_lines(stage: Stage, set_key: str, vk: str, rnd: int) -> list[str]:
     name = run_name(set_key, vk, rnd)
     stem = f"{PHONE}/out/{name}"
     sdir = f"{PHONE}/{stage.sets[set_key]}"
-    env = " ".join(x for x in (f"LD_LIBRARY_PATH={sdir}/lib ADSP_LIBRARY_PATH={sdir}/lib", BASE_ENV, v.env) if x)
-    args = (f"-m {MODEL_DIR}/{MODEL} --mmproj $P --image {image_path(v.image)} --image-tokens {v.tokens} "
-            f"--dev {v.dev} --reps {v.reps} --rgb-out {stem}.rgb")
-    if v.embd:
-        args += f" --embd-out {stem}.f32"
-    if v.dump:
-        args += f" --dump {stem}-dump --dump-re \"{DUMP_RE}\""
-    if v.args:
-        args += f" {v.args}"
-    pre = f"mkdir -p {stem}-dump && " if v.dump else ""
-    cmd = (f"{pre}sh {sdir}/bin/gate.sh {GATE_KB} > {stem}-gate.txt && {BEFORE} >> {stem}-gate.txt && "
+    libs = f"{sdir}/lib"
+    gate_kb = GATE_KB
+    pre = ""
+    if v.tool == "vit":
+        args = (f"-m {MODEL_DIR}/{MODEL} --mmproj $P --image {image_path(v.image)} --image-tokens {v.tokens} "
+                f"--dev {v.dev} --reps {v.reps} --rgb-out {stem}.rgb")
+        if v.embd:
+            args += f" --embd-out {stem}.f32"
+        if v.dump:
+            args += f" --dump {stem}-dump --dump-re \"{DUMP_RE}\""
+            pre = f"mkdir -p {stem}-dump && "
+        if v.args:
+            args += f" {v.args}"
+        tool = f"{sdir}/bin/vitprobe {args}"
+    elif v.tool == "tbo":
+        tool = f"{sdir}/bin/test-backend-ops test -b HTP0 {v.args}"
+    else:
+        # llama-bench of the tools set, with the libraries of this set first in the search path
+        tdir = f"{PHONE}/{stage.sets[stage.tools_set]}"
+        libs = f"{sdir}/lib:{tdir}/lib"
+        gate_kb = BENCH_GATE_KB
+        tool = f"{tdir}/bin/llama-bench -m {MODEL_DIR}/{MODEL} {BENCH_ARGS}"
+    env = " ".join(x for x in (f"LD_LIBRARY_PATH={libs} ADSP_LIBRARY_PATH={sdir}/lib", BASE_ENV, v.env) if x)
+    cmd = (f"{pre}sh {sdir}/bin/gate.sh {gate_kb} > {stem}-gate.txt && {BEFORE} >> {stem}-gate.txt && "
            f"P={MODEL_DIR}/{MMPROJ}; [ -f $P ] || P=/sdcard/qwen/models/{MMPROJ}; echo \"mmproj: $P\" >> {stem}-gate.txt; "
-           f"timeout -s KILL {v.limit} env {env} {sdir}/bin/vitprobe {args} "
+           f"timeout -s KILL {v.limit} env {env} {tool} "
            f"> {stem}.out 2> {stem}.log; echo \"rc=$?\" >> {stem}-gate.txt; {AFTER} >> {stem}-gate.txt; "
-           f"cat {stem}-gate.txt {stem}.out")
+           f"cat {stem}-gate.txt; tail -n 12 {stem}.out")
     return ["#", f"# REAL-MODEL {MODEL.removesuffix('.gguf')}: {name}, set {stage.sets[set_key]}, {v.text}",
             THERMAL, f"{ADB} shell '{cmd}'", PGREP]
 
@@ -192,7 +232,8 @@ def header(stage: Stage) -> list[str]:
         lines += ["This is a TIMING stage: put this file into /tmp/phone-timing-stages.txt (unlocked phone, screen on,",
                   "no charger)."]
     lines += [
-        "Run from /home/grigory/airi/qwen-mobile on the laptop, in order. Tool time: about 5 minutes, plus about 8 s of",
+        f"Run from /home/grigory/airi/qwen-mobile on the laptop, in order. Tool time: about {stage.minutes} minutes, plus "
+        "about 8 s of",
         "gate and checks for each run, plus the waits for thermal status 0.",
         f"Then on the box: tools/stages/vit/stage.py table {stage.name}; stage.py oracle {stage.name}; "
         f"stage.py cmp {stage.name}.",
@@ -213,13 +254,12 @@ def setup_lines(stage: Stage) -> list[str]:
             # run-as writes the file of the app to stdout, and the shell of adb writes it into the stage directory.
             f"{ADB} shell 'run-as ai.airi.qwenmobile cat {APP_IMAGE} > {image_path('photo')} && "
             f"cp {OLD_IMAGE} {image_path('user')} && ls -l {PHONE}/in && sha1sum {PHONE}/in/*'"]
+    # Each file of the bin/ and lib/ directories of a set (the SHA256SUMS of the set names them all)
     for d in stage.sets.values():
         local = f"build/vit/{d}"
-        bins = " ".join(f"{local}/{f}" for f in STAGE_FILES if f.startswith("bin/"))
-        libs = " ".join(f"{local}/{f}" for f in STAGE_FILES if f.startswith("lib/"))
         out += [f"{ADB} shell 'mkdir -p {PHONE}/{d}/bin {PHONE}/{d}/lib'",
-                f"{ADB} push {bins} {PHONE}/{d}/bin/",
-                f"{ADB} push {libs} {PHONE}/{d}/lib/",
+                f"{ADB} push {local}/bin/. {PHONE}/{d}/bin/",
+                f"{ADB} push {local}/lib/. {PHONE}/{d}/lib/",
                 f"{ADB} push {local}/SHA256SUMS {PHONE}/{d}/",
                 f"{ADB} shell 'cd {PHONE}/{d} && sha256sum -c SHA256SUMS | grep -c OK && chmod 755 {PHONE}/{d}/bin/*'"]
     return out
@@ -317,7 +357,7 @@ def time_table(stage: Stage, results: dict[str, Result], include_all: bool) -> l
     median of the other encodes of each run, then the median over the runs."""
     out = ["Encode times, ms (rep 1: the first encode of the process; reps 2+: the median of the later encodes)"]
     for vk in dict.fromkeys(vk for _, vk, _ in stage.runs):
-        if not V[vk].timing:
+        if not V[vk].timing or V[vk].tool != "vit":
             continue
         for s in stage.sets:
             rs = [results[run_name(s, vk, r)] for (s2, v2, r) in stage.runs if s2 == s and v2 == vk
@@ -417,19 +457,113 @@ def checks(stage: Stage, results: dict[str, Result]) -> list[str]:
     return out
 
 
+def runner_marks(stage: Stage) -> dict[str, list[str]]:
+    """The marks of the runner log build/vit/STAGE/runner.log (the copy of the log of the laptop runner): a run whose
+    CAPS line says CAPS-CHANGED. O(size of the log)."""
+    path = STAGE_ROOT / stage.name / "runner.log"
+    marks: dict[str, list[str]] = defaultdict(list)
+    if not path.exists():
+        return marks
+    current = None
+    for line in path.read_text(errors="replace").splitlines():
+        m = re.match(r"# REAL-MODEL [^:]*: (\S+),", line)
+        if m:
+            current = m.group(1)
+        elif current and line.startswith("CAPS ") and "CAPS-CHANGED" in line:
+            marks[current].append("the runner marks CAPS-CHANGED")
+    return marks
+
+
+TBO_CASE_RE = re.compile(r"^\s+([A-Z_0-9]+)\((.*)\): (OK|FAIL|not supported)", re.M)
+TBO_SUM_RE = re.compile(r"(\d+)/(\d+) tests passed")
+BENCH_RE = re.compile(r"\|\s*(pp\d+|tg\d+)\s*\|\s*([\d.]+) ± ([\d.]+)\s*\|")
+
+
+def tbo_table(stage: Stage, results: dict[str, Result]) -> list[str]:
+    """The op test runs: the passed, failed and unsupported cases of each run, and each failed case."""
+    out = ["test-backend-ops (HTP0 against the phone CPU):"]
+    for s, vk, r in stage.runs:
+        if V[vk].tool != "tbo":
+            continue
+        name = run_name(s, vk, r)
+        res = results.get(name)
+        if res is None:
+            out.append(f"  {name}: no files")
+            continue
+        cases = TBO_CASE_RE.findall(res.out)
+        cnt = Counter(c[2] for c in cases)
+        summ = TBO_SUM_RE.findall(res.out)
+        mark = "" if res.ok else f"  ({', '.join(res.removed) or 'not ok'})"
+        out.append(f"  {name:10s} {V[vk].text}: OK {cnt['OK']}, FAIL {cnt['FAIL']}, not supported {cnt['not supported']}"
+                   f"{', summary ' + '/'.join(summ[-1]) if summ else ', no summary line'}{mark}")
+        for op, params, st in cases:
+            if st == "FAIL":
+                out.append(f"      FAIL {op}({params[:150]})")
+    return out
+
+
+def bench_table(stage: Stage, results: dict[str, Result], include_all: bool) -> list[str]:
+    """The llama-bench runs: the median of the rounds of each test for each set, and the ratio to the first set."""
+    rates: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    for s, vk, r in stage.runs:
+        if V[vk].tool != "bench":
+            continue
+        res = results.get(run_name(s, vk, r))
+        if res is None or not res.ok or (res.removed and not include_all):
+            continue
+        for test, mean, _sd in BENCH_RE.findall(res.out):
+            rates[test][s].append(float(mean))
+    if not rates:
+        return ["llama-bench: no usable run"]
+    keys = list(stage.sets)
+    out = ["llama-bench of the 4B Q8_0 (t/s, the median of the rounds): " + ", ".join(f"{k} = {stage.sets[k]}" for k in keys)]
+    for test, by_set in rates.items():
+        cells = []
+        base = statistics.median(by_set[keys[0]]) if by_set.get(keys[0]) else None
+        for k in keys:
+            if by_set.get(k):
+                m = statistics.median(by_set[k])
+                ratio = f" ({m / base:.3f})" if base and k != keys[0] else ""
+                cells.append(f"{k} {m:.2f}{ratio} [{', '.join(f'{x:.1f}' for x in by_set[k])}]")
+        out.append(f"  {test:6s} " + "   ".join(cells))
+    return out
+
+
+def hash_table(stage: Stage, results: dict[str, Result]) -> list[str]:
+    """The embedding hash of each encoder run, grouped by the input: equal hashes are equal bits."""
+    groups: dict[str, list[str]] = defaultdict(list)
+    for name, res in results.items():
+        m, g = EMBD_RE.search(res.out), RGB_RE.search(res.out)
+        if m and g:
+            groups[f"{g.group(3)}-{g.group(1)}x{g.group(2)}"].append(f"{name}={m.group(3)}")
+    out = ["The embedding hashes of each input (runs with equal hashes have equal bits):"]
+    for key, runs in sorted(groups.items()):
+        hashes = Counter(x.split("=")[1] for x in runs)
+        out.append(f"  {key}: {len(hashes)} distinct hash(es): " + ", ".join(sorted(runs)))
+    return out
+
+
 def load_results(stage: Stage) -> tuple[Path, dict[str, Result]]:
-    """The results of the runs that have a gate file."""
+    """The results of the runs that have a gate file, with the marks of the runner log."""
     root = STAGE_ROOT / stage.name / "phone-out"
     if not root.is_dir():
         sys.exit(f"stage.py: {root} is not a directory. Pull the outputs of the stage first.")
     names = [run_name(*r) for r in stage.runs]
-    return root, {n: read_result(root, n) for n in names if (root / f"{n}-gate.txt").exists()}
+    results = {n: read_result(root, n) for n in names if (root / f"{n}-gate.txt").exists()}
+    for n, marks in runner_marks(stage).items():
+        if n in results:
+            results[n].removed.extend(marks)
+    return root, results
 
 
 def table(stage: Stage, include_all: bool) -> int:
     """Print the tables."""
     _, results = load_results(stage)
-    parts = [checks(stage, results), time_table(stage, results, include_all)]
+    parts = [checks(stage, results), time_table(stage, results, include_all), hash_table(stage, results)]
+    if any(V[vk].tool == "tbo" for _, vk, _ in stage.runs):
+        parts.append(tbo_table(stage, results))
+    if any(V[vk].tool == "bench" for _, vk, _ in stage.runs):
+        parts.append(bench_table(stage, results, include_all))
     for s, vk, r in stage.runs:
         if V[vk].env == PROFILE_ENV:
             parts.append(profile_table(results, run_name(s, vk, r)))
@@ -449,41 +583,56 @@ def rgb_inputs(stage: Stage, results: dict[str, Result]) -> dict[str, tuple[int,
     return out
 
 
-def oracle_path(w: int, h: int, hsh: str) -> Path:
-    """The oracle embeddings of one input."""
-    return STAGE_ROOT / "oracle" / f"{hsh}-{w}x{h}.f32"
+# The two oracles. "on" is the graph of the phone (flash attention); the CPU flash attention accumulates P x V in
+# F16 when V is F16 (ops.cpp, ggml_vec_mad_f16), thus its error grows with the key count. "off" is the attention of
+# two F32 matmuls and an F32 softmax, the more exact reference.
+ORACLE_FA = ("off", "on")
 
 
-def oracle(stage: Stage, threads: int) -> int:
-    """Encode the RGB input of each run with the x86 oracle, once for each distinct input. O(inputs * encode)."""
-    root, results = load_results(stage)
+def oracle_path(w: int, h: int, hsh: str, fa: str, suffix: str = ".f32") -> Path:
+    """The oracle file of one input and one attention form."""
+    return STAGE_ROOT / "oracle" / f"{hsh}-{w}x{h}-fa{fa}{suffix}"
+
+
+def oracle_run(name: str, rgb: Path, w: int, h: int, hsh: str, fa: str, threads: int, dump: bool) -> bool:
+    """Encode one RGB file with the x86 oracle: the embeddings, or with dump the tensors of DUMP_RE into a directory.
+    Returns False on a failure."""
     tool = STAGE_ROOT / "x86" / "vitprobe-oracle"
     if not tool.exists():
         sys.exit(f"stage.py: {tool} does not exist. Run tools/stages/vit/build.sh oracle.")
-    done = set()
+    dst = oracle_path(w, h, hsh, fa, "-dump" if dump else ".f32")
+    if dst.exists():
+        return True
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.name + ".tmp")
+    cmd = [str(tool), "-m", str(REPO / "weights/gguf" / MODEL), "--mmproj", str(REPO / "weights/gguf" / MMPROJ),
+           "--rgb", str(rgb), "--size", f"{w}x{h}", "--dev", "none", "-t", str(threads), "--reps", "1", "--fa", fa]
+    if dump:
+        tmp.mkdir(parents=True, exist_ok=True)
+        cmd += ["--dump", str(tmp), "--dump-re", DUMP_RE]
+    else:
+        cmd += ["--embd-out", str(tmp)]
+    print(f"oracle: {name} {w}x{h} {hsh} fa {fa}{' dump' if dump else ''}", flush=True)
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    log = oracle_path(w, h, hsh, fa, "-dump.log" if dump else ".log")
+    log.write_text(p.stdout + p.stderr)
+    m = RGB_RE.search(p.stdout)
+    if p.returncode != 0 or m is None or m.group(3) != hsh:
+        print(f"oracle: {name} failed (exit {p.returncode}, input {m.group(3) if m else '?'}), refer to {log}")
+        return False
+    tmp.rename(dst)
+    return True
+
+
+def oracle(stage: Stage, threads: int) -> int:
+    """Encode the RGB input of each run with the two x86 oracles, once for each distinct input and form, and the
+    tensors of each dump run. O(inputs * encode)."""
+    root, results = load_results(stage)
     for name, (w, h, hsh) in sorted(rgb_inputs(stage, results).items()):
-        dst = oracle_path(w, h, hsh)
-        if hsh in done or dst.exists():
-            done.add(hsh)
-            continue
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dst.with_suffix(".tmp")
-        cmd = [str(tool), "-m", str(REPO / "weights/gguf" / MODEL), "--mmproj", str(REPO / "weights/gguf" / MMPROJ),
-               "--rgb", str(root / f"{name}.rgb"), "--size", f"{w}x{h}", "--dev", "none", "-t", str(threads),
-               "--reps", "1", "--embd-out", str(tmp)]
-        print(f"oracle: {name} {w}x{h} {hsh}", flush=True)
-        p = subprocess.run(cmd, capture_output=True, text=True)
-        (dst.parent / f"{hsh}-{w}x{h}.out").write_text(p.stdout)
-        (dst.parent / f"{hsh}-{w}x{h}.log").write_text(p.stderr)
-        if p.returncode != 0:
-            print(f"oracle: {name} failed with {p.returncode}, refer to {dst.parent}/{hsh}-{w}x{h}.log")
-            continue
-        m = RGB_RE.search(p.stdout)
-        if m is None or m.group(3) != hsh:
-            print(f"oracle: {name}: the oracle read other bytes than the phone ({m.group(3) if m else '?'})")
-            continue
-        tmp.rename(dst)
-        done.add(hsh)
+        for fa in ORACLE_FA:
+            oracle_run(name, root / f"{name}.rgb", w, h, hsh, fa, threads, False)
+            if (root / f"{name}-dump").is_dir():
+                oracle_run(name, root / f"{name}.rgb", w, h, hsh, fa, threads, True)
     return 0
 
 
@@ -503,30 +652,67 @@ def compare(ref: np.ndarray, x: np.ndarray, cols: int) -> dict:
             "maxerr_rms": float(np.max(np.abs(err))) / rms, "nonfinite": bad}
 
 
+CMP_HEAD = (f"{'run':14s} {'ref':6s} {'input':26s} {'NMSE':>10} {'cos':>12} {'rowcos min':>11} {'rowcos mean':>12} "
+            f"{'maxerr/rms':>10} {'nonfinite':>9}")
+
+
+def cmp_line(name: str, ref_name: str, label: str, ref: np.ndarray, x: np.ndarray, cols: int) -> str:
+    """One line of the comparison of x with ref."""
+    if ref.size != x.size:
+        return f"{name:14s} {ref_name:6s} {x.size} values against {ref.size} of the reference"
+    c = compare(ref, x, cols)
+    return (f"{name:14s} {ref_name:6s} {label:26s} {c['nmse']:10.3e} {c['cos']:12.9f} {c['rowcos_min']:11.7f} "
+            f"{c['rowcos_mean']:12.9f} {c['maxerr_rms']:10.4f} {c['nonfinite']:9d}")
+
+
 def cmp(stage: Stage) -> int:
-    """Compare the embeddings of each run with the oracle embeddings of its input."""
+    """Compare the embeddings of each run with the two oracles of its input, then the two oracles with each other,
+    then each tensor of a dump run with the tensors of the two oracles."""
     root, results = load_results(stage)
     inputs = rgb_inputs(stage, results)
-    print(f"{'run':14s} {'input':26s} {'NMSE':>10} {'cos':>12} {'rowcos min':>11} {'rowcos mean':>12} "
-          f"{'maxerr/rms':>10} {'nonfinite':>9}")
+    print("The embeddings against the oracle with the F32 attention (fa off) and with the flash attention (fa on):")
+    print(CMP_HEAD)
+    seen = set()
     for name in sorted(inputs):
-        f = root / f"{name}.f32"
-        if not f.exists():
-            continue
         w, h, hsh = inputs[name]
-        ref_path = oracle_path(w, h, hsh)
-        if not ref_path.exists():
-            print(f"{name:14s} no oracle file {ref_path}")
-            continue
+        label = f"{hsh[:12]}-{w}x{h}"
+        refs = {fa: oracle_path(w, h, hsh, fa) for fa in ORACLE_FA}
+        f = root / f"{name}.f32"
         m = EMBD_RE.search(results[name].out)
         cols = int(m.group(2)) if m else 2560
-        ref, x = np.fromfile(ref_path, dtype=np.float32), np.fromfile(f, dtype=np.float32)
-        if ref.size != x.size:
-            print(f"{name:14s} {x.size} values against {ref.size} of the oracle")
+        if f.exists():
+            x = np.fromfile(f, dtype=np.float32)
+            for fa, p in refs.items():
+                if p.exists():
+                    print(cmp_line(name, f"fa{fa}", label, np.fromfile(p, dtype=np.float32), x, cols))
+                else:
+                    print(f"{name:14s} fa{fa:4s} no oracle file {p}")
+        if hsh not in seen and all(p.exists() for p in refs.values()):
+            seen.add(hsh)
+            print(cmp_line("oracle-faon", "faoff", label, np.fromfile(refs["off"], dtype=np.float32),
+                           np.fromfile(refs["on"], dtype=np.float32), cols))
+    for name in sorted(inputs):
+        ddir = root / f"{name}-dump"
+        if not ddir.is_dir():
             continue
-        c = compare(ref, x, cols)
-        print(f"{name:14s} {hsh[:12]}-{w}x{h:<9} {c['nmse']:10.3e} {c['cos']:12.9f} {c['rowcos_min']:11.7f} "
-              f"{c['rowcos_mean']:12.9f} {c['maxerr_rms']:10.4f} {c['nonfinite']:9d}")
+        w, h, hsh = inputs[name]
+        print(f"\nThe tensors of {name} against the two oracles (NMSE, smallest row cosine, max error / rms):")
+        print(f"  {'tensor':16s} {'shape':22s} {'NMSE faoff':>11} {'rowcos':>10} {'max/rms':>8} "
+              f"{'NMSE faon':>11} {'oracle on/off':>13}")
+        index = [ln.split() for ln in (ddir / "index.txt").read_text().splitlines() if ln.strip()]
+        for tname, _type, *ne in index:
+            x = np.fromfile(ddir / f"{tname}.f32", dtype=np.float32)
+            refs = {fa: oracle_path(w, h, hsh, fa, "-dump") / f"{tname}.f32" for fa in ORACLE_FA}
+            if not all(p.exists() for p in refs.values()):
+                print(f"  {tname:16s} no oracle tensor")
+                continue
+            r_off, r_on = (np.fromfile(refs[fa], dtype=np.float32) for fa in ("off", "on"))
+            if r_off.size != x.size or r_on.size != x.size:
+                print(f"  {tname:16s} the sizes differ: {x.size}, {r_off.size}, {r_on.size}")
+                continue
+            c_off, c_on, c_oo = compare(r_off, x, int(ne[0])), compare(r_on, x, int(ne[0])), compare(r_off, r_on, int(ne[0]))
+            print(f"  {tname:16s} {'x'.join(ne):22s} {c_off['nmse']:11.3e} {c_off['rowcos_min']:10.6f} "
+                  f"{c_off['maxerr_rms']:8.3f} {c_on['nmse']:11.3e} {c_oo['nmse']:13.3e}")
     return 0
 
 

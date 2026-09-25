@@ -14,8 +14,8 @@
 #      patch -p1 puts each patch of PATCHES on it.
 #   2. In the Snapdragon container, under the lock build/.container.lock, CMake configures the tree into
 #      build/vit/android with the preset and the compiler flags of scripts/build-native.sh (with -flto). It builds
-#      the libraries of the app (LLAMA_LIBS of scripts/lib.sh), the DSP library v79 and test-backend-ops. The NDK
-#      clang++ compiles tools/vit/vitprobe.cpp.
+#      the libraries of the app (LLAMA_LIBS of scripts/lib.sh), the DSP library v79, test-backend-ops and
+#      llama-bench. The NDK clang++ compiles tools/vit/vitprobe.cpp.
 #   3. The script copies the files into build/vit/$OUT, and writes SHA256SUMS and patches.sha256 there. It stops if a
 #      program or a library needs a llama, ggml or mtmd library that is not in $OUT/lib.
 # oracle:
@@ -65,7 +65,7 @@ build_phone() {
             -e SOURCE_DATE_EPOCH="$epoch" \
             -e LLAMA_BUILD_NUMBER="$LLAMA_BUILD_NUMBER" \
             -e LLAMA_BUILD_COMMIT_SHORT="${LLAMA_COMMIT:0:7}" \
-            -e TARGETS="$LLAMA_LIBS htp-v79 test-backend-ops" \
+            -e TARGETS="$LLAMA_LIBS htp-v79 test-backend-ops llama-bench" \
             -e JOBS="$JOBS" -e FLAGS_EXTRA="$repro" \
             -e TREE="$tree" -e BDIR="$bdir" \
             "$SNAPDRAGON_IMAGE" bash -euo pipefail -c '
@@ -100,8 +100,8 @@ $cxx -O2 -std=c++17 $FLAGS_EXTRA -I"$TREE/include" -I"$TREE/ggml/include" -I"$TR
     for lib in $LLAMA_LIBS; do
         cp -f "$bdir/bin/lib$lib.so" "$out/lib/"
     done
-    cp -f "$bdir/ggml/src/ggml-hexagon/libggml-htp-v79.so" "$out/lib/"
-    cp -f "$bdir/bin/vitprobe" "$bdir/bin/test-backend-ops" "$out/bin/"
+    cp -f "$bdir/ggml/src/ggml-hexagon/libggml-htp-v79.so" "$bdir/bin/libllama-bench-impl.so" "$out/lib/"
+    cp -f "$bdir/bin/vitprobe" "$bdir/bin/test-backend-ops" "$bdir/bin/llama-bench" "$out/bin/"
     # The phone gives the system libraries. Each llama, ggml or mtmd library that an ELF file needs must be in lib/.
     local elf need
     for elf in "$out"/bin/* "$out"/lib/*.so; do
