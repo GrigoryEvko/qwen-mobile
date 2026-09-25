@@ -197,6 +197,12 @@ V = {v.key: v for v in (
                              ("mm", "memory", "0x240,0x245,0x262,0x269,0x256,0x7D,0x8C,0x108"),
                              ("ma", "AXI", "0x40,0x3F,0xCD,0x42,0x46,0x55,0x7F,0x3"))
       for b in (2, 3)),
+    # The m chunk of the HMX 2D matmuls (GGML_HEXAGON_MM_CHUNKS=mc,0: the widest n chunk in the VTCM for that m chunk)
+    *(Variant(f"mc{mc}", f"the op profile, 768 tokens, 2 encodes, the matmul m chunk {mc}", "photo", 768, reps=2,
+              env=f"{PROFILE_ENV} GGML_HEXAGON_MM_CHUNKS={mc},0", args="--log-ts", embd=False, timing=False)
+      for mc in (1504, 1024, 768)),
+    Variant("sd0", "the op profile, 768 tokens, 2 encodes, the old chunk solver (GGML_HEXAGON_MM_SOLVER=0)", "photo",
+            768, reps=2, env=f"{PROFILE_ENV} GGML_HEXAGON_MM_SOLVER=0", args="--log-ts", embd=False, timing=False),
 )}
 
 
@@ -257,6 +263,14 @@ STAGES = {s.name: s for s in (
           [("e", f"tr{b}", 1) for b in (3, 2, 1)] +
           [("e", f"{k}{b}", 1) for k in ("ms", "mm", "ma") for b in (3, 2)] + [("e", "p768", 2), ("e", "pf2", 2)],
           minutes=4),
+    Stage("vit7", "the chunks of the HMX 2D matmuls of the encoder: the solver (mc 2976 nc 96 for QKV, up and o), "
+          "the m chunks 1504, 1024 and 768 with the widest n chunk, and the old solver; 3 processes each, because the "
+          "QKV matmul of one process is fast, slow in every third layer or slow in each layer (vit6)",
+          {"e": "phone-e"},
+          [("e", vk, r) for r in (1, 2, 3)
+           for vk in (["p768", "mc1504", "mc1024", "mc768", "sd0"][r - 1:] + ["p768", "mc1504", "mc1024", "mc768",
+                                                                             "sd0"][:r - 1])],
+          minutes=3),
 )}
 
 
@@ -590,6 +604,33 @@ def profile_summary(stage: Stage, results: dict[str, Result]) -> list[str]:
     return out
 
 
+def layer_summary(stage: Stage, results: dict[str, Result]) -> list[str]:
+    """For each level-1 profile run: the time of the QKV and the up matmul of the layers of the last encode, in us.
+    The layers 0, 3, 6 ... 21 and the other layers have different output addresses, and a process can be slow in
+    one group, in the two groups or in no group. O(size of the logs)."""
+    out = ["The QKV and up matmuls of each layer, us: the median of the layers 0, 3 ... 21, the median of the other "
+           "layers, and the minimum and the maximum:"]
+    for s, vk, r in stage.runs:
+        if PROFILE_ENV not in V[vk].env:
+            continue
+        name = run_name(s, vk, r)
+        res = results.get(name)
+        if res is None or not res.ok:
+            continue
+        cells = []
+        for key, kind in (("attn_qkv", "qkv"), ("ffn_up", "up")):
+            t = [int(mo.group(5)) for mo in map(OP_RE.search, last_encode_lines(res))
+                 if mo and mo.group(1).startswith("MUL_MAT") and f".{key}." in mo.group(2)]
+            if not t:
+                continue
+            third = [v for i, v in enumerate(t) if i % 3 == 0]
+            rest = [v for i, v in enumerate(t) if i % 3 != 0]
+            cells.append(f"{kind} {statistics.median(third):5.0f} {statistics.median(rest):5.0f} "
+                         f"[{min(t)}, {max(t)}]")
+        out.append(f"  {name:10s} " + "   ".join(cells))
+    return out
+
+
 PMU_RE = re.compile(r"pmu \[([\d,]+)\]")
 # The names of the PMU events of the stage variants (tools/prof/pmu.py has the full list)
 PMU_NAMES = {0x3: "PKT_ANY", 0x2A: "INSTS", 0xE8: "IU_NO_PKT", 0xE9: "DU_CACHE_MISS", 0xEA: "DU_BUSY_OTHER",
@@ -867,12 +908,14 @@ def table(stage: Stage, include_all: bool) -> int:
         parts.append(dump_table(stage, results))
     if any(PROFILE_ENV in V[vk].env for _, vk, _ in stage.runs):
         parts.append(profile_summary(stage, results))
+        parts.append(layer_summary(stage, results))
     if any(profile_ids(V[vk].env) for _, vk, _ in stage.runs):
         parts.append(pmu_summary(stage, results))
     if any("GGML_HEXAGON_PROFILE=3" in V[vk].env for _, vk, _ in stage.runs):
         parts.append(trace_summary(stage, results))
+    # The full op table of the first run of each profile variant (the summaries above cover the other runs)
     for s, vk, r in stage.runs:
-        if PROFILE_ENV in V[vk].env:
+        if PROFILE_ENV in V[vk].env and r == 1:
             parts.append(profile_table(results, run_name(s, vk, r)))
     for part in parts:
         print("\n".join(part))
