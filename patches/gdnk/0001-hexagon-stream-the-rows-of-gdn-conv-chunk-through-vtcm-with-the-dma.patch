@@ -1,0 +1,525 @@
+hexagon: stream the rows of GDN_CONV_CHUNK through VTCM with the DMA
+
+The cost
+
+GDN_CONV_CHUNK reads each token row of the projection with vector loads
+from DDR through the L2, and it writes each output row the same way. On
+the phone (HTP0, Qwen3.5-4B Q8_0, one prefill ubatch of 1024 tokens) the op
+takes 71 ms of the 1044 ms of the ubatch, at 11.5 GB/s. The PMU stage of
+2026-09-24 gives the cause: the HVX loads from L2 are 79 % of the HVX
+stalls of the op, and the op does not use the DMA.
+
+The change
+
+The threads get whole 64-channel units of the channels. For each block of
+36 tokens, one 2D DMA transfer moves the channels of a thread from each
+token row into VTCM. The bands of the packed path compute from VTCM into
+VTCM with aligned loads and stores, and one 2D DMA transfer writes the
+block to the output. Two buffers of each kind let the transfers of the next
+block and of the block before run while the bands compute. When the
+channel count has an odd 32-channel block, the last thread gets it as a
+padded unit, thus each channel takes the packed path.
+
+GGML_HEXAGON_GDN_CONV_DMA=0 keeps the path without the DMA. The preset
+value is 1. The host gives the value to the DSP in the kernel params of
+each op (htp/htp-gdn-params.h), thus an A/B run needs no other build.
+test-backend-ops gets the conv chain at the 4B shape (8192 channels, 512
+tokens) and at an odd channel count (8224 channels, 2 snapshot slots). The
+conv chain of a batch on the HTP backend gets the bound 1e-6 in place of
+1e-7: GDN_CONV_CHUNK rounds the tokens and the state to f16, and the phone
+gives an NMSE of 3.0e-07 to 3.3e-07 with the kernel of the series before
+this patch (6144 to 8224 channels, 100 to 512 tokens, stage gdnk of
+2026-09-24). The DMA path takes every channel through that f16 path, thus
+64 and 96 channels give 1.4e-07 where the path without the DMA gives an
+exact f32 result for them.
+
+The results
+
+The kernel lab (tools/htp-lab, target gdnconvdma, the v79 timing model,
+8192 channels, 288 tokens, 6 threads): the path without the DMA takes
+1597110 cycles, which is 64.5 ms for 24 layers of 1024 tokens. The DMA path
+takes 858131 cycles (34.7 ms) when the lab does not count the transfers,
+thus that is its compute. The bytes of the op (32 MiB in and 32 MiB out for
+each layer of 1024 tokens) need about 29 ms at 55 GB/s. The functional run
+against the scalar reference passes for 8192 channels and 76 tokens, 8224
+channels and 40 tokens with 3 snapshot slots, and 64 channels and 7 tokens
+with 3 slots: NMSE 2.9e-07 to 3.3e-07, and each snapshot slot is exact.
+
+The phone stage gdnk of 2026-09-25 (HTP0, Qwen3.5-4B Q8_0) runs one build
+of the series with four switch settings. Variant A is the kernels before
+the series, and variant B adds this patch. In one prefill ubatch of 1024
+tokens, GDN_CONV_CHUNK takes 33.2 ms of DSP op time in place of 73.4 ms
+(the median of 6 graphs). tg32 gives 10.70 t/s for B and 10.69 t/s for A.
+The runner rejected two of the three pp512 rounds of B for a change of the
+CPU caps. The round that stays gives 1025.8 t/s, and A gives 1005.5 to
+1023.8 t/s. test-backend-ops passes the 82 cases of the gated delta net
+ops with the whole series, and the 17 conv chain cases are part of them.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    ggml/src/ggml-hexagon/ggml-hexagon.cpp
+    ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
+    ggml/src/ggml-hexagon/htp/htp-gdn-params.h
+    tests/test-backend-ops.cpp
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 6c3a867..db07996 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -53,6 +53,7 @@
+ #include "ggml-quants.h"
+ #include "htp-opnode.h"
+ #include "htp-gdn-match.h"
++#include "htp-gdn-params.h"
+ #include "htp-gate-fusion.h"
+ #include "htp-ops.h"
+ #include "htp/matmul-ops.h"
+@@ -128,6 +129,10 @@ static int opt_opfusion_state = -1; // GGML_HEXAGON_OPFUSION_STATE: -1 = follow
+ // kernel params of each GATED_DELTA_NET op, thus an A/B run needs no other build.
+ static int opt_gdn_chunk = 1;
+ 
++// GGML_HEXAGON_GDN_CONV_DMA: 1 = GDN_CONV_CHUNK moves its rows with the DMA (the default), 0 = it
++// reads them with vector loads from DDR. The host gives the value in the kernel params of each op.
++static int opt_gdn_conv_dma = 1;
++
+ // GGML_HEXAGON_FWHT: 1 = the host sends a rotation of a quantized KV cache (a MUL_MAT with the hint
+ // GGML_HINT_SRC0_IS_HADAMARD) that ggml_hexagon_is_fwht accepts as HTP_OP_FWHT (the default), 0 = each
+ // such rotation stays HTP_OP_MUL_MAT. Thus an A/B run of the two forms needs no other build.
+@@ -7109,6 +7114,7 @@ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, co
+             node.inputs  = { m.states, m.idx, m.xt, m.W, slots };
+             node.outputs = { m.S, slots };
+             node.fused   = m.fused;
++            node.kernel_params[HTP_GDN_KP_CONV_DMA] = opt_gdn_conv_dma ? 1 : 0;
+ 
+             fu.at.emplace(m.emit, std::move(node));
+             skip_members(m.emit, m.members);
+@@ -8708,6 +8714,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     const char * str_opfusion_state = getenv("GGML_HEXAGON_OPFUSION_STATE");
+     const char * str_multirow = getenv("GGML_HEXAGON_MULTIROW");
+     const char * str_gdn_chunk = getenv("GGML_HEXAGON_GDN_CHUNK");
++    const char * str_gdn_conv_dma = getenv("GGML_HEXAGON_GDN_CONV_DMA");
+     const char * str_fwht     = getenv("GGML_HEXAGON_FWHT");
+     const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
+     const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
+@@ -8786,6 +8793,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     opt_canary    = str_canary   ? atoi(str_canary)                       : opt_canary;
+     opt_opfusion_state = str_opfusion_state ? atoi(str_opfusion_state)    : opt_opfusion_state;
+     opt_gdn_chunk = str_gdn_chunk ? atoi(str_gdn_chunk)                   : opt_gdn_chunk;
++    opt_gdn_conv_dma = str_gdn_conv_dma ? atoi(str_gdn_conv_dma)          : opt_gdn_conv_dma;
+     opt_fwht      = str_fwht     ? atoi(str_fwht)                         : opt_fwht;
+     opt_profile   = str_profile  ? atoi(str_profile)                      : 0;
+     opt_etm       = str_etm      ? atoi(str_etm)                          : 0;
+diff --git a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
+index d2c2a0c..67058b0 100644
+--- a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
++++ b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
+@@ -39,6 +39,7 @@
+ #include "hex-fastdiv.h"
+ #include "hex-common.h"
+ #include "hex-profile.h"
++#include "htp-gdn-params.h"
+ 
+ #define GGML_COMMON_DECL_C
+ #include "ggml-common.h"
+@@ -577,9 +578,12 @@ int op_gdn_conv_step(struct htp_ops_context * octx) {
+ // vector registers and the spill traffic costs more than the latency it hides. A shorter band
+ // packs each packet better (2.38 cycles per packet at G = 2 against 2.65 at G = 3) and needs
+ // 24 % more packets, thus it loses.
++//
++// vtcm is a constant at each call. When it is true, x and y are rows in VTCM that start at a vector,
++// thus the loads and the stores take the aligned form.
+ static inline __attribute__((always_inline)) void gdn_conv_band_packed(const float * x, size_t x_stride, float * y, size_t y_stride,
+                                         __fp16 * hist, const __fp16 * wh, size_t nh,
+-                                        uint32_t units, const int G) {
++                                        uint32_t units, const int G, const bool vtcm) {
+     const HVX_Vector zero  = Q6_V_vzero();
+     // h arrives as an integer of the scale 2^16. The f16 of that integer minus 16 exponent steps
+     // is h itself, and the unsigned saturating subtract gives 0 for the values that underflow.
+@@ -604,7 +608,11 @@ static inline __attribute__((always_inline)) void gdn_conv_band_packed(const flo
+             S[k] = hvx_vmem(hp + k * nh);
+         }
+         for (int r = 0; r < G; r++) {
+-            S[3 + r] = hvx_vec_f32_to_f16_shuff(hvx_vmemu(xp[r]), hvx_vmemu(xp[r] + VLEN_FP32));
++            if (vtcm) {
++                S[3 + r] = hvx_vec_f32_to_f16_shuff(hvx_vmem(xp[r]), hvx_vmem(xp[r] + VLEN_FP32));
++            } else {
++                S[3 + r] = hvx_vec_f32_to_f16_shuff(hvx_vmemu(xp[r]), hvx_vmemu(xp[r] + VLEN_FP32));
++            }
+         }
+         for (int k = 0; k < 3; k++) {
+             hvx_vmem(hp + k * nh) = S[G + k];
+@@ -646,8 +654,13 @@ static inline __attribute__((always_inline)) void gdn_conv_band_packed(const flo
+             const HVX_Vector hf  = Q6_Vuh_vsub_VuhVuh_sat(Q6_Vhf_equals_Vh(h16[r]), e16);
+             const HVX_Vector yh  = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vsub_VhfVhf(rel, hf));
+             const HVX_VectorPair y32 = hvx_vec_f16_to_f32_shuff(yh);
+-            hvx_vmemu(yp[r])             = Q6_V_lo_W(y32);
+-            hvx_vmemu(yp[r] + VLEN_FP32) = Q6_V_hi_W(y32);
++            if (vtcm) {
++                hvx_vmem(yp[r])             = Q6_V_lo_W(y32);
++                hvx_vmem(yp[r] + VLEN_FP32) = Q6_V_hi_W(y32);
++            } else {
++                hvx_vmemu(yp[r])             = Q6_V_lo_W(y32);
++                hvx_vmemu(yp[r] + VLEN_FP32) = Q6_V_hi_W(y32);
++            }
+         }
+ 
+         for (int r = 0; r < G; r++) {
+@@ -662,12 +675,23 @@ static inline __attribute__((always_inline)) void gdn_conv_band_packed(const flo
+ // The two band heights of the chunk op. They are functions of their own, thus a profile shows them.
+ static __attribute__((noinline)) void gdn_conv_band_packed_4(const float * x, size_t x_stride, float * y, size_t y_stride,
+                                                              __fp16 * hist, const __fp16 * wh, size_t nh, uint32_t units) {
+-    gdn_conv_band_packed(x, x_stride, y, y_stride, hist, wh, nh, units, 3);
++    gdn_conv_band_packed(x, x_stride, y, y_stride, hist, wh, nh, units, 3, false);
+ }
+ 
+ static __attribute__((noinline)) void gdn_conv_band_packed_1(const float * x, size_t x_stride, float * y, size_t y_stride,
+                                                              __fp16 * hist, const __fp16 * wh, size_t nh, uint32_t units) {
+-    gdn_conv_band_packed(x, x_stride, y, y_stride, hist, wh, nh, units, 1);
++    gdn_conv_band_packed(x, x_stride, y, y_stride, hist, wh, nh, units, 1, false);
++}
++
++// The two band heights of the DMA path, on rows in VTCM
++static __attribute__((noinline)) void gdn_conv_band_vtcm_3(const float * x, size_t x_stride, float * y, size_t y_stride,
++                                                           __fp16 * hist, const __fp16 * wh, size_t nh, uint32_t units) {
++    gdn_conv_band_packed(x, x_stride, y, y_stride, hist, wh, nh, units, 3, true);
++}
++
++static __attribute__((noinline)) void gdn_conv_band_vtcm_1(const float * x, size_t x_stride, float * y, size_t y_stride,
++                                                           __fp16 * hist, const __fp16 * wh, size_t nh, uint32_t units) {
++    gdn_conv_band_packed(x, x_stride, y, y_stride, hist, wh, nh, units, 1, true);
+ }
+ 
+ struct htp_gdn_conv_chunk_context {
+@@ -686,6 +710,7 @@ struct htp_gdn_conv_chunk_context {
+     uint32_t      slot_stride; // bytes from one slot to the next, n_slots > 1 only
+     uint8_t *     vtcm;       // the plane buffers of the threads
+     size_t        vtcm_per_thread;
++    uint32_t      dma_block;  // the tokens of one DMA block, the DMA path only
+ };
+ 
+ static void gdn_conv_chunk_thread(unsigned int nth, unsigned int ith, void * data) {
+@@ -891,6 +916,222 @@ static void gdn_conv_chunk_thread(unsigned int nth, unsigned int ith, void * dat
+     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) (c0 + n));
+ }
+ 
++// ---- the DMA path of the conv over a batch
++//
++// The path above reads each token row of x with vector loads from DDR through the L2 and writes y the
++// same way. Its HVX work is small, and the loads that wait for the DDR take most of its time. This path
++// moves the rows with the DMA instead. For a block of GDN_CONV_DMA_B tokens, one 2D transfer brings the
++// channels of the thread from each token row of x into VTCM, the bands compute from VTCM into VTCM, and
++// one 2D transfer writes the block to y. Two buffers of each kind let the transfers of the next block
++// and of the previous block run while the bands compute.
++//
++// The threads get whole 64-channel units, thus every channel goes through the packed path. When the
++// channel count has an odd 32-channel block, the last thread gets it, padded to a unit. The pad lanes
++// of the VTCM rows are zero and the DMA to y does not write them.
++//
++// The DMA queue of a thread is in order, thus the pops name no buffer: before block b the thread pops
++// the write of block b - 2 and the read of block b.
++
++#define GDN_CONV_DMA_B 36 // the preset tokens of one block, a multiple of the band height 3
++
++struct gdn_conv_dma_span {
++    uint32_t c0;    // the first channel of the thread
++    uint32_t n;     // the channels of the thread
++    uint32_t n_pad; // n rounded up to a unit of 64 channels
++};
++
++// The channels of thread ith: whole units, the remainder units to the first threads, the odd block to
++// the last thread. O(1).
++static inline struct gdn_conv_dma_span gdn_conv_dma_span_of(uint32_t n_ch, uint32_t nth, uint32_t ith) {
++    const uint32_t units = n_ch / (2 * VLEN_FP32);
++    const uint32_t odd   = (n_ch / VLEN_FP32) % 2;
++    const uint32_t base  = units / nth;
++    const uint32_t rem   = units % nth;
++    const uint32_t u0    = ith * base + (ith < rem ? ith : rem);
++    const uint32_t cnt   = base + (ith < rem ? 1 : 0);
++
++    struct gdn_conv_dma_span s;
++    s.c0    = u0 * 2 * VLEN_FP32;
++    s.n     = cnt * 2 * VLEN_FP32 + ((ith == nth - 1 && odd) ? VLEN_FP32 : 0);
++    s.n_pad = hex_round_up(s.n, 2 * VLEN_FP32);
++    return s;
++}
++
++// The VTCM bytes of one thread for n_pad channels and blocks of b tokens: the weight and state planes
++// in f32 (7 rows), their f16 forms (7 half rows), and two x and two y blocks.
++static inline size_t gdn_conv_dma_vtcm_bytes(uint32_t n_pad, uint32_t b) {
++    return (size_t) n_pad * (7 * sizeof(float) + 7 * sizeof(__fp16)) + (size_t) 4 * b * n_pad * sizeof(float);
++}
++
++static void gdn_conv_chunk_dma_thread(unsigned int nth, unsigned int ith, void * data) {
++    struct htp_gdn_conv_chunk_context * cctx = (struct htp_gdn_conv_chunk_context *) data;
++    struct htp_ops_context *            octx = cctx->octx;
++
++    const struct gdn_conv_dma_span sp = gdn_conv_dma_span_of(cctx->n_ch, nth, ith);
++    if (sp.n == 0) {
++        return;
++    }
++    const uint32_t c0    = sp.c0;
++    const uint32_t n     = sp.n;
++    const uint32_t n_pad = sp.n_pad;
++    const uint32_t nb    = n / VLEN_FP32;         // the real 32-channel blocks
++    const uint32_t units = n_pad / (2 * VLEN_FP32);
++    const uint32_t T     = cctx->n_tokens;
++    const uint32_t B     = cctx->dma_block;
++
++    struct gdn_conv_masks mk __attribute__((aligned(VLEN)));
++    gdn_conv_masks_init(&mk);
++
++    uint8_t * base = cctx->vtcm + cctx->vtcm_per_thread * ith;
++    float *   wt   = (float *) base;                   // [4][n_pad] the weight planes
++    float *   st   = wt + 4 * n_pad;                   // [3][n_pad] the state planes
++    __fp16 *  wh   = (__fp16 *) (st + 3 * n_pad);      // [4][n_pad] the f16 weight planes
++    __fp16 *  hist = wh + 4 * n_pad;                   // [3][n_pad] the last 3 rows as f16
++    float *   xbuf[2];
++    float *   ybuf[2];
++    xbuf[0] = (float *) (hist + 3 * n_pad);
++    xbuf[1] = xbuf[0] + (size_t) B * n_pad;
++    ybuf[0] = xbuf[1] + (size_t) B * n_pad;
++    ybuf[1] = ybuf[0] + (size_t) B * n_pad;
++
++    const float * w_ptr = cctx->w + (size_t) c0 * GDN_CONV_D_CONV;
++    const float * s_ptr = cctx->src_slot + (size_t) c0 * (GDN_CONV_D_CONV - 1);
++
++    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
++    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c0);
++
++    dma_queue * dma = octx->ctx->dma[ith];
++
++    const size_t x_row   = (size_t) cctx->x_stride * sizeof(float);
++    const size_t y_row   = (size_t) cctx->y_stride * sizeof(float);
++    const size_t v_row   = (size_t) n_pad * sizeof(float);
++    const size_t n_bytes = (size_t) n * sizeof(float);
++    const uint32_t n_blk = (T + B - 1) / B;
++
++    // The first two blocks of x go on their way before the planes, thus the prologue hides their wait
++    for (uint32_t b = 0; b < 2 && b < n_blk; b++) {
++        const uint32_t t0 = b * B;
++        const uint32_t bb = MIN(B, T - t0);
++        dma_queue_push(dma, dma_make_ptr(xbuf[b], cctx->x + (size_t) t0 * cctx->x_stride + c0), v_row, x_row, n_bytes, bb);
++    }
++
++    // The planes of the weights and of the state. The pad block of an odd channel count is zero.
++    const HVX_Vector zero = Q6_V_vzero();
++    for (uint32_t i = 0; i < n_pad / VLEN_FP32; i++) {
++        HVX_Vector p0 = zero, p1 = zero, p2 = zero, p3 = zero;
++        HVX_Vector s0 = zero, s1 = zero, s2 = zero;
++        if (i < nb) {
++            gdn_conv_deal4(hvx_vmemu(w_ptr + i * 128), hvx_vmemu(w_ptr + i * 128 + 32),
++                           hvx_vmemu(w_ptr + i * 128 + 64), hvx_vmemu(w_ptr + i * 128 + 96),
++                           &p0, &p1, &p2, &p3);
++            HVX_Vector c[4];
++            gdn_conv_lanes_to_c(&mk, hvx_vmemu(s_ptr + i * 96), hvx_vmemu(s_ptr + i * 96 + 32),
++                                hvx_vmemu(s_ptr + i * 96 + 64), zero, c);
++            HVX_Vector s3;
++            gdn_conv_deal4(c[0], c[1], c[2], c[3], &s0, &s1, &s2, &s3);
++        }
++        hvx_vmem(wt + 0 * n_pad + i * VLEN_FP32) = p0;
++        hvx_vmem(wt + 1 * n_pad + i * VLEN_FP32) = p1;
++        hvx_vmem(wt + 2 * n_pad + i * VLEN_FP32) = p2;
++        hvx_vmem(wt + 3 * n_pad + i * VLEN_FP32) = p3;
++        hvx_vmem(st + 0 * n_pad + i * VLEN_FP32) = s0;
++        hvx_vmem(st + 1 * n_pad + i * VLEN_FP32) = s1;
++        hvx_vmem(st + 2 * n_pad + i * VLEN_FP32) = s2;
++    }
++    for (uint32_t u = 0; u < units; u++) {
++        const uint32_t o = u * 2 * VLEN_FP32;
++        for (uint32_t j = 0; j < 4; j++) {
++            hvx_vmem(wh + (size_t) j * n_pad + o) =
++                hvx_vec_f32_to_f16_shuff(hvx_vmem(wt + j * n_pad + o), hvx_vmem(wt + j * n_pad + o + VLEN_FP32));
++        }
++        for (uint32_t k = 0; k < 3; k++) {
++            hvx_vmem(hist + (size_t) k * n_pad + o) =
++                hvx_vec_f32_to_f16_shuff(hvx_vmem(st + k * n_pad + o), hvx_vmem(st + k * n_pad + o + VLEN_FP32));
++        }
++    }
++
++    // The pad lanes of the x rows stay zero: the DMA writes the first n floats of each row only. The pad
++    // of a row is the one vector after those n floats, thus these stores and the DMA in flight write
++    // different bytes.
++    if (n_pad != n) {
++        for (uint32_t k = 0; k < 2; k++) {
++            for (uint32_t r = 0; r < B; r++) {
++                hvx_vmem(xbuf[k] + (size_t) r * n_pad + n) = zero;
++            }
++        }
++    }
++
++    for (uint32_t b = 0; b < n_blk; b++) {
++        const uint32_t t0 = b * B;
++        const uint32_t bb = MIN(B, T - t0);
++        float * xb = xbuf[b & 1];
++        float * yb = ybuf[b & 1];
++
++        if (b >= 2) {
++            dma_queue_pop(dma); // the write of block b - 2, which used yb
++        }
++        dma_queue_pop(dma);     // the read of block b into xb
++
++        // The band height 3 of the path above. The kernel lab measured the height 2 on this path within
++        // 1 % of it (tools/htp-lab, target gdnconvdma).
++        uint32_t r = 0;
++        for (; r + 3 <= bb; r += 3) {
++            gdn_conv_band_vtcm_3(xb + (size_t) r * n_pad, n_pad, yb + (size_t) r * n_pad, n_pad, hist, wh, n_pad, units);
++        }
++        for (; r < bb; r++) {
++            gdn_conv_band_vtcm_1(xb + (size_t) r * n_pad, n_pad, yb + (size_t) r * n_pad, n_pad, hist, wh, n_pad, units);
++        }
++
++        dma_queue_push(dma, dma_make_ptr(cctx->y + (size_t) t0 * cctx->y_stride + c0, yb), y_row, v_row, n_bytes, bb);
++        if (b + 2 < n_blk) {
++            const uint32_t t2 = (b + 2) * B;
++            const uint32_t b2 = MIN(B, T - t2);
++            dma_queue_push(dma, dma_make_ptr(xb, cctx->x + (size_t) t2 * cctx->x_stride + c0), v_row, x_row, n_bytes, b2);
++        }
++    }
++    dma_queue_flush(dma);
++
++    // The snapshot slots, as in gdn_conv_chunk_thread: the walk reads the last token rows from DDR
++    float * d_ptr = cctx->dst_slot + (size_t) c0 * (GDN_CONV_D_CONV - 1);
++    const uint32_t n_slots = cctx->n_slots;
++    const uint32_t warm    = GDN_CONV_D_CONV - 2;
++    const bool     late    = T >= n_slots + warm;
++    const uint32_t t_start = late ? (T - n_slots - warm) : 0;
++
++    for (uint32_t i = 0; i < nb; i++) {
++        HVX_Vector n0 = zero;
++        HVX_Vector n1 = zero;
++        HVX_Vector n2 = zero;
++
++        if (!late) {
++            n0 = hvx_vmemu(s_ptr + i * 96);
++            n1 = hvx_vmemu(s_ptr + i * 96 + 32);
++            n2 = hvx_vmemu(s_ptr + i * 96 + 64);
++            for (uint32_t g = T; g < n_slots; g++) {
++                float * g_ptr = (float *) ((uint8_t *) d_ptr + (size_t) g * cctx->slot_stride);
++                hvx_vmemu(g_ptr + i * 96)      = n0;
++                hvx_vmemu(g_ptr + i * 96 + 32) = n1;
++                hvx_vmemu(g_ptr + i * 96 + 64) = n2;
++            }
++        }
++
++        for (uint32_t t = t_start; t < T; t++) {
++            HVX_Vector xv = hvx_vmemu(cctx->x + (size_t) t * cctx->x_stride + c0 + i * VLEN_FP32);
++            gdn_conv_shift_slot(&mk, n0, n1, n2, xv, &n0, &n1, &n2);
++
++            const uint32_t g = T - 1 - t;
++            if (g < n_slots) {
++                float * g_ptr = (float *) ((uint8_t *) d_ptr + (size_t) g * cctx->slot_stride);
++                hvx_vmemu(g_ptr + i * 96)      = n0;
++                hvx_vmemu(g_ptr + i * 96 + 32) = n1;
++                hvx_vmemu(g_ptr + i * 96 + 64) = n2;
++            }
++        }
++    }
++
++    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) (c0 + n));
++}
++
+ // The error detail codes of this op (reported to the host with the batch status)
+ enum {
+     GDN_CHUNK_ERR_INPUT  = 30, // an input or the output is missing
+@@ -973,6 +1214,48 @@ int op_gdn_conv_chunk(struct htp_ops_context * octx) {
+     const uint32_t n_threads = octx->n_threads;
+     const uint32_t chunk     = hex_round_up(fastdiv(n_ch + n_threads - 1, &octx->n_threads_div), VLEN_FP32);
+ 
++    // The DMA path (the host switch GGML_HEXAGON_GDN_CONV_DMA). The block of tokens shrinks by bands of
++    // 3 until the buffers of all threads fit in the VTCM. Thread 0 has the most units and the last
++    // thread can have the odd block, thus the larger of the two sizes the buffers of every thread.
++    if (octx->kernel_params[HTP_GDN_KP_CONV_DMA] == 1) {
++        const uint32_t np0   = gdn_conv_dma_span_of(n_ch, n_threads, 0).n_pad;
++        const uint32_t npl   = gdn_conv_dma_span_of(n_ch, n_threads, n_threads - 1).n_pad;
++        const uint32_t n_pad = np0 > npl ? np0 : npl;
++        uint32_t       B     = GDN_CONV_DMA_B;
++        while (B > 3 && hex_round_up(gdn_conv_dma_vtcm_bytes(n_pad, B), 128) * n_threads > octx->ctx->vtcm_size) {
++            B -= 3;
++        }
++        const size_t per_thread = hex_round_up(gdn_conv_dma_vtcm_bytes(n_pad, B), 128);
++        if (per_thread * n_threads <= octx->ctx->vtcm_size) {
++            struct htp_gdn_conv_chunk_context cctx;
++            memset(&cctx, 0, sizeof(cctx));
++            cctx.octx            = octx;
++            cctx.src_slot        = (const float *) ((const uint8_t *) (uintptr_t) states->data + (size_t) src_idx * states->nb[1]);
++            cctx.dst_slot        = (float *) (uintptr_t) slot->data;
++            cctx.x               = (const float *) (uintptr_t) x->data;
++            cctx.y               = (float *) (uintptr_t) y->data;
++            cctx.w               = (const float *) (uintptr_t) w->data;
++            cctx.x_stride        = x->nb[0] / sizeof(float);
++            cctx.y_stride        = y->nb[1] / sizeof(float);
++            cctx.n_ch            = n_ch;
++            cctx.n_tokens        = T;
++            cctx.chunk           = n_pad;
++            cctx.n_slots         = n_slots;
++            cctx.slot_stride     = n_slots > 1 ? slot->nb[1] : 0;
++            cctx.vtcm            = octx->ctx->vtcm_base;
++            cctx.vtcm_per_thread = per_thread;
++            cctx.dma_block       = B;
++
++            FARF(HIGH, "gdn-conv-chunk-dma: n_ch %u tokens %u slot %d slots %u block %u threads %u vtcm %zu\n",
++                 n_ch, T, src_idx, n_slots, B, n_threads, per_thread * n_threads);
++
++            work_queue_run(octx->ctx->work_queue, gdn_conv_chunk_dma_thread, &cctx, n_threads);
++            return HTP_STATUS_OK;
++        }
++        FARF(HIGH, "gdn-conv-chunk-dma: VTCM %zu holds no block, the path without the DMA runs\n",
++             octx->ctx->vtcm_size);
++    }
++
+     // the weight planes and the state planes of one thread
+     const size_t vtcm_per_thread = hex_round_up((size_t) 11 * chunk * sizeof(float) + 512, 128);
+     if (octx->ctx->vtcm_size < vtcm_per_thread * n_threads) {
+diff --git a/ggml/src/ggml-hexagon/htp/htp-gdn-params.h b/ggml/src/ggml-hexagon/htp/htp-gdn-params.h
+new file mode 100644
+index 0000000..a3e929e
+--- /dev/null
++++ b/ggml/src/ggml-hexagon/htp/htp-gdn-params.h
+@@ -0,0 +1,11 @@
++// The kernel params of the gated delta net ops that the host sets for the DSP (plain C, the host and
++// the DSP include it). GDN_CONV_STEP, GDN_CONV_CHUNK and GDN_STATE_STEP hold the slot index in
++// kernel_params[0] and its valid flag in kernel_params[1].
++
++#ifndef HTP_GDN_PARAMS_H
++#define HTP_GDN_PARAMS_H
++
++// GDN_CONV_CHUNK: 1 moves the rows with the DMA (GGML_HEXAGON_GDN_CONV_DMA)
++#define HTP_GDN_KP_CONV_DMA 2
++
++#endif // HTP_GDN_PARAMS_H
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 8ecd489..c6c7af5 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4860,6 +4860,21 @@ struct test_gdn_conv_state_fusion : public test_case {
+         return "GDN_CONV_STATE_FUSION";
+     }
+ 
++    // The HTP backend runs a batch as GDN_CONV_CHUNK, which rounds the tokens and the state to f16 once
++    // and sums the four taps in qfloat. Against this f32 CPU reference that gives an NMSE of 2.9e-07 to
++    // 3.3e-07 in the kernel lab (8192 channels and 76 tokens, 8224 channels and 40 tokens with 3 slots, 64
++    // channels and 7 tokens), and 3.0e-07 to 3.3e-07 on the phone for 6144 to 8224 channels and 100 to
++    // 512 tokens. Each output reads four taps, thus the error does not grow with the token count. The
++    // bound holds the worst of those with a margin of 3. The step at one token is f32 and keeps the tight
++    // bound, as does every other backend.
++    double max_nmse_err(ggml_backend_t backend) override {
++        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
++        if (n_tokens > 1 && strcmp(ggml_backend_reg_name(reg), "HTP") == 0) {
++            return std::max(test_case::max_nmse_err(backend), 1e-6);
++        }
++        return test_case::max_nmse_err(backend);
++    }
++
+     bool run_whole_graph() override { return true; }
+ };
+ 
+@@ -11585,6 +11600,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_gdn_state_fusion(16, 128, 1, 0, 0));
+     test_cases.emplace_back(new test_gdn_state_fusion(16, 128, 3, 2, 1));
+     test_cases.emplace_back(new test_gdn_state_fusion(4, 32, 2, 1, 1));
++    // the conv chain over a batch at the Qwen3.5-4B shape (8192 channels) and with an odd 32-channel block
++    test_cases.emplace_back(new test_gdn_conv_state_fusion(4, 8192, 1, 0, 0, 512));
++    test_cases.emplace_back(new test_gdn_conv_state_fusion(4, 8224, 2, 1, 0, 100));
+ 
+     // the gated norm of a gated delta net output: the Qwen3.5-4B shape (128 values x 32 heads) at one token,
+     // at 7, 64 and 1024 tokens, x as the head of a GATED_DELTA_NET output, rows with a gap, a width that is
