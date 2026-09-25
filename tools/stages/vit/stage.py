@@ -46,7 +46,10 @@ PHONE = "/data/local/tmp/qwen/vit"
 MODEL_DIR = "/data/local/tmp/qwen/models"
 MODEL = "Qwen3.5-4B-Q8_0.gguf"
 MMPROJ = "Qwen3.5-4B-Q8_0.mmproj.gguf"
-APP_IMAGE = "files/images/a2200d1a726ec0a8576b4a18dc2ef1aa4e4c797d.jpg"
+# The photo of the user: the saved copy on the box (a new chat of the app deletes the photos of the chat, thus a
+# stage never takes the photo from the app)
+PHOTO_COPY = "build/imgturn/photo.jpg"
+PHOTO_SHA1 = "a2200d1a726ec0a8576b4a18dc2ef1aa4e4c797d"
 OLD_IMAGE = "/sdcard/qwen/user.jpg"
 GATE_KB = 3145728
 BOX = "grigory@10.10.20.200:airi/qwen-mobile/build"
@@ -169,6 +172,13 @@ V = {v.key: v for v in (
     Variant("q3s", "256 tokens, ROPE_QKV io 3 alone (the embeddings must have the bits of HEAD)", "photo", 256,
             reps=3, env="GGML_HEXAGON_FUSE_VIT=2 GGML_HEXAGON_VIT_QKV_IO=3", timing=False),
     Variant("u256", "the older test photo, 256 tokens, 2 encodes", "user", 256, reps=2, timing=False),
+    # The op profile with one plan of the vision encoder at a time
+    Variant("pf0", "the op profile, 768 tokens, 2 encodes, the vision plans off", "photo", 768, reps=2,
+            env=f"{PROFILE_ENV} {VIT_OFF}", args="--log-ts", embd=False, timing=False),
+    Variant("pf1", "the op profile, 768 tokens, 2 encodes, the LayerNorm op only", "photo", 768, reps=2,
+            env=f"{PROFILE_ENV} GGML_HEXAGON_FUSE_VIT=1", args="--log-ts", embd=False, timing=False),
+    Variant("pf2", "the op profile, 768 tokens, 2 encodes, ROPE_QKV only", "photo", 768, reps=2,
+            env=f"{PROFILE_ENV} GGML_HEXAGON_FUSE_VIT=2", args="--log-ts", embd=False, timing=False),
 )}
 
 
@@ -212,6 +222,15 @@ STAGES = {s.name: s for s in (
           [(s, v, 1) for v in ("u768", "u256", "d256") for s in "hc"] + [("c", "p768", 1)] +
           runs_ab("hc", ["b"], 2),
           tools_set="c", minutes=15),
+    Stage("vit5", "candidate e (the LayerNorm op calls norm_f32 of the NORM op with the params of the NORM node, "
+          "and the allocation deps of ROPE_QKV work, thus the last layer also fuses) against HEAD: the bits and the "
+          "speed of the encoder, the op profile with each plan alone, the text bench in alternated rounds, the op "
+          "tests",
+          {"h": "phone-head", "e": "phone-e"},
+          [("e", "ovd", 1), ("e", "onx", 1)] + runs_ab("he", ["p768"], 2) +
+          [("e", "pf0", 1), ("e", "pf1", 1), ("e", "pf2", 1)] + runs_ab("he", ["t768", "t256"], 2) +
+          [("e", "u768", 1), ("e", "u256", 1), ("h", "d256", 1), ("e", "d256", 1)] + runs_ab("he", ["b"], 3),
+          tools_set="e", minutes=16),
 )}
 
 
@@ -273,9 +292,9 @@ def header(stage: Stage) -> list[str]:
         "The tool: build/vit/<set>/bin/vitprobe (tools/vit/vitprobe.cpp) with the libraries of its set. It loads the",
         "vocabulary of the 4B and the projector Qwen3.5-4B-Q8_0.mmproj.gguf on the device of the run, with the",
         "parameters of the app (no warmup, flash attention AUTO, 4 threads, the fusion switches of the app), and",
-        "encodes the image. The image of the user comes from the app with run-as; the older test photo is",
-        f"{OLD_IMAGE}. The tool resizes the image to the target size with an exact integer filter and writes the",
-        "RGB bytes, thus the box encodes the same bytes with the x86 oracle.",
+        f"encodes the image. The photo of the user is the saved copy {PHOTO_COPY} (sha1 {PHOTO_SHA1[:8]}...), which",
+        f"adb push copies; the older test photo is {OLD_IMAGE}. The tool resizes the image to the target size with",
+        "an exact integer filter and writes the RGB bytes, thus the box encodes the same bytes with the x86 oracle.",
         "",
         "The sets: " + ", ".join(f"{k} = build/vit/{d}" for k, d in stage.sets.items()) + ".",
         f"The runs, {len(stage.runs)}: " + ", ".join(f"{vk} x{n} ({V[vk].text})" for vk, n in runs.items()) + ".",
@@ -298,18 +317,20 @@ def header(stage: Stage) -> list[str]:
 
 
 def setup_lines(stage: Stage) -> list[str]:
-    """The lines that copy the phone files of each set and the two images to the phone and check them."""
+    """The lines that copy the phone files of each set and the two images to the phone and check them. The photo of
+    the user comes from the saved copy on the box, never from the app."""
     out = []
     for d in stage.sets.values():
         local = f"build/vit/{d}"
         out += [f"mkdir -p {local} && rsync -a --delete {BOX}/vit/{d}/ {local}/",
                 f"(cd {local} && sha256sum -c SHA256SUMS)"]
+    out += [f"mkdir -p {Path(PHOTO_COPY).parent} && rsync -a {BOX}/{Path(PHOTO_COPY).relative_to('build')} {PHOTO_COPY}",
+            f"echo '{PHOTO_SHA1}  {PHOTO_COPY}' | sha1sum -c"]
     # No "models/Qwen3.5" in these lines: the runner gates each line with that text as a model run.
     out += [f"{ADB} shell 'ls -l {MODEL_DIR} /sdcard/qwen/models | grep -E \"Qwen3.5-4B-Q8_0(.mmproj)?.gguf\"'",
             f"{ADB} shell 'rm -rf {PHONE} && mkdir -p {PHONE}/in {PHONE}/out'",
-            # run-as writes the file of the app to stdout, and the shell of adb writes it into the stage directory.
-            f"{ADB} shell 'run-as ai.airi.qwenmobile cat {APP_IMAGE} > {image_path('photo')} && "
-            f"cp {OLD_IMAGE} {image_path('user')} && ls -l {PHONE}/in && sha1sum {PHONE}/in/*'"]
+            f"{ADB} push {PHOTO_COPY} {image_path('photo')}",
+            f"{ADB} shell 'cp {OLD_IMAGE} {image_path('user')} && ls -l {PHONE}/in && sha1sum {PHONE}/in/*'"]
     # Each file of the bin/ and lib/ directories of a set (the SHA256SUMS of the set names them all)
     for d in stage.sets.values():
         local = f"build/vit/{d}"
@@ -493,6 +514,56 @@ def profile_table(results: dict[str, Result], name: str) -> list[str]:
     return out
 
 
+PROFILE_KINDS = ("qkv", "o", "up", "down", "merger", "fa", "gelu", "ln", "rope", "add", "other")
+
+
+def profile_kind(op: str, names: str) -> str:
+    """The kind of one profiled op of the encoder: the four matmuls of a layer by their weight, the merger, the
+    attention, GELU, the LayerNorm ops, the attention input ops (ROPE, the casts), ADD and the rest."""
+    if op.startswith("MUL_MAT"):
+        for key, kind in (("attn_qkv", "qkv"), ("attn_out", "o"), ("ffn_up", "up"), ("ffn_down", "down"), ("mm.", "merger")):
+            if key in names:
+                return kind
+        return "other"
+    if op == "ADD" and re.search(r"\.(ln1|ln2|post_ln|ln_q)\.bias", names):
+        return "ln"  # the bias ADD of an unfused LayerNorm
+    return {"FLASH_ATTN_EXT": "fa", "GELU": "gelu", "NORM": "ln", "MUL": "ln", "NORM_MUL_ADD": "ln", "ROPE": "rope",
+            "ROPE_QKV": "rope", "CPY": "rope", "ADD": "add"}.get(op, "other")
+
+
+def profile_summary(stage: Stage, results: dict[str, Result]) -> list[str]:
+    """One line for each profile run: the op time of each kind in the last encode, in ms. O(size of the logs)."""
+    out = ["The op time by kind in the last encode of each profile run, ms (qkv, o, up, down: the MUL_MAT+ADD of "
+           "the layers; ln: NORM, MUL, the bias ADD and NORM_MUL_ADD; rope: ROPE, ROPE_QKV and CPY):",
+           f"  {'run':10s} " + " ".join(f"{k:>7s}" for k in PROFILE_KINDS) + f" {'total':>8s}"]
+    for s, vk, r in stage.runs:
+        if PROFILE_ENV not in V[vk].env:
+            continue
+        name = run_name(s, vk, r)
+        res = results.get(name)
+        if res is None or not res.ok:
+            out.append(f"  {name:10s} no data")
+            continue
+        lines, start, last = res.log.splitlines(), None, None
+        for i, line in enumerate(lines):
+            m = STAMP_RE.search(line)
+            if m and m.group(1) == "encode-begin":
+                start = i
+            elif m and m.group(1) == "encode-end" and start is not None:
+                last = (start, i)
+        if last is None:
+            out.append(f"  {name:10s} no encode window")
+            continue
+        sums = Counter()
+        for line in lines[last[0]:last[1] + 1]:
+            mo = OP_RE.search(line)
+            if mo and mo.group(1) != "OPBATCH":
+                sums[profile_kind(mo.group(1), mo.group(2))] += int(mo.group(5))
+        out.append(f"  {name:10s} " + " ".join(f"{sums[k] / 1000:7.1f}" for k in PROFILE_KINDS) +
+                   f" {sum(sums.values()) / 1000:8.1f}")
+    return out
+
+
 def checks(stage: Stage, results: dict[str, Result]) -> list[str]:
     """The conditions of the runs."""
     names = [run_name(*r) for r in stage.runs]
@@ -668,8 +739,10 @@ def table(stage: Stage, include_all: bool) -> int:
         parts.append(bench_table(stage, results, include_all))
     if any("--dump -" in V[vk].args for _, vk, _ in stage.runs):
         parts.append(dump_table(stage, results))
+    if any(PROFILE_ENV in V[vk].env for _, vk, _ in stage.runs):
+        parts.append(profile_summary(stage, results))
     for s, vk, r in stage.runs:
-        if V[vk].env == PROFILE_ENV:
+        if PROFILE_ENV in V[vk].env:
             parts.append(profile_table(results, run_name(s, vk, r)))
     for part in parts:
         print("\n".join(part))
