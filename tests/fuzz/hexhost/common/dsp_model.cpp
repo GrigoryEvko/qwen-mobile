@@ -438,6 +438,7 @@ bool unary_has_tiled_task(uint32_t op) {
         case HTP_OP_NORM:
         case HTP_OP_RMS_NORM:
         case HTP_OP_RMS_NORM_MUL:
+        case HTP_OP_NORM_MUL_ADD:
         case HTP_OP_L2_NORM:
             return false;
         default:
@@ -479,6 +480,21 @@ op_verdict model_unary(const dsp_ctx & ctx, const op_record & op) {
     const uint32_t nrows = src0.ne[1] * src0.ne[2] * src0.ne[3];
     if (nrows == 0) {
         return op_verdict();
+    }
+    // NORM_MUL_ADD (unary-ops.c, execute_op_unary): an F32 weight row and an F32 bias row of the row width, both
+    // broadcast to each row
+    if (op.opcode == HTP_OP_NORM_MUL_ADD) {
+        const tensor_ref & w = op.src[1];
+        const tensor_ref & b = op.src[2];
+        if (!w.present) {
+            return fail(HTP_STATUS_INVAL_PARAMS, "norm-mul-add: no weight");
+        }
+        if (!k.broadcast_weight || w.type != HTP_TYPE_F32 || w.ne[0] != src0.ne[0]) {
+            return fail(HTP_STATUS_NO_SUPPORT, "norm-mul-add: the weight is not one F32 row of %u values", src0.ne[0]);
+        }
+        if (k.has_bias && (!b.present || b.type != HTP_TYPE_F32 || b.ne[0] != src0.ne[0] || b.ne[1] * b.ne[2] * b.ne[3] != 1)) {
+            return fail(HTP_STATUS_NO_SUPPORT, "norm-mul-add: the bias is not one F32 row of %u values", src0.ne[0]);
+        }
     }
     if (ctx.vtcm_size < (uint64_t) k.vtcm_size) {
         return fail(HTP_STATUS_VTCM_TOO_SMALL, "unary: kparams vtcm_size %u > VTCM %" PRIu64, k.vtcm_size, ctx.vtcm_size);
@@ -615,6 +631,50 @@ op_verdict model_rope(const dsp_ctx & ctx, const op_record & op) {
     }
     if (ctx.vtcm_size < k.vtcm_size) {
         return tagged(overflow(k.vtcm_size, ctx.vtcm_size, "rope (an assert only)"), "vtcm-rope");
+    }
+    return op_verdict();
+}
+
+// op_rope_qkv (rope-ops.c): the layout of rope-ops.h, the plan of the kernel params, the VTCM, the thread count
+// and an M-RoPE mode (the bit 8 of the mode) whose rotated values fit in a row
+op_verdict model_rope_qkv(const dsp_ctx & ctx, const op_record & op) {
+    const tensor_ref & qk  = op.src[0];
+    const tensor_ref & pos = op.src[1];
+    const tensor_ref & v   = op.src[3];
+    const tensor_ref & dqk = op.dst[0];
+    const tensor_ref & dk  = op.dst[1];
+    const tensor_ref & dv  = op.dst[2];
+    if (!qk.present || !pos.present || !v.present || !dqk.present || !dk.present || !dv.present || op.src[2].present ||
+        qk.type != HTP_TYPE_F32 || v.type != HTP_TYPE_F32 || pos.type != HTP_TYPE_I32 || dqk.type != HTP_TYPE_F32 ||
+        dk.type != HTP_TYPE_F16 || dv.type != HTP_TYPE_F16) {
+        return fail(HTP_STATUS_NO_SUPPORT, "rope-qkv: a tensor is missing or has a different type");
+    }
+    const uint32_t d = qk.ne[0], H = qk.ne[1] / 2, N = qk.ne[2];
+    if (d % 64 != 0 || qk.ne[1] != 2 * H || qk.ne[3] != 1 || qk.nb[0] != 4 || qk.nb[1] != d * 4 || v.ne[0] != d ||
+        v.ne[1] != N || v.ne[2] != H || v.ne[3] != 1 || v.nb[0] != 4 || v.nb[2] != d * 4 || pos.ne[0] != 4 * N ||
+        dqk.ne[0] != d || dqk.ne[1] != 2 * H || dqk.ne[2] != N || dqk.nb[1] != d * 4 || dqk.nb[2] != 2 * H * d * 4 ||
+        dk.ne[0] != d || dk.ne[1] != N || dk.ne[2] != H || dk.nb[1] != d * 2 || dk.nb[2] != (uint64_t) N * d * 2 ||
+        dv.ne[0] != d || dv.ne[1] != N || dv.ne[2] != H || dv.nb[1] != d * 2 || dv.nb[2] != (uint64_t) N * d * 2) {
+        return fail(HTP_STATUS_NO_SUPPORT, "rope-qkv: the layout is not the layout of rope-ops.h");
+    }
+    const auto & k = *(const htp_rope_qkv_kernel_params *) op.kparams;
+    if (k.block == 0 || k.block > HTP_ROPE_QKV_MAX_BLOCK || k.tokens_per_thread == 0 ||
+        (uint64_t) k.tokens_per_thread * k.n_threads < N ||
+        k.n_sets != ((k.io & HTP_ROPE_QKV_IO_2SETS) ? 2u : (uint32_t) HTP_ROPE_QKV_MAX_SETS)) {
+        return fail(HTP_STATUS_INVAL_PARAMS, "rope-qkv: the plan (block %u, tokens %u of %u threads, sets %u) does not fit",
+                    k.block, k.tokens_per_thread, k.n_threads, k.n_sets);
+    }
+    if (ctx.vtcm_size < k.vtcm_size) {
+        return fail(HTP_STATUS_VTCM_TOO_SMALL, "rope-qkv: kparams vtcm_size %u > VTCM %" PRIu64, k.vtcm_size, ctx.vtcm_size);
+    }
+    if (!valid_n_threads(ctx, k.n_threads)) {
+        return fail(HTP_STATUS_INVAL_PARAMS, "rope-qkv: n_threads %u is outside [1, %u]", k.n_threads, ctx.n_threads);
+    }
+    const int32_t mode = op.params[2], n_dims = op.params[1], n_offs = op.params[15];
+    const uint32_t rotated = mode == GGML_ROPE_TYPE_VISION ? d : (uint32_t) n_dims;  // VISION rotates the full row
+    if ((mode & GGML_ROPE_TYPE_MROPE) == 0 || n_offs < 0 || (uint64_t) n_offs + rotated > d) {
+        return fail(HTP_STATUS_NO_SUPPORT, "rope-qkv: mode %d with %d dims at offset %d is not an M-RoPE of the row",
+                    mode, n_dims, n_offs);
     }
     return op_verdict();
 }
@@ -998,6 +1058,9 @@ const char * opcode_name(uint32_t opcode) {
         case HTP_OP_MUL_MAT_ADD: return "MUL_MAT_ADD";
         case HTP_OP_RMS_NORM: return "RMS_NORM";
         case HTP_OP_RMS_NORM_MUL: return "RMS_NORM_MUL";
+        case HTP_OP_NORM: return "NORM";
+        case HTP_OP_NORM_MUL_ADD: return "NORM_MUL_ADD";
+        case HTP_OP_ROPE_QKV: return "ROPE_QKV";
         case HTP_OP_UNARY_SILU: return "SILU";
         case HTP_OP_UNARY_SIGMOID: return "SIGMOID";
         case HTP_OP_UNARY_SOFTPLUS: return "SOFTPLUS";
@@ -1057,6 +1120,7 @@ op_verdict model_op(const dsp_ctx & ctx, const op_record & op) {
         case HTP_OP_NORM:
         case HTP_OP_RMS_NORM:
         case HTP_OP_RMS_NORM_MUL:
+        case HTP_OP_NORM_MUL_ADD:
         case HTP_OP_SCALE:
         case HTP_OP_CLAMP:
         case HTP_OP_LEAKY_RELU:
@@ -1085,6 +1149,8 @@ op_verdict model_op(const dsp_ctx & ctx, const op_record & op) {
             return model_softmax(ctx, op);
         case HTP_OP_ROPE:
             return model_rope(ctx, op);
+        case HTP_OP_ROPE_QKV:
+            return model_rope_qkv(ctx, op);
         case HTP_OP_FLASH_ATTN_EXT:
             return model_fa(ctx, op);
         case HTP_OP_GET_ROWS:

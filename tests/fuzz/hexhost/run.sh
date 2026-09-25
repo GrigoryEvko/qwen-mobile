@@ -103,8 +103,9 @@ Modes:
                         of the app on the 2B and the 4B Q8_0 of weights/gguf: decode, decode with
                         4 recurrent state snapshots, prefill 512, the MTP draft step and the image
                         turn at 576 and 768 image tokens. A run fails when a llama_decode fails, a
-                        node of a later split reads the state tail of a fused GDN state chain, or a
-                        decode path does not fuse the GDN conv step.
+                        node of a later split reads the state tail of a fused GDN state chain, a
+                        decode path does not fuse the GDN conv step, or an image turn does not fuse
+                        the attention input of each layer or a LayerNorm of the vision encoder.
   fuzz <config>         Build, then fuzz each target for the budget. A crash does not stop the
                         target: it starts again until the budget ends.
   phone-build <config>  Build the phone driver (phone/driver.cpp) and the ggml libraries for arm64
@@ -549,9 +550,11 @@ phone_commands() {
 # Build hexhost_graphs and run it on the paths of the app: decode, decode with the 4 recurrent state
 # snapshots of speculative decoding, prefill 512, the MTP draft step and the image turn at 576 and
 # 768 image tokens, on the 2B and on the 4B Q8_0. A run fails when a llama_decode fails, when a node
-# of a later split reads the state tail of a fused GDN state chain, or when a decode path does not
-# fuse the GDN conv step (the matcher rejects the layout of the app). The program loads full models,
-# thus it has no sanitizer. Gives the code 1 when a run fails.
+# of a later split reads the state tail of a fused GDN state chain, when a decode path does not
+# fuse the GDN conv step (the matcher rejects the layout of the app), or when an image turn does not
+# fuse the attention input of each layer (HTP_OP_ROPE_QKV) or leaves a NORM of the vision encoder (the
+# text model has no NORM). The program loads full models, thus it has no sanitizer. Gives the code 1
+# when a run fails.
 graphs_check() {
     local dir="$REPO/build/fuzz/$AREA-graphs${BUILD_TAG:+-$BUILD_TAG}" m model mmproj rc bad=0
     refresh_llama
@@ -584,6 +587,19 @@ graphs_check() {
             if [[ ${labels[i]} == decode* && -z $conv ]]; then
                 echo "$AREA graphs $name: the host does not fuse the GDN conv step of the app"
                 rc=1
+            fi
+            # The vision encoder: one ROPE_QKV for each layer of each photo, and no NORM (the text model has none)
+            if [[ ${labels[i]} == vision* ]]; then
+                local vis re='vision: ([0-9]+) images, ([0-9]+) blocks, ([0-9]+) ROPE_QKV, ([0-9]+) NORM_MUL_ADD, ([0-9]+) NORM'
+                vis=$(rg -o "$re" "$dir/out/$name.stdout" || true)
+                if [[ $vis =~ $re ]] && (( BASH_REMATCH[2] > 0 && BASH_REMATCH[3] == BASH_REMATCH[1] * BASH_REMATCH[2] &&
+                                            BASH_REMATCH[5] == 0 )); then
+                    echo "$AREA graphs $name: ${vis}"
+                else
+                    echo "$AREA graphs $name: the host does not fuse the attention input or the LayerNorm of each layer" \
+                         "of the vision encoder (${vis:-no vision line})"
+                    rc=1
+                fi
             fi
             [[ $rc == 0 ]] || bad=1
         done

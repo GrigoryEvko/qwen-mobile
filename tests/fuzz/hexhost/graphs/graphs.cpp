@@ -20,7 +20,9 @@
 //
 // Outputs: OUT_PREFIX.supports.txt, OUT_PREFIX.ops.txt, OUT_PREFIX.log.txt, OUT_PREFIX.hazards.txt,
 // OUT_PREFIX.tails.txt. The exit code is 1 when a llama_decode fails or a state tail has a reader in a
-// later split.
+// later split. The vision mode also writes the line "vision: I images, B blocks, Q ROPE_QKV, L NORM_MUL_ADD,
+// N NORM" (B is clip.vision.block_count of the mmproj). run.sh checks that the host fuses the attention input
+// of each layer (Q = I * B) and each LayerNorm (N = 0, the text model has no NORM).
 // Environment: GGML_HEXAGON_* as for the app. HEXHOST_IGNORE lists the checks of the fake DSP
 // that do not stop the run (refer to run.sh). HEXHOST_TOUCH=1 makes the fake DSP write the outputs.
 // HEXHOST_RS_SEQ=N gives the decode and prefill modes N recurrent state snapshots, as the app has
@@ -36,6 +38,7 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-hexagon.h"
+#include "gguf.h"
 #include "htp-gdn-match.h"
 #include "llama.h"
 #include "mtmd.h"
@@ -357,6 +360,22 @@ int run_mtp(llama_model * model, llama_context * ctx, const std::string & model_
 // photo shapes (4:3, 16:9 and 1:1) of random pixels. Each photo goes through the vision encoder, then
 // its text and image embeddings go through the model from an empty memory. Gives 0 when each turn
 // works.
+// The three photo shapes of the vision mode (4:3, 16:9 and 1:1)
+const std::vector<std::pair<uint32_t, uint32_t>> k_vision_shapes = { { 1024, 768 }, { 1280, 720 }, { 800, 800 } };
+
+// The layer count of the vision encoder of an mmproj (clip.vision.block_count), or 0
+uint32_t vision_blocks(const std::string & mmproj) {
+    gguf_init_params p = { /* .no_alloc = */ true, /* .ctx = */ nullptr };
+    gguf_context *   g = gguf_init_from_file(mmproj.c_str(), p);
+    if (!g) {
+        return 0;
+    }
+    const int64_t  id = gguf_find_key(g, "clip.vision.block_count");
+    const uint32_t n  = id >= 0 ? gguf_get_val_u32(g, id) : 0;
+    gguf_free(g);
+    return n;
+}
+
 int run_vision(llama_model * model, llama_context * ctx, ggml_backend_dev_t htp, const std::string & mmproj,
                int max_tokens) {
     mtmd_context_params vp = mtmd_context_params_default();
@@ -372,7 +391,7 @@ int run_vision(llama_model * model, llama_context * ctx, ggml_backend_dev_t htp,
         return -1;
     }
     int rc = 0;
-    for (const auto & wh : std::vector<std::pair<uint32_t, uint32_t>>{ { 1024, 768 }, { 1280, 720 }, { 800, 800 } }) {
+    for (const auto & wh : k_vision_shapes) {
         std::vector<unsigned char> rgb((size_t) wh.first * wh.second * 3);
         uint32_t                   x = 12345;
         for (auto & c : rgb) {
@@ -581,6 +600,14 @@ int main(int argc, char ** argv) {
     write_lines(out + ".log.txt", g_log);
     write_lines(out + ".hazards.txt", g_hazards);
     write_lines(out + ".tails.txt", g_tail_hazards);
+    if (vision) {
+        auto count = [&](const char * name) {
+            const auto it = ops.find(name);
+            return it == ops.end() ? 0ull : (unsigned long long) it->second;
+        };
+        printf("hexhost_graphs: vision: %zu images, %u blocks, %llu ROPE_QKV, %llu NORM_MUL_ADD, %llu NORM\n",
+               k_vision_shapes.size(), vision_blocks(mmproj), count("ROPE_QKV"), count("NORM_MUL_ADD"), count("NORM"));
+    }
     printf("hexhost_graphs: %s %s %d: llama_decode %d, %zu supports lines, %zu HTP op kinds, %zu log lines, "
            "%zu products with the MUL_MAT_ADD conditions, %zu of them with a view reader, %zu fused state chains, "
            "%zu state tail readers in a later split, %zu HTP0 graph_compute calls at most in one llama_decode\n",

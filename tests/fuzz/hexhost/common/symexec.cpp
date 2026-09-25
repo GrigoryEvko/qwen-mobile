@@ -13,6 +13,7 @@
 #include "matmul-ops.h"
 #include "gate-ops.h"
 #include "htp-gdn-params.h"
+#include "unary-ops.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -561,6 +562,37 @@ void checker::dev_op(const fakedsp::op_record & op) {
             const val    v_rms  = op_value(HTP_OP_RMS_NORM, op.params, xne, x.type, { dev_content(x) }, false);
             dev_write_all(d0, op_value(HTP_OP_MUL, ZERO_PARAMS, dne, d0.type,
                                        { const_content(v_rms, nelements(xne)), dev_content(op.src[1]) }, true));
+            return;
+        }
+        case HTP_OP_NORM_MUL_ADD: {
+            // The chain ADD(MUL(NORM(x), w), b) (htp-vit-fusion.h). The op params are those of the NORM node.
+            const auto & x = op.src[0];
+            const auto * kp = (const htp_unary_kernel_params *) op.kparams;
+            int64_t      xne[4] = { x.ne[0], x.ne[1], x.ne[2], x.ne[3] };
+            int64_t      dne[4] = { d0.ne[0], d0.ne[1], d0.ne[2], d0.ne[3] };
+            const val    v_n    = op_value(HTP_OP_NORM, op.params, xne, x.type, { dev_content(x) }, false);
+            const val    v_m    = op_value(HTP_OP_MUL, ZERO_PARAMS, xne, x.type,
+                                           { const_content(v_n, nelements(xne)), dev_content(op.src[1]) }, true);
+            dev_write_all(d0, kp->has_bias ? op_value(HTP_OP_ADD, ZERO_PARAMS, dne, d0.type,
+                                                      { const_content(v_m, nelements(xne)), dev_content(op.src[2]) }, true)
+                                           : v_m);
+            return;
+        }
+        case HTP_OP_ROPE_QKV: {
+            // ROPE(QK), CPY(the permuted key view of the ROPE output -> F16), CPY(the permuted V view -> F16)
+            // (htp-vit-fusion.h). The op params are those of the ROPE node. The host keeps the bytes of the outputs
+            // apart from the bytes of the inputs, thus the order of the reads and the writes gives the same result.
+            const auto & dr = op.dst[0];
+            const auto & dk = op.dst[1];
+            const auto & dv = op.dst[2];
+            int64_t      rne[4] = { dr.ne[0], dr.ne[1], dr.ne[2], dr.ne[3] };
+            int64_t      kne[4] = { dk.ne[0], dk.ne[1], dk.ne[2], dk.ne[3] };
+            int64_t      vne[4] = { dv.ne[0], dv.ne[1], dv.ne[2], dv.ne[3] };
+            const val    v_r    = op_value(HTP_OP_ROPE, op.params, rne, dr.type, { dev_content(op.src[0]), dev_content(op.src[1]) }, false);
+            const val    v_v    = op_value(HTP_OP_CPY, ZERO_PARAMS, vne, dv.type, { dev_content(op.src[3]) }, false);
+            dev_write_all(dr, v_r);
+            dev_write_all(dk, op_value(HTP_OP_CPY, ZERO_PARAMS, kne, dk.type, { const_content(v_r, nelements(kne)) }, false));
+            dev_write_all(dv, v_v);
             return;
         }
         case HTP_OP_RMS_NORM_GATE: {

@@ -1,0 +1,1503 @@
+hexagon: fuse the LayerNorm and the attention input of the vision encoder
+Fold-into: upstream/hexagon-htp
+
+Base: llama.cpp commit c6824a9 plus the patches before this one in patches/series.
+
+Files:
+    ggml/src/ggml-hexagon/htp-vit-fusion.h      the match of the two chains, their placement checks, the op
+                                                nodes and the allocation deps (a new file)
+    ggml/src/ggml-hexagon/ggml-hexagon.cpp      the op names, the match in graph_compute, the deps in
+                                                graph_optimize, the weight row of NORM_MUL_ADD in the unary
+                                                params
+    ggml/src/ggml-hexagon/htp/htp-ops.h         HTP_OP_NORM_MUL_ADD and HTP_OP_ROPE_QKV
+    ggml/src/ggml-hexagon/htp/unary-ops.h       the field has_bias, the VTCM rows of the weight and the bias
+    ggml/src/ggml-hexagon/htp/unary-ops.c       the task of NORM_MUL_ADD
+    ggml/src/ggml-hexagon/htp/rope-ops.h        the kernel params and the plan of ROPE_QKV
+    ggml/src/ggml-hexagon/htp/rope-ops.c        rope_ctx_init_params (the params of both ROPE ops) and the op
+                                                ROPE_QKV
+    ggml/src/ggml-hexagon/htp/main.c, htp-ctx.h the dispatch of the two ops
+    tests/test-backend-ops.cpp                  the test VIT_BLOCK, and the error of each compared tensor for a
+                                                test that asks for it (print_err)
+
+The commit of this patch also gives the two ops to the DSP model and to the symbolic check of the hexhost
+harness (tests/fuzz/hexhost/common), and the graphs mode of tests/fuzz/hexhost/run.sh checks that the host
+fuses the attention input of each layer of the vision encoder and each LayerNorm.
+
+The time before this patch
+
+The vision encoder of the 4B projector (24 layers, 2976 patches for 768 image tokens) on HTP0 spends 55.7 ms
+in NORM, MUL and the bias ADD of its 49 LayerNorms, and 76.9 ms in the ROPE of Q and K and the two F16 casts
+of K and V, of 559 ms of op time (the phone stage vit1, measured).
+
+The change
+
+1. HTP_OP_NORM_MUL_ADD. The chain ADD(MUL(NORM(x), w), b) of build_norm, with w and b one F32 row each,
+   becomes one op of the unary kernel. The task calls norm_f32 of the NORM op on each block of rows in VTCM,
+   then hvx_mul_f32_aaa of MUL and hvx_add_f32_aaa of ADD on each row. The weight row and the bias row go to
+   the VTCM of each thread one time. The node of the op is the NORM node, thus the op params give its
+   epsilon.
+
+2. HTP_OP_ROPE_QKV. The chain ROPE(QK), CPY(the permuted key view of the ROPE output to F16), CPY(the permuted
+   V view to F16) becomes one op. Each thread takes a range of tokens in blocks. A block of Q and K rows comes
+   into VTCM with one DMA transfer, the op rotates them with the theta cache and hvx_rope_neox_f32_aa of the
+   ROPE op, writes the ROPE output with DMA, and converts the key rows and the V rows with the conversion of
+   the CPY op into the F16 rows of each head. The bits of the field io select DMA or HVX for V and for the
+   F16 outputs; the preset value 3 moves each tensor with DMA, as the ROPE op does, with a ring of 4 buffer
+   sets. The op needs an M-RoPE mode and v75 or later (the DMA strides of v73 have 16 bits).
+
+3. The host matches the chains in graph_compute, after the gate chains. The fused op goes to the index of
+   the last node of its chain. graph_optimize asks the scheduler to keep each input until that node, and the
+   match checks the bytes of the allocated graph: no node between the two indexes writes a moved input or
+   reads or writes a moved output, no other node reads a result that the fused op does not write, and no
+   output shares bytes with an input. The key-view check of ROPE_QKV compares the view source and the view
+   offset, because graph_optimize runs before ggml-alloc gives the tensors their data.
+
+4. GGML_HEXAGON_FUSE_VIT holds the bits of the two plans (1 NORM_MUL_ADD, 2 ROPE_QKV, the preset value 3).
+   GGML_HEXAGON_VIT_QKV_IO sets the field io (the preset value 3). GGML_HEXAGON_OPFUSION=0 disables the
+   two plans.
+
+5. The residual stream of the encoder has values of more than the F16 maximum (approximately 9e4 at the
+   last layer of the 4B projector). Thus no fused op writes F16 other than the casts of K and V.
+
+The tests on the host
+
+- tests/fuzz/hexhost/run.sh graphs on the tree with this patch: the vision paths of the 2B and the 4B (576
+  and 768 image tokens, 3 photos of 24 layers) give 72 ROPE_QKV, 147 NORM_MUL_ADD and 0 NORM each. The
+  prefill 512 and the decode graphs of the 4B send the same ops as the tree without this patch, and the
+  verbose log has no match line of the vision chains. The host time of one decode graph without the graph
+  cache: 1839 to 1853 us before, 1843 to 1905 us with this patch.
+- tests/fuzz/hexhost/run.sh test none --profile release with the DSP model and the symbolic check of the two
+  ops: 0 findings for dirty, repack, mmap, envparse, kparams, graph and queue-cancel.
+
+The results on the phone (HTP0 v79, OnePlus 13, the 4B Q8_0 and its projector; the stages vit4 and vit5 of
+2026-09-25, measured)
+
+- The embeddings have the bits of the graph without this patch for each input: the photo of the user at 768
+  and 256 image tokens, and the older test photo at 768 and 256 tokens. Each plan alone has the same bits.
+  Thus the NMSE against the naive x86 oracle does not change (7.25e-5 at 768 tokens).
+- test-backend-ops: VIT_BLOCK 26 of 26, NORM, NORM_MUL_ADD, RMS_NORM, RMS_NORM_MUL_ADD, GELU and FFN_SWIGLU
+  231 of 231, ROPE 287 of 287. The NMSE of the qkv cases of VIT_BLOCK is 1.1e-5 to 2.1e-5 for the io values
+  0, 3 and 7 and for the plans off, thus no io value reads a stale byte.
+- The op time of one encode at 768 tokens: 513 to 518 ms, against 578 to 591 ms without this patch. The
+  LayerNorms take 19.5 ms (57 ms before), the attention input 32 to 35 ms (81 to 83 ms before). The QKV
+  matmul takes 59 ms, against 44 to 47 ms before; with one plan alone it takes 41 to 47 ms.
+- The warm encode: 507 ms against 599 ms at 768 tokens, 163 ms against 181 ms at 256 tokens.
+- llama-bench of the text model, 3 alternated rounds (the median of the 2 rounds of each set that the cap
+  filter keeps): pp512 1174 against 1164 t/s, tg32 11.97 against 11.98 t/s.
+
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 292da7e..b2c1b21 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -238,6 +238,8 @@ static const char * htp_op_name(uint32_t opcode) {
+         case HTP_OP_FWHT:             return "FWHT";
+         case HTP_OP_RMS_NORM_GATE:    return "RMS_NORM_GATE";
+         case HTP_OP_SIGMOID_GATE:     return "SIGMOID_GATE";
++        case HTP_OP_NORM_MUL_ADD:     return "NORM_MUL_ADD";
++        case HTP_OP_ROPE_QKV:         return "ROPE_QKV";
+         case HTP_OP_MUL_MAT_ID:       return "MUL_MAT_ID";
+         case HTP_OP_MUL_MAT_NX:       return "MUL_MAT_NX";
+         case HTP_OP_MUL_MAT_ID_NX:    return "MUL_MAT_ID_NX";
+@@ -3476,6 +3478,7 @@ struct ggml_hexagon_opbatch {
+     }
+ };
+ 
++#include "htp-vit-fusion.h"
+ #include "htp-mm-fusion.h"
+ 
+ struct ggml_hexagon_registry {
+@@ -5676,7 +5679,10 @@ static void ggml_hexagon_precompute_unary_params(
+     size_t src1_row_size_aligned = 0;
+     bool broadcast_weight = false;
+ 
+-    if (op == HTP_OP_RMS_NORM_MUL) {
++    // RMS_NORM_MUL and NORM_MUL_ADD read a weight (src1). The bias of NORM_MUL_ADD has the shape of the weight,
++    // and the layout keeps it in the VTCM next to the weight row.
++    const bool has_weight = op == HTP_OP_RMS_NORM_MUL || op == HTP_OP_NORM_MUL_ADD;
++    if (has_weight) {
+         GGML_ASSERT(src1 != nullptr);
+         src1_data_row_size = src1->ne[0] * ggml_type_size(src1->type);
+         src1_row_size_aligned = hex_round_up(src1_data_row_size, 128);
+@@ -5691,7 +5697,7 @@ static void ggml_hexagon_precompute_unary_params(
+     uint32_t vtcm_row_per_thread = 0;
+ 
+     htp_unary_vtcm_layout_build(&L, op, src0->ne[0], dst->ne[0],
+-                                op == HTP_OP_RMS_NORM_MUL ? src1->ne[0] : 0,
++                                has_weight ? src1->ne[0] : 0,
+                                 broadcast_weight, n_threads, sess->vtcm_size, elem_size,
+                                 &col_tile, &vtcm_row_per_thread);
+ 
+@@ -7373,6 +7379,8 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+         // The gate chains of the Qwen3.5 layers (htp-gate-fusion.h)
+         if (opt_opfusion > 0 && sess->mdev.count == 1) {
+             ggml_hexagon_gate_match_all(graph, sess->n_threads, sess->vtcm_size, gdn_fu.skip, gdn_fu.at, sess->c_name(), opt_verbose != 0);
++            // The LayerNorm and the attention input of the vision encoder (htp-vit-fusion.h)
++            ggml_hexagon_vit_match_all(sess, graph, gdn_fu.skip, gdn_fu.at, sess->c_name(), opt_verbose != 0);
+         }
+ 
+         computed_nodes.reserve(graph->n_nodes);
+@@ -7747,9 +7755,11 @@ static void ggml_backend_hexagon_graph_optimize(ggml_backend_t backend, ggml_cgr
+         }
+     }
+ 
+-    // The gate chains read their inputs at the index of their output (htp-gate-fusion.h)
++    // The gate chains and the chains of the vision encoder read their inputs at the index of their last node
++    // (htp-gate-fusion.h, htp-vit-fusion.h)
+     if (opt_opfusion > 0) {
+         ggml_hexagon_gate_keep_inputs(gf, params);
++        ggml_hexagon_vit_keep_inputs(gf, params);
+     }
+     ggml_hexagon_gdn_conv_keep_inputs(gf, params);
+ 
+diff --git a/ggml/src/ggml-hexagon/htp-vit-fusion.h b/ggml/src/ggml-hexagon/htp-vit-fusion.h
+new file mode 100644
+index 0000000..9e4829c
+--- /dev/null
++++ b/ggml/src/ggml-hexagon/htp-vit-fusion.h
+@@ -0,0 +1,411 @@
++// The graph match of two op chains of the vision encoder of Qwen3-VL and Qwen3.5 (host side). Refer to
++// htp/unary-ops.c (norm_mul_add_f32) and htp/rope-ops.c (op_rope_qkv) for the DSP ops.
++//
++//   ADD(MUL(NORM(x), w), b)                                -> HTP_OP_NORM_MUL_ADD (x, w, b)
++//   ROPE(QK), CPY(K view of the ROPE output -> F16),
++//   CPY(V view -> F16)                                     -> HTP_OP_ROPE_QKV (QK, positions, V)
++//
++// The first chain is the LayerNorm of each layer. The second chain is the attention input of each layer:
++// clip_graph::build_attn casts the permuted K and V views to F16 for the flash attention, and the graph of
++// Qwen3-VL (tools/mtmd/models/qwen3vl.cpp) runs one ROPE over the Q and K rows of the QKV product. Each DSP op
++// calls the vector functions of its unfused ops in their order, thus it gives the bits of the unfused ops (the
++// embeddings of the 4B projector on HTP0 v79 have the bits of the unfused graph).
++//
++// The fused op goes to the index of the last node of its chain. Thus it reads the inputs of the earlier nodes
++// later, and HTP_OP_ROPE_QKV writes the ROPE output and K later. As in htp-gate-fusion.h:
++//   - ggml_hexagon_vit_keep_inputs (graph_optimize, before ggml-alloc) asks the scheduler to keep each input
++//     allocated until the last node.
++//   - ggml_hexagon_vit_match_all (graph_compute) checks the bytes of the allocated graph: no node between the
++//     two indexes writes a byte of a moved input, or reads or writes a byte of a moved output.
++// The LayerNorm op does not write the NORM and the MUL results, thus the match rejects a chain when a node
++// outside it reads one of them.
++//
++// The switch: GGML_HEXAGON_FUSE_VIT holds the bits of the vision encoder plans (3, all bits, is the preset
++// value):
++//   1  HTP_OP_NORM_MUL_ADD
++//   2  HTP_OP_ROPE_QKV
++// GGML_HEXAGON_OPFUSION=0 disables each of them.
++//
++// The residual stream of the vision encoder has values of more than the F16 maximum (65504): the output of the
++// last layer of the 4B projector has values of approximately 9e4. Thus the fused ops keep the F32 of their
++// unfused ops, and no output of a fused op is F16 other than the F16 casts of K and V.
++
++#ifndef HTP_VIT_FUSION_H
++#define HTP_VIT_FUSION_H
++
++#include "htp-gdn-match.h"
++#include "htp-opnode.h"
++#include "htp/rope-ops.h"
++#include "htp/unary-ops.h"
++
++#include <cstdlib>
++#include <cstring>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++
++enum ggml_hexagon_vit_bits {
++    GGML_HEXAGON_VIT_LN       = 1,
++    GGML_HEXAGON_VIT_ROPE_QKV = 2,
++};
++
++// The bits of GGML_HEXAGON_FUSE_VIT. The process reads the variable one time.
++static inline unsigned ggml_hexagon_vit_bits() {
++    static const unsigned bits = [] {
++        const char * v = getenv("GGML_HEXAGON_FUSE_VIT");
++        return v ? (unsigned) strtoul(v, nullptr, 0) & 3u : 3u;
++    }();
++    return opt_opfusion > 0 ? bits : 0u;
++}
++
++// GGML_HEXAGON_VIT_QKV_IO: the bits HTP_ROPE_QKV_IO_* of htp/rope-ops.h for HTP_OP_ROPE_QKV. The preset value 3
++// moves V in and the F16 K and V out with DMA, with a ring of 4 buffer sets, as the ROPE op moves its rows.
++// The other values are for the op tests. The process reads the variable one time.
++static inline uint32_t ggml_hexagon_vit_qkv_io() {
++    static const uint32_t io = [] {
++        const char * v = getenv("GGML_HEXAGON_VIT_QKV_IO");
++        return v ? (uint32_t) strtoul(v, nullptr, 0) & 7u : HTP_ROPE_QKV_IO_V_DMA | HTP_ROPE_QKV_IO_OUT_DMA;
++    }();
++    return io;
++}
++
++struct ggml_hexagon_vit_match {
++    htp_op_code                opcode = HTP_OP_INVALID;
++    ggml_tensor *              out    = nullptr;  // the last node of the chain: the emit index
++    std::vector<ggml_tensor *> members;           // the replaced nodes in graph order
++    std::vector<ggml_tensor *> inter;             // the replaced nodes that the fused op does not write
++    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> reads;   // each input and the member that reads it
++    std::vector<ggml_tensor *> late;              // the outputs that the fused op writes after their node
++    // NORM_MUL_ADD
++    ggml_tensor * x = nullptr, * w = nullptr, * b = nullptr;
++    // ROPE_QKV
++    ggml_tensor * rope = nullptr, * k16 = nullptr, * v16 = nullptr, * qk = nullptr, * pos = nullptr, * v = nullptr;
++};
++
++// An F32 op result that is not a view
++static inline bool ggml_hexagon_vit_is_op(const ggml_tensor * t, ggml_op op) {
++    return t && t->op == op && t->view_src == nullptr && t->type == GGML_TYPE_F32;
++}
++
++// One contiguous F32 row of n values
++static inline bool ggml_hexagon_vit_is_row(const ggml_tensor * t, int64_t n) {
++    return t && ggml_hexagon_gdn_is_f32_row(t, n) && ggml_is_contiguous(t);
++}
++
++// The LayerNorm chain that ends at the ADD `e`: ADD(MUL(NORM(x), w), b) with the operands in the order of
++// build_norm (clip.cpp): the NORM result is src0 of the MUL, the MUL result is src0 of the ADD. Returns nullptr
++// when the chain matches, or a short text for the first failed condition.
++static inline const char * ggml_hexagon_vit_ln_chain(ggml_tensor * e, ggml_hexagon_vit_match & m) {
++    m = ggml_hexagon_vit_match();
++    if (!ggml_hexagon_vit_is_op(e, GGML_OP_ADD) || !e->src[0] || !e->src[1]) {
++        return "not an F32 ADD";
++    }
++    ggml_tensor * M = e->src[0];
++    ggml_tensor * b = e->src[1];
++    if (!ggml_hexagon_vit_is_op(M, GGML_OP_MUL) || !M->src[0] || !M->src[1]) {
++        return "src0 of the ADD is not a MUL";
++    }
++    ggml_tensor * N = M->src[0];
++    ggml_tensor * w = M->src[1];
++    if (!ggml_hexagon_vit_is_op(N, GGML_OP_NORM) || !N->src[0]) {
++        return "src0 of the MUL is not a NORM";
++    }
++    ggml_tensor * x = N->src[0];
++    const int64_t n = e->ne[0];
++    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !ggml_is_contiguous(e) || !ggml_are_same_shape(x, e) ||
++        !ggml_are_same_shape(N, e) || !ggml_are_same_shape(M, e)) {
++        return "the rows are not contiguous F32 rows of one shape";
++    }
++    if (!ggml_hexagon_vit_is_row(w, n) || !ggml_hexagon_vit_is_row(b, n)) {
++        return "the weight or the bias is not one F32 row of the norm width";
++    }
++    m.opcode  = HTP_OP_NORM_MUL_ADD;
++    m.out     = e;
++    m.x       = x;
++    m.w       = w;
++    m.b       = b;
++    m.members = { N, M, e };
++    m.inter   = { N, M };
++    m.reads   = { { x, N }, { w, M }, { b, e } };
++    return nullptr;
++}
++
++// A CPY of an F32 source to a contiguous F16 tensor [d, N, H] (the cast of build_attn)
++static inline bool ggml_hexagon_vit_is_f16_cast(const ggml_tensor * t) {
++    return t && t->op == GGML_OP_CPY && t->src[0] && t->src[0]->type == GGML_TYPE_F32 && t->type == GGML_TYPE_F16 &&
++           ggml_is_contiguous(t) && ggml_are_same_shape(t, t->src[0]);
++}
++
++// The attention input chain that ends at the CPY `cv` (the F16 cast of V). The chain needs the ROPE and the CPY
++// of its key rows before `cv` in the graph (the index map gives the positions). Returns nullptr when it matches.
++static inline const char * ggml_hexagon_vit_qkv_chain(const ggml_cgraph * gf, ggml_tensor * cv,
++                                                      ggml_hexagon_vit_match & m) {
++    m = ggml_hexagon_vit_match();
++    if (!ggml_hexagon_vit_is_f16_cast(cv)) {
++        return "not a CPY of F32 to a contiguous F16 tensor";
++    }
++    const ggml_tensor * vs = cv->src[0];
++    const int64_t       d  = vs->ne[0];
++    const int64_t       N  = vs->ne[1];
++    const int64_t       H  = vs->ne[2];
++    if (d % 64 != 0 || vs->ne[3] != 1 || vs->nb[0] != sizeof(float) || vs->nb[2] != (size_t) d * sizeof(float) ||
++        vs->nb[1] < (size_t) (H * d) * sizeof(float)) {
++        return "V is not the permuted view of the V rows of a token";
++    }
++    // The ROPE whose key rows another CPY casts: the ROPE output is the root of the source of that CPY, and the
++    // ROPE reads a view of the tensor whose view V is (the QKV product of the same layer)
++    const ggml_tensor * v_root = cv->src[0]->view_src;
++    if (!v_root) {
++        return "V is not a view";
++    }
++    ggml_tensor * ck = nullptr;
++    ggml_tensor * R  = nullptr;
++    for (int i = 0; i < gf->n_nodes && !ck; i++) {
++        ggml_tensor * c = gf->nodes[i];
++        if (c == cv || !ggml_hexagon_vit_is_f16_cast(c) || !c->src[0]->view_src) {
++            continue;
++        }
++        ggml_tensor * r = c->src[0]->view_src;
++        if (ggml_hexagon_vit_is_op(r, GGML_OP_ROPE) && r->src[0] && r->src[0]->view_src == v_root &&
++            ggml_are_same_shape(c, cv)) {
++            ck = c;
++            R  = r;
++        }
++    }
++    if (!ck) {
++        return "no F16 cast of the key rows of a ROPE output";
++    }
++    ggml_tensor * qk  = R->src[0];
++    ggml_tensor * pos = R->src[1];
++    if (!qk || !pos || R->src[2] || qk->type != GGML_TYPE_F32 || pos->type != GGML_TYPE_I32) {
++        return "the ROPE has frequency factors or other types";
++    }
++    int32_t mode = 0;
++    memcpy(&mode, (const int32_t *) R->op_params + 2, sizeof(int32_t));
++    if ((mode & GGML_ROPE_TYPE_MROPE) == 0) {
++        return "the ROPE is not an M-RoPE mode";
++    }
++    if (qk->ne[0] != d || qk->ne[1] != 2 * H || qk->ne[2] != N || qk->ne[3] != 1 || qk->nb[0] != sizeof(float) ||
++        qk->nb[1] != (size_t) d * sizeof(float) || qk->nb[2] < (size_t) (2 * H * d) * sizeof(float) ||
++        pos->ne[0] != 4 * N || !ggml_is_contiguous(pos)) {
++        return "the Q and K rows are not the rows of the tokens";
++    }
++    if (!ggml_is_contiguous(R) || !ggml_are_same_shape(R, qk)) {
++        return "the ROPE output is not contiguous";
++    }
++    // The source of the key cast: the permuted view of the key heads of the ROPE output. The check uses the view
++    // offset and not the data address, because graph_optimize runs before ggml-alloc gives the tensors their data.
++    const ggml_tensor * ks = ck->src[0];
++    if (ks->ne[0] != d || ks->ne[1] != N || ks->ne[2] != H || ks->nb[0] != sizeof(float) || ks->nb[1] != R->nb[2] ||
++        ks->nb[2] != R->nb[1] || ks->view_src != R || ks->view_offs != (size_t) H * R->nb[1]) {
++        return "the key cast does not read the key heads of the ROPE output";
++    }
++    // The DMA of v73 and older has 16-bit strides (htp/dma-queue.h); the op moves the heads of K and V as rows
++    // with the stride N * d * 2, thus it runs on v75 and later only.
++    if (opt_arch < 75) {
++        return "the DMA of this core has 16-bit strides";
++    }
++    m.opcode  = HTP_OP_ROPE_QKV;
++    m.out     = cv;
++    m.rope    = R;
++    m.k16     = ck;
++    m.v16     = cv;
++    m.qk      = qk;
++    m.pos     = pos;
++    m.v       = cv->src[0];
++    m.members = { R, ck, cv };
++    m.reads   = { { qk, R }, { pos, R }, { m.v, cv } };
++    m.late    = { R, ck };
++    return nullptr;
++}
++
++// The checks of a chain in the graph of one split. Needs the data of the allocated graph.
++// O(nodes * (GGML_MAX_SRC + members)) for each chain.
++static inline const char * ggml_hexagon_vit_placement(const ggml_cgraph * gf,
++                                                      const std::unordered_map<const ggml_tensor *, int> & index,
++                                                      const std::vector<uint8_t> & skip, const ggml_hexagon_vit_match & m,
++                                                      int * emit) {
++    for (auto * t : m.members) {
++        auto it = index.find(t);
++        if (it == index.end()) {
++            return "a member is not a node of this split";
++        }
++        if (skip[it->second]) {
++            return "a member is part of a different fused op";
++        }
++        if (it->second > index.at(m.out)) {
++            return "a member comes after the last node";
++        }
++    }
++    *emit = index.at(m.out);
++
++    const char * reason = ggml_hexagon_gdn_chain_is_private(gf, m.inter, m.members, nullptr, 0);
++    if (reason) {
++        return reason;
++    }
++    for (const auto & rd : m.reads) {
++        if (!ggml_hexagon_gdn_move_is_safe(gf, *emit, index.at(rd.second), rd.first, false, m.members)) {
++            return "a node between the read of an input and the last node writes a byte of the input";
++        }
++    }
++    for (ggml_tensor * t : m.late) {
++        if (!ggml_hexagon_gdn_move_is_safe(gf, *emit, index.at(t), t, true, m.members)) {
++            return "a node between an output and the last node reads or writes a byte of the output";
++        }
++    }
++    // The outputs and the inputs share no byte
++    std::vector<const ggml_tensor *> outs, ins;
++    if (m.opcode == HTP_OP_NORM_MUL_ADD) {
++        outs = { m.out };
++        ins  = { m.x, m.w, m.b };
++    } else {
++        outs = { m.rope, m.k16, m.v16 };
++        ins  = { m.qk, m.pos, m.v };
++    }
++    for (const ggml_tensor * o : outs) {
++        for (const ggml_tensor * i : ins) {
++            if (ggml_hexagon_gdn_bytes_overlap(o, i)) {
++                return "an output shares bytes with an input";
++            }
++        }
++    }
++    for (size_t a = 0; a < outs.size(); a++) {
++        for (size_t c = a + 1; c < outs.size(); c++) {
++            if (ggml_hexagon_gdn_bytes_overlap(outs[a], outs[c])) {
++                return "two outputs share bytes";
++            }
++        }
++    }
++    return nullptr;
++}
++
++// Builds the fused op of a matched chain. False when the op does not fit in the VTCM.
++static inline bool ggml_hexagon_vit_make_node(const struct ggml_hexagon_session * sess, const ggml_hexagon_vit_match & m,
++                                              htp_opnode & node) {
++    if (m.opcode == HTP_OP_NORM_MUL_ADD) {
++        struct htp_unary_kernel_params kp;
++        ggml_hexagon_precompute_unary_params(sess, HTP_OP_NORM_MUL_ADD, m.x, m.w, m.out, &kp);
++        if (!ggml_hexagon_unary_has_rows(kp) || kp.col_tile != 0 || (size_t) kp.vtcm_size > sess->vtcm_size) {
++            return false;
++        }
++        kp.has_bias = 1;
++        // node.node is the NORM, thus the op params of the fused op are the params of the NORM (its epsilon)
++        node         = htp_opnode(HTP_OP_NORM_MUL_ADD, m.members[0]);
++        node.name    = "NORM_MUL_ADD";
++        node.inputs  = { m.x, m.w, m.b };
++        node.outputs = { m.out };
++        node.fused.assign(m.members.begin() + 1, m.members.end());
++        memcpy(node.kernel_params, &kp, sizeof(kp));
++        return true;
++    }
++
++    struct htp_rope_qkv_kernel_params kp;
++    memset(&kp, 0, sizeof(kp));
++    const uint32_t d = (uint32_t) m.qk->ne[0];
++    const uint32_t H = (uint32_t) (m.qk->ne[1] / 2);
++    const uint32_t N = (uint32_t) m.qk->ne[2];
++    if (!htp_rope_qkv_plan(&kp, d, H, N, (uint32_t) sess->n_threads, ggml_hexagon_vit_qkv_io(), sess->vtcm_size)) {
++        return false;
++    }
++    // node.node is the ROPE, thus the op params of the fused op are the params of the ROPE
++    node         = htp_opnode(HTP_OP_ROPE_QKV, m.rope);
++    node.name    = "ROPE_QKV";
++    node.inputs  = { m.qk, m.pos, nullptr, m.v };
++    node.outputs = { m.rope, m.k16, m.v16 };
++    node.fused   = { m.k16, m.v16 };
++    memcpy(node.kernel_params, &kp, sizeof(kp));
++    return true;
++}
++
++// graph_optimize: asks the scheduler to keep the inputs of each chain allocated until its last node. A weight is
++// not a tensor of ggml-alloc, thus it needs no such request. O(nodes * members) with the check of each chain.
++static inline void ggml_hexagon_vit_keep_inputs(ggml_cgraph * gf, ggml_backend_graph_optimize_params * params) {
++    const unsigned bits = ggml_hexagon_vit_bits();
++    if (!params || !params->add_alloc_dep || !(bits & (GGML_HEXAGON_VIT_LN | GGML_HEXAGON_VIT_ROPE_QKV))) {
++        return;
++    }
++    for (int i = 0; i < gf->n_nodes; i++) {
++        ggml_tensor *          e = gf->nodes[i];
++        ggml_hexagon_vit_match m;
++        const char *           reason = "no chain";
++        if ((bits & GGML_HEXAGON_VIT_LN) && e->op == GGML_OP_ADD) {
++            reason = ggml_hexagon_vit_ln_chain(e, m);
++        } else if ((bits & GGML_HEXAGON_VIT_ROPE_QKV) && e->op == GGML_OP_CPY) {
++            reason = ggml_hexagon_vit_qkv_chain(gf, e, m);
++        }
++        if (reason || ggml_hexagon_gdn_chain_is_private(gf, m.inter, m.members, nullptr, 0)) {
++            continue;
++        }
++        for (const auto & rd : m.reads) {
++            ggml_tensor *       t    = rd.first;
++            const ggml_tensor * root = ggml_hexagon_gdn_root(t);
++            if (root->buffer && ggml_backend_buffer_get_usage(root->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
++                continue;
++            }
++            params->add_alloc_dep(params->user_data, t, m.out);
++        }
++    }
++}
++
++// graph_compute: matches the chains of one split. A matched chain puts its fused op at the index of its last node
++// into `at`, and marks each member in `skip`. The entries that `skip` and `at` already hold keep their nodes.
++// `name` and `verbose` are for the log. O(nodes^2) in the worst case: the key cast search of each V cast.
++static inline void ggml_hexagon_vit_match_all(const struct ggml_hexagon_session * sess, const ggml_cgraph * gf,
++                                              std::vector<uint8_t> & skip, std::unordered_map<int, htp_opnode> & at,
++                                              const char * name, bool verbose) {
++    const unsigned bits = ggml_hexagon_vit_bits();
++    if (!(bits & (GGML_HEXAGON_VIT_LN | GGML_HEXAGON_VIT_ROPE_QKV))) {
++        return;
++    }
++    const auto index = ggml_hexagon_gdn_index(gf);
++
++    for (int i = 0; i < gf->n_nodes; i++) {
++        ggml_tensor * e = gf->nodes[i];
++        if (skip[i] || (e->op != GGML_OP_ADD && e->op != GGML_OP_CPY)) {
++            continue;
++        }
++        ggml_hexagon_vit_match m;
++        const char *           reason = nullptr;
++        if (e->op == GGML_OP_ADD) {
++            if (!(bits & GGML_HEXAGON_VIT_LN)) {
++                continue;
++            }
++            reason = ggml_hexagon_vit_ln_chain(e, m);
++            if (reason && (!e->src[0] || e->src[0]->op != GGML_OP_MUL)) {
++                continue;  // not a candidate, no log line
++            }
++        } else {
++            if (!(bits & GGML_HEXAGON_VIT_ROPE_QKV) || !ggml_hexagon_vit_is_f16_cast(e) || e->src[0]->view_src == nullptr ||
++                e->src[0]->view_src->op == GGML_OP_ROPE) {
++                continue;  // the V cast reads a view of the QKV product, not of a ROPE output
++            }
++            reason = ggml_hexagon_vit_qkv_chain(gf, e, m);
++        }
++        int        emit = -1;
++        htp_opnode node;
++        if (!reason) {
++            reason = ggml_hexagon_vit_placement(gf, index, skip, m, &emit);
++        }
++        if (!reason && at.count(emit)) {
++            reason = "a different fused op has the same index";
++        }
++        if (!reason && !ggml_hexagon_vit_make_node(sess, m, node)) {
++            reason = "the op does not fit in the VTCM";
++        }
++        if (reason) {
++            if (verbose) {
++                GGML_LOG_DEBUG("ggml-hex: %s vit candidate %s (node %d): %s\n", name, e->name, i, reason);
++            }
++            continue;
++        }
++        for (auto * t : m.members) {
++            skip[index.at(t)] = 1;
++        }
++        if (verbose) {
++            GGML_LOG_DEBUG("ggml-hex: %s fused %s %s at node %d\n", name, node.name.c_str(), m.out->name, emit);
++        }
++        at.emplace(emit, std::move(node));
++    }
++}
++
++#endif  // HTP_VIT_FUSION_H
+diff --git a/ggml/src/ggml-hexagon/htp/htp-ctx.h b/ggml/src/ggml-hexagon/htp/htp-ctx.h
+index fed787d..dcde92c 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-ctx.h
++++ b/ggml/src/ggml-hexagon/htp/htp-ctx.h
+@@ -163,6 +163,7 @@ int op_activations(struct htp_ops_context * octx);
+ int op_softmax(struct htp_ops_context * octx);
+ int op_add_id(struct htp_ops_context * octx);
+ int op_rope(struct htp_ops_context * octx);
++int op_rope_qkv(struct htp_ops_context * octx);
+ int op_flash_attn_ext(struct htp_ops_context * octx);
+ int op_set_rows(struct htp_ops_context * octx);
+ int op_get_rows(struct htp_ops_context * octx);
+diff --git a/ggml/src/ggml-hexagon/htp/htp-ops.h b/ggml/src/ggml-hexagon/htp/htp-ops.h
+index 1e84cb2..ee9ca49 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-ops.h
++++ b/ggml/src/ggml-hexagon/htp/htp-ops.h
+@@ -111,6 +111,8 @@ enum htp_op_code {
+     HTP_OP_FWHT,            // a MUL_MAT by the Hadamard matrix of llama.cpp (GGML_HINT_SRC0_IS_HADAMARD)
+     HTP_OP_RMS_NORM_GATE,   // RMS_NORM + MUL (weight) + SILU + MUL: the gated norm of a gated delta net output
+     HTP_OP_SIGMOID_GATE,    // (CONT) + SIGMOID + MUL: the output gate of an attention layer
++    HTP_OP_NORM_MUL_ADD,    // NORM + MUL (weight) + ADD (bias): the LayerNorm of the vision encoder
++    HTP_OP_ROPE_QKV,        // ROPE of Q and K + the F16 casts of K and V: the attention input of the vision encoder
+ 
+     HTP_OP_INVALID
+ };
+diff --git a/ggml/src/ggml-hexagon/htp/main.c b/ggml/src/ggml-hexagon/htp/main.c
+index 6de782f..c2fa515 100644
+--- a/ggml/src/ggml-hexagon/htp/main.c
++++ b/ggml/src/ggml-hexagon/htp/main.c
+@@ -806,6 +806,7 @@ static int execute_op(struct htp_ops_context * octx) {
+         case HTP_OP_NORM:
+         case HTP_OP_RMS_NORM:
+         case HTP_OP_RMS_NORM_MUL:
++        case HTP_OP_NORM_MUL_ADD:
+         case HTP_OP_SCALE:
+         case HTP_OP_CLAMP:
+         case HTP_OP_LEAKY_RELU:
+@@ -837,6 +838,9 @@ static int execute_op(struct htp_ops_context * octx) {
+         case HTP_OP_ROPE:
+             return op_rope(octx);
+ 
++        case HTP_OP_ROPE_QKV:
++            return op_rope_qkv(octx);
++
+         case HTP_OP_FLASH_ATTN_EXT:
+             return op_flash_attn_ext(octx);
+ 
+diff --git a/ggml/src/ggml-hexagon/htp/rope-ops.c b/ggml/src/ggml-hexagon/htp/rope-ops.c
+index c36976e..3e0210b 100644
+--- a/ggml/src/ggml-hexagon/htp/rope-ops.c
++++ b/ggml/src/ggml-hexagon/htp/rope-ops.c
+@@ -389,6 +389,32 @@ static void rope_corr_dims(int     n_dims,
+     dims[1]     = MIN(n_dims - 1, end);
+ }
+ 
++// The parameters of a ROPE op from its op params, and the powers of theta that the caches use. HTP_OP_ROPE and
++// HTP_OP_ROPE_QKV both call it, thus the two give the same thetas.
++static void rope_ctx_init_params(struct htp_rope_context * rctx, const int32_t * op_params) {
++    rctx->n_dims     = op_params[1];
++    rctx->mode       = op_params[2];
++    rctx->n_ctx_orig = op_params[4];
++    rctx->n_offs     = op_params[15];
++
++    memcpy(&rctx->freq_base,   op_params + 5,  sizeof(float));
++    memcpy(&rctx->freq_scale,  op_params + 6,  sizeof(float));
++    memcpy(&rctx->ext_factor,  op_params + 7,  sizeof(float));
++    memcpy(&rctx->attn_factor, op_params + 8,  sizeof(float));
++    memcpy(&rctx->beta_fast,   op_params + 9,  sizeof(float));
++    memcpy(&rctx->beta_slow,   op_params + 10, sizeof(float));
++    memcpy(&rctx->sections,    op_params + 11, sizeof(int) * 4);
++
++    rctx->theta_scale = powf(rctx->freq_base, -2.0f / rctx->n_dims);
++    rctx->theta_powers[0] = 1.0f;
++    for (int j = 1; j < 32; j++) {
++        rctx->theta_powers[j] = rctx->theta_powers[j - 1] * rctx->theta_scale;
++    }
++    rctx->theta_scale_32 = rctx->theta_powers[31] * rctx->theta_scale;
++
++    rope_corr_dims(rctx->n_dims, rctx->n_ctx_orig, rctx->freq_base, rctx->beta_fast, rctx->beta_slow, rctx->corr_dims);
++}
++
+ static inline void hvx_rope_neox_mul(HVX_Vector v0, HVX_Vector v1, HVX_Vector vcos, HVX_Vector vsin,
+                                      HVX_Vector * o0, HVX_Vector * o1) {
+     HVX_Vector vx0_c = Q6_Vqf32_vmpy_VsfVsf(v0, vcos);
+@@ -748,28 +774,7 @@ static int execute_op_rope_f32(struct htp_ops_context * octx) {
+     rctx.spad_per_thread       = kparams->spad_per_thread;
+     rctx.theta_cache_offset    = kparams->theta_cache_offset;
+ 
+-    const int32_t * op_params = &octx->op_params[0];
+-    rctx.n_dims     = ((const int32_t *) op_params)[1];
+-    rctx.mode       = ((const int32_t *) op_params)[2];
+-    rctx.n_ctx_orig = ((const int32_t *) op_params)[4];
+-    rctx.n_offs     = ((const int32_t *) op_params)[15];
+-
+-    memcpy(&rctx.freq_base,   (int32_t *) op_params + 5,  sizeof(float));
+-    memcpy(&rctx.freq_scale,  (int32_t *) op_params + 6,  sizeof(float));
+-    memcpy(&rctx.ext_factor,  (int32_t *) op_params + 7,  sizeof(float));
+-    memcpy(&rctx.attn_factor, (int32_t *) op_params + 8,  sizeof(float));
+-    memcpy(&rctx.beta_fast,   (int32_t *) op_params + 9,  sizeof(float));
+-    memcpy(&rctx.beta_slow,   (int32_t *) op_params + 10, sizeof(float));
+-    memcpy(&rctx.sections,    (int32_t *) op_params + 11, sizeof(int) * 4);
+-
+-    rctx.theta_scale = powf(rctx.freq_base, -2.0f / rctx.n_dims);
+-    rctx.theta_powers[0] = 1.0f;
+-    for (int j = 1; j < 32; j++) {
+-        rctx.theta_powers[j] = rctx.theta_powers[j - 1] * rctx.theta_scale;
+-    }
+-    rctx.theta_scale_32 = rctx.theta_powers[31] * rctx.theta_scale;
+-
+-    rope_corr_dims(rctx.n_dims, rctx.n_ctx_orig, rctx.freq_base, rctx.beta_fast, rctx.beta_slow, rctx.corr_dims);
++    rope_ctx_init_params(&rctx, &octx->op_params[0]);
+ 
+     rctx.src0_row_size         = src0_row_size;
+     rctx.src0_row_stride       = src0_row_stride;
+@@ -801,3 +806,237 @@ int op_rope(struct htp_ops_context * octx) {
+             return HTP_STATUS_NO_SUPPORT;
+     }
+ }
++
++// ---- HTP_OP_ROPE_QKV: the ROPE of Q and K and the F16 casts of K and V (refer to rope-ops.h) ----
++//
++// The unfused graph runs ROPE on the Q and K rows, then CPY of the permuted key view of the ROPE output to F16,
++// then CPY of the permuted V view to F16. This op reads the Q and K rows of a block of tokens with one DMA
++// transfer, rotates them in VTCM with the functions of the ROPE op (the same theta cache and
++// hvx_rope_neox_f32_aa), writes the ROPE output with one DMA transfer, and converts the key rows and the V rows
++// with hvx_vec_f32_to_f16 (the conversion of the CPY op). Thus the outputs have the bits of the three unfused ops.
++//
++// The bits of kp->io (rope-ops.h) select the path of V and of the F16 outputs. The ROPE op reads and writes with
++// DMA, and the CPY op reads and writes with HVX loads and stores through the caches. A DMA transfer bypasses L2,
++// and the range flush of the batch does not reach L2 on v79 (htp-tensor.c). Thus the path of a tensor decides
++// whether the op reads the bytes that the op before it left in L2. The preset value of the host (3) moves each
++// tensor with DMA, as the ROPE op moves its rows, and the flash attention reads K and V with DMA.
++//
++// The DMA queue of a thread runs its transfers in the order of the pushes. Block b uses the buffer set
++// b % n_sets. The inputs of block b + 2 go into the set (b + 2) % n_sets after the pushes of the outputs of b.
++// The pops follow the order of the pushes:
++//   in(0), in(1), out(0), in(2), out(1), in(3), ...
++// With 4 sets, the outputs of the block that last used a set are popped (done) before its new inputs go in.
++// Time: O(tokens * H * d) for each thread.
++
++struct htp_rope_qkv_context {
++    struct htp_rope_context                   rope;
++    const struct htp_rope_qkv_kernel_params * kp;
++    uint32_t                                  n_tok;   // N
++    uint32_t                                  n_head;  // H
++    uint32_t                                  d;       // the head size
++};
++
++// Push the Q and K rows (and with HTP_ROPE_QKV_IO_V_DMA the V rows) of the tokens [tb, tb + nt) into the buffer
++// set s.
++static inline void rope_qkv_push_in(dma_queue * q, uint8_t * base, const struct htp_rope_qkv_kernel_params * kp,
++                                    uint32_t s, const struct htp_tensor * qk, const struct htp_tensor * v, uint32_t tb,
++                                    uint32_t nt, size_t qk_bytes, size_t v_bytes) {
++    dma_queue_push(q, dma_make_ptr(base + kp->off_qk[s], (const uint8_t *) qk->data + (size_t) tb * qk->nb[2]), qk_bytes,
++                   qk->nb[2], qk_bytes, nt);
++    if (kp->io & HTP_ROPE_QKV_IO_V_DMA) {
++        dma_queue_push(q, dma_make_ptr(base + kp->off_v[s], (const uint8_t *) v->data + (size_t) tb * v->nb[1]), v_bytes,
++                       v->nb[1], v_bytes, nt);
++    }
++}
++
++static void rope_qkv_job(unsigned int nth, unsigned int ith, void * data) {
++    const struct htp_rope_qkv_context *       qc   = (const struct htp_rope_qkv_context *) data;
++    const struct htp_rope_context *           rctx = &qc->rope;
++    const struct htp_rope_qkv_kernel_params * kp   = qc->kp;
++    struct htp_ops_context *                  octx = rctx->octx;
++
++    const struct htp_tensor * qk   = octx->src[0];
++    const struct htp_tensor * psrc = octx->src[1];
++    const struct htp_tensor * v    = octx->src[3];
++    const struct htp_tensor * dqk  = octx->dsts[0];
++    const struct htp_tensor * dk   = octx->dsts[1];
++    const struct htp_tensor * dv   = octx->dsts[2];
++
++    const uint32_t N  = qc->n_tok;
++    const uint32_t H  = qc->n_head;
++    const uint32_t d  = qc->d;
++    const uint32_t t0 = ith * kp->tokens_per_thread;
++    const uint32_t t1 = MIN(t0 + kp->tokens_per_thread, N);
++    if (t0 >= t1) {
++        return;
++    }
++
++    const size_t   row_f32  = (size_t) d * sizeof(float);
++    const size_t   row_f16  = (size_t) d * sizeof(__fp16);
++    const size_t   qk_bytes = 2 * H * row_f32;
++    const size_t   v_bytes  = H * row_f32;
++    const uint32_t T        = kp->block;
++    const uint32_t n_blocks = (t1 - t0 + T - 1) / T;
++
++    uint8_t * const base  = octx->ctx->vtcm_base + (size_t) ith * kp->bytes_per_thread;
++    float * const   theta = (float *) (base + kp->off_theta);
++    dma_queue *     q     = octx->ctx->dma[ith];
++
++    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
++    const int32_t *           pos = (const int32_t *) psrc->data;
++    const bool is_imrope = rctx->mode == HTP_ROPE_TYPE_IMROPE;
++    const bool is_vision = rctx->mode == HTP_ROPE_TYPE_VISION;
++    // VISION rotates the full row, the other modes the first n_dims values (as rope_job_f32)
++    const uint32_t ne = is_vision ? d : (uint32_t) rctx->n_dims;
++
++    const bool     v_dma   = (kp->io & HTP_ROPE_QKV_IO_V_DMA) != 0;
++    const bool     out_dma = (kp->io & HTP_ROPE_QKV_IO_OUT_DMA) != 0;
++    const uint32_t n_sets  = kp->n_sets;
++    const uint32_t n_out   = out_dma ? 3 : 1;  // the output transfers of one block
++
++    // The V rows of the block of a thread for the HVX loads: one prefetch of nt rows of H * d values
++    const uint32_t v_row = (uint32_t) (H * row_f32);
++
++    for (uint32_t b = 0; b < 2 && b < n_blocks; b++) {
++        const uint32_t tb = t0 + b * T;
++        rope_qkv_push_in(q, base, kp, b % n_sets, qk, v, tb, MIN(T, t1 - tb), qk_bytes, v_bytes);
++    }
++    if (!v_dma) {
++        hex_l2fetch((const uint8_t *) v->data + (size_t) t0 * v->nb[1], v_row, (uint32_t) v->nb[1], MIN(T, t1 - t0));
++    }
++
++    for (uint32_t b = 0; b < n_blocks; b++) {
++        const uint32_t s  = b % n_sets;
++        const uint32_t tb = t0 + b * T;
++        const uint32_t nt = MIN(T, t1 - tb);
++        if (b >= 2) {
++            for (uint32_t i = 0; i < n_out; i++) {
++                dma_queue_pop(q);  // the outputs of block b - 2
++            }
++        }
++        uint8_t * qk_buf = (uint8_t *) dma_queue_pop(q).dst;
++        uint8_t * v_buf  = v_dma ? (uint8_t *) dma_queue_pop(q).dst : NULL;
++        uint8_t * k16    = base + kp->off_k16[s];
++        uint8_t * v16    = base + kp->off_v16[s];
++        if (!v_dma && b + 1 < n_blocks) {
++            const uint32_t tn = tb + T;
++            hex_l2fetch((const uint8_t *) v->data + (size_t) tn * v->nb[1], v_row, (uint32_t) v->nb[1], MIN(T, t1 - tn));
++        }
++
++        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, tb);
++        for (uint32_t j = 0; j < nt; j++) {
++            const uint32_t t = tb + j;
++            mrope_cache_init((float) pos[t], (float) pos[t + N], (float) pos[t + N * 2], (float) pos[t + N * 3],
++                             rctx->sections, is_imrope, is_vision, rctx->freq_scale, NULL, (float *) rctx->corr_dims, ne,
++                             rctx->ext_factor, rctx->attn_factor, theta, rctx->theta_scale, rctx->theta_powers,
++                             rctx->theta_scale_32);
++
++            float * rows = (float *) (qk_buf + (size_t) j * qk_bytes);
++            for (uint32_t r = 0; r < 2 * H; r++) {
++                float * row = rows + (size_t) r * d + rctx->n_offs;
++                hvx_rope_neox_f32_aa(row, row, ne, theta);
++            }
++            const uint8_t * v_tok = v_dma ? v_buf + (size_t) j * v_bytes : (const uint8_t *) v->data + (size_t) t * v->nb[1];
++            for (uint32_t h = 0; h < H; h++) {
++                const uint8_t * krow = (const uint8_t *) (rows + (size_t) (H + h) * d);
++                const uint8_t * vrow = v_tok + (size_t) h * row_f32;
++                if (out_dma) {
++                    hvx_copy_f16_f32_aa(k16 + ((size_t) h * T + j) * row_f16, krow, d);
++                    if (v_dma) {
++                        hvx_copy_f16_f32_aa(v16 + ((size_t) h * T + j) * row_f16, vrow, d);
++                    } else {
++                        hvx_copy_f16_f32_au(v16 + ((size_t) h * T + j) * row_f16, vrow, d);
++                    }
++                } else {
++                    uint8_t * kd = (uint8_t *) dk->data + (size_t) h * dk->nb[2] + (size_t) t * dk->nb[1];
++                    uint8_t * vd = (uint8_t *) dv->data + (size_t) h * dv->nb[2] + (size_t) t * dv->nb[1];
++                    hvx_copy_f16_f32_ua(kd, krow, d);
++                    hvx_copy_f16_f32_uu(vd, vrow, d);
++                }
++            }
++        }
++        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, tb);
++
++        dma_queue_push(q, dma_make_ptr((uint8_t *) dqk->data + (size_t) tb * dqk->nb[2], qk_buf), dqk->nb[2], qk_bytes,
++                       qk_bytes, nt);
++        if (out_dma) {
++            dma_queue_push(q, dma_make_ptr((uint8_t *) dk->data + (size_t) tb * dk->nb[1], k16), dk->nb[2], T * row_f16,
++                           nt * row_f16, H);
++            dma_queue_push(q, dma_make_ptr((uint8_t *) dv->data + (size_t) tb * dv->nb[1], v16), dv->nb[2], T * row_f16,
++                           nt * row_f16, H);
++        }
++
++        if (b + 2 < n_blocks) {
++            const uint32_t tn = t0 + (b + 2) * T;
++            rope_qkv_push_in(q, base, kp, (b + 2) % n_sets, qk, v, tn, MIN(T, t1 - tn), qk_bytes, v_bytes);
++        }
++    }
++
++    dma_queue_flush(q);
++    (void) nth;
++}
++
++int op_rope_qkv(struct htp_ops_context * octx) {
++    const struct htp_tensor * qk  = octx->src[0];
++    const struct htp_tensor * pos = octx->src[1];
++    const struct htp_tensor * v   = octx->src[3];
++    const struct htp_tensor * dqk = octx->dsts[0];
++    const struct htp_tensor * dk  = octx->dsts[1];
++    const struct htp_tensor * dv  = octx->dsts[2];
++
++    const struct htp_rope_qkv_kernel_params * kp = (const struct htp_rope_qkv_kernel_params *) octx->kernel_params;
++
++    // The layout of rope-ops.h. The host checks the same rules before it fuses the three ops.
++    if (!qk || !pos || !v || !dqk || !dk || !dv || octx->src[2] || qk->type != HTP_TYPE_F32 || v->type != HTP_TYPE_F32 ||
++        pos->type != HTP_TYPE_I32 || dqk->type != HTP_TYPE_F32 || dk->type != HTP_TYPE_F16 || dv->type != HTP_TYPE_F16) {
++        return HTP_STATUS_NO_SUPPORT;
++    }
++    const uint32_t d = qk->ne[0];
++    const uint32_t H = qk->ne[1] / 2;
++    const uint32_t N = qk->ne[2];
++    if (d % 64 != 0 || qk->ne[1] != 2 * H || qk->ne[3] != 1 || qk->nb[0] != sizeof(float) || qk->nb[1] != d * sizeof(float) ||
++        v->ne[0] != d || v->ne[1] != N || v->ne[2] != H || v->ne[3] != 1 || v->nb[0] != sizeof(float) ||
++        v->nb[2] != d * sizeof(float) || pos->ne[0] != 4 * N ||
++        dqk->ne[0] != d || dqk->ne[1] != 2 * H || dqk->ne[2] != N || dqk->nb[1] != d * sizeof(float) ||
++        dqk->nb[2] != 2 * H * d * sizeof(float) ||
++        dk->ne[0] != d || dk->ne[1] != N || dk->ne[2] != H || dk->nb[1] != d * sizeof(__fp16) ||
++        dk->nb[2] != (size_t) N * d * sizeof(__fp16) ||
++        dv->ne[0] != d || dv->ne[1] != N || dv->ne[2] != H || dv->nb[1] != d * sizeof(__fp16) ||
++        dv->nb[2] != (size_t) N * d * sizeof(__fp16)) {
++        return HTP_STATUS_NO_SUPPORT;
++    }
++    if (kp->block == 0 || kp->block > HTP_ROPE_QKV_MAX_BLOCK || kp->tokens_per_thread == 0 ||
++        (uint64_t) kp->tokens_per_thread * kp->n_threads < N ||
++        kp->n_sets != ((kp->io & HTP_ROPE_QKV_IO_2SETS) ? 2u : (uint32_t) HTP_ROPE_QKV_MAX_SETS)) {
++        return HTP_STATUS_INVAL_PARAMS;
++    }
++    if (octx->ctx->vtcm_size < kp->vtcm_size) {
++        return HTP_STATUS_VTCM_TOO_SMALL;
++    }
++    if (!htp_ops_context_set_n_threads(octx, kp->n_threads)) {
++        return HTP_STATUS_INVAL_PARAMS;
++    }
++    if (octx->ctx->mdev.count > 1) {
++        return HTP_STATUS_NO_SUPPORT;
++    }
++
++    struct htp_rope_qkv_context qc;
++    memset(&qc, 0, sizeof(qc));
++    qc.rope.octx = octx;
++    rope_ctx_init_params(&qc.rope, &octx->op_params[0]);
++    // The fused op has the path of rope_job_f32 for the M-RoPE modes (MROPE, VISION, IMROPE): the cache of
++    // mrope_cache_init with the four positions of a token, and the NEOX pairs.
++    if ((qc.rope.mode & HTP_ROPE_TYPE_MROPE) == 0 || qc.rope.n_offs < 0 ||
++        (uint32_t) qc.rope.n_offs + (qc.rope.mode == HTP_ROPE_TYPE_VISION ? d : (uint32_t) qc.rope.n_dims) > d) {
++        return HTP_STATUS_NO_SUPPORT;
++    }
++    qc.kp     = kp;
++    qc.n_tok  = N;
++    qc.n_head = H;
++    qc.d      = d;
++
++    if (!(octx->flags & HTP_OPFLAGS_SKIP_COMPUTE)) {
++        work_queue_run(octx->ctx->work_queue, rope_qkv_job, &qc, kp->n_threads);
++    }
++    return HTP_STATUS_OK;
++}
+diff --git a/ggml/src/ggml-hexagon/htp/rope-ops.h b/ggml/src/ggml-hexagon/htp/rope-ops.h
+index 476653d..5fda7b7 100644
+--- a/ggml/src/ggml-hexagon/htp/rope-ops.h
++++ b/ggml/src/ggml-hexagon/htp/rope-ops.h
+@@ -53,4 +53,90 @@ static inline uint8_t * rope_spad_slot(uint8_t * base, uint32_t slot, size_t row
+     return base + (slot * HTP_ROPE_SPAD_BLOCK) * row_size_aligned;
+ }
+ 
++// HTP_OP_ROPE_QKV: the attention input of the vision encoder in one op (refer to op_rope_qkv in rope-ops.c).
++//   src[0]  the Q and K rows of the tokens, F32 [d, 2H, N]: H query heads, then H key heads, each head a
++//           contiguous row of d values (nb1 = 4 d), nb2 the token stride
++//   src[1]  the positions, I32 [4 N]
++//   src[3]  the V rows, the permuted F32 view [d, N, H] with the heads of a token contiguous (nb2 = 4 d)
++//   dst[0]  the ROPE output, F32 [d, 2H, N], contiguous
++//   dst[1]  K, F16 [d, N, H], contiguous: the ROPE output of the key heads
++//   dst[2]  V, F16 [d, N, H], contiguous
++// Each thread takes a range of tokens in blocks of `block` tokens. The VTCM of a thread holds the theta cache
++// and a ring of buffer sets. A set holds the Q and K rows of the block (F32, one token after the other), and with
++// the matching bits of `io` the V rows of the block and the F16 K and V rows of the block (the rows of a head
++// together, thus one DMA row of a head is the block).
++//
++// The bits of `io` select how the op moves each tensor:
++//   HTP_ROPE_QKV_IO_V_DMA    the V rows come into VTCM with DMA. Without it, HVX loads read them from DDR.
++//   HTP_ROPE_QKV_IO_OUT_DMA  the F16 K and V rows go to DDR with DMA. Without it, HVX stores write them.
++//   HTP_ROPE_QKV_IO_2SETS    a ring of 2 sets: the inputs of block b + 2 go into the set of block b while the
++//                            outputs of block b can still be in flight. Without it, a ring of 4 sets.
++#define HTP_ROPE_QKV_MAX_BLOCK   32
++#define HTP_ROPE_QKV_MAX_SETS    4
++#define HTP_ROPE_QKV_IO_V_DMA    1u
++#define HTP_ROPE_QKV_IO_OUT_DMA  2u
++#define HTP_ROPE_QKV_IO_2SETS    4u
++
++struct htp_rope_qkv_kernel_params {
++    uint32_t n_threads;
++    uint32_t block;             // the tokens of one block of a thread
++    uint32_t tokens_per_thread;
++    uint32_t vtcm_size;         // all threads
++    uint32_t bytes_per_thread;
++    uint32_t io;                // the bits HTP_ROPE_QKV_IO_*
++    uint32_t n_sets;
++    uint32_t off_theta;         // the offsets in the VTCM region of a thread
++    uint32_t off_qk[HTP_ROPE_QKV_MAX_SETS];
++    uint32_t off_v[HTP_ROPE_QKV_MAX_SETS];
++    uint32_t off_k16[HTP_ROPE_QKV_MAX_SETS];
++    uint32_t off_v16[HTP_ROPE_QKV_MAX_SETS];
++};
++
++#if defined(__cplusplus)
++static_assert(sizeof(struct htp_rope_qkv_kernel_params) <= 128, "htp_rope_qkv_kernel_params is too large for kernel_params blob");
++#else
++_Static_assert(sizeof(struct htp_rope_qkv_kernel_params) <= 128, "htp_rope_qkv_kernel_params is too large for kernel_params blob");
++#endif
++
++// The plan of HTP_OP_ROPE_QKV for head size d (a multiple of 64), H heads, N tokens, n_threads threads and the
++// access bits io, in vtcm_size bytes. Returns false when no block of one token fits. O(1).
++static inline bool htp_rope_qkv_plan(struct htp_rope_qkv_kernel_params * kp, uint32_t d, uint32_t H, uint32_t N,
++                                     uint32_t n_threads, uint32_t io, size_t vtcm_size) {
++    if (d == 0 || d % 64 != 0 || H == 0 || N == 0 || n_threads == 0) {
++        return false;
++    }
++    const uint32_t threads   = n_threads < N ? n_threads : N;
++    const uint32_t n_sets    = (io & HTP_ROPE_QKV_IO_2SETS) ? 2 : HTP_ROPE_QKV_MAX_SETS;
++    const size_t   qk_bytes  = (size_t) 2 * H * d * sizeof(float);   // the Q and K rows of one token
++    const size_t   v_bytes   = (io & HTP_ROPE_QKV_IO_V_DMA) ? (size_t) H * d * sizeof(float) : 0;
++    const size_t   f16_bytes = (io & HTP_ROPE_QKV_IO_OUT_DMA) ? (size_t) H * d * 2 : 0;  // the F16 K (or V) rows
++    const size_t   theta     = hex_round_up((uint32_t) (d * sizeof(float)), 256);
++    const size_t   per_token = qk_bytes + v_bytes + 2 * f16_bytes;   // one set
++    const size_t   budget    = vtcm_size / threads;
++    if (budget <= theta + n_sets * per_token) {
++        return false;
++    }
++    const uint32_t per_thread = (N + threads - 1) / threads;
++    uint32_t       block      = (uint32_t) ((budget - theta) / (n_sets * per_token));
++    block = block < HTP_ROPE_QKV_MAX_BLOCK ? block : HTP_ROPE_QKV_MAX_BLOCK;
++    block = block < per_thread ? block : per_thread;
++
++    kp->n_threads         = threads;
++    kp->block             = block;
++    kp->tokens_per_thread = per_thread;
++    kp->io                = io;
++    kp->n_sets            = n_sets;
++    kp->off_theta         = 0;
++    uint32_t off          = (uint32_t) theta;
++    for (uint32_t s = 0; s < n_sets; s++) {
++        kp->off_qk[s]  = off; off += (uint32_t) (block * qk_bytes);
++        kp->off_v[s]   = off; off += (uint32_t) (block * v_bytes);
++        kp->off_k16[s] = off; off += (uint32_t) (block * f16_bytes);
++        kp->off_v16[s] = off; off += (uint32_t) (block * f16_bytes);
++    }
++    kp->bytes_per_thread = hex_round_up(off, 128);
++    kp->vtcm_size        = kp->bytes_per_thread * threads;
++    return kp->vtcm_size <= vtcm_size;
++}
++
+ #endif // HTP_ROPE_OPS_H
+diff --git a/ggml/src/ggml-hexagon/htp/unary-ops.c b/ggml/src/ggml-hexagon/htp/unary-ops.c
+index 7e71d63..9dc6376 100644
+--- a/ggml/src/ggml-hexagon/htp/unary-ops.c
++++ b/ggml/src/ggml-hexagon/htp/unary-ops.c
+@@ -30,7 +30,8 @@ struct htp_unary_context {
+     const struct htp_unary_kernel_params * kparams;
+ 
+     const uint8_t *           data_src0;
+-    const uint8_t *           data_src1;            // weight/scale tensor for RMS_NORM_MUL
++    const uint8_t *           data_src1;            // weight/scale tensor for RMS_NORM_MUL and NORM_MUL_ADD
++    const uint8_t *           data_src2;            // the bias row of NORM_MUL_ADD, or NULL
+     uint8_t *                 data_dst;
+ 
+     size_t                    src0_data_row_size;   // actual data bytes per row
+@@ -225,6 +226,30 @@ static void norm_f32(const float * restrict src,
+     }
+ }
+ 
++// The LayerNorm: NORM, then MUL by the weight row, then ADD of the bias row (bias can be NULL). The NORM step
++// is norm_f32 of the NORM op on all rows of the block, with the epsilon of the op params (the op params of the
++// fused op are those of its NORM node). Then each row gets hvx_mul_f32_aaa of MUL and hvx_add_f32_aaa of
++// ADD, with the operands in the order of the graph. The rows stay in the VTCM between the steps.
++// O(num_rows * ne0).
++static void norm_mul_add_f32(const float * restrict src,
++                             const float * restrict weight,
++                             const float * restrict bias,
++                             float * restrict dst,
++                             const uint32_t num_rows,
++                             const struct htp_unary_context * uctx) {
++    norm_f32(src, dst, num_rows, uctx);
++
++    const uint32_t ne0                  = uctx->nc;
++    const size_t   dst_row_size_aligned = uctx->dst_row_size_aligned;
++    for (uint32_t ir = 0; ir < num_rows; ir++) {
++        uint8_t * row = (uint8_t *) dst + (ir * dst_row_size_aligned);
++        hvx_mul_f32_aaa(row, row, (const uint8_t *) weight, ne0);
++        if (bias) {
++            hvx_add_f32_aaa(row, row, (const uint8_t *) bias, ne0);
++        }
++    }
++}
++
+ static void sqr_f32(const float * restrict src,
+                     float * restrict dst,
+                     const uint32_t num_rows,
+@@ -752,6 +777,11 @@ static void unary_task_##SUFFIX##_##NAME(unsigned int nth, unsigned int ith, voi
+     if ((IS_RMS_NORM_MUL) && uctx->broadcast_weight) {                                                              \
+         dma_queue_push(dma_queue, dma_make_ptr(src1_vtcm_data, data_src1),                                          \
+                        uctx->src1_row_size_aligned, 0, uctx->src1_data_row_size, 1);                                \
++        if (uctx->data_src2) {                                                                                      \
++            /* NORM_MUL_ADD: the bias row follows the weight row */                                                 \
++            dma_queue_push(dma_queue, dma_make_ptr(src1_vtcm_data + uctx->src1_row_size_aligned, uctx->data_src2),  \
++                           uctx->src1_row_size_aligned, 0, uctx->src1_data_row_size, 1);                            \
++        }                                                                                                           \
+         dma_queue_flush(dma_queue);                                                                                 \
+     }                                                                                                               \
+                                                                                                                     \
+@@ -838,6 +868,10 @@ static void unary_task_##SUFFIX##_##NAME(unsigned int nth, unsigned int ith, voi
+ DEFINE_UNARY_TASK(norm,           false, false, norm_f32(src0_vtcm, dst_vtcm, block_size, uctx))
+ DEFINE_UNARY_TASK(rms_norm,       false, false, rms_norm_f32(src0_vtcm, dst_vtcm, block_size, uctx))
+ DEFINE_UNARY_TASK(rms_norm_mul,   true,  false, rms_norm_mul_f32(src0_vtcm, uctx->broadcast_weight ? (const float *) src1_vtcm_data : src1_vtcm, dst_vtcm, block_size, uctx))
++// The weight and the bias are broadcast rows (the host checks it): the weight row at src1_vtcm_data, the bias row after it.
++DEFINE_UNARY_TASK(norm_mul_add,   true,  false, norm_mul_add_f32(src0_vtcm, (const float *) src1_vtcm_data,
++                                                                 uctx->data_src2 ? (const float *) (src1_vtcm_data + uctx->src1_row_size_aligned) : NULL,
++                                                                 dst_vtcm, block_size, uctx))
+ DEFINE_UNARY_TASK(scale,          false, false, scale_f32(src0_vtcm, dst_vtcm, block_size, uctx))
+ DEFINE_UNARY_TASK(clamp,          false, false, clamp_f32(src0_vtcm, dst_vtcm, block_size, uctx))
+ DEFINE_UNARY_TASK(leaky_relu,     false, false, leaky_relu_f32(src0_vtcm, dst_vtcm, block_size, uctx))
+@@ -1146,6 +1180,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
+         case HTP_OP_NORM:            op_type = is_f16 ? "norm-f16"     : "norm-f32";         break;
+         case HTP_OP_RMS_NORM:        op_type = is_f16 ? "rmsnorm-f16"  : "rmsnorm-f32";      break;
+         case HTP_OP_RMS_NORM_MUL:    op_type = "rmsnorm-mul-f32";                            break;
++        case HTP_OP_NORM_MUL_ADD:    op_type = "norm-mul-add-f32";                           break;
+         case HTP_OP_SCALE:           op_type = is_f16 ? "scale-f16"    : "scale-f32";        break;
+         case HTP_OP_CLAMP:           op_type = is_f16 ? "clamp-f16"    : "clamp-f32";        break;
+         case HTP_OP_LEAKY_RELU:      op_type = "leaky-relu-f32";                             break;
+@@ -1229,12 +1264,26 @@ static int execute_op_unary(struct htp_ops_context * octx) {
+     bool broadcast_weight = kparams->broadcast_weight;
+     const struct htp_tensor * src1 = NULL;
+ 
+-    // RMS_NORM_MUL fusion is F32-only (its weight tensor is always F32; see
+-    // try_fuse_node()'s type guard), so this never triggers when is_f16 is true.
+-    if (octx->op == HTP_OP_RMS_NORM_MUL) {
++    // RMS_NORM_MUL and NORM_MUL_ADD are F32-only (the weight and the bias are always F32), so this never
++    // triggers when is_f16 is true. NORM_MUL_ADD reads a broadcast weight row and a broadcast bias row.
++    const bool has_weight = octx->op == HTP_OP_RMS_NORM_MUL || octx->op == HTP_OP_NORM_MUL_ADD;
++    const struct htp_tensor * src2 = NULL;
++    if (has_weight) {
+         src1 = octx->src[1];
+         src1_data_row_size = src1->ne[0] * sizeof(float);
+     }
++    if (octx->op == HTP_OP_NORM_MUL_ADD) {
++        if (is_f16 || !broadcast_weight || src1->type != HTP_TYPE_F32 || src1->ne[0] != src0->ne[0]) {
++            return HTP_STATUS_NO_SUPPORT;
++        }
++        if (kparams->has_bias) {
++            src2 = octx->src[2];
++            if (!src2 || src2->type != HTP_TYPE_F32 || src2->ne[0] != src0->ne[0] ||
++                src2->ne[1] * src2->ne[2] * src2->ne[3] != 1) {
++                return HTP_STATUS_NO_SUPPORT;
++            }
++        }
++    }
+ 
+     if (octx->ctx->vtcm_size < (size_t)kparams->vtcm_size) {
+         FARF(ERROR, "unary-%s : current VTCM reservation %zu is too small, needed %zu\n", op_type, octx->ctx->vtcm_size, (size_t)kparams->vtcm_size);
+@@ -1267,7 +1316,8 @@ static int execute_op_unary(struct htp_ops_context * octx) {
+             .row_start             = row_start,
+ 
+             .data_src0             = (const uint8_t *)src0->data,
+-            .data_src1             = (octx->op == HTP_OP_RMS_NORM_MUL) ? (const uint8_t *)src1->data : NULL,
++            .data_src1             = has_weight ? (const uint8_t *)src1->data : NULL,
++            .data_src2             = src2 ? (const uint8_t *)src2->data : NULL,
+             .data_dst              = (uint8_t *)dst->data,
+ 
+             .src0_data_row_size    = src0_data_row_size,
+@@ -1279,7 +1329,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
+             .dst_row_size_aligned  = dst_row_size_aligned,
+ 
+             .src0_vtcm_half_size   = kparams->vtcm_src0_size_per_thread / 2,
+-            .src1_vtcm_half_size   = (octx->op == HTP_OP_RMS_NORM_MUL) ? (kparams->vtcm_src1_size_per_thread / (broadcast_weight ? 1 : 2)) : 0,
++            .src1_vtcm_half_size   = has_weight ? (kparams->vtcm_src1_size_per_thread / (broadcast_weight ? 1 : 2)) : 0,
+             .dst_vtcm_half_size    = kparams->vtcm_dst_size_per_thread / 2,
+ 
+             .block                 = kparams->block,
+@@ -1338,6 +1388,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
+                 case HTP_OP_NORM:            task_func = unary_task_f32_norm;                 break;
+                 case HTP_OP_RMS_NORM:        task_func = unary_task_f32_rms_norm;             break;
+                 case HTP_OP_RMS_NORM_MUL:    task_func = unary_task_f32_rms_norm_mul;         break;
++                case HTP_OP_NORM_MUL_ADD:    task_func = unary_task_f32_norm_mul_add;         break;
+                 case HTP_OP_SCALE:           task_func = unary_task_f32_scale;                break;
+                 case HTP_OP_CLAMP:           task_func = unary_task_f32_clamp;                break;
+                 case HTP_OP_LEAKY_RELU:      task_func = unary_task_f32_leaky_relu;           break;
+diff --git a/ggml/src/ggml-hexagon/htp/unary-ops.h b/ggml/src/ggml-hexagon/htp/unary-ops.h
+index 451b822..f21f657 100644
+--- a/ggml/src/ggml-hexagon/htp/unary-ops.h
++++ b/ggml/src/ggml-hexagon/htp/unary-ops.h
+@@ -26,6 +26,9 @@ struct htp_unary_kernel_params {
+ 
+     uint32_t  vtcm_size;
+ 
++    // HTP_OP_NORM_MUL_ADD: 1 when the op has a bias (src2)
++    uint32_t  has_bias;
++
+     // Fastdiv helpers
+     struct fastdiv_values div_ne01;
+     struct fastdiv_values div_ne02;
+@@ -46,6 +49,7 @@ static inline bool htp_op_is_unary(uint32_t opcode) {
+         case HTP_OP_NORM:
+         case HTP_OP_RMS_NORM:
+         case HTP_OP_RMS_NORM_MUL:
++        case HTP_OP_NORM_MUL_ADD:
+         case HTP_OP_SCALE:
+         case HTP_OP_SQR:
+         case HTP_OP_SQRT:
+@@ -98,9 +102,12 @@ static inline void htp_unary_vtcm_layout_build(
+     const size_t src0_row_size_aligned = hex_round_up(src0_data_row_size, 128);
+     const size_t dst_row_size_aligned  = hex_round_up(dst_data_row_size,  128);
+ 
++    // RMS_NORM_MUL and NORM_MUL_ADD are F32-only; the weight (and the bias) are always F32. NORM_MUL_ADD
++    // always has a broadcast weight, and its src1 region holds two rows: the weight, then the bias.
++    const bool   has_src1  = op == HTP_OP_RMS_NORM_MUL || op == HTP_OP_NORM_MUL_ADD;
++    const size_t src1_rows = op == HTP_OP_NORM_MUL_ADD ? 2 : 1;
+     size_t src1_row_size_aligned = 0;
+-    if (op == HTP_OP_RMS_NORM_MUL) {
+-        // RMS_NORM_MUL fusion is F32-only; its weight tensor is always F32.
++    if (has_src1) {
+         const size_t src1_data_row_size = ne11 * sizeof(float);
+         src1_row_size_aligned = hex_round_up(src1_data_row_size, 128);
+     }
+@@ -108,10 +115,10 @@ static inline void htp_unary_vtcm_layout_build(
+     size_t vtcm_size_per_row = 0;
+     size_t vtcm_row_per_thread = 0;
+ 
+-    if (op == HTP_OP_RMS_NORM_MUL) {
++    if (has_src1) {
+         if (broadcast_weight) {
+             size_t available_vtcm = vtcm_size;
+-            size_t src1_vtcm_total = n_threads * src1_row_size_aligned;
++            size_t src1_vtcm_total = n_threads * src1_rows * src1_row_size_aligned;
+             if (available_vtcm > src1_vtcm_total) {
+                 available_vtcm -= src1_vtcm_total;
+             } else {
+@@ -128,8 +135,8 @@ static inline void htp_unary_vtcm_layout_build(
+         vtcm_row_per_thread = vtcm_size / (n_threads * vtcm_size_per_row);
+     }
+ 
+-    const bool is_reduction = (op == HTP_OP_NORM || op == HTP_OP_RMS_NORM ||
+-                               op == HTP_OP_RMS_NORM_MUL || op == HTP_OP_L2_NORM);
++    const bool is_reduction = (op == HTP_OP_NORM || op == HTP_OP_RMS_NORM || op == HTP_OP_RMS_NORM_MUL ||
++                               op == HTP_OP_NORM_MUL_ADD || op == HTP_OP_L2_NORM);
+     // The tiled fallback path below only has F32 task functions (unary_task_f32_tiled_*);
+     // F16 has no tiled kernels, so it must stay on the row-block path like reduction ops.
+     // NOTE: if F16 ends up with vtcm_row_per_thread == 0 here (row too large for the VTCM
+@@ -150,9 +157,9 @@ static inline void htp_unary_vtcm_layout_build(
+     } else {
+         L->src0_bytes = src0_row_size_aligned * vtcm_row_per_thread * 2;
+         L->dst_bytes  = dst_row_size_aligned * vtcm_row_per_thread * 2;
+-        if (op == HTP_OP_RMS_NORM_MUL) {
++        if (has_src1) {
+             if (broadcast_weight) {
+-                L->src1_bytes = src1_row_size_aligned;
++                L->src1_bytes = src1_rows * src1_row_size_aligned;
+             } else {
+                 L->src1_bytes = src1_row_size_aligned * vtcm_row_per_thread * 2;
+             }
+@@ -162,7 +169,7 @@ static inline void htp_unary_vtcm_layout_build(
+     }
+ 
+     L->off_src0 = 0;
+-    if (op == HTP_OP_RMS_NORM_MUL) {
++    if (has_src1) {
+         L->off_src1 = L->off_src0 + L->src0_bytes * n_threads;
+         L->off_dst  = L->off_src1 + L->src1_bytes * n_threads;
+     } else {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index b3ed0c1..19a1a6d 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -1187,6 +1187,11 @@ struct test_case {
+         return max_nmse_err(backend);
+     }
+ 
++    // True when the test writes the error of each compared tensor also when the error is in the limit
++    virtual bool print_err() {
++        return false;
++    }
++
+     virtual double err(const float * a, const float * b, size_t n) {
+         return nmse(a, b, n);
+     }
+@@ -1505,6 +1510,8 @@ struct test_case {
+                 //printf("\n");
+                 //exit(1);
+                 ud->ok = false;
++            } else if (ud->tc->print_err()) {
++                printf("[%s %s] ERR = %.3e ", ggml_op_desc(t1), t1->name, err);
+             }
+             return true;
+ 
+@@ -7714,6 +7721,216 @@ struct test_ffn_swiglu : public test_case {
+     }
+ };
+ 
++// The op chains of a layer of the vision encoder of Qwen3-VL and Qwen3.5 (tools/mtmd/models/qwen3vl.cpp), on a
++// whole graph, thus a backend can fuse each chain:
++//   ln    the LayerNorm (NORM, MUL by the weight, ADD of the bias), then the QKV MUL_MAT and its bias ADD
++//   gelu  the MLP: the up MUL_MAT and its bias ADD, GELU, the down MUL_MAT and its bias ADD
++//   res   the second half of a layer: the residual ADD, the LayerNorm, the MLP of gelu and the residual ADD. Some
++//         channels of the residual have values of approximately 1e5, as the residual of the last layers of the 4B
++//         projector: a path that puts such a value into F16 (maximum 65504) gives inf and fails
++//   attn  the attention input: one M-RoPE of the vision mode over the Q and K heads of the QKV product, the F16
++//         casts of the permuted K and V views, and the flash attention with no mask
++//   qkv   the QKV MUL_MAT and its bias ADD, then the chain of attn. The MUL_MAT writes the QKV product just before
++//         the attention input reads it, as in the model: the bytes that the MUL_MAT leaves in the caches of the
++//         DSP are part of the test
++// The random values of each case are different in each run, and `rep` makes the same shape again with different
++// values. The test writes the error of each compared tensor.
++struct test_vit_block : public test_case {
++    const std::string mode;
++    const int64_t     d;     // the head size (attn, qkv) or the width of a token (ln, gelu, res)
++    const int64_t     h;     // the heads (attn, qkv) or the rows of the first weight (ln, gelu, res)
++    const int64_t     n;     // the tokens
++    const int64_t     grid;  // attn, qkv: the width of the patch grid of the positions
++    const int         rep;   // the index of a case with the same shape
++
++    ggml_tensor * ln_out   = nullptr;  // res: the tensors that the test compares
++    ggml_tensor * mlp_out  = nullptr;
++    ggml_tensor * res_out  = nullptr;
++
++    // res: the largest value of the residual
++    static constexpr float kResMax = 1e5f;
++
++    test_vit_block(std::string mode, int64_t d, int64_t h, int64_t n, int64_t grid = 16, int rep = 0)
++        : mode(std::move(mode)), d(d), h(h), n(n), grid(grid), rep(rep) {}
++
++    std::string vars() override {
++        return VARS_TO_STR6(mode, d, h, n, grid, rep);
++    }
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "VIT_BLOCK";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    bool print_err() override { return true; }
++
++    std::vector<ggml_tensor *> fusion_test_nodes() override {
++        if (mode == "res") {
++            return { ln_out, mlp_out, res_out };
++        }
++        return {};
++    }
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        if (mode == "res") {
++            ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, n);
++            ggml_tensor * a  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, n);
++            ggml_tensor * w  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d);
++            ggml_tensor * b  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d);
++            ggml_tensor * W1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, d, h);
++            ggml_tensor * B1 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, h);
++            ggml_tensor * W2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, h, d);
++            ggml_tensor * B2 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d);
++            ggml_set_name(x, "resid");
++            ggml_set_name(a, "attn");
++            ggml_set_name(w, "ln_w");
++            ggml_set_name(b, "ln_b");
++            ggml_set_name(W1, "W1");
++            ggml_set_name(B1, "B1");
++            ggml_set_name(W2, "W2");
++            ggml_set_name(B2, "B2");
++            ggml_tensor * r = ggml_add(ctx, x, a);
++            ggml_set_name(r, "ffn_inp");
++            ln_out = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, r, 1e-6f), w), b);
++            ggml_set_name(ln_out, "ln");
++            ggml_tensor * up = ggml_add(ctx, ggml_mul_mat(ctx, W1, ln_out), B1);
++            mlp_out = ggml_add(ctx, ggml_mul_mat(ctx, W2, ggml_gelu(ctx, up)), B2);
++            ggml_set_name(mlp_out, "ffn_out");
++            res_out = ggml_add(ctx, r, mlp_out);
++            ggml_set_name(res_out, "out");
++            return res_out;
++        }
++        if (mode == "ln") {
++            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, n);
++            ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d);
++            ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d);
++            ggml_tensor * W = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, d, h);
++            ggml_tensor * B = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, h);
++            ggml_set_name(x, "x");
++            ggml_set_name(w, "ln_w");
++            ggml_set_name(b, "ln_b");
++            ggml_set_name(W, "W");
++            ggml_set_name(B, "B");
++            ggml_tensor * cur = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, x, 1e-6f), w), b);
++            ggml_set_name(cur, "ln");
++            ggml_tensor * out = ggml_add(ctx, ggml_mul_mat(ctx, W, cur), B);
++            ggml_set_name(out, "out");
++            return out;
++        }
++        if (mode == "gelu") {
++            ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, n);
++            ggml_tensor * W1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, d, h);
++            ggml_tensor * B1 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, h);
++            ggml_tensor * W2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, h, d);
++            ggml_tensor * B2 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d);
++            ggml_set_name(x, "x");
++            ggml_set_name(W1, "W1");
++            ggml_set_name(B1, "B1");
++            ggml_set_name(W2, "W2");
++            ggml_set_name(B2, "B2");
++            ggml_tensor * up = ggml_add(ctx, ggml_mul_mat(ctx, W1, x), B1);
++            ggml_tensor * g  = ggml_gelu(ctx, up);
++            ggml_set_name(g, "gelu");
++            ggml_tensor * out = ggml_add(ctx, ggml_mul_mat(ctx, W2, g), B2);
++            ggml_set_name(out, "out");
++            return out;
++        }
++        // attn and qkv: the views of qwen3vl.cpp over the QKV product [3 * h * d, n]
++        const int64_t embd = h * d;
++        ggml_tensor * qkv  = nullptr;
++        if (mode == "qkv") {
++            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, n);
++            ggml_tensor * W = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, embd, 3 * embd);
++            ggml_tensor * B = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3 * embd);
++            ggml_set_name(x, "x");
++            ggml_set_name(W, "Wqkv");
++            ggml_set_name(B, "B");
++            qkv = ggml_add(ctx, ggml_mul_mat(ctx, W, x), B);
++        } else {
++            qkv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3 * embd, n);
++        }
++        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * n);
++        ggml_set_name(qkv, "qkv");
++        ggml_set_name(pos, "pos");
++        ggml_tensor * QK = ggml_view_3d(ctx, qkv, d, 2 * h, n, ggml_row_size(qkv->type, d), qkv->nb[1], 0);
++        ggml_tensor * V  = ggml_view_3d(ctx, qkv, d, h, n, ggml_row_size(qkv->type, d), qkv->nb[1],
++                                        ggml_row_size(qkv->type, 2 * embd));
++        int sections[4] = { (int) d / 4, (int) d / 4, (int) d / 4, (int) d / 4 };
++        QK = ggml_rope_multi(ctx, QK, pos, nullptr, (int) d / 2, sections, GGML_ROPE_TYPE_VISION, 32768, 10000, 1, 0, 1,
++                             32, 1);
++        ggml_set_name(QK, "qk_rope");
++        ggml_tensor * Q = ggml_view_3d(ctx, QK, d, h, n, QK->nb[1], QK->nb[2], 0);
++        ggml_tensor * K = ggml_view_3d(ctx, QK, d, h, n, QK->nb[1], QK->nb[2], (size_t) h * QK->nb[1]);
++        ggml_tensor * q = ggml_permute(ctx, Q, 0, 2, 1, 3);
++        ggml_tensor * k = ggml_cast(ctx, ggml_permute(ctx, K, 0, 2, 1, 3), GGML_TYPE_F16);
++        ggml_tensor * v = ggml_cast(ctx, ggml_permute(ctx, V, 0, 2, 1, 3), GGML_TYPE_F16);
++        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f / std::sqrt((float) d), 0.0f, 0.0f);
++        ggml_prec_set_acc(out, GGML_PREC_F32);
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    // The weights have the range sqrt(3 / their input width), thus a product has about the range of its input.
++    // The positions are the rows and the columns of a patch grid, as the vision positions of mtmd.
++    // The input of qkv has the range 4: the logits then have a standard deviation of approximately 6, thus each
++    // query has a few large probabilities, as in the model. With the range 2 the softmax is almost flat, the output
++    // of a token is the mean of many V rows and is small, and the F16 rounding of K, V and the probabilities gives
++    // an NMSE of approximately 1e-3 at 2976 tokens.
++    // The residual of res: the range 2, and in three channels of each token a value of 2.5e4 to 1e5 (two positive
++    // channels, one negative channel), as the large channels of the residual of the model.
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            const std::string name = ggml_get_name(t);
++            if (name == "pos") {
++                std::vector<int32_t> p((size_t) 4 * n);
++                for (int64_t i = 0; i < n; i++) {
++                    p[i]         = (int32_t) (i / grid);
++                    p[i + n]     = (int32_t) (i % grid);
++                    p[i + 2 * n] = (int32_t) (i / grid);
++                    p[i + 3 * n] = (int32_t) (i % grid);
++                }
++                ggml_backend_tensor_set(t, p.data(), 0, p.size() * sizeof(int32_t));
++            } else if (name == "W" || name == "W1") {
++                const float a = std::sqrt(3.0f / (float) d);
++                init_tensor_uniform(t, -a, a);
++            } else if (name == "Wqkv") {
++                const float a = std::sqrt(3.0f / (float) (h * d));
++                init_tensor_uniform(t, -a, a);
++            } else if (name == "W2") {
++                const float a = std::sqrt(3.0f / (float) h);
++                init_tensor_uniform(t, -a, a);
++            } else if (name == "x" || name == "qkv") {
++                const float r = mode == "qkv" ? 4.0f : 2.0f;
++                init_tensor_uniform(t, -r, r);
++            } else if (name == "attn") {
++                init_tensor_uniform(t, -2.0f, 2.0f);
++            } else if (name == "resid") {
++                init_tensor_uniform(t, -2.0f, 2.0f);
++                std::vector<float> v((size_t) d * n);
++                ggml_backend_tensor_get(t, v.data(), 0, v.size() * sizeof(float));
++                std::mt19937                          gen(std::random_device{}());
++                std::uniform_real_distribution<float> u(0.25f, 1.0f);
++                const int64_t ch[3]  = { d / 7, d / 3, d - 5 };
++                const float   sgn[3] = { 1.0f, -1.0f, 1.0f };
++                for (int64_t i = 0; i < n; i++) {
++                    for (int c = 0; c < 3; c++) {
++                        v[(size_t) i * d + ch[c]] = sgn[c] * kResMax * u(gen);
++                    }
++                }
++                ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(float));
++            } else {
++                init_tensor_uniform(t);
++            }
++        }
++    }
++
++    double max_nmse_err() override {
++        return 1e-3;
++    }
++};
++
+ // GGML_OP_SUM
+ struct test_sum : public test_case {
+     const ggml_type type;
+@@ -11596,6 +11813,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_ffn_swiglu(GGML_TYPE_Q8_0, 2560, 9216, m, true, true, 2560));
+     }
+ 
++    // The chains of the vision encoder: a row count of 1, tails of the blocks, and the shapes of an image of 256
++    // tokens (1008 patches) of the 4B projector
++    for (int64_t n : {1, 7, 100, 1008}) {
++        test_cases.emplace_back(new test_vit_block("ln", 1024, 3072, n));
++        test_cases.emplace_back(new test_vit_block("gelu", 1024, 4096, n));
++    }
++    test_cases.emplace_back(new test_vit_block("ln", 96, 64, 33));
++    for (int64_t n : {1, 37, 100, 1008}) {
++        test_cases.emplace_back(new test_vit_block("attn", 64, 16, n, n == 1008 ? 28 : 10));
++    }
++    test_cases.emplace_back(new test_vit_block("attn", 64, 4, 200, 20));
++    test_cases.emplace_back(new test_vit_block("attn", 128, 2, 65, 13));
++    // The residual with values of more than the F16 maximum
++    for (int64_t n : {7, 1008}) {
++        test_cases.emplace_back(new test_vit_block("res", 1024, 4096, n));
++    }
++    // The QKV product of the model shapes: 256 tokens (1008 patches) and 744 tokens (2976 patches), three times
++    // each with different values
++    for (int64_t n : {100, 1008, 2976}) {
++        for (int rep = 0; rep < 3; rep++) {
++            test_cases.emplace_back(new test_vit_block("qkv", 64, 16, n, n == 2976 ? 48 : 28, rep));
++        }
++    }
++
+     // Both sides of the same row-count boundary as above, on the fused path.
+     for (int64_t rows : {6271, 6272, 6273}) {
+         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 2, rows, 256,

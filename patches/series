@@ -248,3 +248,4 @@ gdnk/0004-hexagon-fuse-the-conv-chain-of-the-verify-batch-of-a-draft-into-gdn-co
 hexagon-fa/0001-hexagon-a-flash-attention-kernel-whose-softmax-reads-the-hmx-tiles.patch
 hexagon-fa/0002-hexagon-the-tile-flash-attention-for-the-decode-shapes-in-spans-of-kv-rows.patch
 gdnk/0005-hexagon-skip-the-zero-terms-of-the-forward-substitution-of-version-2.patch
+hexagon-vit/0002-hexagon-fuse-the-layernorm-and-the-attention-input-of-the-vision-encoder.patch
