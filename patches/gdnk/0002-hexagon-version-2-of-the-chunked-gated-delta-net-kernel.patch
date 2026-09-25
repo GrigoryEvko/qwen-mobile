@@ -1,0 +1,1751 @@
+hexagon: version 2 of the chunked gated delta net kernel
+
+The cost
+
+On the phone (HTP0, Qwen3.5-4B Q8_0, one prefill ubatch of 1024 tokens) the
+chunked kernel of GATED_DELTA_NET takes 128 ms of the 1044 ms of the
+ubatch, 5.3 to 5.65 ms for each of the 24 layers. The PMU stage of
+2026-09-24 shows an op that the HVX instruction count bounds (1.82
+instructions per packet), with the HMX busy 9 % of the op and each HMX job
+between two HVX phases. The kernel lab (tools/htp-lab, target gdnk, the v79
+timing model) gives the split of the HVX work: the forward substitution
+takes 4 packets for each multiply-add (a conversion to IEEE after each
+product and each sum), the two transposes of K use vector scatters (about
+45 cycles each), the gates of a head come from scalar reads of VTCM (about
+27 cycles each), and a 32 x 32 transpose keeps 64 vectors on the stack.
+
+The change
+
+kernel_params[1] = 2 selects version 2 in gdn-chunk-ops.c. Version 1 stays
+unchanged for the A/B runs. Version 2 keeps the dataflow and changes these
+things:
+- The products take the plain tiles of K, Q and V. The per-token factors go
+  to the small operands: W = T' K with T' = T diag(beta e^gamma), U = T'' V
+  with T'' = T diag(beta), S_upd = K^T Delta' with Delta' = diag(e^(gamma_C
+  - gamma)) Delta. Thus K, Q and V each convert to f16 tiles once.
+- One transpose of K gives the weight of A and P and the input of S_upd.
+  It is a 32-bit shuffle transpose of the f16 rows through 4 KB of VTCM.
+- The forward substitution does two rows together, keeps qfloat sums,
+  skips the half of a row of T that is zero, and sets the lanes above the
+  diagonal to +0.
+- Each operand of an HVX multiply is 2^-50 or more, or +0: the smaller
+  values flush to +0. A strong decay makes values near the end of the f32
+  range. In the kernel lab a qfloat sum of such products gave -1.6e38 and
+  -inf where the true value is about 1e-39 (target gdnsolve).
+- A chunk with a zero coefficient in the forward substitution (a strong
+  decay flushes E to +0) takes the solve with the arithmetic of version 1:
+  each product and each sum goes to f32 at once, and a term with a zero
+  coefficient does not run. On the phone (stage gdnk2, gates from -20) the
+  qfloat sums of the paired solve gave values near 2^105 for such chunks,
+  with A' and beta finite and at most 1, where the lab gives values below
+  10. Version 1 gives correct results for the same chunks. The chunk decay
+  of the state update takes no multiply when it is zero.
+- The HMX product takes any tile strides, thus one tile set serves as an
+  activation and as a weight.
+- The DMA brings the gate and beta of the head as one column each.
+- Each HMX job runs beside the HVX work that it does not touch: m1 beside
+  the state update of the chunk before, m2 beside the output store of the
+  chunk before, m3 beside the loads and tiles of the next chunk. The output
+  rows go to DDR by DMA.
+- The op can apply the L2 norm of q and k when it loads them (gdn-step.h,
+  kernel_params[2..6]). The sequential kernel, the fused state step and the
+  tail tokens of the chunked kernel take the same norm. The host does not
+  ask for it in this patch.
+
+GGML_HEXAGON_GDN_CHUNK=2 is the new preset value. 1 selects version 1, and
+0 the sequential kernel for each batch.
+
+The results
+
+The kernel lab, timing model, 12 heads of 128, 512 tokens, 6 threads. The
+model does not time the HMX, and the lab does each DMA transfer as a
+memcpy on the thread. Thus the comparison uses the cycles of the kernel
+functions on the threads:
+    version 1    6.62 M cycles, 69.0 k for each row and chunk of 64 tokens
+    version 2    4.46 M cycles, 46.4 k for each row and chunk of 64 tokens
+The cycles of version 2 are 67 % of those of version 1. The forward
+substitution goes from 3.36 M cycles (phase b of version 1) to 1.78 M
+(phase solve of version 2, which also makes A', P', T' and T''). The
+flushes to +0 and the f32 solve of the chunks with a zero coefficient
+cost 0.94 M of the 4.46 M cycles. Without them, version 2 took 3.52 M
+cycles, but the phone gave values that are not finite.
+
+The functional runs against a float64 reference of the recurrence, with
+the HMX in the functional mode (the bound of test-backend-ops is 2e-6):
+    tokens  K  heads  gate from  norm  NMSE attention  NMSE state
+    128     1  4      -0.5       no    3.37e-07        2.36e-07
+    128     1  4      -8         no    3.25e-07        2.08e-07
+    128     1  4      -20        no    3.28e-07        1.94e-07
+    512     1  2      -0.5       no    3.56e-07        2.19e-07
+    70      1  4      -0.5       no    3.14e-07        3.03e-07
+    70      1  4 x 64 -3         yes   2.59e-07        1.96e-07
+    100     3  4      -0.5       yes   3.17e-07        6.34e-08
+    165     5  4      -0.5       yes   3.36e-07        3.27e-08
+    512     1  2      -0.5       yes   3.56e-07        2.19e-07
+The heads have 128 values, and 4 x 64 is 4 heads of 64 values. The
+snapshot slots of the K = 3 and K = 5 runs give 1.16e-07 and 8.71e-08.
+Version 1 gives 3.11e-07 and 1.46e-07 for 128 tokens from -8. Each HMX job
+gives the same bits when it runs before or after the HVX phase beside it
+(--defer 1, 128 tokens, and 165 tokens with the norm). Thus no phase
+writes an input of that job or reads its output.
+
+The phone stage gdnk of 2026-09-25 (HTP0, Qwen3.5-4B Q8_0) runs one build
+of the series with four switch settings. Variant C adds this patch to
+variant B (the conv DMA), and variant A is the kernels before the series.
+In one prefill ubatch of 1024 tokens, GATED_DELTA_NET takes 93.0 ms of DSP
+op time in place of 129.3 ms (the median of 6 graphs). test-backend-ops
+perf, the median of 2 rounds:
+    case                                    B          C
+    16 k heads, 32 v heads, 1024 tokens     5191 us    3112 us
+    32 heads, 1024 tokens, gates from -20   5911 us    4108 us
+pp512 gives 1061.5 t/s for C and 1014.6 t/s for A, and tg32 gives 10.67
+and 10.69 t/s. The stage gdnk2 of 2026-09-25 gives the KL divergence of
+the prefill path against the naive x86 base: 0.000588 +- 0.000042 for C
+and 0.000584 +- 0.000040 for A. The op tests of C and of the whole series
+pass.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    ggml/src/ggml-hexagon/ggml-hexagon.cpp
+    ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
+    ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c
+    ggml/src/ggml-hexagon/htp/gdn-step.h
+    ggml/src/ggml-hexagon/htp/htp-gdn-params.h
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index db07996..aa72664 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -124,10 +124,11 @@ enum ggml_hexagon_fusion_flags {
+ 
+ static int opt_opfusion_state = -1; // GGML_HEXAGON_OPFUSION_STATE: -1 = follow GGML_HEXAGON_OPFUSION, 0 = off, 1 = on
+ 
+-// GGML_HEXAGON_GDN_CHUNK: 1 = a batch of tokens runs the chunked gated delta rule on the HMX (the
+-// default), 0 = every batch runs the sequential kernel. The host gives the value to the DSP in the
+-// kernel params of each GATED_DELTA_NET op, thus an A/B run needs no other build.
+-static int opt_gdn_chunk = 1;
++// GGML_HEXAGON_GDN_CHUNK: the kernel of a batch of tokens in GATED_DELTA_NET. 2 = version 2 of the
++// chunked gated delta rule on the HMX (the default), 1 = version 1, 0 = every batch runs the sequential
++// kernel. The host gives the value to the DSP in the kernel params of each GATED_DELTA_NET op, thus an
++// A/B run needs no other build.
++static int opt_gdn_chunk = 2;
+ 
+ // GGML_HEXAGON_GDN_CONV_DMA: 1 = GDN_CONV_CHUNK moves its rows with the DMA (the default), 0 = it
+ // reads them with vector loads from DDR. The host gives the value in the kernel params of each op.
+@@ -7272,8 +7273,9 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+                     (struct htp_rope_kernel_params *)node.kernel_params
+                 );
+             } else if (node.opcode == HTP_OP_GATED_DELTA_NET) {
+-                // 1 keeps the sequential kernel for a batch of tokens (see GGML_HEXAGON_GDN_CHUNK)
+-                node.kernel_params[0] = opt_gdn_chunk ? 0 : 1;
++                // the kernel of a batch of tokens (see GGML_HEXAGON_GDN_CHUNK)
++                node.kernel_params[HTP_GDN_KP_SEQ]     = opt_gdn_chunk ? 0 : 1;
++                node.kernel_params[HTP_GDN_KP_VERSION] = opt_gdn_chunk;
+             }
+             return node;
+         };
+diff --git a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
+index cb4673e..93f3ad7 100644
+--- a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
++++ b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
+@@ -582,11 +582,37 @@ static inline void gdn_add_scaled_dot8_f32(float * restrict dst0, float * restri
+     hvx_vec_store_u(sums + 4, 4 * sizeof(float), hvx_vec_reduce_sum_f32x4(accB));
+ }
+ 
++// Multiplies the S_v floats of the aligned row x by r = s / sqrt(max(a * sum(x^2) + b, c)), the factor
++// of the L2 norm of gdn-step.h. The lanes of the last vector past S_v stay out of the sum. O(S_v).
++static void gdn_qk_norm_row(float * restrict x, uint32_t S_v, const struct gdn_qk_norm * nrm) {
++    const uint32_t nvec = S_v / 32;
++    const uint32_t nloe = S_v % 32;
++
++    HVX_Vector acc = Q6_V_vzero();
++    for (uint32_t i = 0; i < nvec; ++i) {
++        const HVX_Vector v = hvx_vmem(x + i * 32);
++        acc = Q6_Vqf32_vadd_Vqf32Vqf32(acc, Q6_Vqf32_vmpy_VsfVsf(v, v));
++    }
++    if (nloe) {
++        const HVX_Vector v = Q6_V_vmux_QVV(Q6_Q_vsetq2_R(nloe * sizeof(float)), hvx_vmem(x + nvec * 32), Q6_V_vzero());
++        acc = Q6_Vqf32_vadd_Vqf32Vqf32(acc, Q6_Vqf32_vmpy_VsfVsf(v, v));
++    }
++    const float sum = hvx_vec_get_f32(hvx_vec_reduce_sum_f32(Q6_Vsf_equals_Vqf32(acc)));
++
++    float d = nrm->a * sum + nrm->b;
++    d = d > nrm->c ? d : nrm->c;
++    const HVX_Vector vr = hvx_vec_splat_f32(nrm->s / sqrtf(d));
++    for (uint32_t i = 0; i < nvec + (nloe ? 1 : 0); ++i) {
++        hvx_vmem(x + i * 32) = hvx_vec_mul_f32_f32(hvx_vmem(x + i * 32), vr);
++    }
++}
++
+ // One token of the recurrence. Refer to gdn-step.h for the contract. The sequential threads of this
+ // file and the tail of the chunked kernel call it, thus the two paths give the same numbers.
+ void gdn_step_token_f32(float * restrict state, const float * restrict q_t, const float * restrict k_t,
+                         const float * restrict v_t, const float * restrict g_t, float beta_val,
+-                        float * restrict attn_out, uint32_t S_v, bool kda, float scale) {
++                        float * restrict attn_out, uint32_t S_v, bool kda, float scale,
++                        const struct gdn_qk_norm * nrm) {
+     float local_gate[HTP_GDN_MAX_SV] __attribute__((aligned(128)));
+     float local_q[HTP_GDN_MAX_SV] __attribute__((aligned(128)));
+     float local_k[HTP_GDN_MAX_SV] __attribute__((aligned(128)));
+@@ -594,6 +620,10 @@ void gdn_step_token_f32(float * restrict state, const float * restrict q_t, cons
+ 
+     hvx_copy_f32_au((uint8_t *) local_q, (const uint8_t *) q_t, S_v);
+     hvx_copy_f32_au((uint8_t *) local_k, (const uint8_t *) k_t, S_v);
++    if (nrm) {
++        gdn_qk_norm_row(local_q, S_v, nrm);
++        gdn_qk_norm_row(local_k, S_v, nrm);
++    }
+ 
+     if (kda) {
+         hvx_exp_f32((uint8_t *) local_gate, (const uint8_t *) g_t, S_v, false);
+@@ -744,6 +774,9 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
+ 
+     const bool kda = (g->ne[0] == S_v);
+ 
++    struct gdn_qk_norm nrm;
++    const struct gdn_qk_norm * p_nrm = gdn_qk_norm_from_params(&octx->kernel_params[HTP_GDN_KP_QKNORM], &nrm) ? &nrm : NULL;
++
+     dma_queue * dma = octx->ctx->dma[ith];
+     size_t state_aligned = (size_t) S_v * S_v * sizeof(float);
+     state_aligned = (state_aligned + 127) & ~(size_t)127;
+@@ -820,7 +853,7 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
+             const float beta_val = *(const float *) ((const uint8_t *) (uintptr_t) beta->data +
+                     (uint64_t) iv3 * beta->nb[3] + (uint64_t) t * beta->nb[2] + (uint64_t) iv1 * beta->nb[1]);
+ 
+-            gdn_step_token_f32(s_work_curr, q_t, k_t, v_t, g_t, beta_val, attn_data, S_v, kda, scale);
++            gdn_step_token_f32(s_work_curr, q_t, k_t, v_t, g_t, beta_val, attn_data, S_v, kda, scale, p_nrm);
+ 
+             if (K > 1) {
+                 // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
+@@ -904,6 +937,9 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
+ 
+     const bool kda = (g->ne[0] == S_v);
+ 
++    struct gdn_qk_norm nrm;
++    const struct gdn_qk_norm * p_nrm = gdn_qk_norm_from_params(&octx->kernel_params[HTP_GDN_KP_QKNORM], &nrm) ? &nrm : NULL;
++
+     dma_queue * dma = octx->ctx->dma[ith];
+     size_t state_aligned = (size_t) S_v * S_v * sizeof(float);
+     state_aligned = (state_aligned + 127) & ~(size_t)127;
+@@ -978,7 +1014,7 @@ static void gated_delta_net_f32_tg_thread(unsigned int nth, unsigned int ith, vo
+         const float beta_val = *(const float *) ((const uint8_t *) (uintptr_t) beta->data +
+                 (uint64_t) iv3 * beta->nb[3] + (uint64_t) iv1 * beta->nb[1]);
+ 
+-        gdn_step_token_f32(s_work_curr, q_t, k_t, v_t, g_t, beta_val, attn_data, S_v, kda, scale);
++        gdn_step_token_f32(s_work_curr, q_t, k_t, v_t, g_t, beta_val, attn_data, S_v, kda, scale, p_nrm);
+ 
+         // Push real write-back. A final state that shares an L2 line with the attention output
+         // (written through the cache) takes the cache path too: the write-back of that dirty line
+diff --git a/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c b/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c
+index f6550d3..dfbd0a9 100644
+--- a/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c
++++ b/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c
+@@ -946,7 +946,7 @@ static void gdn_ch_tail_token(struct gdn_ch_ctx * c, uint32_t i, const struct gd
+     float * attn = rp->attn + (size_t) t * c->D * c->H;
+ 
+     // The kernel takes a scalar gate only, thus kda is false. Refer to the selection of the op.
+-    gdn_step_token_f32(rw->stg_q, q_t, k_t, v_t, g_t, b_t, attn, c->D, false, c->scale);
++    gdn_step_token_f32(rw->stg_q, q_t, k_t, v_t, g_t, b_t, attn, c->D, false, c->scale, NULL);
+ }
+ 
+ // The last chunk of the group, then the tail tokens, and the state of each snapshot slot to DDR
+@@ -1112,6 +1112,1403 @@ static size_t gdn_ch_layout_row(struct gdn_ch_row * rw, uint8_t * base, uint32_t
+     return off;
+ }
+ 
++// ---- version 2 of the chunked kernel
++//
++// kernel_params[1] = 2 selects this version (the host switch GGML_HEXAGON_GDN_CHUNK=2). The dataflow is
++// the one of the head of this file. These changes remove the costs that the kernel lab measured in the
++// version above (tools/htp-lab, target gdnk):
++//   - The products take the plain tiles of K, Q and V. The per-token factors go to the small operands:
++//     beta and the decay to the columns of T, e^(gamma_C - gamma) to the rows of Delta, the decay to E.
++//     Thus W = T' K with T' = T diag(beta e^gamma), U = T'' V with T'' = T diag(beta), and
++//     S_upd = K^T Delta' with Delta' = diag(e^(gamma_C - gamma)) Delta.
++//   - One transpose of K gives the weight of A and P and the input of S_upd. It is a 32-bit shuffle
++//     transpose of the f16 rows: a pair of f16 values of one row is one 32-bit word, and a word
++//     transpose of 32 rows gives the paired rows of a weight tile. The version above used two
++//     transposes with vector scatters, and a scatter retires in about 45 cycles.
++//   - The forward substitution keeps qfloat accumulators, four chains, and skips the half of a row of
++//     T that is zero. The version above converted each product and each sum to IEEE and took 4
++//     packets for each multiply-add.
++//   - A' = A * E is one widening multiply of the two f16 tiles, and P' = P * E the same with a mask.
++//   - The DMA brings the gate and beta of the head as one column, thus no scalar code reads VTCM.
++//     A scalar read of VTCM waits about 27 cycles.
++//   - Each HMX job overlaps HVX work that it does not touch: m1 the state update of the previous
++//     chunk, m2 the output store of the previous chunk, m3 the loads and tiles of the next chunk.
++//   - The output rows go to DDR by DMA.
++//   - Optional: the L2 norm of q and k (gdn-step.h), a factor for each token row that the tiles of K
++//     and Q take in their conversion.
++//
++// The tile grids. A tile is 32 x 32 fp16, its vector p holds the rows 2p and 2p + 1 with the lanes
++// interleaved. The HMX product of this version takes any tile strides (struct gdn_c2_sum), thus one
++// set of tiles serves as an activation and as a weight:
++//   k_t, q_t, qg, v_t   [token tile][feature tile]    (the rows of K, Q, Q_g and V)
++//   kT                  [token tile][feature tile]    (K^T: rows are features, lanes are tokens)
++//   e_a, out_a, out_p, t2  [token tile][token tile]   (C x C)
++//   out_w, out_u, out_ws, o_t  [token tile][feature tile]
++//   s_upd  [key tile][value tile], s_wt  [value tile][key tile] (the weight grid of S_0)
++
++#define GDN_C2_MAX_PROD (GDN_CH_MAX_GROUP * 3)
++
++// The HMX job and the HVX work of the op thread run at the same time. A test program can set this hook
++// to run the job at the wait instead of at the push, and so find a missing dependency.
++#ifndef GDN_C2_HMX_WAIT_HOOK
++#define GDN_C2_HMX_WAIT_HOOK() ((void) 0)
++#endif
++
++// A test program can set this to 1: each chunk then takes gdn_c2_solve_f32, also with no zero coefficient
++#ifndef GDN_C2_SOLVE_F32_ALWAYS
++#define GDN_C2_SOLVE_F32_ALWAYS 0
++#endif
++
++// One sum of tile products. The tile of act at (r, k) is act + (r * a_r + k * a_k) tiles, and the tile
++// of wt at (k, c) is wt + (k * w_k + c * w_c) tiles. tri limits k to k <= r.
++struct gdn_c2_sum {
++    const __fp16 * act;
++    const __fp16 * wt;
++    uint16_t       a_r;
++    uint16_t       a_k;
++    uint16_t       w_k;
++    uint16_t       w_c;
++    uint8_t        n_k;
++    uint8_t        tri;
++};
++
++// One HMX product: the output tile (r, c) at out + (r * o_r + c * o_c) tiles is the sum of the n_s sums.
++// lower skips the tiles with c > r.
++struct gdn_c2_prod {
++    struct gdn_c2_sum s[2];
++    __fp16 *          out;
++    uint16_t          o_r;
++    uint16_t          o_c;
++    uint8_t           n_r;
++    uint8_t           n_c;
++    uint8_t           n_s;
++    uint8_t           lower;
++};
++
++struct gdn_c2_job {
++    const uint8_t *            scales;
++    const struct gdn_c2_prod * prod;
++    uint32_t                   n_stage0; // the products from here on read the output of the ones before
++    uint32_t                   n_prod;
++};
++
++// The VTCM buffers of one row. Three buffers take a second role in a phase where their first role is
++// dead: out_w holds the K rows of phase prep, E of the fallback and A' of phase solve; out_ws holds T.
++struct gdn_c2_row {
++    float *  stg_q;   // [C x D] f32, the DMA targets of the chunk
++    float *  stg_k;   // stg_q and stg_k are adjacent: together they stage the D x D state
++    float *  stg_v;
++    float *  stg_gb;  // [2][C] f32, the gate and beta of the head for the chunk tokens
++    float *  s32;     // [D x D] f32, S[i][j]
++    __fp16 * e_a;     // E
++    __fp16 * k_t;
++    __fp16 * v_t;
++    __fp16 * q_t;     // scale * Q
++    __fp16 * kT[2];   // K^T, by the parity of the chunk
++    __fp16 * qg[2];   // scale * e^gamma * Q, by the parity of the chunk
++    __fp16 * out_a;   // A, then T'
++    __fp16 * out_p;   // P, then P'
++    __fp16 * t2;      // T''
++    __fp16 * out_w;   // W
++    __fp16 * out_u;   // U, then Delta
++    __fp16 * out_ws;  // W S_0, then Delta'
++    __fp16 * o_t;     // O
++    __fp16 * s_upd;   // (K^T Delta')
++    __fp16 * s_wt;    // S_0
++    float *  o32;     // [C x D] f32, the output rows for the DMA
++    HVX_Vector * scr; // 32 vectors, the scratch of the transposes
++};
++
++// The per-token values of one row and chunk. They live in DDR: the scalar code reads them from its
++// cache, and a scalar read of VTCM is slow.
++struct gdn_c2_scal {
++    float gam[GDN_CH_C] __attribute__((aligned(VLEN))); // the cumulative log decay
++    float bet[GDN_CH_C] __attribute__((aligned(VLEN))); // beta
++    float egc[GDN_CH_C] __attribute__((aligned(VLEN))); // exp(gamma_C - gamma)
++    float cs1[GDN_CH_C] __attribute__((aligned(VLEN))); // beta * exp(gamma), the column scale of T'
++    float u[GDN_CH_C]   __attribute__((aligned(VLEN))); // the row factor of E
++    float w[GDN_CH_C]   __attribute__((aligned(VLEN))); // the column factor of E
++    float rq[GDN_CH_C]  __attribute__((aligned(VLEN))); // scale times the norm factor of q
++    float sq[GDN_CH_C]  __attribute__((aligned(VLEN))); // scale * exp(gamma) times the norm factor of q
++    float rk[GDN_CH_C]  __attribute__((aligned(VLEN))); // the norm factor of k
++    float eC[2];                                        // exp(gamma_C), by the parity of the chunk
++    int   span_ok;                                      // the factored E holds this chunk
++};
++
++struct gdn_c2_ctx {
++    struct htp_ops_context * octx;
++    struct gdn_c2_row        row[GDN_CH_MAX_GROUP];
++    struct gdn_c2_scal       scal[GDN_CH_MAX_GROUP];
++    const uint8_t *          scales;
++    uint32_t                 row0;
++    uint32_t                 n_rows;
++    uint32_t                 n_use;
++    uint32_t                 rows_per_thread;
++    uint32_t                 ic;       // the chunk of the phases solve, delta and state
++    uint32_t                 ic_prep;  // the chunk of the phase prep
++    uint32_t                 ic_store; // the chunk of the phase store
++    uint32_t                 n_chunks;
++    uint32_t                 D;
++    uint32_t                 H;
++    uint32_t                 n_tokens;
++    uint32_t                 n_tok_ch;
++    uint32_t                 n_tail;
++    uint64_t                 snap_stride;
++    uint32_t                 n_seqs;
++    uint32_t                 n_kt;
++    float                    scale;
++    bool                     qknorm;
++    struct gdn_qk_norm       nrm;
++    struct gdn_c2_prod       prod[GDN_C2_MAX_PROD];
++    struct gdn_c2_job        job;
++};
++
++static void gdn_c2_hmx_run(void * data) {
++    const struct gdn_c2_job * job = (const struct gdn_c2_job *) data;
++
++    asm volatile(HMX_SET_BIAS("%0") :: "r"((unsigned int) (uintptr_t) job->scales));
++
++    for (uint32_t ip = 0; ip < job->n_prod; ++ip) {
++        if (ip == job->n_stage0 && ip != 0) {
++            // The products from here on read tiles that the products before them wrote
++            asm volatile("syncht" : : : "memory");
++        }
++        const struct gdn_c2_prod * p = &job->prod[ip];
++        for (uint32_t r = 0; r < p->n_r; ++r) {
++            for (uint32_t c = 0; c < p->n_c; ++c) {
++                if (p->lower && c > r) {
++                    continue;
++                }
++                asm volatile(HMX_CLRACC_F16());
++                for (uint32_t si = 0; si < p->n_s; ++si) {
++                    const struct gdn_c2_sum * s = &p->s[si];
++                    const uint32_t nk = (s->tri && r + 1 < s->n_k) ? r + 1 : s->n_k;
++                    if (s->a_k == 1 && s->w_k == 1) {
++                        // The tiles of this sum are contiguous: one instruction streams them
++                        const __fp16 * act   = s->act + (size_t) (r * s->a_r) * GDN_CH_TILE;
++                        const __fp16 * wt    = s->wt + (size_t) (c * s->w_c) * GDN_CH_TILE;
++                        const uint32_t range = 2048u * nk - 1;
++                        asm volatile(HMX_LOAD_MPY_DEEP_F16("%1", "%2", "%0") : : "r"(range), "r"(act), "r"(wt));
++                    } else {
++                        for (uint32_t k = 0; k < nk; ++k) {
++                            const __fp16 * act = s->act + (size_t) (r * s->a_r + k * s->a_k) * GDN_CH_TILE;
++                            const __fp16 * wt  = s->wt + (size_t) (k * s->w_k + c * s->w_c) * GDN_CH_TILE;
++                            asm volatile(HMX_LOAD_MPY_DEEP_F16("%1", "%2", "%0") : : "r"(2047u), "r"(act), "r"(wt));
++                        }
++                    }
++                }
++                __fp16 * out = p->out + (size_t) (r * p->o_r + c * p->o_c) * GDN_CH_TILE;
++                asm volatile(HMX_STORE_AFTER_F16("%0", "%1") : : "r"(out), "r"(0) : "memory");
++            }
++        }
++    }
++}
++
++// Gives the job to the HMX queue thread and returns the slot of its descriptor, or -1 when the queue
++// takes no job. Refer to gdn_ch_hmx_submit for the slot rule. Only the op thread calls this.
++static int gdn_c2_hmx_push(struct gdn_c2_ctx * c) {
++    hmx_queue_t q = c->octx->ctx->hmx_queue;
++
++    // The job reads the tiles that the workers wrote. The join of work_queue_run ordered their writes
++    // before this point, and syncht waits for the writes of this thread.
++    asm volatile("syncht" : : : "memory");
++
++    const unsigned int my = atomic_load(&q->idx_write);
++    if (!hmx_queue_push(q, hmx_queue_make_desc(gdn_c2_hmx_run, &c->job))) {
++        return -1;
++    }
++    return (int) my;
++}
++
++// Waits for the job of the slot. Returns 0, or the detail code of the failure.
++static int gdn_c2_hmx_wait(struct gdn_c2_ctx * c, int slot) {
++    hmx_queue_t q = c->octx->ctx->hmx_queue;
++    if (slot < 0) {
++        return GDN_CH_ERR_QUEUE_FULL;
++    }
++    GDN_C2_HMX_WAIT_HOOK();
++
++    struct hmx_queue_desc * d = &q->desc[slot];
++    const uint64_t deadline = hex_get_cycles() + GDN_CH_WAIT_CYCLES;
++    while (!atomic_load(&d->done)) {
++        if (hex_get_cycles() > deadline) {
++            FARF(ERROR, "gdn-chunk: the HMX queue did not finish a job of %u products inside %llu cycles\n",
++                 c->job.n_prod, (unsigned long long) GDN_CH_WAIT_CYCLES);
++            q->idx_pop = ((unsigned int) slot + 1) & q->idx_mask;
++            return GDN_CH_ERR_TIMEOUT;
++        }
++        hex_pause();
++    }
++    q->idx_pop = ((unsigned int) slot + 1) & q->idx_mask;
++    // The tiles that the job wrote are in VTCM before the workers read them
++    asm volatile("syncht" : : : "memory");
++    return 0;
++}
++
++static inline void gdn_c2_sum_set(struct gdn_c2_sum * s, const __fp16 * act, uint32_t a_r, uint32_t a_k,
++                                  const __fp16 * wt, uint32_t w_k, uint32_t w_c, uint32_t n_k, bool tri) {
++    s->act = act;
++    s->wt  = wt;
++    s->a_r = (uint16_t) a_r;
++    s->a_k = (uint16_t) a_k;
++    s->w_k = (uint16_t) w_k;
++    s->w_c = (uint16_t) w_c;
++    s->n_k = (uint8_t) n_k;
++    s->tri = tri ? 1 : 0;
++}
++
++static inline struct gdn_c2_prod * gdn_c2_prod_set(struct gdn_c2_prod * p, __fp16 * out, uint32_t o_r, uint32_t o_c,
++                                                   uint32_t n_r, uint32_t n_c, bool lower) {
++    p->out   = out;
++    p->o_r   = (uint16_t) o_r;
++    p->o_c   = (uint16_t) o_c;
++    p->n_r   = (uint8_t) n_r;
++    p->n_c   = (uint8_t) n_c;
++    p->n_s   = 1;
++    p->lower = lower ? 1 : 0;
++    return p;
++}
++
++// ---- the HVX helpers of version 2
++
++// The lanes of x with a magnitude below 2^-50 become +0. A strong decay makes values much smaller than
++// that in T, in A', in the state and in the per-token factors. A qfloat product or sum whose value falls
++// below the normal f32 range does not give that small value:
++//   - In the kernel lab (target gdnsolve, gates from -8 and from -20) such a sum gave -1.6e38 and -inf
++//     where the true value is about 1e-39.
++//   - On the v79 NPU of the phone (stage gdnk2, gates from -20) the forward substitution gave values
++//     near 2^105 where the lab gives values below 10, and the operands of its last multiply (the sum
++//     of a row and beta) had no flush.
++// Thus each operand of a multiply of version 2 is 2^-50 or more, or zero. Then each product is 2^-100
++// or more, and a sum of such products is 0 or 2^-125 or more (the operands have 24-bit mantissas), in
++// the normal range. A flushed value adds at most 64 * 2^-50 to a sum of O(1) terms, far below the f16
++// rounding of the HMX inputs. The test is on the exponent field: three integer operations and no float
++// compare.
++static inline HVX_Vector gdn_c2_ftz(HVX_Vector x) {
++    const HVX_Vector exp_mask = Q6_V_vsplat_R(0x7F800000);
++    const HVX_Vector exp_min  = Q6_V_vsplat_R((127 - 50) << 23);
++    const HVX_VectorPred tiny = Q6_Q_vcmp_gt_VwVw(exp_min, Q6_V_vand_VV(x, exp_mask));
++    return Q6_V_vmux_QVV(tiny, Q6_V_vzero(), x);
++}
++
++// The f16 tile vector of two f32 rows, each multiplied by its own factor: lane 2i is x0[i] * s0 and
++// lane 2i + 1 is x1[i] * s1. The products stay in qfloat, thus the one rounding is the one to f16. The
++// rows go through gdn_c2_ftz, and the factors must be 2^-50 or more, or zero.
++static inline HVX_Vector gdn_c2_pair_f16(HVX_Vector x0, HVX_Vector x1, HVX_Vector s0, HVX_Vector s1) {
++    const HVX_Vector q0 = Q6_Vqf32_vmpy_VsfVsf(gdn_c2_ftz(x0), s0);
++    const HVX_Vector q1 = Q6_Vqf32_vmpy_VsfVsf(gdn_c2_ftz(x1), s1);
++    return Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(q1, q0));
++}
++
++// The f16 tile vector of two f32 rows without a factor. The add of zero converts to qfloat in the adder,
++// thus it leaves the multipliers to the other work of the loop. It gives +0 for -0, which the HMX
++// input does not care about. The rows go through gdn_c2_ftz: a value below 2^-50 is 0 in f16 anyway.
++static inline HVX_Vector gdn_c2_pair_f16_plain(HVX_Vector x0, HVX_Vector x1) {
++    const HVX_Vector zero = Q6_V_vzero();
++    const HVX_Vector q0   = Q6_Vqf32_vadd_VsfVsf(gdn_c2_ftz(x0), zero);
++    const HVX_Vector q1   = Q6_Vqf32_vadd_VsfVsf(gdn_c2_ftz(x1), zero);
++    return Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(q1, q0));
++}
++
++// The 32 x 32 transpose of 32-bit words: output vector q holds word q of each of the 32 input rows,
++// in row order. The input row r is at in + r * in_stride bytes. The output vector q goes to
++// (q < 16 ? out_lo : out_hi) + (q % 16) * out_stride bytes, and a NULL half is not written. scr is
++// 32 vectors of VTCM.
++//
++// The network is the five shuffle stages of gdn_ch_transpose_32x32_f32, in four passes through scr
++// with at most 16 live vectors: stages 1 and 2 on groups of 4 rows, stage 3 on groups of 8, stage 4 on
++// groups of 16, stage 5 in pairs to the output. gdn_ch_transpose_32x32_f32 holds 64 vectors, thus the
++// compiler keeps them on the stack in DDR. This form reads and writes VTCM only: 128 loads, 64 permutes
++// and 128 stores.
++static void gdn_c2_transpose32(HVX_Vector * restrict scr, const uint8_t * in, size_t in_stride, uint8_t * out_lo,
++                               uint8_t * out_hi, size_t out_stride) {
++    for (uint32_t g = 0; g < 8; ++g) {
++        const HVX_Vector v0 = hvx_vmem(in + (size_t) (4 * g + 0) * in_stride);
++        const HVX_Vector v1 = hvx_vmem(in + (size_t) (4 * g + 1) * in_stride);
++        const HVX_Vector v2 = hvx_vmem(in + (size_t) (4 * g + 2) * in_stride);
++        const HVX_Vector v3 = hvx_vmem(in + (size_t) (4 * g + 3) * in_stride);
++        const HVX_VectorPair p01 = Q6_W_vshuff_VVR(v1, v0, -4);
++        const HVX_VectorPair p23 = Q6_W_vshuff_VVR(v3, v2, -4);
++        const HVX_VectorPair q0  = Q6_W_vshuff_VVR(Q6_V_lo_W(p23), Q6_V_lo_W(p01), -8);
++        const HVX_VectorPair q1  = Q6_W_vshuff_VVR(Q6_V_hi_W(p23), Q6_V_hi_W(p01), -8);
++        scr[4 * g + 0] = Q6_V_lo_W(q0);
++        scr[4 * g + 1] = Q6_V_hi_W(q0);
++        scr[4 * g + 2] = Q6_V_lo_W(q1);
++        scr[4 * g + 3] = Q6_V_hi_W(q1);
++    }
++    for (uint32_t b = 0; b < 32; b += 8) {
++        HVX_Vector m[8];
++        for (uint32_t i = 0; i < 8; ++i) {
++            m[i] = scr[b + i];
++        }
++        for (uint32_t i = 0; i < 4; ++i) {
++            const HVX_VectorPair p = Q6_W_vshuff_VVR(m[i + 4], m[i], -16);
++            scr[b + 2 * i + 0] = Q6_V_lo_W(p);
++            scr[b + 2 * i + 1] = Q6_V_hi_W(p);
++        }
++    }
++    for (uint32_t b = 0; b < 32; b += 16) {
++        HVX_Vector t[16];
++        for (uint32_t i = 0; i < 16; ++i) {
++            t[i] = scr[b + i];
++        }
++        for (uint32_t i = 0; i < 8; ++i) {
++            const HVX_VectorPair p = Q6_W_vshuff_VVR(t[i + 8], t[i], -32);
++            scr[b + 2 * i + 0] = Q6_V_lo_W(p);
++            scr[b + 2 * i + 1] = Q6_V_hi_W(p);
++        }
++    }
++    for (uint32_t i = 0; i < 16; ++i) {
++        const HVX_VectorPair p = Q6_W_vshuff_VVR(scr[i + 16], scr[i], -64);
++        const uint32_t q0 = 2 * i;
++        const uint32_t q1 = 2 * i + 1;
++        uint8_t * o0 = q0 < 16 ? out_lo : out_hi;
++        uint8_t * o1 = q1 < 16 ? out_lo : out_hi;
++        if (o0) {
++            hvx_vmem(o0 + (size_t) (q0 % 16) * out_stride) = Q6_V_lo_W(p);
++        }
++        if (o1) {
++            hvx_vmem(o1 + (size_t) (q1 % 16) * out_stride) = Q6_V_hi_W(p);
++        }
++    }
++}
++
++// dst[c][r] = src[r][c] for an n x n f32 matrix in VTCM (n a multiple of 32), block by block through
++// gdn_c2_transpose32. O(n^2).
++static void gdn_c2_transpose_f32(float * restrict dst, const float * restrict src, uint32_t n, HVX_Vector * scr) {
++    for (uint32_t bi = 0; bi < n; bi += 32) {
++        for (uint32_t bj = 0; bj < n; bj += 32) {
++            uint8_t * out = (uint8_t *) (dst + (size_t) bj * n + bi);
++            gdn_c2_transpose32(scr, (const uint8_t *) (src + (size_t) bi * n + bj), n * sizeof(float), out,
++                               out + (size_t) 16 * n * sizeof(float), n * sizeof(float));
++        }
++    }
++    gdn_ch_mem_sync();
++}
++
++// One stage of the row sums: lanes 0 to 15 of the result hold the sums of the lane pairs of p0, and
++// lanes 16 to 31 those of p1. Thus the result holds the rows of p0 and of p1 with half the partial sums.
++static inline HVX_Vector gdn_c2_fold(HVX_Vector p0, HVX_Vector p1) {
++    const HVX_VectorPair d = Q6_W_vdeal_VVR(p1, p0, -4);
++    return Q6_Vqf32_vadd_Vqf32Vqf32(Q6_V_lo_W(d), Q6_V_hi_W(d));
++}
++
++// The norm factors of the C rows of an f32 block [C x D] (D a multiple of 32): r = s / sqrt(max(a * sum
++// + b, c)) for each row, into out[C]. Four rows go together as four independent sums. Five stages of
++// gdn_c2_fold give the vector whose lane r holds the sum of row r of 32 rows. The sums stay in qfloat
++// and in registers until the last stage. O(C * D).
++static void gdn_c2_norm_factors(float * restrict out, const float * restrict x, uint32_t D,
++                                const struct gdn_qk_norm * nrm) {
++    const HVX_Vector va   = hvx_vec_splat_f32(nrm->a);
++    const HVX_Vector vb   = hvx_vec_splat_f32(nrm->b);
++    const HVX_Vector vc   = hvx_vec_splat_f32(nrm->c);
++    const HVX_Vector vs   = hvx_vec_splat_f32(nrm->s);
++    const HVX_Vector zero = Q6_V_vzero();
++    for (uint32_t t0 = 0; t0 < GDN_CH_C; t0 += 32) {
++        HVX_Vector g[8];
++        for (uint32_t r = 0; r < 32; r += 4) {
++            const float * x0 = x + (size_t) (t0 + r) * D;
++            HVX_Vector a0 = zero, a1 = zero, a2 = zero, a3 = zero;
++            for (uint32_t j = 0; j < D; j += 32) {
++                // each value is both operands of its square (refer to gdn_c2_ftz)
++                const HVX_Vector v0 = gdn_c2_ftz(hvx_vmem(x0 + j));
++                const HVX_Vector v1 = gdn_c2_ftz(hvx_vmem(x0 + D + j));
++                const HVX_Vector v2 = gdn_c2_ftz(hvx_vmem(x0 + 2 * D + j));
++                const HVX_Vector v3 = gdn_c2_ftz(hvx_vmem(x0 + 3 * D + j));
++                a0 = Q6_Vqf32_vadd_Vqf32Vqf32(a0, Q6_Vqf32_vmpy_VsfVsf(v0, v0));
++                a1 = Q6_Vqf32_vadd_Vqf32Vqf32(a1, Q6_Vqf32_vmpy_VsfVsf(v1, v1));
++                a2 = Q6_Vqf32_vadd_Vqf32Vqf32(a2, Q6_Vqf32_vmpy_VsfVsf(v2, v2));
++                a3 = Q6_Vqf32_vadd_Vqf32Vqf32(a3, Q6_Vqf32_vmpy_VsfVsf(v3, v3));
++            }
++            g[r / 4] = gdn_c2_fold(gdn_c2_fold(a0, a1), gdn_c2_fold(a2, a3));
++        }
++        for (uint32_t n = 8; n > 1; n /= 2) {
++            for (uint32_t i = 0; i < n / 2; ++i) {
++                g[i] = gdn_c2_fold(g[2 * i], g[2 * i + 1]);
++            }
++        }
++        // A sum of squares is not negative. The max keeps a qfloat conversion error near the end of the
++        // f32 range out of the square root.
++        const HVX_Vector sum = Q6_Vsf_vmax_VsfVsf(Q6_Vsf_equals_Vqf32(g[0]), zero);
++        HVX_Vector d = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(sum, va), vb));
++        d = Q6_Vsf_vmax_VsfVsf(d, vc);
++        hvx_vmem(out + t0) = hvx_vec_mul_f32_f32(hvx_vec_rsqrt_f32(d), vs);
++    }
++}
++
++// The rows of the chunk past Cc (the last chunk) are zero, and so are their gate and beta
++static void gdn_c2_zero_tail(struct gdn_c2_row * rw, uint32_t Cc, uint32_t D) {
++    if (Cc >= GDN_CH_C) {
++        return;
++    }
++    gdn_ch_zero_rows(rw->stg_q, Cc, GDN_CH_C, D);
++    gdn_ch_zero_rows(rw->stg_k, Cc, GDN_CH_C, D);
++    gdn_ch_zero_rows(rw->stg_v, Cc, GDN_CH_C, D);
++    const HVX_Vector zero = Q6_V_vzero();
++    for (uint32_t k = 0; k < 2; ++k) {
++        float * col = rw->stg_gb + k * GDN_CH_C;
++        for (uint32_t t = 0; t < GDN_CH_C; t += 32) {
++            if (t + 32 <= Cc) {
++                continue;
++            }
++            // keep is 0 to 31. vsetq of 0 bytes sets no lane, but vsetq2 of 0 bytes sets all lanes.
++            const uint32_t keep = Cc > t ? Cc - t : 0;
++            hvx_vmem(col + t) = Q6_V_vmux_QVV(Q6_Q_vsetq_R(keep * sizeof(float)), hvx_vmem(col + t), zero);
++        }
++    }
++}
++
++// The per-token values of the chunk (struct gdn_c2_scal) from the gate and beta columns
++static void gdn_c2_gates(struct gdn_c2_ctx * c, struct gdn_c2_row * rw, struct gdn_c2_scal * sc, uint32_t ic) {
++    // The gate and beta come to DDR memory, then the scalar core sums the log decay in token order,
++    // which is the order of the version above.
++    hvx_vmem(sc->gam)      = hvx_vmem(rw->stg_gb);
++    hvx_vmem(sc->gam + 32) = hvx_vmem(rw->stg_gb + 32);
++    // beta is a multiply operand of the solve and of the tiles of T'', thus it goes through gdn_c2_ftz
++    hvx_vmem(sc->bet)      = gdn_c2_ftz(hvx_vmem(rw->stg_gb + GDN_CH_C));
++    hvx_vmem(sc->bet + 32) = gdn_c2_ftz(hvx_vmem(rw->stg_gb + GDN_CH_C + 32));
++    float acc = 0.0f;
++    for (uint32_t t = 0; t < GDN_CH_C; ++t) {
++        acc += sc->gam[t];
++        sc->gam[t] = acc;
++    }
++
++    const float gC = sc->gam[GDN_CH_C - 1];
++    const float gm = sc->gam[GDN_CH_C / 2];
++    const HVX_Vector vgC = hvx_vec_splat_f32(gC);
++    const HVX_Vector vgm = hvx_vec_splat_f32(gm);
++    const HVX_Vector vsc = hvx_vec_splat_f32(c->scale);
++    for (uint32_t t = 0; t < GDN_CH_C; t += 32) {
++        const HVX_Vector vg = hvx_vmem(sc->gam + t);
++        const HVX_Vector vb = hvx_vmem(sc->bet + t);
++        const HVX_Vector eg = gdn_c2_ftz(hvx_vec_exp_f32(vg));
++        hvx_vmem(sc->egc + t) = gdn_c2_ftz(hvx_vec_exp_f32(hvx_vec_sub_f32_f32(vgC, vg)));
++        hvx_vmem(sc->cs1 + t) = gdn_c2_ftz(hvx_vec_mul_f32_f32(eg, vb));
++        hvx_vmem(sc->u + t)   = hvx_vec_exp_f32(hvx_vec_sub_f32_f32(vg, vgm));
++        hvx_vmem(sc->w + t)   = hvx_vec_exp_f32(hvx_vec_sub_f32_f32(vgm, vg));
++        // rq and rk hold the norm factors when the op normalizes (gdn_c2_phase_prep writes them first)
++        const HVX_Vector rq = c->qknorm ? hvx_vmem(sc->rq + t) : hvx_vec_splat_f32(1.0f);
++        hvx_vmem(sc->sq + t) = gdn_c2_ftz(hvx_vec_mul_f32_f32(hvx_vec_mul_f32_f32(eg, vsc), rq));
++        hvx_vmem(sc->rq + t) = hvx_vec_mul_f32_f32(rq, vsc);
++        if (!c->qknorm) {
++            hvx_vmem(sc->rk + t) = hvx_vec_splat_f32(1.0f);
++        }
++    }
++    // the decay of the chunk, flushed below 2^-50 as gdn_c2_ftz does
++    const float eC = expf(gC);
++    sc->eC[ic & 1] = eC >= 0x1p-50f ? eC : 0.0f;
++
++    const float span = sc->gam[0] - gC;
++    sc->span_ok = (span >= 0.0f && span <= GDN_CH_DECAY_MAX_SPAN) ? 1 : 0;
++}
++
++// The tiles of K (row factor rk), the f16 rows of K in out_w, and K^T from those rows
++static void gdn_c2_tiles_k(struct gdn_c2_ctx * c, struct gdn_c2_row * rw, const struct gdn_c2_scal * sc, uint32_t par) {
++    const uint32_t D    = c->D;
++    const uint32_t n_kt = c->n_kt;
++    const uint32_t D2   = hex_round_up(D, 64);                 // the f16 row of K, whole vectors
++    __fp16 *       rows = rw->out_w;                           // [C x D2] f16
++    const HVX_Vector zero = Q6_V_vzero();
++
++    for (uint32_t r = 0; r < GDN_CH_C; r += 2) {
++        const float *  x0 = rw->stg_k + (size_t) r * D;
++        const float *  x1 = x0 + D;
++        const HVX_Vector s0 = hvx_vec_splat_f32(sc->rk[r]);
++        const HVX_Vector s1 = hvx_vec_splat_f32(sc->rk[r + 1]);
++        const uint32_t tt = r / 32;
++        const uint32_t p  = (r % 32) / 2;
++        HVX_Vector prev = zero;
++        for (uint32_t ct = 0; ct < n_kt; ++ct) {
++            const HVX_Vector v = gdn_c2_pair_f16(hvx_vmem(x0 + ct * 32), hvx_vmem(x1 + ct * 32), s0, s1);
++            ((HVX_Vector *) (rw->k_t + (size_t) (tt * n_kt + ct) * GDN_CH_TILE))[p] = v;
++            if (ct & 1) {
++                // The deal of two tile vectors gives the 64 f16 values of row r and of row r + 1
++                const HVX_VectorPair d = Q6_W_vdeal_VVR(v, prev, -2);
++                hvx_vmem(rows + (size_t) r * D2 + (ct - 1) * 32)       = Q6_V_lo_W(d);
++                hvx_vmem(rows + (size_t) (r + 1) * D2 + (ct - 1) * 32) = Q6_V_hi_W(d);
++            }
++            prev = v;
++        }
++        if (n_kt & 1) {
++            const HVX_VectorPair d = Q6_W_vdeal_VVR(zero, prev, -2);
++            hvx_vmem(rows + (size_t) r * D2 + (n_kt - 1) * 32)       = Q6_V_lo_W(d);
++            hvx_vmem(rows + (size_t) (r + 1) * D2 + (n_kt - 1) * 32) = Q6_V_hi_W(d);
++        }
++    }
++
++    // K^T: word q of the transposed block holds the features 2q and 2q + 1 of 32 tokens, which is
++    // vector q % 16 of the weight tile of feature tile 2 * fb + q / 16
++    __fp16 * kT = rw->kT[par];
++    for (uint32_t st = 0; st < GDN_CH_CT; ++st) {
++        for (uint32_t fb = 0; fb < D2 / 64; ++fb) {
++            const uint32_t it = fb * 2;
++            uint8_t * lo = (uint8_t *) (kT + (size_t) (st * n_kt + it) * GDN_CH_TILE);
++            uint8_t * hi = it + 1 < n_kt ? lo + (size_t) GDN_CH_TILE * sizeof(__fp16) : NULL;
++            gdn_c2_transpose32(rw->scr, (const uint8_t *) (rows + (size_t) st * 32 * D2 + fb * 64),
++                               D2 * sizeof(__fp16), lo, hi, VLEN);
++        }
++    }
++}
++
++// The tiles of Q (row factor rq = scale * norm) and of Q_g (row factor sq), and of V
++static void gdn_c2_tiles_qv(struct gdn_c2_ctx * c, struct gdn_c2_row * rw, const struct gdn_c2_scal * sc, uint32_t par) {
++    const uint32_t D    = c->D;
++    const uint32_t n_kt = c->n_kt;
++    __fp16 * qg = rw->qg[par];
++
++    for (uint32_t r = 0; r < GDN_CH_C; r += 2) {
++        const float * q0 = rw->stg_q + (size_t) r * D;
++        const float * q1 = q0 + D;
++        const float * v0 = rw->stg_v + (size_t) r * D;
++        const float * v1 = v0 + D;
++        const HVX_Vector a0 = hvx_vec_splat_f32(sc->rq[r]);
++        const HVX_Vector a1 = hvx_vec_splat_f32(sc->rq[r + 1]);
++        const HVX_Vector g0 = hvx_vec_splat_f32(sc->sq[r]);
++        const HVX_Vector g1 = hvx_vec_splat_f32(sc->sq[r + 1]);
++        const uint32_t tt = r / 32;
++        const uint32_t p  = (r % 32) / 2;
++        for (uint32_t ct = 0; ct < n_kt; ++ct) {
++            const size_t   ti = (size_t) (tt * n_kt + ct) * GDN_CH_TILE;
++            const HVX_Vector x0 = hvx_vmem(q0 + ct * 32);
++            const HVX_Vector x1 = hvx_vmem(q1 + ct * 32);
++            ((HVX_Vector *) (rw->q_t + ti))[p] = gdn_c2_pair_f16(x0, x1, a0, a1);
++            ((HVX_Vector *) (qg + ti))[p]      = gdn_c2_pair_f16(x0, x1, g0, g1);
++            ((HVX_Vector *) (rw->v_t + ti))[p] = gdn_c2_pair_f16_plain(hvx_vmem(v0 + ct * 32), hvx_vmem(v1 + ct * 32));
++        }
++    }
++}
++
++// The lane mask of the vector p of a diagonal tile: keep (t, s) for s <= t, with t = 2p + e the row of
++// lane 2s + e. Those are the lanes below 4p + 2, and the lane 4p + 3.
++static inline HVX_VectorPred gdn_c2_diag_mask(uint32_t p) {
++    const HVX_VectorPred lt  = Q6_Q_vsetq_R((4 * p + 2) * sizeof(__fp16));
++    const HVX_VectorPred one = Q6_Q_and_QQn(Q6_Q_vsetq2_R((4 * p + 4) * sizeof(__fp16)),
++                                            Q6_Q_vsetq_R((4 * p + 3) * sizeof(__fp16)));
++    return Q6_Q_or_QQ(lt, one);
++}
++
++// E in f16 tiles, for a span that the factored E (u[t] * w[s], gdn_ch_decay_matrix) does not hold: the
++// rows of E come from the exponential of each row. Phase solve reads these tiles only in that case, and
++// it makes the rows of the factored E in f32 by itself. The tile (0, 1) above the diagonal is not
++// written: no product reads it.
++static void gdn_c2_tiles_e(struct gdn_c2_ctx * c, struct gdn_c2_row * rw, const struct gdn_c2_scal * sc) {
++    (void) c;
++    if (sc->span_ok) {
++        return;
++    }
++
++    // The rows of the version above, into the f32 region of out_w
++    struct gdn_ch_gates ga;
++    memcpy(ga.gam, sc->gam, sizeof(ga.gam));
++    struct gdn_ch_row tmp;
++    tmp.e32 = (float *) rw->out_w;
++    gdn_ch_decay_matrix(&tmp, &ga);
++    for (uint32_t tt = 0; tt < GDN_CH_CT; ++tt) {
++        for (uint32_t st = 0; st <= tt; ++st) {
++            HVX_Vector * e = (HVX_Vector *) (rw->e_a + (size_t) (tt * GDN_CH_CT + st) * GDN_CH_TILE);
++            for (uint32_t p = 0; p < 16; ++p) {
++                const float * r0 = tmp.e32 + (size_t) (tt * 32 + 2 * p) * GDN_CH_C + st * 32;
++                e[p] = gdn_c2_pair_f16_plain(hvx_vmem(r0), hvx_vmem(r0 + GDN_CH_C));
++            }
++        }
++    }
++}
++
++// Row i of T from its sums (f32): e_i - beta_i * (lo, hi), with the lane i set to 1 and the lanes above it
++// set to +0. The sums of the lanes above i are zero only up to the implied bit of a qfloat, thus the mask
++// keeps the next rows from that error. hi is used from row 32 on. The sums go through gdn_c2_ftz before
++// the multiply by beta (refer to gdn_c2_ftz), and beta is 2^-50 or more, or zero.
++static inline void gdn_c2_solve_row_out(float * restrict row, uint32_t i, HVX_Vector lo, HVX_Vector hi, float beta) {
++    const HVX_Vector one  = hvx_vec_splat_f32(1.0f);
++    const HVX_Vector zero = Q6_V_vzero();
++    const HVX_Vector nb   = hvx_vec_splat_f32(-beta);
++    HVX_Vector t0 = gdn_c2_ftz(hvx_vec_mul_f32_f32(gdn_c2_ftz(lo), nb));
++    HVX_Vector t1 = zero;
++    if (i < 32) {
++        const HVX_VectorPred below = Q6_Q_vsetq_R(i * 4);
++        t0 = Q6_V_vmux_QVV(below, t0, zero);
++        t0 = Q6_V_vmux_QVV(Q6_Q_and_QQn(Q6_Q_vsetq2_R((i + 1) * 4), below), one, t0);
++    } else {
++        t1 = gdn_c2_ftz(hvx_vec_mul_f32_f32(gdn_c2_ftz(hi), nb));
++        const HVX_VectorPred below = Q6_Q_vsetq_R((i - 32) * 4);
++        t1 = Q6_V_vmux_QVV(below, t1, zero);
++        t1 = Q6_V_vmux_QVV(Q6_Q_and_QQn(Q6_Q_vsetq2_R((i - 31) * 4), below), one, t1);
++    }
++    hvx_vmem(row)      = t0;
++    hvx_vmem(row + 32) = t1;
++}
++
++// The forward substitution T = (I + A')^-1 with A'[i][s] = beta_i * E[i][s] * (k_i . k_s) for s < i.
++// a32 holds E * (K K^T) on entry, and beta comes in at the end of each row: row i of T is
++// e_i - beta_i * sum_s a32[i][s] T[s]. Row s of T is zero past lane s, thus the terms s < 32 add to the
++// low vector only, and a row below 32 has no high vector.
++//
++// Two rows go together: each row s of T loads once for the terms of rows i and i + 1, and the four to
++// eight sums are independent chains. Row i + 1 takes its term s = i after row i is done. The sums stay in
++// qfloat until the end of a row. O(C^3 / 6).
++static void gdn_c2_solve(float * restrict t32, const float * restrict a32, const float * restrict bet) {
++    // the coefficients of the two rows in work, on the stack for the scalar reads
++    float ai[GDN_CH_C] __attribute__((aligned(VLEN)));
++    float bi[GDN_CH_C] __attribute__((aligned(VLEN)));
++    const HVX_Vector zero = Q6_V_vzero();
++
++    for (uint32_t i = 0; i < GDN_CH_C; i += 2) {
++        const float * ra = a32 + (size_t) i * GDN_CH_C;
++        hvx_vmem(ai)      = hvx_vmem(ra);
++        hvx_vmem(ai + 32) = hvx_vmem(ra + 32);
++        hvx_vmem(bi)      = hvx_vmem(ra + GDN_CH_C);
++        hvx_vmem(bi + 32) = hvx_vmem(ra + GDN_CH_C + 32);
++
++        HVX_Vector la0 = zero, la1 = zero, lb0 = zero, lb1 = zero;
++        HVX_Vector ha0 = zero, ha1 = zero, hb0 = zero, hb1 = zero;
++
++        // the terms s < min(i, 32): the low vectors. i is even, thus so is the count.
++        const uint32_t nlo = i < 32 ? i : 32;
++        for (uint32_t s = 0; s < nlo; s += 2) {
++            const float *    r  = t32 + (size_t) s * GDN_CH_C;
++            const HVX_Vector r0 = hvx_vmem(r);
++            const HVX_Vector r1 = hvx_vmem(r + GDN_CH_C);
++            la0 = Q6_Vqf32_vadd_Vqf32Vqf32(la0, Q6_Vqf32_vmpy_VsfVsf(r0, hvx_vec_splat_f32(ai[s])));
++            lb0 = Q6_Vqf32_vadd_Vqf32Vqf32(lb0, Q6_Vqf32_vmpy_VsfVsf(r0, hvx_vec_splat_f32(bi[s])));
++            la1 = Q6_Vqf32_vadd_Vqf32Vqf32(la1, Q6_Vqf32_vmpy_VsfVsf(r1, hvx_vec_splat_f32(ai[s + 1])));
++            lb1 = Q6_Vqf32_vadd_Vqf32Vqf32(lb1, Q6_Vqf32_vmpy_VsfVsf(r1, hvx_vec_splat_f32(bi[s + 1])));
++        }
++        // the terms 32 <= s < i: both vectors
++        for (uint32_t s = 32; s < i; s += 2) {
++            const float *    r   = t32 + (size_t) s * GDN_CH_C;
++            const HVX_Vector r0l = hvx_vmem(r);
++            const HVX_Vector r0h = hvx_vmem(r + 32);
++            const HVX_Vector r1l = hvx_vmem(r + GDN_CH_C);
++            const HVX_Vector r1h = hvx_vmem(r + GDN_CH_C + 32);
++            const HVX_Vector a0  = hvx_vec_splat_f32(ai[s]);
++            const HVX_Vector a1  = hvx_vec_splat_f32(ai[s + 1]);
++            const HVX_Vector b0  = hvx_vec_splat_f32(bi[s]);
++            const HVX_Vector b1  = hvx_vec_splat_f32(bi[s + 1]);
++            la0 = Q6_Vqf32_vadd_Vqf32Vqf32(la0, Q6_Vqf32_vmpy_VsfVsf(r0l, a0));
++            ha0 = Q6_Vqf32_vadd_Vqf32Vqf32(ha0, Q6_Vqf32_vmpy_VsfVsf(r0h, a0));
++            lb0 = Q6_Vqf32_vadd_Vqf32Vqf32(lb0, Q6_Vqf32_vmpy_VsfVsf(r0l, b0));
++            hb0 = Q6_Vqf32_vadd_Vqf32Vqf32(hb0, Q6_Vqf32_vmpy_VsfVsf(r0h, b0));
++            la1 = Q6_Vqf32_vadd_Vqf32Vqf32(la1, Q6_Vqf32_vmpy_VsfVsf(r1l, a1));
++            ha1 = Q6_Vqf32_vadd_Vqf32Vqf32(ha1, Q6_Vqf32_vmpy_VsfVsf(r1h, a1));
++            lb1 = Q6_Vqf32_vadd_Vqf32Vqf32(lb1, Q6_Vqf32_vmpy_VsfVsf(r1l, b1));
++            hb1 = Q6_Vqf32_vadd_Vqf32Vqf32(hb1, Q6_Vqf32_vmpy_VsfVsf(r1h, b1));
++        }
++
++        float * ti = t32 + (size_t) i * GDN_CH_C;
++        gdn_c2_solve_row_out(ti, i, Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(la0, la1)),
++                             Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(ha0, ha1)), bet[i]);
++
++        // row i + 1 takes the term s = i
++        const HVX_Vector c = hvx_vec_splat_f32(bi[i]);
++        lb0 = Q6_Vqf32_vadd_Vqf32Vqf32(lb0, Q6_Vqf32_vmpy_VsfVsf(hvx_vmem(ti), c));
++        if (i >= 32) {
++            hb0 = Q6_Vqf32_vadd_Vqf32Vqf32(hb0, Q6_Vqf32_vmpy_VsfVsf(hvx_vmem(ti + 32), c));
++        }
++        gdn_c2_solve_row_out(ti + GDN_CH_C, i + 1, Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(lb0, lb1)),
++                             Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(hb0, hb1)), bet[i + 1]);
++    }
++}
++
++// The forward substitution of gdn_c2_solve with the arithmetic of version 1: each product and each sum
++// goes to IEEE f32 at once, row by row. A term with a zero coefficient does not run. Phase solve uses it
++// when a coefficient of the chunk is zero: on the v79 NPU of the phone the qfloat sums of gdn_c2_solve
++// gave values near 2^105 for such chunks (stage gdnk2, gates from -20, beta and A' finite and at most
++// 1), where the kernel lab gives values below 10. The phone gives correct results for zero terms in this
++// form (version 1). O(C^3 / 6) at most, less for each zero coefficient.
++static void gdn_c2_solve_f32(float * restrict t32, const float * restrict a32, const float * restrict bet) {
++    // the coefficients of the row in work, on the stack for the scalar reads
++    float ai[GDN_CH_C] __attribute__((aligned(VLEN)));
++    const HVX_Vector zero = Q6_V_vzero();
++
++    for (uint32_t i = 0; i < GDN_CH_C; ++i) {
++        const float * ra = a32 + (size_t) i * GDN_CH_C;
++        hvx_vmem(ai)      = hvx_vmem(ra);
++        hvx_vmem(ai + 32) = hvx_vmem(ra + 32);
++
++        HVX_Vector lo = zero;
++        HVX_Vector hi = zero;
++        for (uint32_t s = 0; s < i; ++s) {
++            if (ai[s] == 0.0f) {
++                continue;
++            }
++            const HVX_Vector a = hvx_vec_splat_f32(ai[s]);
++            const float *    r = t32 + (size_t) s * GDN_CH_C;
++            lo = hvx_vec_add_f32_f32(lo, hvx_vec_mul_f32_f32(hvx_vmem(r), a));
++            if (s >= 32) {
++                hi = hvx_vec_add_f32_f32(hi, hvx_vec_mul_f32_f32(hvx_vmem(r + 32), a));
++            }
++        }
++        gdn_c2_solve_row_out(t32 + (size_t) i * GDN_CH_C, i, lo, hi, bet[i]);
++    }
++}
++
++// True when a coefficient of the solve, a32[t][s] with s < t, is zero. The lanes of the tile vectors of
++// phase solve: zmask gathers them, one bit for each lane that is zero and below the diagonal.
++static inline HVX_Vector gdn_c2_zero_below(HVX_Vector zmask, HVX_Vector row, uint32_t n_below) {
++    const HVX_Vector abs_mask = Q6_V_vsplat_R(0x7FFFFFFF);
++    const HVX_VectorPred z    = Q6_Q_vcmp_eq_VwVw(Q6_V_vand_VV(row, abs_mask), Q6_V_vzero());
++    // n_below is 0 to 32 lanes; vsetq2 of 128 bytes sets every lane, vsetq of 0 sets none
++    const HVX_VectorPred below = n_below >= 32 ? Q6_Q_vsetq2_R(128) : Q6_Q_vsetq_R(n_below * 4);
++    return Q6_V_vor_VV(zmask, Q6_V_vmux_QVV(Q6_Q_and_QQ(z, below), Q6_V_vsplat_R(1), Q6_V_vzero()));
++}
++
++// ---- the phases of version 2
++
++static inline void gdn_c2_range(const struct gdn_c2_ctx * c, unsigned int ith, uint32_t * begin, uint32_t * end) {
++    uint32_t b = ith * c->rows_per_thread;
++    uint32_t e = b + c->rows_per_thread;
++    *begin = b < c->n_rows ? b : c->n_rows;
++    *end   = e < c->n_rows ? e : c->n_rows;
++}
++
++static inline uint32_t gdn_c2_chunk_len(const struct gdn_c2_ctx * c, uint32_t ic) {
++    const uint32_t t0   = ic * GDN_CH_C;
++    const uint32_t left = c->n_tok_ch - t0;
++    return left < GDN_CH_C ? left : GDN_CH_C;
++}
++
++// The DDR pointers of one row, the same as gdn_ch_row_ptrs_init gives for the version above
++static void gdn_c2_row_ptrs(const struct gdn_c2_ctx * c, uint32_t i, struct gdn_ch_row_ptrs * rp) {
++    const struct htp_ops_context * octx = c->octx;
++    const struct htp_tensor * q     = octx->src[0];
++    const struct htp_tensor * k     = octx->src[1];
++    const struct htp_tensor * v     = octx->src[2];
++    const struct htp_tensor * g     = octx->src[3];
++    const struct htp_tensor * beta  = octx->src[4];
++    const struct htp_tensor * state = octx->src[5];
++    const struct htp_tensor * dst   = octx->dst;
++
++    const uint32_t D   = c->D;
++    const uint32_t H   = c->H;
++    const uint32_t ir  = c->row0 + i;
++    const uint32_t iv1 = ir % H;
++    const uint32_t iv3 = ir / H;
++    const uint32_t iq1 = iv1 % q->ne[1];
++    const uint32_t ik1 = iv1 % k->ne[1];
++    const uint32_t iq3 = iv3 / (c->n_seqs / q->ne[3]);
++    const uint32_t ik3 = iv3 / (c->n_seqs / k->ne[3]);
++
++    rp->q     = (const uint8_t *) (uintptr_t) q->data + (size_t) iq3 * q->nb[3] + (size_t) iq1 * q->nb[1];
++    rp->k     = (const uint8_t *) (uintptr_t) k->data + (size_t) ik3 * k->nb[3] + (size_t) ik1 * k->nb[1];
++    rp->v     = (const uint8_t *) (uintptr_t) v->data + (size_t) iv3 * v->nb[3] + (size_t) iv1 * v->nb[1];
++    rp->g     = (const uint8_t *) (uintptr_t) g->data + (size_t) iv3 * g->nb[3];
++    rp->b     = (const uint8_t *) (uintptr_t) beta->data + (size_t) iv3 * beta->nb[3];
++    rp->q_nb2 = q->nb[2];
++    rp->k_nb2 = k->nb[2];
++    rp->v_nb2 = v->nb[2];
++    rp->g_nb2 = g->nb[2];
++    rp->b_nb2 = beta->nb[2];
++
++    float * attn_base = (float *) (uintptr_t) dst->data;
++    rp->s_in  = (const float *) (uintptr_t) state->data + (size_t) iv3 * (state->nb[3] / sizeof(float)) +
++                (size_t) iv1 * D * D;
++    rp->s_out = attn_base + (size_t) D * H * c->n_tokens * c->n_seqs + ((size_t) iv3 * H + iv1) * D * D;
++    rp->attn  = attn_base + ((size_t) iv3 * c->n_tokens * H + iv1) * D;
++}
++
++// The transfers of one chunk of one row: q, k and v rows, and the gate and beta of the head as two
++// columns of C floats. Each transfer is one queue entry, 5 in all.
++static void gdn_c2_push_chunk(dma_queue * dma, struct gdn_c2_row * rw, const struct gdn_ch_row_ptrs * rp,
++                              uint32_t t0, uint32_t Cc, uint32_t D, uint32_t head) {
++    const size_t row = (size_t) D * sizeof(float);
++    dma_queue_push(dma, dma_make_ptr(rw->stg_q, rp->q + (size_t) t0 * rp->q_nb2), row, rp->q_nb2, row, Cc);
++    dma_queue_push(dma, dma_make_ptr(rw->stg_k, rp->k + (size_t) t0 * rp->k_nb2), row, rp->k_nb2, row, Cc);
++    dma_queue_push(dma, dma_make_ptr(rw->stg_v, rp->v + (size_t) t0 * rp->v_nb2), row, rp->v_nb2, row, Cc);
++    dma_queue_push(dma, dma_make_ptr(rw->stg_gb, rp->g + (size_t) t0 * rp->g_nb2 + head * sizeof(float)),
++                   sizeof(float), rp->g_nb2, sizeof(float), Cc);
++    dma_queue_push(dma, dma_make_ptr(rw->stg_gb + GDN_CH_C, rp->b + (size_t) t0 * rp->b_nb2 + head * sizeof(float)),
++                   sizeof(float), rp->b_nb2, sizeof(float), Cc);
++}
++
++// The state of each row into VTCM, and the first chunk on its way
++static void gdn_c2_phase_begin(unsigned int nth, unsigned int ith, void * data) {
++    struct gdn_c2_ctx * c = (struct gdn_c2_ctx *) data;
++    (void) nth;
++    uint32_t begin, end;
++    gdn_c2_range(c, ith, &begin, &end);
++    if (begin >= end) {
++        return;
++    }
++    dma_queue * dma = c->octx->ctx->dma[ith];
++
++    for (uint32_t i = begin; i < end; ++i) {
++        struct gdn_c2_row * rw = &c->row[i];
++        struct gdn_ch_row_ptrs rp;
++        gdn_c2_row_ptrs(c, i, &rp);
++        // DDR holds M[j][i] = S[i][j]. stg_q and stg_k are adjacent and stage the D * D floats.
++        const size_t row = (size_t) c->D * sizeof(float);
++        dma_queue_push(dma, dma_make_ptr(rw->stg_q, rp.s_in), row, row, row, c->D);
++        dma_queue_pop(dma);
++        gdn_c2_transpose_f32(rw->s32, rw->stg_q, c->D, rw->scr);
++    }
++    for (uint32_t i = begin; i < end; ++i) {
++        struct gdn_ch_row_ptrs rp;
++        gdn_c2_row_ptrs(c, i, &rp);
++        gdn_c2_push_chunk(dma, &c->row[i], &rp, 0, gdn_c2_chunk_len(c, 0), c->D, (c->row0 + i) % c->H);
++    }
++}
++
++// The loads of chunk ic_prep land, and its tiles go up: K, K^T, Q, Q_g, V and E. The next chunk starts
++// its transfers. The state does not enter this phase, thus it runs beside the job m3 of the chunk before.
++static void gdn_c2_phase_prep(unsigned int nth, unsigned int ith, void * data) {
++    struct gdn_c2_ctx * c = (struct gdn_c2_ctx *) data;
++    (void) nth;
++    uint32_t begin, end;
++    gdn_c2_range(c, ith, &begin, &end);
++    if (begin >= end) {
++        return;
++    }
++    dma_queue * dma = c->octx->ctx->dma[ith];
++    const uint32_t ic  = c->ic_prep;
++    const uint32_t Cc  = gdn_c2_chunk_len(c, ic);
++    const uint32_t par = ic & 1;
++
++    for (uint32_t i = begin; i < end; ++i) {
++        for (int k = 0; k < 5; ++k) {
++            dma_queue_pop(dma);
++        }
++    }
++
++    for (uint32_t i = begin; i < end; ++i) {
++        struct gdn_c2_row *  rw = &c->row[i];
++        struct gdn_c2_scal * sc = &c->scal[i];
++
++        gdn_c2_zero_tail(rw, Cc, c->D);
++        if (c->qknorm) {
++            gdn_c2_norm_factors(sc->rq, rw->stg_q, c->D, &c->nrm);
++            gdn_c2_norm_factors(sc->rk, rw->stg_k, c->D, &c->nrm);
++        }
++        gdn_c2_gates(c, rw, sc, ic);
++        gdn_c2_tiles_k(c, rw, sc, par);
++        gdn_c2_tiles_qv(c, rw, sc, par);
++        gdn_c2_tiles_e(c, rw, sc);
++    }
++
++    // The staging buffers are free again: fetch the next chunk
++    if (ic + 1 < c->n_chunks) {
++        for (uint32_t i = begin; i < end; ++i) {
++            struct gdn_ch_row_ptrs rp;
++            gdn_c2_row_ptrs(c, i, &rp);
++            gdn_c2_push_chunk(dma, &c->row[i], &rp, (ic + 1) * GDN_CH_C, gdn_c2_chunk_len(c, ic + 1), c->D,
++                              (c->row0 + i) % c->H);
++        }
++    }
++}
++
++// S = e^gamma_C S + S_upd of the chunk before (not at the first chunk), and the weight tiles of S for
++// this chunk (not at the end). One pass: the updated rows go to f16 from their qfloat sums.
++static void gdn_c2_state_row(struct gdn_c2_ctx * c, uint32_t i, bool update, bool tiles, float eC) {
++    struct gdn_c2_row * rw = &c->row[i];
++    const uint32_t D    = c->D;
++    const uint32_t n_kt = c->n_kt;
++    const HVX_Vector ve  = hvx_vec_splat_f32(eC);
++    const HVX_Vector one = hvx_vec_splat_f16(1.0);
++    const HVX_Vector zero = Q6_V_vzero();
++    // A chunk decay of zero (gdn_c2_gates flushes it below 2^-50) takes no multiply: the qfloat sum of a
++    // product by a zero factor is the case that gdn_c2_solve_f32 keeps out of the solve
++    const bool decay = eC != 0.0f;
++
++    for (uint32_t r = 0; r < D; r += 2) {
++        float * p0 = rw->s32 + (size_t) r * D;
++        float * p1 = p0 + D;
++        const uint32_t it = r / 32;
++        const uint32_t p  = (r % 32) / 2;
++        for (uint32_t jt = 0; jt < n_kt; ++jt) {
++            HVX_Vector q0, q1;
++            if (update) {
++                const HVX_Vector upd = ((const HVX_Vector *) (rw->s_upd + (size_t) (it * n_kt + jt) * GDN_CH_TILE))[p];
++                const HVX_VectorPair w = Q6_Wqf32_vmpy_VhfVhf(upd, one);
++                if (decay) {
++                    // The state is a multiply operand here and in the tail tokens, thus it goes through
++                    // gdn_c2_ftz: the input state when it is read, the updated state when it is stored
++                    q0 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(gdn_c2_ftz(hvx_vmem(p0 + jt * 32)), ve), Q6_V_lo_W(w));
++                    q1 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(gdn_c2_ftz(hvx_vmem(p1 + jt * 32)), ve), Q6_V_hi_W(w));
++                } else {
++                    q0 = Q6_V_lo_W(w);
++                    q1 = Q6_V_hi_W(w);
++                }
++                hvx_vmem(p0 + jt * 32) = gdn_c2_ftz(Q6_Vsf_equals_Vqf32(q0));
++                hvx_vmem(p1 + jt * 32) = gdn_c2_ftz(Q6_Vsf_equals_Vqf32(q1));
++            } else {
++                q0 = Q6_Vqf32_vadd_VsfVsf(hvx_vmem(p0 + jt * 32), zero);
++                q1 = Q6_Vqf32_vadd_VsfVsf(hvx_vmem(p1 + jt * 32), zero);
++            }
++            if (tiles) {
++                ((HVX_Vector *) (rw->s_wt + (size_t) (jt * n_kt + it) * GDN_CH_TILE))[p] =
++                    Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(q1, q0));
++            }
++        }
++    }
++}
++
++// The state for chunk ic: the update by the chunk before and the weight tiles. Beside the job m1.
++static void gdn_c2_phase_state(unsigned int nth, unsigned int ith, void * data) {
++    struct gdn_c2_ctx * c = (struct gdn_c2_ctx *) data;
++    (void) nth;
++    uint32_t begin, end;
++    gdn_c2_range(c, ith, &begin, &end);
++    const uint32_t ic = c->ic;
++    for (uint32_t i = begin; i < end; ++i) {
++        const float eC = ic > 0 ? c->scal[i].eC[(ic - 1) & 1] : 1.0f;
++        gdn_c2_state_row(c, i, ic > 0, true, eC);
++    }
++}
++
++// A' = A * E into f32 rows, the forward substitution, T' and T'' tiles, and P' = P * E
++static void gdn_c2_phase_solve(unsigned int nth, unsigned int ith, void * data) {
++    struct gdn_c2_ctx * c = (struct gdn_c2_ctx *) data;
++    (void) nth;
++    uint32_t begin, end;
++    gdn_c2_range(c, ith, &begin, &end);
++
++    for (uint32_t i = begin; i < end; ++i) {
++        struct gdn_c2_row *        rw  = &c->row[i];
++        const struct gdn_c2_scal * sc  = &c->scal[i];
++        float *                    a32 = (float *) rw->out_w;
++        float *                    t32 = (float *) rw->out_ws;
++
++        // A' = A * E and P' = P * E. With the factored E the rows of E come in f32 from its factors, as
++        // in the version above, and A' and P' round once. Else E comes from its f16 tiles. zmask gathers
++        // the zero coefficients of the solve.
++        const HVX_Vector one   = hvx_vec_splat_f16(1.0);
++        HVX_Vector       zmask = Q6_V_vzero();
++        for (uint32_t tt = 0; tt < GDN_CH_CT; ++tt) {
++            for (uint32_t st = 0; st <= tt; ++st) {
++                const size_t       ti = (size_t) (tt * GDN_CH_CT + st) * GDN_CH_TILE;
++                const HVX_Vector * a  = (const HVX_Vector *) (rw->out_a + ti);
++                const HVX_Vector * e  = (const HVX_Vector *) (rw->e_a + ti);
++                HVX_Vector *       pp = (HVX_Vector *) (rw->out_p + ti);
++                const HVX_Vector   wv = hvx_vmem(sc->w + st * 32);
++                for (uint32_t p = 0; p < 16; ++p) {
++                    const uint32_t t0 = tt * 32 + 2 * p;
++                    float *        r0 = a32 + (size_t) t0 * GDN_CH_C + st * 32;
++                    HVX_Vector     a0, a1, pv;
++                    if (sc->span_ok) {
++                        const HVX_Vector e0 = gdn_c2_ftz(hvx_vec_mul_f32_f32(wv, hvx_vec_splat_f32(sc->u[t0])));
++                        const HVX_Vector e1 = gdn_c2_ftz(hvx_vec_mul_f32_f32(wv, hvx_vec_splat_f32(sc->u[t0 + 1])));
++                        const HVX_VectorPair wa = Q6_Wqf32_vmpy_VhfVhf(a[p], one);
++                        const HVX_VectorPair wp = Q6_Wqf32_vmpy_VhfVhf(pp[p], one);
++                        a0 = gdn_c2_ftz(hvx_vec_mul_f32_f32(Q6_Vsf_equals_Vqf32(Q6_V_lo_W(wa)), e0));
++                        a1 = gdn_c2_ftz(hvx_vec_mul_f32_f32(Q6_Vsf_equals_Vqf32(Q6_V_hi_W(wa)), e1));
++                        pv = gdn_c2_pair_f16(Q6_Vsf_equals_Vqf32(Q6_V_lo_W(wp)), Q6_Vsf_equals_Vqf32(Q6_V_hi_W(wp)), e0, e1);
++                    } else {
++                        const HVX_VectorPair w = Q6_Wqf32_vmpy_VhfVhf(a[p], e[p]);
++                        a0 = gdn_c2_ftz(Q6_Vsf_equals_Vqf32(Q6_V_lo_W(w)));
++                        a1 = gdn_c2_ftz(Q6_Vsf_equals_Vqf32(Q6_V_hi_W(w)));
++                        pv = Q6_Vhf_equals_Wqf32(Q6_Wqf32_vmpy_VhfVhf(pp[p], e[p]));
++                    }
++                    hvx_vmem(r0)            = a0;
++                    hvx_vmem(r0 + GDN_CH_C) = a1;
++                    zmask = gdn_c2_zero_below(zmask, a0, st < tt ? 32 : 2 * p);
++                    zmask = gdn_c2_zero_below(zmask, a1, st < tt ? 32 : 2 * p + 1);
++                    if (st == tt) {
++                        pv = Q6_V_vmux_QVV(gdn_c2_diag_mask(p), pv, Q6_V_vzero());
++                    }
++                    pp[p] = pv;
++                }
++            }
++        }
++
++        // A zero coefficient takes the solve with the arithmetic of version 1 (gdn_c2_solve_f32)
++        uint32_t zw[32] __attribute__((aligned(VLEN)));
++        hvx_vmem(zw) = zmask;
++        bool has_zero = GDN_C2_SOLVE_F32_ALWAYS != 0;
++        for (uint32_t k = 0; k < 32; ++k) {
++            has_zero = has_zero || zw[k] != 0;
++        }
++        if (has_zero) {
++            gdn_c2_solve_f32(t32, a32, sc->bet);
++        } else {
++            gdn_c2_solve(t32, a32, sc->bet);
++        }
++
++        // T' = T diag(beta e^gamma) into out_a, T'' = T diag(beta) into t2
++        for (uint32_t tt = 0; tt < GDN_CH_CT; ++tt) {
++            for (uint32_t st = 0; st <= tt; ++st) {
++                const size_t     ti = (size_t) (tt * GDN_CH_CT + st) * GDN_CH_TILE;
++                const HVX_Vector c1 = hvx_vmem(sc->cs1 + st * 32);
++                const HVX_Vector c2 = hvx_vmem(sc->bet + st * 32);
++                HVX_Vector * o1 = (HVX_Vector *) (rw->out_a + ti);
++                HVX_Vector * o2 = (HVX_Vector *) (rw->t2 + ti);
++                for (uint32_t p = 0; p < 16; ++p) {
++                    const float *    r0 = t32 + (size_t) (tt * 32 + 2 * p) * GDN_CH_C + st * 32;
++                    const HVX_Vector x0 = hvx_vmem(r0);
++                    const HVX_Vector x1 = hvx_vmem(r0 + GDN_CH_C);
++                    o1[p] = gdn_c2_pair_f16(x0, x1, c1, c1);
++                    o2[p] = gdn_c2_pair_f16(x0, x1, c2, c2);
++                }
++            }
++        }
++    }
++}
++
++// Delta = U - W S_0 in place of U, and Delta' = diag(e^(gamma_C - gamma)) Delta into the region of W S_0.
++// The difference is exact in qfloat (two f16 values), and each output rounds to f16 once: Delta from the
++// difference, Delta' from the f32 product of the difference and the factor.
++static void gdn_c2_phase_delta(unsigned int nth, unsigned int ith, void * data) {
++    struct gdn_c2_ctx * c = (struct gdn_c2_ctx *) data;
++    (void) nth;
++    uint32_t begin, end;
++    gdn_c2_range(c, ith, &begin, &end);
++    const uint32_t   n_kt = c->n_kt;
++    const HVX_Vector one  = hvx_vec_splat_f16(1.0);
++
++    for (uint32_t i = begin; i < end; ++i) {
++        struct gdn_c2_row *        rw = &c->row[i];
++        const struct gdn_c2_scal * sc = &c->scal[i];
++
++        for (uint32_t tt = 0; tt < GDN_CH_CT; ++tt) {
++            for (uint32_t p = 0; p < 16; ++p) {
++                const uint32_t   t0 = tt * 32 + 2 * p;
++                const HVX_Vector e0 = hvx_vec_splat_f32(sc->egc[t0]);
++                const HVX_Vector e1 = hvx_vec_splat_f32(sc->egc[t0 + 1]);
++                for (uint32_t jt = 0; jt < n_kt; ++jt) {
++                    const size_t ti = (size_t) (tt * n_kt + jt) * GDN_CH_TILE;
++                    HVX_Vector * u  = (HVX_Vector *) (rw->out_u + ti);
++                    HVX_Vector * ws = (HVX_Vector *) (rw->out_ws + ti);
++                    const HVX_VectorPair wu = Q6_Wqf32_vmpy_VhfVhf(u[p], one);
++                    const HVX_VectorPair ww = Q6_Wqf32_vmpy_VhfVhf(ws[p], one);
++                    const HVX_Vector d0 = Q6_Vqf32_vsub_Vqf32Vqf32(Q6_V_lo_W(wu), Q6_V_lo_W(ww));
++                    const HVX_Vector d1 = Q6_Vqf32_vsub_Vqf32Vqf32(Q6_V_hi_W(wu), Q6_V_hi_W(ww));
++                    u[p]  = Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(d1, d0));
++                    ws[p] = gdn_c2_pair_f16(Q6_Vsf_equals_Vqf32(d0), Q6_Vsf_equals_Vqf32(d1), e0, e1);
++                }
++            }
++        }
++    }
++}
++
++// The output rows of one row and chunk: O tiles to f32 rows, then one DMA to DDR. The DMA of the
++// chunk before on this queue goes first, because its rows use the same buffer.
++static void gdn_c2_store_row(struct gdn_c2_ctx * c, uint32_t i, uint32_t ic, dma_queue * dma, bool wait_prev) {
++    struct gdn_c2_row * rw = &c->row[i];
++    const uint32_t D    = c->D;
++    const uint32_t n_kt = c->n_kt;
++    const uint32_t Cc   = gdn_c2_chunk_len(c, ic);
++    const HVX_Vector one = hvx_vec_splat_f16(1.0);
++
++    if (wait_prev) {
++        dma_queue_pop(dma);
++    }
++    for (uint32_t r = 0; r < GDN_CH_C; r += 2) {
++        float * p0 = rw->o32 + (size_t) r * D;
++        float * p1 = p0 + D;
++        const uint32_t tt = r / 32;
++        const uint32_t p  = (r % 32) / 2;
++        for (uint32_t jt = 0; jt < n_kt; ++jt) {
++            const HVX_Vector v = ((const HVX_Vector *) (rw->o_t + (size_t) (tt * n_kt + jt) * GDN_CH_TILE))[p];
++            const HVX_VectorPair w = Q6_Wqf32_vmpy_VhfVhf(v, one);
++            hvx_vmem(p0 + jt * 32) = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(w));
++            hvx_vmem(p1 + jt * 32) = Q6_Vsf_equals_Vqf32(Q6_V_hi_W(w));
++        }
++    }
++    // The DMA reads the rows that the stores above wrote
++    gdn_ch_mem_sync();
++    struct gdn_ch_row_ptrs rp;
++    gdn_c2_row_ptrs(c, i, &rp);
++    float * attn = rp.attn + (size_t) ic * GDN_CH_C * c->H * D;
++    const size_t row = (size_t) D * sizeof(float);
++    dma_queue_push(dma, dma_make_ptr(attn, rw->o32), (size_t) D * c->H * sizeof(float), row, row, Cc);
++}
++
++// The output of chunk ic_store. Beside the job m2 of the chunk after it.
++static void gdn_c2_phase_store(unsigned int nth, unsigned int ith, void * data) {
++    struct gdn_c2_ctx * c = (struct gdn_c2_ctx *) data;
++    (void) nth;
++    uint32_t begin, end;
++    gdn_c2_range(c, ith, &begin, &end);
++    dma_queue * dma = c->octx->ctx->dma[ith];
++    for (uint32_t i = begin; i < end; ++i) {
++        gdn_c2_store_row(c, i, c->ic_store, dma, c->ic_store > 0);
++    }
++}
++
++// The last chunk: its state update and its output, then the tail tokens and the snapshot slots as in
++// gdn_ch_phase_end
++static void gdn_c2_phase_end(unsigned int nth, unsigned int ith, void * data) {
++    struct gdn_c2_ctx * c = (struct gdn_c2_ctx *) data;
++    (void) nth;
++    uint32_t begin, end;
++    gdn_c2_range(c, ith, &begin, &end);
++    if (begin >= end) {
++        return;
++    }
++    dma_queue * dma = c->octx->ctx->dma[ith];
++    const uint32_t last = c->n_chunks - 1;
++    const size_t   row  = (size_t) c->D * sizeof(float);
++
++    for (uint32_t i = begin; i < end; ++i) {
++        gdn_c2_state_row(c, i, true, false, c->scal[i].eC[last & 1]);
++        gdn_c2_store_row(c, i, last, dma, last > 0);
++        gdn_c2_transpose_f32(c->row[i].stg_q, c->row[i].s32, c->D, c->row[i].scr);
++    }
++    dma_queue_flush(dma);
++
++    const struct gdn_qk_norm * nrm = c->qknorm ? &c->nrm : NULL;
++
++    if (c->n_tail == 0) {
++        for (uint32_t i = begin; i < end; ++i) {
++            struct gdn_ch_row_ptrs rp;
++            gdn_c2_row_ptrs(c, i, &rp);
++            dma_queue_push(dma, dma_make_ptr(rp.s_out, c->row[i].stg_q), row, row, row, c->D);
++            dma_queue_pop(dma);
++        }
++        return;
++    }
++
++    // The tail tokens: token n_tok_ch + s gives snapshot slot n_tail - 1 - s
++    for (uint32_t s = 0; s < c->n_tail; ++s) {
++        const uint32_t t    = c->n_tok_ch + s;
++        const uint32_t slot = c->n_tail - 1 - s;
++        for (uint32_t i = begin; i < end; ++i) {
++            if (s > 0) {
++                dma_queue_pop(dma);
++            }
++            struct gdn_ch_row_ptrs rp;
++            gdn_c2_row_ptrs(c, i, &rp);
++            const uint32_t head = (c->row0 + i) % c->H;
++            const float * q_t = (const float *) (rp.q + (size_t) t * rp.q_nb2);
++            const float * k_t = (const float *) (rp.k + (size_t) t * rp.k_nb2);
++            const float * v_t = (const float *) (rp.v + (size_t) t * rp.v_nb2);
++            const float * g_t = (const float *) (rp.g + (size_t) t * rp.g_nb2) + head;
++            const float   b_t = *((const float *) (rp.b + (size_t) t * rp.b_nb2) + head);
++            float * attn = rp.attn + (size_t) t * c->D * c->H;
++            gdn_step_token_f32(c->row[i].stg_q, q_t, k_t, v_t, g_t, b_t, attn, c->D, false, c->scale, nrm);
++            gdn_ch_mem_sync();
++            dma_queue_push(dma, dma_make_ptr(rp.s_out + (size_t) slot * c->snap_stride, c->row[i].stg_q), row, row,
++                           row, c->D);
++        }
++    }
++    for (uint32_t i = begin; i < end; ++i) {
++        (void) i;
++        dma_queue_pop(dma);
++    }
++}
++
++// ---- the HMX jobs of version 2
++
++static void gdn_c2_job_m1(struct gdn_c2_ctx * c, uint32_t par) {
++    const uint32_t n_kt = c->n_kt;
++    uint32_t n = 0;
++    for (uint32_t i = 0; i < c->n_rows; ++i) {
++        struct gdn_c2_row * rw = &c->row[i];
++        // A = K K^T and P = (scale Q) K^T, the tiles on and below the diagonal
++        struct gdn_c2_prod * p = gdn_c2_prod_set(&c->prod[n++], rw->out_a, GDN_CH_CT, 1, GDN_CH_CT, GDN_CH_CT, true);
++        gdn_c2_sum_set(&p->s[0], rw->k_t, n_kt, 1, rw->kT[par], 1, n_kt, n_kt, false);
++        p = gdn_c2_prod_set(&c->prod[n++], rw->out_p, GDN_CH_CT, 1, GDN_CH_CT, GDN_CH_CT, true);
++        gdn_c2_sum_set(&p->s[0], rw->q_t, n_kt, 1, rw->kT[par], 1, n_kt, n_kt, false);
++    }
++    c->job.scales   = c->scales;
++    c->job.prod     = c->prod;
++    c->job.n_prod   = n;
++    c->job.n_stage0 = n;
++}
++
++static void gdn_c2_job_m2(struct gdn_c2_ctx * c) {
++    const uint32_t n_kt = c->n_kt;
++    uint32_t n = 0;
++    for (uint32_t i = 0; i < c->n_rows; ++i) {
++        struct gdn_c2_row * rw = &c->row[i];
++        // W = T' K and U = T'' V: T' and T'' are lower triangular in tiles
++        struct gdn_c2_prod * p = gdn_c2_prod_set(&c->prod[n++], rw->out_w, n_kt, 1, GDN_CH_CT, n_kt, false);
++        gdn_c2_sum_set(&p->s[0], rw->out_a, GDN_CH_CT, 1, rw->k_t, n_kt, 1, GDN_CH_CT, true);
++        p = gdn_c2_prod_set(&c->prod[n++], rw->out_u, n_kt, 1, GDN_CH_CT, n_kt, false);
++        gdn_c2_sum_set(&p->s[0], rw->t2, GDN_CH_CT, 1, rw->v_t, n_kt, 1, GDN_CH_CT, true);
++    }
++    const uint32_t stage0 = n;
++    for (uint32_t i = 0; i < c->n_rows; ++i) {
++        struct gdn_c2_row * rw = &c->row[i];
++        // W S_0 reads the W of the first stage
++        struct gdn_c2_prod * p = gdn_c2_prod_set(&c->prod[n++], rw->out_ws, n_kt, 1, GDN_CH_CT, n_kt, false);
++        gdn_c2_sum_set(&p->s[0], rw->out_w, n_kt, 1, rw->s_wt, 1, n_kt, n_kt, false);
++    }
++    c->job.scales   = c->scales;
++    c->job.prod     = c->prod;
++    c->job.n_prod   = n;
++    c->job.n_stage0 = stage0;
++}
++
++static void gdn_c2_job_m3(struct gdn_c2_ctx * c, uint32_t par) {
++    const uint32_t n_kt = c->n_kt;
++    uint32_t n = 0;
++    for (uint32_t i = 0; i < c->n_rows; ++i) {
++        struct gdn_c2_row * rw = &c->row[i];
++        // O = P' Delta + Q_g S_0
++        struct gdn_c2_prod * p = gdn_c2_prod_set(&c->prod[n++], rw->o_t, n_kt, 1, GDN_CH_CT, n_kt, false);
++        gdn_c2_sum_set(&p->s[0], rw->out_p, GDN_CH_CT, 1, rw->out_u, n_kt, 1, GDN_CH_CT, true);
++        gdn_c2_sum_set(&p->s[1], rw->qg[par], n_kt, 1, rw->s_wt, 1, n_kt, n_kt, false);
++        p->n_s = 2;
++        // S_upd = K^T Delta': the rows of K^T are the key tiles, its tiles are [token tile][key tile]
++        p = gdn_c2_prod_set(&c->prod[n++], rw->s_upd, n_kt, 1, n_kt, n_kt, false);
++        gdn_c2_sum_set(&p->s[0], rw->kT[par], 1, n_kt, rw->out_ws, n_kt, 1, GDN_CH_CT, false);
++    }
++    c->job.scales   = c->scales;
++    c->job.prod     = c->prod;
++    c->job.n_prod   = n;
++    c->job.n_stage0 = n;
++}
++
++// ---- the VTCM layout of version 2
++
++static size_t gdn_c2_layout_row(struct gdn_c2_row * rw, uint8_t * base, uint32_t D) {
++    const size_t D2     = hex_round_up(D, 64);
++    const size_t cd_f32 = (size_t) GDN_CH_C * D * sizeof(float);
++    const size_t dd_f32 = (size_t) D * D * sizeof(float);
++    const size_t cc_f32 = (size_t) GDN_CH_C * GDN_CH_C * sizeof(float);
++    const size_t cd_f16 = (size_t) GDN_CH_C * D * sizeof(__fp16);
++    const size_t cc_f16 = (size_t) GDN_CH_C * GDN_CH_C * sizeof(__fp16);
++    const size_t dd_f16 = (size_t) D * D * sizeof(__fp16);
++    const size_t krows  = (size_t) GDN_CH_C * D2 * sizeof(__fp16);
++    const size_t stg    = cd_f32 > dd_f32 / 2 ? cd_f32 : dd_f32 / 2;
++
++    size_t off = 0;
++#define GDN_C2_ALLOC(field, type, bytes)                          \
++    do {                                                          \
++        if (base) { rw->field = (type *) (base + off); }          \
++        off = gdn_ch_align(off + (bytes));                        \
++    } while (0)
++#define GDN_C2_MAX3(a, b, c) ((a) > (b) ? ((a) > (c) ? (a) : (c)) : ((b) > (c) ? (b) : (c)))
++
++    // stg_q and stg_k must be adjacent: together they stage the D x D state
++    GDN_C2_ALLOC(stg_q, float, stg);
++    GDN_C2_ALLOC(stg_k, float, stg);
++    GDN_C2_ALLOC(stg_v, float, cd_f32);
++    GDN_C2_ALLOC(stg_gb, float, 2 * GDN_CH_C * sizeof(float));
++    GDN_C2_ALLOC(s32, float, dd_f32);
++    GDN_C2_ALLOC(e_a, __fp16, cc_f16);
++    GDN_C2_ALLOC(k_t, __fp16, cd_f16);
++    GDN_C2_ALLOC(v_t, __fp16, cd_f16);
++    GDN_C2_ALLOC(q_t, __fp16, cd_f16);
++    GDN_C2_ALLOC(kT[0], __fp16, cd_f16);
++    GDN_C2_ALLOC(kT[1], __fp16, cd_f16);
++    GDN_C2_ALLOC(qg[0], __fp16, cd_f16);
++    GDN_C2_ALLOC(qg[1], __fp16, cd_f16);
++    GDN_C2_ALLOC(out_a, __fp16, cc_f16);
++    GDN_C2_ALLOC(out_p, __fp16, cc_f16);
++    GDN_C2_ALLOC(t2, __fp16, cc_f16);
++    GDN_C2_ALLOC(out_w, __fp16, GDN_C2_MAX3(cd_f16, cc_f32, krows));
++    GDN_C2_ALLOC(out_u, __fp16, cd_f16);
++    GDN_C2_ALLOC(out_ws, __fp16, GDN_C2_MAX3(cd_f16, cc_f32, 0));
++    GDN_C2_ALLOC(o_t, __fp16, cd_f16);
++    GDN_C2_ALLOC(s_upd, __fp16, dd_f16);
++    GDN_C2_ALLOC(s_wt, __fp16, dd_f16);
++    GDN_C2_ALLOC(o32, float, cd_f32);
++    GDN_C2_ALLOC(scr, HVX_Vector, 32 * VLEN);
++#undef GDN_C2_MAX3
++#undef GDN_C2_ALLOC
++    return off;
++}
++
++// The op on version 2. The shapes passed the checks of op_gated_delta_net_chunked. Returns
++// HTP_STATUS_NO_SUPPORT when the VTCM holds no row.
++static int gdn_c2_run(struct htp_ops_context * octx, uint32_t row_start, uint32_t nrows, uint32_t n_tok_ch,
++                      uint32_t n_tail, const struct gdn_qk_norm * nrm) {
++    const struct htp_tensor * v = octx->src[2];
++    const uint32_t D        = v->ne[0];
++    const uint32_t H        = v->ne[1];
++    const uint32_t n_tokens = v->ne[2];
++    const uint32_t n_seqs   = v->ne[3];
++
++    // one static context in DDR: the ops of a batch run one after the other
++    static struct gdn_c2_ctx c;
++    memset(&c, 0, sizeof(c));
++
++    const size_t per_row = gdn_c2_layout_row(&c.row[0], NULL, D);
++    const size_t avail   = (octx->ctx->vtcm_size > GDN_CH_ALIGN) ? (octx->ctx->vtcm_size - GDN_CH_ALIGN) : 0;
++    uint32_t group = (per_row > 0) ? (uint32_t) (avail / per_row) : 0;
++    if (group == 0) {
++        FARF(HIGH, "gdn-chunk-2: VTCM %zu holds no row of %zu bytes\n", octx->ctx->vtcm_size, per_row);
++        return HTP_STATUS_NO_SUPPORT;
++    }
++    group = group > GDN_CH_MAX_GROUP ? GDN_CH_MAX_GROUP : group;
++    group = group > nrows ? nrows : group;
++
++    uint8_t * base = octx->ctx->vtcm_base;
++    c.scales = base;
++    hmx_init_column_scales(base, Q6_V_vsplat_R(0x3c00)); // 1.0 in fp16
++    base += GDN_CH_ALIGN;
++
++    c.octx        = octx;
++    c.D           = D;
++    c.H           = H;
++    c.n_tokens    = n_tokens;
++    c.n_tok_ch    = n_tok_ch;
++    c.n_tail      = n_tail;
++    c.snap_stride = (uint64_t) D * D * H * n_seqs;
++    c.n_seqs      = n_seqs;
++    c.n_kt        = D / 32;
++    c.scale       = 1.0f / sqrtf((float) D);
++    c.n_chunks    = (n_tok_ch + GDN_CH_C - 1) / GDN_CH_C;
++    c.qknorm      = nrm != NULL;
++    if (nrm) {
++        c.nrm = *nrm;
++    }
++
++    FARF(HIGH, "gdn-chunk-2: D %u H %u n_tokens %u (chunked %u tail %u) rows %u..%u group %u per-row %zu chunks %u "
++         "qknorm %d\n", D, H, n_tokens, n_tok_ch, n_tail, row_start, row_start + nrows, group, per_row, c.n_chunks,
++         (int) c.qknorm);
++
++    work_queue_t wq = octx->ctx->work_queue;
++
++    for (uint32_t g0 = 0; g0 < nrows; g0 += group) {
++        c.row0   = row_start + g0;
++        c.n_rows = (nrows - g0 < group) ? (nrows - g0) : group;
++        for (uint32_t i = 0; i < c.n_rows; ++i) {
++            gdn_c2_layout_row(&c.row[i], base + per_row * i, D);
++        }
++        c.n_use = octx->n_threads < c.n_rows ? octx->n_threads : c.n_rows;
++        c.rows_per_thread = (c.n_rows + c.n_use - 1) / c.n_use;
++
++        work_queue_run(wq, gdn_c2_phase_begin, &c, c.n_use);
++        c.ic_prep = 0;
++        work_queue_run(wq, gdn_c2_phase_prep, &c, c.n_use);
++
++        for (uint32_t ic = 0; ic < c.n_chunks; ++ic) {
++            c.ic = ic;
++
++            gdn_c2_job_m1(&c, ic & 1);
++            int slot = gdn_c2_hmx_push(&c);
++            work_queue_run(wq, gdn_c2_phase_state, &c, c.n_use);
++            int err = gdn_c2_hmx_wait(&c, slot);
++            if (err) {
++                octx->err_detail = err;
++                return HTP_STATUS_INTERNAL_ERR;
++            }
++
++            work_queue_run(wq, gdn_c2_phase_solve, &c, c.n_use);
++
++            gdn_c2_job_m2(&c);
++            slot = gdn_c2_hmx_push(&c);
++            if (ic > 0) {
++                c.ic_store = ic - 1;
++                work_queue_run(wq, gdn_c2_phase_store, &c, c.n_use);
++            }
++            err = gdn_c2_hmx_wait(&c, slot);
++            if (err) {
++                octx->err_detail = err;
++                return HTP_STATUS_INTERNAL_ERR;
++            }
++
++            work_queue_run(wq, gdn_c2_phase_delta, &c, c.n_use);
++
++            gdn_c2_job_m3(&c, ic & 1);
++            slot = gdn_c2_hmx_push(&c);
++            if (ic + 1 < c.n_chunks) {
++                c.ic_prep = ic + 1;
++                work_queue_run(wq, gdn_c2_phase_prep, &c, c.n_use);
++            }
++            err = gdn_c2_hmx_wait(&c, slot);
++            if (err) {
++                octx->err_detail = err;
++                return HTP_STATUS_INTERNAL_ERR;
++            }
++        }
++
++        work_queue_run(wq, gdn_c2_phase_end, &c, c.n_use);
++    }
++    return HTP_STATUS_OK;
++}
++
+ // ---- the op
+ 
+ // Returns HTP_STATUS_NO_SUPPORT when the shapes or the device do not fit this kernel. The caller then
+@@ -1200,6 +2597,21 @@ int op_gated_delta_net_chunked(struct htp_ops_context * octx) {
+         return HTP_STATUS_OK;
+     }
+ 
++    // The version of the kernel (the host switch GGML_HEXAGON_GDN_CHUNK), and the L2 norm of q and k.
++    // Version 1 has no norm, thus a normalized op that version 2 does not take goes to the sequential
++    // kernel.
++    struct gdn_qk_norm nrm;
++    const bool qknorm = gdn_qk_norm_from_params(&octx->kernel_params[HTP_GDN_KP_QKNORM], &nrm);
++    if (octx->kernel_params[HTP_GDN_KP_VERSION] == 2) {
++        const int status = gdn_c2_run(octx, row_start, nrows, n_tok_ch, n_tail, qknorm ? &nrm : NULL);
++        if (status != HTP_STATUS_NO_SUPPORT) {
++            return status;
++        }
++    }
++    if (qknorm) {
++        return HTP_STATUS_NO_SUPPORT;
++    }
++
+     // one static context: the ops of a batch run one after the other
+     static struct gdn_ch_ctx c;
+     memset(&c, 0, sizeof(c));
+diff --git a/ggml/src/ggml-hexagon/htp/gdn-step.h b/ggml/src/ggml-hexagon/htp/gdn-step.h
+index 11b15f2..fb9ba18 100644
+--- a/ggml/src/ggml-hexagon/htp/gdn-step.h
++++ b/ggml/src/ggml-hexagon/htp/gdn-step.h
+@@ -15,6 +15,36 @@
+ 
+ #include <stdbool.h>
+ #include <stdint.h>
++#include <string.h>
++
++#include "htp-gdn-params.h"
++
++// The L2 norm of q and k that the op applies when it loads them. The graph normalizes each head
++// of q and k before the op: L2_NORM(x, eps), or SCALE(RMS_NORM(x, eps / n), 1 / sqrt(n)) as
++// build_gdn_l2_norm makes it. The host removes those ops and gives the op the raw rows and these
++// four values. The factor of one head row x is
++//   r = s / sqrt(max(a * sum(x^2) + b, c))
++// thus L2_NORM is (a, b, c, s) = (1, 0, eps^2, 1), and SCALE(RMS_NORM) is (1 / n, eps / n, 0, 1 / sqrt(n)).
++struct gdn_qk_norm {
++    float a;
++    float b;
++    float c;
++    float s;
++};
++
++// The kernel params of the norm, from HTP_GDN_KP_QKNORM on (htp-gdn-params.h): params[0] is 1 when
++// the op normalizes q and k, and params[1..4] hold the bits of a, b, c and s. Returns true and fills
++// n when the op normalizes.
++static inline bool gdn_qk_norm_from_params(const int32_t * params, struct gdn_qk_norm * n) {
++    if (params[0] != 1) {
++        return false;
++    }
++    memcpy(&n->a, &params[1], sizeof(float));
++    memcpy(&n->b, &params[2], sizeof(float));
++    memcpy(&n->c, &params[3], sizeof(float));
++    memcpy(&n->s, &params[4], sizeof(float));
++    return true;
++}
+ 
+ // Applies one token to the state and writes the attention output of that token.
+ //
+@@ -34,8 +64,10 @@
+ // S_v:      the head size, a maximum of HTP_GDN_MAX_SV
+ // kda:      true when the gate is one value for each key index
+ // scale:    1 / sqrt(S_v)
++// nrm:      the L2 norm of q_t and k_t, or NULL when they are normalized
+ void gdn_step_token_f32(float * restrict state, const float * restrict q_t, const float * restrict k_t,
+                         const float * restrict v_t, const float * restrict g_t, float beta_val,
+-                        float * restrict attn_out, uint32_t S_v, bool kda, float scale);
++                        float * restrict attn_out, uint32_t S_v, bool kda, float scale,
++                        const struct gdn_qk_norm * nrm);
+ 
+ #endif // GDN_STEP_H
+diff --git a/ggml/src/ggml-hexagon/htp/htp-gdn-params.h b/ggml/src/ggml-hexagon/htp/htp-gdn-params.h
+index a3e929e..e9c35f1 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-gdn-params.h
++++ b/ggml/src/ggml-hexagon/htp/htp-gdn-params.h
+@@ -5,6 +5,16 @@
+ #ifndef HTP_GDN_PARAMS_H
+ #define HTP_GDN_PARAMS_H
+ 
++// GATED_DELTA_NET: 1 runs every batch on the sequential kernel (GGML_HEXAGON_GDN_CHUNK=0)
++#define HTP_GDN_KP_SEQ      0
++
++// GATED_DELTA_NET: the version of the chunked kernel, 2 for version 2 and another value for version 1
++#define HTP_GDN_KP_VERSION  1
++
++// GATED_DELTA_NET and GDN_STATE_STEP: 1 when the op applies the L2 norm of q and k. The four floats of
++// the norm (a, b, c, s of gdn-step.h) follow in the next four params.
++#define HTP_GDN_KP_QKNORM   2
++
+ // GDN_CONV_CHUNK: 1 moves the rows with the DMA (GGML_HEXAGON_GDN_CONV_DMA)
+ #define HTP_GDN_KP_CONV_DMA 2
+ 

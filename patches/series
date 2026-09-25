@@ -242,3 +242,4 @@ hexagon-gemv/0001-hexagon-htp-move-each-q8-0-column-tile-with-one-dma-row.patch
 hexagon-v81/0002-hexagon-a-start-up-self-test-of-the-dsp-before-the-backend-registers-a-device.patch
 hexagon-v81/0003-hexagon-htp-the-transpose-tile-copy-reads-the-source-rows-at-the-stride-of-a-row.patch
 gdnk/0001-hexagon-stream-the-rows-of-gdn-conv-chunk-through-vtcm-with-the-dma.patch
+gdnk/0002-hexagon-version-2-of-the-chunked-gated-delta-net-kernel.patch

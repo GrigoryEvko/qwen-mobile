@@ -98,12 +98,12 @@ int main(int argc, char ** argv) {
 
     // ---- timing. One call is one token of one head.
     uint64_t best = UINT64_MAX;
-    gdn_step_token_f32(state, q, k, v, g, beta, attn, D, kda, (float) scale);
+    gdn_step_token_f32(state, q, k, v, g, beta, attn, D, kda, (float) scale, NULL);
     for (uint32_t it = 0; it < iters; it++) {
         memcpy(state, state0, dd * sizeof(float));
         LAB_BARRIER();
         const uint64_t t0 = lab_cycles();
-        gdn_step_token_f32(state, q, k, v, g, beta, attn, D, kda, (float) scale);
+        gdn_step_token_f32(state, q, k, v, g, beta, attn, D, kda, (float) scale, NULL);
         const uint64_t t1 = lab_cycles();
         LAB_BARRIER();
         if (t1 - t0 < best) {
@@ -120,7 +120,7 @@ int main(int argc, char ** argv) {
 
     // ---- the float64 check, after the timing
     memcpy(state, state0, dd * sizeof(float));
-    gdn_step_token_f32(state, q, k, v, g, beta, attn, D, kda, (float) scale);
+    gdn_step_token_f32(state, q, k, v, g, beta, attn, D, kda, (float) scale, NULL);
 
     double * ref_state = lab_ddr_alloc(dd * sizeof(double), 128);
     double * ref_attn  = lab_ddr_alloc(D * sizeof(double), 128);
