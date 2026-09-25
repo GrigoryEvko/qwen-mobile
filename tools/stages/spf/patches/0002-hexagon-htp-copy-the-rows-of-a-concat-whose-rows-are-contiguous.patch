@@ -1,0 +1,104 @@
+hexagon: htp: copy the rows of a concat whose rows are contiguous
+
+The cost
+
+op_concat sends each case to concat_generic, except a 2D concat along dimension 0 with a transposed src1.
+concat_generic calculates the four indices of each element with three fastdiv steps and copies one element
+at a time. The MTP draft context of Qwen3.5 concatenates two rows of 2560 floats for each token
+(mtp_concat). In the op profile of the 4B Q8_0 on the v79 NPU (the stage imgturn, the draft on), that op
+uses 29.3 ms for 1024 tokens, 16.6 ms for 623 tokens and 0.6 ms for 22 tokens.
+
+The change
+
+concat_rows copies each row of dst with hvx_copy_uu: for dimension 0, the row of src0 and then the row of
+src1; for a different dimension, the row of the source that the index of the row selects. A thread gets a
+range of rows. op_concat uses concat_rows when src0, src1 and dst have the same type and contiguous rows
+(nb[0] is the size of one element), on one device. The transposed path and the path of more devices do
+not change. The copy moves bits, thus the output has the bytes of concat_generic.
+
+The results
+
+The phone stage spf (tools/stages/spf) holds the checks: test-backend-ops -o CONCAT on HTP0 against the
+CPU backend, and the time of the op in the op profile with the draft on.
+
+diff --git a/ggml/src/ggml-hexagon/htp/concat-ops.c b/ggml/src/ggml-hexagon/htp/concat-ops.c
+index 966e867b3976bac86d3f99b691517e39f758751e..1b2d63e292c9321751b7d1a680d7237709e4221d 100644
+--- a/ggml/src/ggml-hexagon/htp/concat-ops.c
++++ b/ggml/src/ggml-hexagon/htp/concat-ops.c
+@@ -230,6 +230,51 @@ static void concat_generic(unsigned int nth, unsigned int ith, void * data) {
+     }
+ }
+ 
++// The rows of dst in the order i1, i2, i3, each copied whole with HVX vector moves. A thread gets a range
++// of rows. For dim 0 a row of dst is a row of src0 and then a row of src1. For another dim, the index of
++// the row along dim selects src0 or src1, and the row is one row of that source. The caller makes sure
++// that the three tensors have one type and contiguous rows (nb[0] is the size of one element). The copy
++// moves bits, thus it gives the bytes of concat_generic. O(elements of dst) for all threads together.
++static void concat_rows(unsigned int nth, unsigned int ith, void * data) {
++    struct htp_concat_context * cctx = (struct htp_concat_context *) data;
++    struct htp_ops_context *    octx = cctx->octx;
++
++    const struct htp_tensor * src0 = octx->src[0];
++    const struct htp_tensor * src1 = octx->src[1];
++    const struct htp_tensor * dst  = octx->dst;
++
++    const uint32_t dim       = cctx->dim;
++    const uint32_t type_size = (dst->type == HTP_TYPE_F32 || dst->type == HTP_TYPE_I32) ? 4 : 2;
++    const uint32_t row_start = ith * cctx->nrows_per_thread;
++    const uint32_t row_end   = MIN(row_start + cctx->nrows_per_thread, cctx->nrows);
++
++    for (uint32_t r = row_start; r < row_end; ++r) {
++        const uint32_t r12 = fastdiv(r, &cctx->div_ne1);
++        const uint32_t i1  = r - r12 * dst->ne[1];
++        const uint32_t i3  = fastdiv(r12, &cctx->div_ne2);
++        const uint32_t i2  = r12 - i3 * dst->ne[2];
++
++        uint8_t * d = (uint8_t *) dst->data + i3 * dst->nb[3] + i2 * dst->nb[2] + i1 * dst->nb[1];
++
++        if (dim == 0) {
++            const uint8_t * s0 = (const uint8_t *) src0->data + i3 * src0->nb[3] + i2 * src0->nb[2] + i1 * src0->nb[1];
++            const uint8_t * s1 = (const uint8_t *) src1->data + i3 * src1->nb[3] + i2 * src1->nb[2] + i1 * src1->nb[1];
++            hvx_copy_uu(d, s0, src0->ne[0], type_size);
++            hvx_copy_uu(d + src0->ne[0] * type_size, s1, src1->ne[0], type_size);
++            continue;
++        }
++
++        uint32_t idx[4] = { 0, i1, i2, i3 };
++        const struct htp_tensor * src = src0;
++        if (idx[dim] >= src0->ne[dim]) {
++            idx[dim] -= src0->ne[dim];
++            src = src1;
++        }
++        const uint8_t * s = (const uint8_t *) src->data + idx[3] * src->nb[3] + idx[2] * src->nb[2] + idx[1] * src->nb[1];
++        hvx_copy_uu(d, s, dst->ne[0], type_size);
++    }
++}
++
+ int op_concat(struct htp_ops_context * octx) {
+     const struct htp_tensor * src0 = octx->src[0];
+     const struct htp_tensor * src1 = octx->src[1];
+@@ -253,6 +298,24 @@ int op_concat(struct htp_ops_context * octx) {
+ 
+     void (*worker_func)(unsigned int, unsigned int, void *) = concat_generic;
+ 
++    // Rows that are contiguous in the three tensors go as whole rows (concat_rows). concat_generic calculates
++    // the indices of each element and copies one element at a time: 29 ms for the MTP concat of 5120 x 1024
++    // floats on the v79. One device only: the partition of more devices splits the elements at L2 lines, and
++    // the row copy writes whole rows.
++    const bool rows_contiguous = src0->type == dst->type && src1->type == dst->type && src0->nb[0] == type_size &&
++                                 src1->nb[0] == type_size && dst->nb[0] == type_size && dim >= 0 && dim <= 3;
++    const uint32_t n_dst_rows  = dst->ne[1] * dst->ne[2] * dst->ne[3];
++
++    if (rows_contiguous && octx->ctx->mdev.count == 1) {
++        if (n_dst_rows == 0 || dst->ne[0] == 0) {
++            return HTP_STATUS_OK;
++        }
++        cctx.nrows            = n_dst_rows;
++        cctx.nrows_per_thread = fastdiv(n_dst_rows + n_threads - 1, &octx->n_threads_div);
++        work_queue_run(octx->ctx->work_queue, concat_rows, &cctx, n_threads);
++        return HTP_STATUS_OK;
++    }
++
+     if (dim == 0 && is_2d && is_src1_transposed && !is_src0_transposed) {
+         const uint32_t total_rows = dst->ne[1];
+         const size_t dst_data_row_size = dst->ne[0] * type_size;

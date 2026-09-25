@@ -233,6 +233,9 @@ int main(int argc, char ** argv) {
     const uint32_t vtcm_kb  = (uint32_t) lab_arg_long(argc, argv, "--vtcm_kb", 0);
     g_hmx_run               = (int) lab_arg_long(argc, argv, "--hmx", 1);
     g_hmx_defer             = (int) lab_arg_long(argc, argv, "--defer", 0);
+    // The smallest batch of version 2 (HTP_GDN_KP_CHUNK_MIN). 0 gives the limit of the DSP. A tree without the
+    // param ignores it.
+    const uint32_t chunk_min = (uint32_t) lab_arg_long(argc, argv, "--chunk_min", 0);
 
     if (D > 128 || D % 32 != 0 || H % Hk != 0 || nth == 0 || nth > HTP_MAX_NTHREADS) {
         printf("lab: %s the shape is not supported\n", TARGET);
@@ -240,8 +243,8 @@ int main(int argc, char ** argv) {
     }
 
     lab_init();
-    printf("lab: %s H %u Hk %u D %u T %u K %u threads %u ver %u qknorm %u hmx %d gate_min %.3f\n", TARGET, H, Hk, D,
-           T, K, nth, ver, qknorm, g_hmx_run, (double) gate_min);
+    printf("lab: %s H %u Hk %u D %u T %u K %u threads %u ver %u qknorm %u hmx %d gate_min %.3f chunk_min %u\n", TARGET,
+           H, Hk, D, T, K, nth, ver, qknorm, g_hmx_run, (double) gate_min, chunk_min);
 
     // ---- the inputs, in the layout of the model graph
     const uint32_t row_floats = 2 * Hk * D + H * D;
@@ -340,6 +343,13 @@ int main(int argc, char ** argv) {
     octx.dst    = &td;
     octx.kernel_params[0] = 0;
     octx.kernel_params[1] = (int32_t) ver;
+#ifdef HTP_GDN_KP_CHUNK_MIN
+    octx.kernel_params[HTP_GDN_KP_CHUNK_MIN] = (int32_t) chunk_min;
+#else
+    if (chunk_min != 0) {
+        printf("lab: %s the tree has no HTP_GDN_KP_CHUNK_MIN, thus --chunk_min has no effect\n", TARGET);
+    }
+#endif
     if (qknorm) {
         // the L2_NORM form: r = 1 / sqrt(max(sum, eps^2))
         const float a = 1.0f, b = 0.0f, c = l2_eps * l2_eps, s = 1.0f;
