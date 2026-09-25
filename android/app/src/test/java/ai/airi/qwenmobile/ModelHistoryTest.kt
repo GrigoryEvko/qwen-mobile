@@ -1,6 +1,7 @@
 package ai.airi.qwenmobile
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertSame
 import org.junit.Test
 
 /** The messages that reach the chat template after interrupted, failed and restored turns. */
@@ -69,6 +70,32 @@ class ModelHistoryTest {
             val out = modelHistory(listOf(user("hello")), blank)
             assertEquals(1, out.size)
             assertEquals("user", out[0].role)
+        }
+    }
+
+    @Test
+    fun theStageOfAnImageHasTheHistoryOfItsSendExceptTheText() {
+        // The stage decodes the prompt up to the image before the user writes the text, thus
+        // each message before the new one, the system prompt and the image must be those of the send.
+        val image = byteArrayOf(1, 2, 3)
+        val histories = listOf(
+            listOf(user("q1"), answer("a1")),
+            listOf(user("q1"), answer("", ChatMessage.Phase.INTERRUPTED)),
+            listOf(ChatMessage("system", "be brief"), user("q1"), answer("a1"), user("q2")),
+            emptyList(),
+        )
+        for (messages in histories) {
+            val staged = stageHistory(messages, image, "Describe the image.", "You answer in Russian.")
+            val sent = modelHistory(messages + ChatMessage("user", "What is the price?", image), "You answer in Russian.")
+            assertEquals(sent.size, staged.size)
+            for (i in 0 until sent.size - 1) {
+                assertEquals(sent[i].role, staged[i].role)
+                assertEquals(sent[i].content, staged[i].content)
+                assertSame(sent[i].image, staged[i].image)
+            }
+            assertEquals("user", staged.last().role)
+            assertEquals("Describe the image.", staged.last().content)
+            assertSame(image, staged.last().image)
         }
     }
 

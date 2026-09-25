@@ -70,6 +70,8 @@
 #include "ggml-cpu.h"
 #include "image_cache.h"
 #include "llama.h"
+// The memory breakdown of a context: the path of common/speculative.cpp, through the include directory common.
+#include "../src/llama-ext.h"
 #include "mtmd-helper.h"
 #include "mtmd.h"
 #include "perf_hint.h"
@@ -363,6 +365,37 @@ int api_chat_start(Program & p, jlong h, const std::vector<Msg> & msgs, bool thi
                                                            thinking ? JNI_TRUE : JNI_FALSE, temp, top_p);
     });
     return out.threw ? -2 : rc;
+}
+
+/** stageImage. Returns the result, or -2 on an exception. */
+int api_stage_image(Program & p, jlong h, const std::vector<Msg> & msgs, bool thinking) {
+    int rc = -2;
+    const fakejni::CallOutcome out = jni_call("stageImage", [&](JNIEnv * env) {
+        std::vector<fakejni::Obj *> roles, contents, imgs;
+        for (const Msg & m : msgs) {
+            roles.push_back(fakejni::new_string_utf8(m.role));
+            contents.push_back(fakejni::new_string(m.text));
+            imgs.push_back(m.image >= 0 ? fakejni::new_byte_array(p.images[(size_t) m.image].data(),
+                                                                  p.images[(size_t) m.image].size())
+                                        : nullptr);
+        }
+        jobject jroles    = fakejni::arg(env, fakejni::new_object_array("java/lang/String", roles));
+        jobject jcontents = fakejni::arg(env, fakejni::new_object_array("java/lang/String", contents));
+        jobject jimages   = fakejni::arg(env, fakejni::new_object_array("[B", imgs));
+        rc = Java_ai_airi_qwenmobile_LlamaNative_stageImage(env, native_class(env), h, (jobjectArray) jroles,
+                                                            (jobjectArray) jcontents, (jobjectArray) jimages,
+                                                            thinking ? JNI_TRUE : JNI_FALSE);
+    });
+    return out.threw ? -2 : rc;
+}
+
+/** prepareVision. Returns 1 when the projector is ready, 0 when not, -2 on an exception. */
+int api_prepare_vision(jlong h) {
+    jboolean r = JNI_FALSE;
+    const fakejni::CallOutcome out = jni_call("prepareVision", [&](JNIEnv * env) {
+        r = Java_ai_airi_qwenmobile_LlamaNative_prepareVision(env, native_class(env), h);
+    });
+    return out.threw ? -2 : (r == JNI_TRUE ? 1 : 0);
 }
 
 /** generateNext. Returns 1 with the piece, 0 for null, -1 for an exception. */
@@ -1162,6 +1195,38 @@ void op_chat(Program & p) {
     check_all(p, "chatStart", false);
 }
 
+/**
+ * The stage of an attached image, as the app calls it before the send: the
+ * history of the engine with its answer, or a new chat, and a user message
+ * with an image of the program (or without one, which stages nothing).
+ */
+void op_stage(Program & p) {
+    FuzzedDataProvider & fdp = *p.fdp;
+    const jlong h = pick_handle(p);
+    LiveEngine * le = live_of(p, h);
+    std::vector<Msg> msgs;
+    if (le != nullptr && !le->convo.empty() && fdp.ConsumeIntegralInRange<int>(0, 3) != 0) {
+        msgs = le->convo;
+        if (!le->answer.empty() || fdp.ConsumeBool()) {
+            msgs.push_back(Msg{"assistant", fakejni::new_string_utf8(le->answer)->chars, -1});
+        }
+    }
+    Msg m{"user", gen_text(fdp, 32), -1};
+    if (!p.images.empty() && fdp.ConsumeIntegralInRange<int>(0, 7) != 0) {
+        m.image = fdp.ConsumeIntegralInRange<int>(0, (int) p.images.size() - 1);
+    }
+    msgs.push_back(std::move(m));
+    const bool thinking = fdp.ConsumeBool();
+    const int  rc       = api_stage_image(p, h, msgs, thinking);
+    trace(*p.opt, "stageImage h=%lld %zu messages thinking=%d: %d", (long long) h, msgs.size(), (int) thinking, rc);
+    if (le != nullptr) {
+        // The stage ends an answer that the app did not read to its end, and it changes the memory.
+        le->dirty    = true;
+        le->tracking = false;
+    }
+    check_all(p, "stageImage", false);
+}
+
 void op_generate(Program & p) {
     FuzzedDataProvider & fdp = *p.fdp;
     const jlong h = pick_handle(p);
@@ -1913,6 +1978,454 @@ int check_spec_limit(Program & p, LoadSpec s) {
     return 0;
 }
 
+/**
+ * One flow of the scenario image-stage. A flow starts from an empty memory,
+ * makes the first turn of the chat when turn1 is set, stages the images of
+ * stages (stageImage, in order), and then sends the second message with
+ * send_image (-1 for none).
+ */
+struct StageFlowSpec {
+    const char * name;
+    /** The flow whose answer this one must give, or null for a reference flow. */
+    const char * ref;
+    bool         turn1;
+    std::vector<int> stages;
+    /** resetChat after the stages, before the send. */
+    bool         reset_before_send;
+    int          send_image;
+    /** The thinking of the stages and of the send. */
+    bool         stage_thinking;
+    bool         send_thinking;
+};
+
+/** The result of one flow. */
+struct StageFlowResult {
+    std::vector<llama_token> tokens;
+    std::vector<float>       logits;
+    double                   stage_ms    = 0.0;
+    double                   chat_ms     = 0.0;
+    double                   ttft_ms     = 0.0;
+    int                      staged      = 0;
+    bool                     first_image = false;
+    /** The compute buffers of the decode context at the start and at the end of the flow, in MiB. */
+    double                   compute0_mib = 0.0;
+    double                   compute1_mib = 0.0;
+    /** The items of the last staged part, and the first item that the send decoded after it, as text. */
+    std::string              part;
+    std::string              next;
+    std::string              stats;
+};
+
+/**
+ * The flows of the scenario. The first image is A (0), the second B (1).
+ * "warm" is a send of B that no other flow refers to: on the phone it runs
+ * first, thus the first image of the engine (the load of the projector and the
+ * first image graph) is not part of a measured flow.
+ */
+const std::vector<StageFlowSpec> & stage_flows() {
+    static const std::vector<StageFlowSpec> flows = {
+        // Not a flow: prepareVision alone (the user opens the photo menu). The loop of the scenario runs it.
+        {"vision", nullptr, false, {}, false, -1, false, false},
+        {"warm", nullptr, true, {}, false, 1, false, false},
+        {"send", nullptr, true, {}, false, 0, false, false},
+        {"send-again", "send", true, {}, false, 0, false, false},
+        {"stage-send", "send", true, {0}, false, 0, false, false},
+        {"stage-twice", "send", true, {0, 0}, false, 0, false, false},
+        {"text", nullptr, true, {}, false, -1, false, false},
+        {"stage-drop", "text", true, {0}, false, -1, false, false},
+        {"send-b", nullptr, true, {}, false, 1, false, false},
+        {"stage-other", "send-b", true, {0}, false, 1, false, false},
+        {"stage-swap", "send-b", true, {0, 1}, false, 1, false, false},
+        {"send-think", nullptr, true, {}, false, 0, true, true},
+        {"stage-think", "send-think", true, {0}, false, 0, true, true},
+        {"stage-mixed", "send-think", true, {0}, false, 0, false, true},
+        {"send-first", nullptr, false, {}, false, 0, false, false},
+        {"stage-first", "send-first", false, {0}, false, 0, false, false},
+        {"reset-send", nullptr, true, {}, true, 0, false, false},
+        {"stage-reset", "reset-send", true, {0}, true, 0, false, false},
+    };
+    return flows;
+}
+
+/** The logits of the last position of the decode context, which chatStart leaves for the first sample. */
+std::vector<float> prompt_logits(jlong h) {
+    const std::shared_ptr<Engine> sp = engine_of(h);
+    std::lock_guard<std::mutex> lock(sp->mutex);
+    const int     n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(sp->model));
+    const float * l       = llama_get_logits_ith(sp->ctx, -1);
+    return l != nullptr ? std::vector<float>(l, l + n_vocab) : std::vector<float>();
+}
+
+/** The compute buffers of the decode context of the engine h, over all buffer types, in MiB. */
+double compute_mib(jlong h) {
+    const std::shared_ptr<Engine> sp = engine_of(h);
+    std::lock_guard<std::mutex> lock(sp->mutex);
+    size_t bytes = 0;
+    for (const auto & [buft, mb] : llama_get_memory_breakdown(sp->ctx)) {
+        (void) buft;
+        bytes += mb.compute;
+    }
+    return bytes / 1048576.0;
+}
+
+/** The items [from, to) of the memory of the engine h as text: the piece of each token, an image as [image]. */
+std::string items_text(jlong h, size_t from, size_t to) {
+    const std::shared_ptr<Engine> sp = engine_of(h);
+    std::lock_guard<std::mutex> lock(sp->mutex);
+    const llama_vocab * vocab = llama_model_get_vocab(sp->model);
+    std::string out;
+    for (size_t i = from; i < to && i < sp->cache.size(); ++i) {
+        const MemItem & it = sp->cache[i];
+        std::string piece = it.token == kMemTokenNull ? "[image]" : common_token_to_piece(vocab, it.token, true);
+        // No white space, thus the text is one field of a STAGE line.
+        for (char c : piece) {
+            switch (c) {
+                case '\n': out += "\\n"; break;
+                case '\r': out += "\\r"; break;
+                case '\t': out += "\\t"; break;
+                case ' ':  out += "_"; break;
+                default:   out += c; break;
+            }
+        }
+        out += '|';
+    }
+    return out;
+}
+
+/**
+ * The Kullback-Leibler divergence KL(P || Q) of the distributions softmax(p)
+ * and softmax(q), in double, or infinity for vectors of different lengths.
+ * O(vocabulary).
+ */
+double kl_divergence(const std::vector<float> & p, const std::vector<float> & q) {
+    if (p.size() != q.size() || p.empty()) {
+        return std::numeric_limits<double>::infinity();
+    }
+    const double max_p = *std::max_element(p.begin(), p.end());
+    const double max_q = *std::max_element(q.begin(), q.end());
+    double sum_p = 0.0, sum_q = 0.0;
+    for (size_t i = 0; i < p.size(); ++i) {
+        sum_p += std::exp((double) p[i] - max_p);
+        sum_q += std::exp((double) q[i] - max_q);
+    }
+    const double log_zp = max_p + std::log(sum_p);
+    const double log_zq = max_q + std::log(sum_q);
+    double kl = 0.0;
+    for (size_t i = 0; i < p.size(); ++i) {
+        const double lp = (double) p[i] - log_zp;
+        const double lq = (double) q[i] - log_zq;
+        kl += std::exp(lp) * (lp - lq);
+    }
+    return std::max(kl, 0.0);
+}
+
+/** The index of the largest logit, the token that a greedy sample takes. */
+size_t top_token(const std::vector<float> & logits) {
+    return logits.empty() ? 0 : (size_t) (std::max_element(logits.begin(), logits.end()) - logits.begin());
+}
+
+/** The largest absolute difference of two logit vectors, or infinity for vectors of different lengths. */
+float logit_distance(const std::vector<float> & a, const std::vector<float> & b) {
+    if (a.size() != b.size() || a.empty()) {
+        return std::numeric_limits<float>::infinity();
+    }
+    float worst = 0.0f;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const float d = std::fabs(a[i] - b[i]);
+        if (!(d <= worst)) {
+            worst = d;
+        }
+    }
+    return worst;
+}
+
+/**
+ * Run one flow on the engine h: the memory starts empty, then the first turn,
+ * the stages and the send. The answer is the first n_tokens tokens of the
+ * sampler of the app (temperature 0.7, top-p 0.8, the seed of
+ * QWEN_SAMPLER_SEED). O(prompt + n_tokens) decodes.
+ */
+StageFlowResult run_stage_flow(Program & p, jlong h, const StageFlowSpec & f, const std::u16string & first_text,
+                               int n_tokens, const char * what) {
+    const std::u16string first_answer = u"I read the log. Every step finished with no error.";
+    const std::u16string send_text    = u"What is in the picture? Answer in two sentences.";
+    const std::u16string stage_text   = u"Describe the image.";
+    StageFlowResult r;
+    const std::shared_ptr<Engine> sp = engine_of(h);
+    api_reset(h);
+    {
+        std::lock_guard<std::mutex> lock(sp->mutex);
+        r.first_image = sp->mctx == nullptr;
+    }
+    r.compute0_mib = compute_mib(h);
+    std::vector<Msg> history;
+    if (f.turn1) {
+        history.push_back(Msg{"user", first_text, -1});
+        if (api_chat_start(p, h, history, false, 0.7f, 0.8f, false, false) < 0) {
+            fail("%s: flow %s: the first turn did not start", what, f.name);
+        }
+        const std::string answer = fakejni::to_modified_utf8(first_answer);
+        inject_answer(h, answer, what);
+        // The snapshot after a complete answer runs on the background thread.
+        sp->worker->drain();
+        history.push_back(Msg{"assistant", first_answer, -1});
+    }
+    for (const int image : f.stages) {
+        std::vector<Msg> msgs = history;
+        msgs.push_back(Msg{"user", stage_text, image});
+        const auto t0 = std::chrono::steady_clock::now();
+        r.staged = api_stage_image(p, h, msgs, f.stage_thinking);
+        r.stage_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        check_engine(h, "stageImage of a scenario");
+        if (r.staged <= 0) {
+            fail("%s: flow %s: stageImage gave %d, it must stage the image", what, f.name, r.staged);
+        }
+    }
+    // The staged part and the end of it: the send decodes from there when it extends the part.
+    size_t part_end = 0;
+    if (!f.stages.empty()) {
+        size_t from = 0;
+        {
+            std::lock_guard<std::mutex> lock(sp->mutex);
+            from     = sp->staged.active() ? sp->staged.from : sp->cache.size();
+            part_end = sp->cache.size();
+        }
+        r.part = items_text(h, from, part_end);
+    }
+    if (f.reset_before_send) {
+        api_reset(h);
+    }
+    std::vector<Msg> msgs = history;
+    msgs.push_back(Msg{"user", send_text, f.send_image});
+    const auto t0 = std::chrono::steady_clock::now();
+    if (api_chat_start(p, h, msgs, f.send_thinking, 0.7f, 0.8f, false, false) < 0) {
+        fail("%s: flow %s: chatStart failed", what, f.name);
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    r.logits = prompt_logits(h);
+    bool extended = false;
+    {
+        std::lock_guard<std::mutex> lock(sp->mutex);
+        extended = sp->turn.staged_tokens > 0;
+    }
+    if (extended) {
+        // The send kept the staged part: its first own item follows the image.
+        r.next = items_text(h, part_end, part_end + 1);
+    }
+    LiveEngine le;
+    le.handle = h;
+    start_tracking(le);
+    std::vector<int8_t> piece;
+    const int64_t given = given_tokens(le);
+    const int     rc    = api_generate_next(h, piece);
+    const auto    t2    = std::chrono::steady_clock::now();
+    note_delivered(le, given);
+    check_engine(h, "the first generateNext of a scenario");
+    if (rc == 1) {
+        drain_answer(le, n_tokens - 1);
+    }
+    r.tokens  = le.delivered;
+    r.chat_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    r.ttft_ms = std::chrono::duration<double, std::milli>(t2 - t0).count();
+    r.stats   = api_string_call("stats", h);
+    r.compute1_mib = compute_mib(h);
+    return r;
+}
+
+/**
+ * The scenario image-stage: stageImage of an attached image before its send
+ * gives the answer of the send alone. Each flow of stage_flows() with a
+ * reference must give the tokens of that reference, and the logits after its
+ * prompt must be those of the reference when two runs of the same send give
+ * the same logits ("send-again"). The flows cover a continuation of the live
+ * form, the same image staged two times, a send without the image, a
+ * different image, a second stage of another image, the template form of a
+ * thinking turn, a stage without thinking and a send with it, the first
+ * message of a chat, and a reset after the stage.
+ *
+ * With FUZZ_APP_REAL_MODEL and FUZZ_APP_REAL_MMPROJ the scenario takes that
+ * model on FUZZ_APP_DEVICE with the settings of the app (n_ctx 8192, four
+ * threads, FUZZ_APP_IMAGE_TOKENS image tokens, the draft when
+ * FUZZ_APP_SPECULATIVE is not 0), the photo of FUZZ_APP_IMAGE as the first
+ * image, a first message of about 1700 tokens, and the flows of
+ * FUZZ_APP_STAGE_FLOWS (names separated by commas, in order). Each flow
+ * prints one "STAGE" line with its times, the compute buffers of the context
+ * at its start and end, the staged part and the first item after it, and
+ * against its reference the largest logit difference, the KL divergence and
+ * the top token of the logits after the prompt, and the count of equal
+ * leading tokens. FUZZ_APP_STAGE_TOKENS is the length of each answer (the
+ * preset is 32). FUZZ_APP_STAGE_STRICT=0 turns the checks into reports: the
+ * kernels of HTP0 round differently for other batch shapes. O(flows x
+ * (prompt + answer)) decodes.
+ */
+int check_image_stage(Program & p, LoadSpec s, bool speculative) {
+    const Options & opt  = *p.opt;
+    const bool      real = !opt.real_model.empty() && !opt.real_mmproj.empty();
+    const char *    what = speculative ? "scenario image-stage (draft)" : "scenario image-stage";
+    auto env_int = [](const char * name, int preset) {
+        const char * v = getenv(name);
+        return v != nullptr ? atoi(v) : preset;
+    };
+    s.speculative = speculative;
+    s.cache.clear();
+    std::u16string first_text = u"Here is the log of the tool. ";
+    // About 9 tokens for each line: the first message of the real model is 1517 tokens, and the memory after the
+    // image turn holds about 1590 positions, near the 1647 of the chat of the user.
+    const int lines = real ? 160 : 6;
+    for (int i = 0; i < lines; ++i) {
+        first_text += u"Step " + fakejni::new_string_utf8(std::to_string(i + 1))->chars + u" finished with no error. ";
+    }
+    first_text += u"Did any step fail?";
+    p.images.clear();
+    if (real) {
+        s.model            = opt.real_model;
+        s.mmproj           = opt.real_mmproj;
+        s.vision           = opt.device;
+        s.gpu_layers       = opt.device.empty() ? 0 : 999;
+        // Four threads as the app. A host run on the CPU takes more with FUZZ_APP_REAL_THREADS.
+        s.threads          = std::max(1, env_int("FUZZ_APP_REAL_THREADS", 4));
+        s.n_ctx            = 8192;
+        s.image_max_tokens = env_int("FUZZ_APP_IMAGE_TOKENS", 768);
+        std::vector<uint8_t> photo;
+        const char * path = getenv("FUZZ_APP_IMAGE");
+        if (path == nullptr || !cache_io::read_file(path, photo, 64u << 20) || photo.empty()) {
+            fail("%s: FUZZ_APP_IMAGE must name a readable photo", what);
+        }
+        p.images.push_back(std::move(photo));
+        p.images.push_back(make_bmp(640, 480, 5));
+    } else {
+        p.images.push_back(make_bmp(48, 40, 3));
+        p.images.push_back(make_bmp(40, 48, 4));
+    }
+    // decodeImage gives no pixels, thus the engine decodes each image itself (stb_image): the same pixels each time.
+    p.tape = {4};
+    const int n_tokens = std::max(1, env_int("FUZZ_APP_STAGE_TOKENS", 32));
+    // FUZZ_APP_STAGE_STRICT=0 (the phone) reports the KL and the top token of each comparison and does not stop: the
+    // kernels of HTP0 round differently for other batch shapes, thus the tokens of an answer can differ.
+    const bool strict = env_int("FUZZ_APP_STAGE_STRICT", 1) != 0;
+    std::vector<const StageFlowSpec *> order;
+    if (const char * list = getenv("FUZZ_APP_STAGE_FLOWS")) {
+        std::string names = list;
+        size_t at = 0;
+        while (at <= names.size()) {
+            const size_t comma = std::min(names.find(',', at), names.size());
+            const std::string name = names.substr(at, comma - at);
+            const auto it = std::find_if(stage_flows().begin(), stage_flows().end(),
+                                         [&](const StageFlowSpec & f) { return name == f.name; });
+            if (it == stage_flows().end()) {
+                fail("%s: FUZZ_APP_STAGE_FLOWS names the unknown flow '%s'", what, name.c_str());
+            }
+            order.push_back(&*it);
+            at = comma + 1;
+        }
+    } else {
+        for (const StageFlowSpec & f : stage_flows()) {
+            order.push_back(&f);
+        }
+    }
+    setenv("QWEN_SAMPLER_SEED", "20260925", 1);
+    const auto t_load = std::chrono::steady_clock::now();
+    const jlong h = api_load(s);
+    const double load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_load).count();
+    unsetenv("QWEN_SAMPLER_SEED");
+    if (h == 0) {
+        fail("%s: the model did not load", what);
+    }
+    printf("STAGE-LOAD ms=%.1f model=%s draft=%d image_tokens=%d\n", load_ms, s.model.c_str(), (int) speculative,
+           s.image_max_tokens);
+    // The first result of each reference name with the flow that gave it, the logit distance of two sends
+    // without a stage (the noise of the device), and the distance of each comparison with a stage flow.
+    struct FirstResult {
+        StageFlowResult result;
+        std::string     flow;
+        bool            staged = false;
+    };
+    std::map<std::string, FirstResult> first;
+    std::vector<std::pair<std::string, float>> staged_dist;
+    float noise = -1.0f;
+    int   compared = 0;
+    // FUZZ_APP_STAGE_DUMP=<prefix> writes the logits after the prompt of flow k to <prefix>-<k>-<flow>.f32 (raw
+    // floats), thus a comparison across processes (with and without a switch) can read them.
+    const char * dump = getenv("FUZZ_APP_STAGE_DUMP");
+    int          index = 0;
+    for (const StageFlowSpec * f : order) {
+        if (std::string(f->name) == "vision") {
+            const auto t0 = std::chrono::steady_clock::now();
+            const int  ok = api_prepare_vision(h);
+            printf("STAGE-VISION ms=%.1f ready=%d\n",
+                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), ok);
+            if (ok != 1) {
+                fail("%s: prepareVision gave %d, the projector must load", what, ok);
+            }
+            ++index;
+            continue;
+        }
+        const StageFlowResult r = run_stage_flow(p, h, *f, first_text, n_tokens, what);
+        if (dump != nullptr) {
+            const std::string path = std::string(dump) + "-" + std::to_string(index) + "-" + f->name + ".f32";
+            if (!cache_io::write_file_atomic(path, {{r.logits.data(), r.logits.size() * sizeof(float)}})) {
+                fail("%s: the logits did not write to %s", what, path.c_str());
+            }
+        }
+        ++index;
+        const std::string ref = f->ref != nullptr ? f->ref : f->name;
+        const bool        is_stage = !f->stages.empty();
+        std::string same = "-";
+        float       dist = -1.0f;
+        double      kl   = -1.0;
+        int         top1 = -1;
+        size_t      lead = 0;
+        const auto  it   = first.find(ref);
+        if (it != first.end()) {
+            const StageFlowResult & want = it->second.result;
+            dist = logit_distance(want.logits, r.logits);
+            kl   = kl_divergence(want.logits, r.logits);
+            top1 = top_token(want.logits) == top_token(r.logits) ? 1 : 0;
+            while (lead < r.tokens.size() && lead < want.tokens.size() && r.tokens[lead] == want.tokens[lead]) {
+                ++lead;
+            }
+            same = want.tokens == r.tokens ? "yes" : "no";
+            compared += 1;
+            if (!is_stage && !it->second.staged) {
+                noise = std::max(noise, dist);
+            } else {
+                staged_dist.emplace_back(is_stage ? f->name : it->second.flow, dist);
+            }
+        }
+        printf("STAGE flow=%s ref=%s first_image=%d stage_ms=%.1f staged=%d chat_ms=%.1f ttft_ms=%.1f tokens=%zu same=%s "
+               "dlogit=%g kl=%.6g top1=%d lead=%zu compute0_mib=%.1f compute1_mib=%.1f part=%s next=%s stats=%s\n",
+               f->name, ref.c_str(), (int) r.first_image, r.stage_ms, r.staged, r.chat_ms, r.ttft_ms, r.tokens.size(),
+               same.c_str(), dist, kl, top1, lead, r.compute0_mib, r.compute1_mib, r.part.empty() ? "-" : r.part.c_str(),
+               r.next.empty() ? "-" : r.next.c_str(), r.stats.c_str());
+        fflush(stdout);
+        if (same == "no" && strict) {
+            const std::vector<llama_token> & want = it->second.result.tokens;
+            size_t at = 0;
+            while (at < r.tokens.size() && at < want.size() && r.tokens[at] == want[at]) {
+                ++at;
+            }
+            fail("%s: flow %s gave other tokens than flow %s: they differ at token %zu of %zu (logits %g apart)", what,
+                 f->name, it->second.flow.c_str(), at, r.tokens.size(), dist);
+        }
+        if (it == first.end()) {
+            first.emplace(ref, FirstResult{r, f->name, is_stage});
+        }
+    }
+    // Two runs of the same send gave the same logits: then each stage flow must give exactly the logits of its reference.
+    if (strict && noise == 0.0f) {
+        for (const auto & [name, dist] : staged_dist) {
+            if (dist != 0.0f) {
+                fail("%s: flow %s gave logits %g apart from its reference, and two runs of one send gave the same logits",
+                     what, name.c_str(), dist);
+            }
+        }
+    }
+    api_free(h);
+    fprintf(stderr, "%s: %zu flows, %d compared with their reference, %s, logit noise of a repeated send %g\n", what,
+            order.size(), compared, strict ? "the same tokens in each" : "the STAGE lines report each comparison", noise);
+    return 0;
+}
+
 }  // namespace
 
 int run_scenario(const Options & opt, const std::string & name) {
@@ -2148,10 +2661,21 @@ int run_scenario(const Options & opt, const std::string & name) {
         }
     } else if (name == "spec-limit") {
         result = check_spec_limit(p, s);
+    } else if (name == "image-stage") {
+        // FUZZ_APP_SPECULATIVE selects one mode (the phone), else the scenario runs without and with the draft.
+        if (const char * mode = getenv("FUZZ_APP_SPECULATIVE")) {
+            result = check_image_stage(p, s, atoi(mode) != 0);
+        } else {
+            result = check_image_stage(p, s, false);
+            if (result == 0) {
+                result = check_image_stage(p, s, true);
+            }
+        }
     } else {
         fprintf(stderr,
                 "unknown scenario %s: image-shape, image-twice, jni-pending, spec-disable, spec-parity, spec-image, "
-                "snapshot-damage, image-damage, sampler-nan, stop-free, priority, render-live, live-turns, spec-limit\n",
+                "snapshot-damage, image-damage, sampler-nan, stop-free, priority, render-live, live-turns, spec-limit, "
+                "image-stage\n",
                 name.c_str());
         result = 2;
     }
@@ -2292,6 +2816,12 @@ int run_program(const Options & opt, const uint8_t * data, size_t size) {
                 le.dirty = true;
             }
             check_all(p, "check", true);
+        } else if (op == 30) {
+            // The user opens the photo menu: the projector loads before the image.
+            api_prepare_vision(pick_handle(p));
+            check_all(p, "prepareVision", false);
+        } else if (op == 31) {
+            op_stage(p);
         } else {
             op_generate(p);
         }

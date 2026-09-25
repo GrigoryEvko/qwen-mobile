@@ -47,6 +47,7 @@ add_library(qwenmobile SHARED
     perf_hint.cpp
     spec_policy.cpp
     state_cache.cpp
+    token_rows.cpp
     trace.cpp)
 
 target_include_directories(qwenmobile PRIVATE

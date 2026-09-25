@@ -244,6 +244,7 @@ add_library(app_harness STATIC
     "${APP_CPP_DIR}/engine_tasks.cpp"
     "${APP_CPP_DIR}/perf_hint.cpp"
     "${APP_CPP_DIR}/spec_policy.cpp"
+    "${APP_CPP_DIR}/token_rows.cpp"
     "${APP_CPP_DIR}/trace.cpp")
 # tests/sanitizers holds fuzz_death.h, the shared TSan death callback of each libFuzzer target.
 set(FUZZ_SHARED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../sanitizers")

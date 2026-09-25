@@ -205,14 +205,31 @@ bool ChatPrompt::continues(const std::vector<PromptMessage> & msgs, size_t mem_i
 
 TurnPrompt ChatPrompt::make(const std::vector<PromptMessage> & msgs, bool thinking, size_t mem_items,
                             llama_token mem_last) {
-    TurnPrompt p;
-    const bool live = form_ == HistoryForm::kLive && !thinking;
-    const bool cont = live && continues(msgs, mem_items, mem_last);
     // The record describes the memory before this turn. The turn changes the
-    // memory, thus the record goes, and answer_ended() makes the next one.
+    // memory, thus the record goes, and answer_ended() makes the next one. The
+    // record also goes when the render throws.
+    TurnPrompt p;
+    try {
+        p = plan(msgs, thinking, mem_items, mem_last);
+    } catch (...) {
+        forget();
+        throw;
+    }
     held_.clear();
     turn_.clear();
     turn_live_ = false;
+    if (p.live) {
+        turn_      = msgs;
+        turn_live_ = true;
+    }
+    return p;
+}
+
+TurnPrompt ChatPrompt::plan(const std::vector<PromptMessage> & msgs, bool thinking, size_t mem_items,
+                            llama_token mem_last) const {
+    TurnPrompt p;
+    const bool live = form_ == HistoryForm::kLive && !thinking;
+    const bool cont = live && continues(msgs, mem_items, mem_last);
     try {
         if (cont) {
             p.text          = joint_ + apply({msgs.back()}, true, false);
@@ -234,10 +251,6 @@ TurnPrompt ChatPrompt::make(const std::vector<PromptMessage> & msgs, bool thinki
     }
     if (!p.live) {
         render_template(msgs, thinking, p.text, p.tail);
-    }
-    if (p.live) {
-        turn_      = msgs;
-        turn_live_ = true;
     }
     return p;
 }

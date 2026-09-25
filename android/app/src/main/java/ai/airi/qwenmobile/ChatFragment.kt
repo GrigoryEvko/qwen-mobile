@@ -182,6 +182,8 @@ class ChatFragment : Fragment() {
     // --- the attachment ---
 
     private fun showAttachMenu(anchor: View) {
+        // The projector loads while the user selects the photo.
+        session.prepareVision()
         val menu = PopupMenu(requireContext(), anchor)
         menu.menu.add(0, 1, 0, R.string.attach_photo_library).setIcon(R.drawable.ic_image)
         menu.menu.add(0, 2, 1, R.string.attach_take_photo).setIcon(R.drawable.ic_camera)
@@ -215,8 +217,13 @@ class ChatFragment : Fragment() {
         }
     }
 
-    /** Read the image behind the URI off the main thread and hold it for the next message. */
+    /**
+     * Read the image behind the URI off the main thread and hold it for the next
+     * message. setPendingImage then stages it. A shared image comes here without
+     * the photo menu, thus the projector load starts here as well.
+     */
     private fun attachImage(uri: Uri) {
+        session.prepareVision()
         val resolver = requireContext().contentResolver
         val side = (THUMBNAIL_DP * resources.displayMetrics.density).toInt()
         viewLifecycleOwner.lifecycleScope.launch {
@@ -239,10 +246,16 @@ class ChatFragment : Fragment() {
         }
     }
 
+    /** Hold the image for the next message, and stage it in the engine while the user writes the text. */
     private fun setPendingImage(bytes: ByteArray?, thumbnail: Bitmap?) {
         pendingImage = bytes
         pendingThumbnail = thumbnail
         showAttachment()
+        if (bytes != null) {
+            session.stageImage(bytes)
+        } else {
+            session.dropStagedImage()
+        }
     }
 
     /** The chip of the pending image, or no chip. It survives a new view. */

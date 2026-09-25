@@ -119,6 +119,38 @@ object LlamaNative {
     ): Int
 
     /**
+     * Load the vision projector before the first image. The app calls this
+     * when the user opens the photo menu, thus the time in the picker hides
+     * the load. A loaded projector returns at once.
+     *
+     * @return False when the model has no projector or it did not load (the log gives the reason)
+     */
+    @JvmStatic external fun prepareVision(handle: Long): Boolean
+
+    /**
+     * Decode the prompt of the next turn up to and including the image of its
+     * last message, before the user sends that message. The encoder output
+     * goes into the image cache, and the prompt goes into the model memory. A
+     * [chatStart] whose prompt extends that memory decodes only the rest, and
+     * a different one puts the memory back first. The answers are the same.
+     *
+     * @param roles    The messages of the next turn as [chatStart] will get them, with the image
+     *                 in the last user message. The text of that message can differ at the send
+     * @param images   One entry per message: the encoded image bytes or null
+     * @param thinking The thinking mode that the send will use
+     * @return The number of prompt tokens that the memory holds for the message, 0 when the request
+     *   has nothing to stage
+     * @throws RuntimeException If the template, the image, or the decode fails
+     */
+    @JvmStatic external fun stageImage(
+        handle: Long,
+        roles: Array<String>,
+        contents: Array<String>,
+        images: Array<ByteArray?>,
+        thinking: Boolean,
+    ): Int
+
+    /**
      * Sample and decode one token.
      *
      * @return Byte 0 is the kind of the token (0 text, 1 the thinking opens, 2 the thinking closes),

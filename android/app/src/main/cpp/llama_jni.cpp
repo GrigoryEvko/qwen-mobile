@@ -35,6 +35,16 @@
  * size that the preprocessor selects, thus mtmd gets RGB pixels and
  * copies them without a resize.
  *
+ * When the user attaches an image, stageImage decodes the prompt of the next
+ * turn up to and including that image, before the user sends the message:
+ * the text before the image of a message does not depend on the text after
+ * it. The encoder output goes into the image cache, and the memory holds a
+ * staged part after the conversation. chatStart then decodes only the text
+ * after the image when its prompt extends the memory with the staged part.
+ * Else it puts the memory back to the state before the staged part, from the
+ * snapshot store. The send makes the same decode calls in the same order as
+ * without a stage, thus the answers are the same.
+ *
  * With speculative decoding (load with speculative = true), the engine
  * holds a second context on the same model with the graph of the MTP
  * block (common/speculative.h, type draft-mtp). One step drafts up to
@@ -87,6 +97,7 @@
 #include "spec_policy.h"
 #include "speculative.h"
 #include "state_cache.h"
+#include "token_rows.h"
 #include "trace.h"
 
 #define TAG "QwenMobile"
@@ -196,6 +207,9 @@ struct TurnStats {
     /** The tokens that the MTP draft context proposed, and the ones that the target sampler accepted. */
     int64_t drafted        = 0;
     int64_t accepted       = 0;
+    /** The tokens of the prompt that stageImage decoded before the send (the image and the text before it), and the time of that decode. */
+    int64_t staged_tokens  = 0;
+    int64_t staged_us      = 0;
     /**
      * The steps of the answer, with and without a draft.
      *
@@ -203,6 +217,26 @@ struct TurnStats {
      * must compute the steps as gen_tokens - accepted, which is not obvious.
      */
     int64_t gen_steps      = 0;
+};
+
+/**
+ * The part of the memory that stageImage decoded for a message that the user
+ * did not send yet: the text of the prompt before the new image, and the
+ * image. The items before it are the memory that the record of the
+ * conversation (chat_prompt.h) describes.
+ */
+struct StagedPart {
+    /** The index of the first item of the part in the memory, or kNone when the memory holds no staged part. */
+    size_t  from = kNone;
+    /** The tokens of the memory without the part. */
+    int64_t base_tokens = 0;
+    /** The tokens of the part, and the time of its decode. */
+    int64_t tokens = 0;
+    int64_t us     = 0;
+
+    static constexpr size_t kNone = SIZE_MAX;
+
+    bool active() const { return from != kNone; }
 };
 
 /**
@@ -288,11 +322,20 @@ struct Engine {
     /** The hybrid backend: the items that sequence 0 of the prefill context holds, and its positions. */
     std::vector<MemItem> pf_cache;
     llama_pos pf_n_past = 0;
+    /** The part of cache that stageImage decoded before the send of its message. */
+    StagedPart staged;
     /** The snapshots of the prompt states, and the outputs of the vision encoder. */
     std::unique_ptr<StateCache> states;
     std::unique_ptr<ImageCache> images;
     /** The dimensions of the images that this turn decoded from their bytes, by id. The encoder output of a new image goes into the cache with them. */
     std::unordered_map<std::string, ImageInfo> turn_images;
+    /** The model file that loaded, for the reader of its token rows. */
+    std::string model_file;
+    /** The reader of the token embedding rows (image_text_rows). The first image with text before it makes it. */
+    std::unique_ptr<TokenRows> token_rows;
+    bool token_rows_tried = false;
+    /** False with QWEN_IMAGE_TEXT_ROWS=0: the text before an image decodes in its own batch, for an A/B measurement. */
+    bool merge_image_text = true;
     /** Bytes of an incomplete UTF-8 sequence from the last token. */
     std::string utf8_pending;
     /** Set by requestStop from another thread. generateNext reads it before the sample. */
@@ -334,6 +377,8 @@ struct Engine {
     int  n_threads  = 4;
     int  gpu_layers = 0;
     bool thinking   = false;
+    /** The seed of the sampler of each answer. LLAMA_DEFAULT_SEED (the app) takes a new random seed for each answer. */
+    uint32_t sampler_seed = LLAMA_DEFAULT_SEED;
 
     TurnStats turn;
 
@@ -533,7 +578,7 @@ void rebuild_sampler(Engine & e, bool thinking, float temp, float top_p) {
         llama_sampler_chain_add(e.smpl, llama_sampler_init_top_k(20));
         llama_sampler_chain_add(e.smpl, llama_sampler_init_top_p(std::min(std::max(top_p, 0.05f), 1.0f), 1));
         llama_sampler_chain_add(e.smpl, llama_sampler_init_temp(temp));
-        llama_sampler_chain_add(e.smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+        llama_sampler_chain_add(e.smpl, llama_sampler_init_dist(e.sampler_seed));
     }
     e.thinking = thinking;
 }
@@ -651,6 +696,7 @@ void clear_all(Engine & e) {
     e.mem_tokens = 0;
     e.pf_cache.clear();
     e.pf_n_past = 0;
+    e.staged    = StagedPart{};
     e.spec_prompt.clear();
     if (e.prompt) {
         e.prompt->forget();
@@ -917,22 +963,118 @@ const float * image_embd(Engine & e, const mtmd_input_chunk * chunk, std::string
 enum class DecodeOutcome { kDone, kStopped, kFailed };
 
 /**
+ * The number of text tokens before an image chunk that go into the batch of
+ * that image as embedding rows, of the n_text tokens of the run before it: the
+ * last ones, as many as the batch has room for. 0 when the image decodes
+ * alone: no text before it, an attention that is not causal, an image of a
+ * full batch, or no reader of the token rows. The reader opens on the first
+ * call. O(size of the metadata of the model file) on the first call, O(1) after it.
+ */
+size_t image_text_rows(Engine & e, const mtmd_input_chunk * chunk, size_t n_text) {
+    const size_t n_img = mtmd_input_chunk_get_n_tokens(chunk);
+    if (n_text == 0 || !e.merge_image_text || mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_IMAGE ||
+        mtmd_decode_use_non_causal(e.mctx, chunk) || n_img >= (size_t) kBatch) {
+        return 0;
+    }
+    if (!e.token_rows_tried) {
+        e.token_rows_tried = true;
+        const int64_t t0 = now_us();
+        e.token_rows = std::make_unique<TokenRows>(e.model_file);
+        if (!e.token_rows->ok() || e.token_rows->n_embd() > llama_model_n_embd_inp(e.model)) {
+            LOGE("the text before an image decodes alone: %s", e.token_rows->ok() ? "the rows are too long" : e.token_rows->error().c_str());
+            e.token_rows.reset();
+        } else {
+            LOGI("the token rows of %s are ready in %.0f ms", e.model_file.c_str(), (now_us() - t0) / 1000.0);
+        }
+    }
+    if (!e.token_rows) {
+        return 0;
+    }
+    return std::min(n_text, (size_t) kBatch - n_img);
+}
+
+/**
+ * Decode n_text text tokens and then an image chunk (its encoder output embd)
+ * as one embedding batch at pos: one pass over the weights for the two. The
+ * text rows come from the token embedding of the model file (TokenRows) with
+ * the positions of the token path, for M-RoPE (p, p, p, 0). The image rows
+ * get the positions of the mtmd helper. The draft context does not follow an
+ * embedding batch. Without text the helper decodes the image. new_pos is the
+ * position after the image. Returns the llama_decode code, 0 on success.
+ */
+int32_t decode_image_rows(Engine & e, llama_context * lctx, const mtmd_input_chunk * chunk, const float * embd,
+                          const llama_token * text, size_t n_text, llama_pos pos, llama_pos & new_pos) {
+    if (n_text == 0) {
+        // The helper takes a non-const pointer and only reads the floats.
+        return mtmd_helper_decode_image_chunk(e.mctx, lctx, chunk, const_cast<float *>(embd), pos, kSeqMain, kBatch,
+                                              &new_pos, nullptr, nullptr);
+    }
+    const size_t n_img  = mtmd_input_chunk_get_n_tokens(chunk);
+    const size_t n_rows = n_text + n_img;
+    const size_t n_embd = (size_t) llama_model_n_embd_inp(e.model);
+    const bool   mrope  = mtmd_decode_use_mrope(e.mctx);
+    const size_t n_pos  = mrope ? 4 : 1;
+    // The rows are longer than the token rows for a model with a wider input: the token path pads them with zeros.
+    std::vector<float> rows(n_rows * n_embd, 0.0f);
+    if (!e.token_rows->read(text, n_text, rows.data(), n_embd)) {
+        return -1;
+    }
+    memcpy(rows.data() + n_text * n_embd, embd, n_img * n_embd * sizeof(float));
+    std::vector<llama_pos> positions(n_rows * n_pos, 0);
+    for (size_t j = 0; j < n_text; ++j) {
+        for (size_t s = 0; s < std::min<size_t>(n_pos, 3); ++s) {
+            positions[s * n_rows + j] = pos + (llama_pos) j;
+        }
+    }
+    const llama_pos img_pos = pos + (llama_pos) n_text;
+    const mtmd_image_tokens * image = mtmd_input_chunk_get_tokens_image(chunk);
+    for (size_t i = 0; i < n_img; ++i) {
+        const size_t r = n_text + i;
+        if (mrope) {
+            const mtmd_decoder_pos p = mtmd_image_tokens_get_decoder_pos(image, img_pos, i);
+            positions[r]              = (llama_pos) p.t;
+            positions[n_rows + r]     = (llama_pos) p.y;
+            positions[2 * n_rows + r] = (llama_pos) p.x;
+            positions[3 * n_rows + r] = (llama_pos) p.z;
+        } else {
+            positions[r] = img_pos + (llama_pos) i;
+        }
+    }
+    llama_seq_id               seq = kSeqMain;
+    std::vector<int32_t>        n_seq_id(n_rows, 1);
+    std::vector<llama_seq_id *> seq_ids(n_rows + 1, &seq);
+    std::vector<int8_t>         logits(n_rows, 0);
+    seq_ids[n_rows] = nullptr;
+    llama_batch b = {(int32_t) n_rows, nullptr, rows.data(), positions.data(), n_seq_id.data(), seq_ids.data(),
+                     logits.data()};
+    const int32_t rc = llama_decode(lctx, b);
+    if (rc == 0) {
+        new_pos = img_pos + mtmd_input_chunk_get_n_pos(chunk);
+    }
+    return rc;
+}
+
+/**
  * Decode the items [start, end) into sequence kSeqMain of a context. Text
- * runs go in batches, an image chunk goes through its encoder output with
- * the M-RoPE positions of the helper. pos advances. A stop request stops
- * the decode before the next batch or image and gives kStopped. Gives
- * kFailed with the error text set.
+ * runs go in batches. An image chunk goes through its encoder output, in one
+ * batch with the text tokens before it that the batch has room for
+ * (image_text_rows), thus a message with an image takes one pass over the
+ * weights less. pos advances. A stop request stops the decode before the next
+ * batch or image and gives kStopped. Gives kFailed with the error text set.
+ * The same items from the same start give the same batches, thus the stage of
+ * an image and a send without it cut the prompt at the same points.
  */
 DecodeOutcome decode_items(Engine & e, llama_context * lctx, const std::vector<MemItem> & items,
                            const std::vector<const mtmd_input_chunk *> & chunk_of, size_t start, size_t end,
                            llama_pos & pos, bool logits_last, std::string & error) {
     std::vector<llama_token> run;
     run.reserve(end - start);
-    auto flush = [&](bool last) {
-        if (run.empty()) {
+    // Decode the first n tokens of the run as text, and remove them from it.
+    auto flush = [&](size_t n, bool last) {
+        if (n == 0) {
             return DecodeOutcome::kDone;
         }
-        const int rc = decode_text(e, lctx, run.data(), (int) run.size(), pos, last, true);
+        const int rc = decode_text(e, lctx, run.data(), (int) n, pos, last, true);
         if (rc == kDecodeStopped) {
             return DecodeOutcome::kStopped;
         }
@@ -940,8 +1082,8 @@ DecodeOutcome decode_items(Engine & e, llama_context * lctx, const std::vector<M
             error = "llama_decode failed on the prompt with code " + std::to_string(rc);
             return DecodeOutcome::kFailed;
         }
-        pos += (llama_pos) run.size();
-        run.clear();
+        pos += (llama_pos) n;
+        run.erase(run.begin(), run.begin() + (ptrdiff_t) n);
         return DecodeOutcome::kDone;
     };
     for (size_t i = start; i < end; ++i) {
@@ -950,7 +1092,8 @@ DecodeOutcome decode_items(Engine & e, llama_context * lctx, const std::vector<M
             run.push_back(items[i].token);
             continue;
         }
-        const DecodeOutcome flushed = flush(false);
+        const size_t n_rows = image_text_rows(e, chunk, run.size());
+        const DecodeOutcome flushed = flush(run.size() - n_rows, false);
         if (flushed != DecodeOutcome::kDone) {
             return flushed;
         }
@@ -964,17 +1107,16 @@ DecodeOutcome decode_items(Engine & e, llama_context * lctx, const std::vector<M
         }
         llama_pos new_pos = pos;
         const int64_t t0 = now_us();
-        // The helper takes a non-const pointer and only reads the floats.
-        const int32_t rc = mtmd_helper_decode_image_chunk(e.mctx, lctx, chunk, const_cast<float *>(embd), pos, kSeqMain,
-                                                          kBatch, &new_pos, nullptr, nullptr);
+        const int32_t rc = decode_image_rows(e, lctx, chunk, embd, run.data(), run.size(), pos, new_pos);
         report_hint(e, t0);
         if (rc != 0) {
             error = "The image did not decode, code " + std::to_string(rc);
             return DecodeOutcome::kFailed;
         }
+        run.clear();
         pos = new_pos;
     }
-    const DecodeOutcome last = flush(logits_last);
+    const DecodeOutcome last = flush(run.size(), logits_last);
     if (last == DecodeOutcome::kDone) {
         // A backend can run the batch asynchronously: the wait belongs to the prefill time, not to the snapshot after it.
         llama_synchronize(lctx);
@@ -989,6 +1131,79 @@ int64_t count_tokens(const std::vector<const mtmd_input_chunk *> & chunk_of, siz
         n += chunk_of[i] == nullptr ? 1 : (int64_t) mtmd_input_chunk_get_n_tokens(chunk_of[i]);
     }
     return n;
+}
+
+/** Where the decode of a prompt starts (find_prompt_start). */
+struct PromptStart {
+    /** The first item that decodes, and the position of it. */
+    size_t    start = 0;
+    llama_pos pos   = 0;
+    /** True when a snapshot of the store gave the prefix, and the time of its restore. */
+    bool      from_snapshot = false;
+    int64_t   restore_us    = 0;
+    /** True when the memory of the context stays: it is the prefix. */
+    bool      kept_live     = false;
+};
+
+/**
+ * The longest prefix of the items that exists already, at most limit items:
+ * the live memory of the context (live, live_pos) when it is a prefix of the
+ * items and at least as long as the best snapshot, else that snapshot, else
+ * nothing. A continuation takes only the live memory. The memory of the
+ * context and its record become items [0, start). The draft context stays
+ * when the live memory stays, else it becomes empty. Returns false when a
+ * continuation cannot keep the live memory, and then nothing changed.
+ * O(snapshots x limit), plus the restore of a snapshot.
+ */
+bool find_prompt_start(Engine & e, llama_context * pctx, std::vector<MemItem> & live, llama_pos & live_pos,
+                       const std::vector<MemItem> & items, size_t limit, bool continuation, PromptStart & out) {
+    const int64_t t0 = now_us();
+    out = PromptStart{};
+    const Snapshot * snap = continuation ? nullptr : e.states->best_prefix(items, limit);
+    // A continuation holds the items of the memory first. The memory can hold a
+    // staged part after them, which chatStart accepts only when the prompt extends it.
+    const bool live_ok = !live.empty() && live.size() <= limit && is_item_prefix(live, items);
+    if (continuation && !live_ok) {
+        return false;
+    }
+    if (live_ok && (snap == nullptr || live.size() >= snap->items.size())) {
+        out.start = live.size();
+        out.pos   = live_pos;
+    } else if (snap != nullptr) {
+        const size_t    n_items = snap->items.size();
+        const llama_pos n_pos   = snap->n_pos;
+        std::shared_ptr<const cache_io::Blob> bytes = e.states->bytes(snap);
+        log_damaged(e);
+        if (bytes && restore_state(pctx, *bytes)) {
+            out.start         = n_items;
+            out.pos           = n_pos;
+            out.from_snapshot = true;
+        } else if (bytes) {
+            LOGE("snapshot of %zu items did not restore (%zu bytes), it is dropped", n_items, bytes->size);
+            e.states->drop(snap);
+        }
+        out.restore_us = now_us() - t0;
+    }
+    if (out.start == 0) {
+        llama_memory_clear(llama_get_memory(pctx), true);
+        out.pos = 0;
+    }
+    out.kept_live = out.start > 0 && out.start == live.size() && !out.from_snapshot;
+    // The draft context cannot follow a prompt that a snapshot restores or
+    // that an image gives, because it reads the hidden state of each token
+    // from a decode of the target context. Thus it starts the turn empty and
+    // follows the decodes of this turn: its attention then reads only cells
+    // that hold tokens of this conversation. A turn that keeps the live
+    // memory (a continuation, or a staged part) keeps it: the draft context
+    // followed each decode of that memory.
+    if (e.ctx_dft != nullptr && !out.kept_live) {
+        llama_memory_clear(llama_get_memory(e.ctx_dft), false);
+    }
+    if (!out.kept_live) {
+        live.assign(items.begin(), items.begin() + (ptrdiff_t) out.start);
+    }
+    live_pos = out.pos;
+    return true;
 }
 
 /**
@@ -1019,15 +1234,6 @@ DecodeOutcome prefill(Engine & e, const std::vector<MemItem> & items,
                       const std::vector<const mtmd_input_chunk *> & chunk_of, size_t base_len, bool base_snapshot,
                       bool continuation, int64_t n_tokens, std::string & error) {
     TraceSection trace("prefill");
-    // The draft context cannot follow a prompt that a snapshot restores or
-    // that an image gives, because it reads the hidden state of each token
-    // from a decode of the target context. Thus it starts each turn empty and
-    // follows the decodes of this turn: its attention then reads only cells
-    // that hold tokens of this conversation. A turn that continues the live
-    // memory keeps it: the draft context followed each decode of that memory.
-    if (e.ctx_dft != nullptr && !continuation) {
-        llama_memory_clear(llama_get_memory(e.ctx_dft), false);
-    }
     const bool hybrid = e.ctx_pf != nullptr;
     // The hybrid backend moves the state at base_len, thus it always splits the prompt there.
     const bool split = base_snapshot || hybrid;
@@ -1037,51 +1243,21 @@ DecodeOutcome prefill(Engine & e, const std::vector<MemItem> & items,
     llama_pos &            live_pos = hybrid ? e.pf_n_past : e.n_past;
     // At least one item decodes on the decode context, thus it has logits.
     const size_t limit = std::min(base_len, items.size() - 1);
-    const int64_t t0   = now_us();
-
-    // The longest prefix that exists already: the live memory when it is at least as long as the best snapshot.
-    size_t    start = 0;
-    llama_pos pos   = 0;
-    const Snapshot * snap = continuation ? nullptr : e.states->best_prefix(items, limit);
-    const bool live_ok = !live.empty() && live.size() <= limit &&
-                         (continuation || is_item_prefix(live, items));
-    if (continuation && !live_ok) {
+    // The live memory holds tokens, but the chunks of its images are gone: the count of its tokens is the one of the memory.
+    const int64_t live_tokens = e.mem_tokens;
+    PromptStart ps;
+    if (!find_prompt_start(e, pctx, live, live_pos, items, limit, continuation, ps)) {
         // The items of a continuation hold the images of the memory without their chunks, thus they cannot decode again.
         error = "The prompt continues a memory of " + std::to_string(live.size()) + " items that it cannot extend";
         clear_all(e);
         return DecodeOutcome::kFailed;
     }
-    e.turn.continued = continuation;
-    // The live memory holds tokens, but the chunks of its images are gone: the count of its tokens is the one of the memory.
-    const int64_t live_tokens = e.mem_tokens;
-    if (live_ok && (snap == nullptr || live.size() >= snap->items.size())) {
-        start = live.size();
-        pos   = live_pos;
-    } else if (snap != nullptr) {
-        const size_t    n_items = snap->items.size();
-        const llama_pos n_pos   = snap->n_pos;
-        std::shared_ptr<const cache_io::Blob> bytes = e.states->bytes(snap);
-        log_damaged(e);
-        if (bytes && restore_state(pctx, *bytes)) {
-            start = n_items;
-            pos   = n_pos;
-            e.turn.from_snapshot = true;
-        } else if (bytes) {
-            LOGE("snapshot of %zu items did not restore (%zu bytes), it is dropped", n_items, bytes->size);
-            e.states->drop(snap);
-        }
-        e.turn.restore_us = now_us() - t0;
-    }
-    if (start == 0) {
-        llama_memory_clear(llama_get_memory(pctx), true);
-        pos = 0;
-    }
-    const bool kept_live = start > 0 && start == live.size() && !e.turn.from_snapshot;
-    e.turn.reused_tokens = kept_live && !hybrid ? live_tokens : count_tokens(chunk_of, 0, start);
-    if (!kept_live) {
-        live.assign(items.begin(), items.begin() + (ptrdiff_t) start);
-    }
-    live_pos = pos;
+    const size_t start = ps.start;
+    llama_pos    pos   = ps.pos;
+    e.turn.continued     = continuation;
+    e.turn.from_snapshot = ps.from_snapshot;
+    e.turn.restore_us    = ps.restore_us;
+    e.turn.reused_tokens = ps.kept_live && !hybrid ? live_tokens : count_tokens(chunk_of, 0, start);
 
     const int64_t t1 = now_us();
     if (!split) {
@@ -1704,17 +1880,32 @@ struct PromptPlan {
     size_t base_len = 0;
 };
 
+/** The number of items of the memory before its staged part: the memory that the record of the conversation describes. */
+size_t record_items(const Engine & e) {
+    return e.staged.active() ? e.staged.from : e.cache.size();
+}
+
+/** The tokens of those items. */
+int64_t record_tokens(const Engine & e) {
+    return e.staged.active() ? e.staged.base_tokens : e.mem_tokens;
+}
+
 /**
  * The items of the prompt of a turn: the render of chat_prompt.h and its
- * tokens. image_of holds the image of each message or null. The call changes
- * no memory, thus a host test calls it without a decode. Returns false with
- * the error text set.
+ * tokens. image_of holds the image of each message or null. A continuation
+ * extends the memory without its staged part. With keep_record the record of
+ * the conversation stays (the stage of a message that is not sent yet), else
+ * the turn takes it (ChatPrompt::make). The call changes no memory, thus a
+ * host test calls it without a decode. Returns false with the error text set.
  */
 bool plan_prompt(JNIEnv * env, jclass native_class, Engine & e, const std::vector<PromptMessage> & msgs,
-                 const std::vector<jbyteArray> & image_of, bool thinking, PromptPlan & plan, std::string & error) {
+                 const std::vector<jbyteArray> & image_of, bool thinking, PromptPlan & plan, std::string & error,
+                 bool keep_record = false) {
+    const size_t      n_record = record_items(e);
+    const llama_token last     = n_record == 0 ? LLAMA_TOKEN_NULL : e.cache[n_record - 1].token;
     // With the live form after a complete answer, only the new message and the generation prompt.
     try {
-        plan.tp = e.prompt->make(msgs, thinking, e.cache.size(), e.cache.empty() ? LLAMA_TOKEN_NULL : e.cache.back().token);
+        plan.tp = keep_record ? e.prompt->plan(msgs, thinking, n_record, last) : e.prompt->make(msgs, thinking, n_record, last);
     } catch (const std::exception & ex) {
         error = std::string("The chat template failed: ") + ex.what();
         return false;
@@ -1737,18 +1928,18 @@ bool plan_prompt(JNIEnv * env, jclass native_class, Engine & e, const std::vecto
     }
     const int64_t fresh_tokens = count_tokens(fresh_chunk_of, 0, fresh.size());
     e.turn.image_tokens = fresh_tokens - (int64_t) std::count(fresh_chunk_of.begin(), fresh_chunk_of.end(), nullptr);
-    const size_t offset = tp.continuation ? e.cache.size() : 0;
+    const size_t offset = tp.continuation ? n_record : 0;
     plan.tail_at  = offset + base_length(e, tp.text, tp.tail, fresh);
     plan.n_tokens = fresh_tokens;
     if (tp.continuation) {
         // The memory holds the items before the new message. Its image items
         // have no chunk here: the prefill decodes only the new items.
         plan.items.reserve(offset + fresh.size());
-        plan.items = e.cache;
+        plan.items.assign(e.cache.begin(), e.cache.begin() + (ptrdiff_t) offset);
         plan.items.insert(plan.items.end(), fresh.begin(), fresh.end());
         plan.chunk_of.assign(offset, nullptr);
         plan.chunk_of.insert(plan.chunk_of.end(), fresh_chunk_of.begin(), fresh_chunk_of.end());
-        plan.n_tokens += e.mem_tokens;
+        plan.n_tokens += record_tokens(e);
     } else {
         plan.items    = std::move(fresh);
         plan.chunk_of = std::move(fresh_chunk_of);
@@ -1761,6 +1952,62 @@ bool plan_prompt(JNIEnv * env, jclass native_class, Engine & e, const std::vecto
         // the sampler reads as a null pointer and aborts the process.
         plan.base_len -= 1;
     }
+    return true;
+}
+
+/** Make the text tokens of the draft driver the text items of the memory. O(items). */
+void sync_spec_prompt(Engine & e) {
+    if (e.spec == nullptr) {
+        return;
+    }
+    e.spec_prompt.clear();
+    for (const MemItem & item : e.cache) {
+        if (item.token != kMemTokenNull) {
+            e.spec_prompt.push_back(item.token);
+        }
+    }
+}
+
+/**
+ * Put the memory back to the items before its staged part: the snapshot of
+ * those items from the store, which stageImage made sure of. Returns false
+ * when the store does not hold them or the state does not restore, and then
+ * the memory and the record of the conversation are empty (clear_all).
+ * O(size of the state).
+ */
+bool unstage(Engine & e) {
+    const StagedPart part = e.staged;
+    e.staged = StagedPart{};
+    if (!part.active() || part.from == 0 || e.ctx_pf != nullptr) {
+        clear_all(e);
+        return part.active() && part.from == 0;
+    }
+    const int64_t        t0 = now_us();
+    std::vector<MemItem> base(e.cache.begin(), e.cache.begin() + (ptrdiff_t) part.from);
+    const Snapshot *     snap = e.states->find(base);
+    if (snap == nullptr) {
+        LOGE("the memory before the staged image (%zu items) has no snapshot, the prompt decodes again", part.from);
+        clear_all(e);
+        return false;
+    }
+    const llama_pos n_pos = snap->n_pos;
+    const std::shared_ptr<const cache_io::Blob> bytes = e.states->bytes(snap);
+    log_damaged(e);
+    if (!bytes || !restore_state(e.ctx, *bytes)) {
+        LOGE("the memory before the staged image (%zu items) did not restore, the prompt decodes again", part.from);
+        clear_all(e);
+        return false;
+    }
+    e.cache      = std::move(base);
+    e.n_past     = n_pos;
+    e.mem_tokens = part.base_tokens;
+    // The draft context followed the text of the staged part: those positions go.
+    if (e.ctx_dft != nullptr) {
+        llama_memory_seq_rm(llama_get_memory(e.ctx_dft), kSeqMain, n_pos, -1);
+    }
+    sync_spec_prompt(e);
+    LOGI("staged image: the message differs, the memory of %zu items came back from its snapshot in %.0f ms",
+         e.cache.size(), (now_us() - t0) / 1000.0);
     return true;
 }
 
@@ -2026,6 +2273,59 @@ std::string array_string(JNIEnv * env, jobjectArray array, jsize i) {
         env->DeleteLocalRef(s);
     }
     return out;
+}
+
+/**
+ * The messages of a request of the app, and the image array of each message
+ * or null. A message with an image starts with the media marker of mtmd, and
+ * its image_id is the SHA-256 of the image bytes. refs keeps the reference of
+ * each image, thus the bytes stay readable until the call ends. Returns false
+ * with the error text set, or with an empty text when a Java exception is
+ * pending. O(bytes of the request).
+ */
+bool read_messages(JNIEnv * env, jobjectArray roles, jobjectArray contents, jobjectArray images, LocalRefs & refs,
+                   std::vector<PromptMessage> & msgs, std::vector<jbyteArray> & image_of, std::string & error) {
+    const jsize n = env->GetArrayLength(roles);
+    if (env->GetArrayLength(contents) != n || (images != nullptr && env->GetArrayLength(images) != n)) {
+        error = "The roles, contents and images arrays have different lengths";
+        return false;
+    }
+    // The table of a thread holds a small number of references. A conversation
+    // with an image in every message needs one for each, thus the capacity is
+    // requested before the loop.
+    if (images != nullptr && env->EnsureLocalCapacity(n + kLocalRefHeadroom) != JNI_OK) {
+        error = "The local reference table cannot hold " + std::to_string(n) + " images";
+        return false;
+    }
+    msgs.reserve((size_t) n);
+    image_of.reserve((size_t) n);
+    for (jsize i = 0; i < n; ++i) {
+        PromptMessage msg;
+        msg.role    = array_string(env, roles, i);
+        msg.content = array_string(env, contents, i);
+        if (env->ExceptionCheck()) {
+            // A string did not read (OutOfMemoryError). That exception goes to the app.
+            return false;
+        }
+        jbyteArray image = images ? (jbyteArray) env->GetObjectArrayElement(images, i) : nullptr;
+        if (image != nullptr) {
+            refs.keep(image);
+            // The identity of an image is the SHA-256 of its file bytes: the
+            // record of the memory and the cache of the encoder find it by that.
+            const jsize len = env->GetArrayLength(image);
+            jbyte * bytes = env->GetByteArrayElements(image, nullptr);
+            if (bytes == nullptr) {
+                error = "The image bytes are not readable";
+                return false;
+            }
+            msg.image_id = cache_io::sha256_hex(bytes, (size_t) len);
+            env->ReleaseByteArrayElements(image, bytes, JNI_ABORT);
+            msg.content = std::string(mtmd_default_marker()) + "\n" + msg.content;
+        }
+        image_of.push_back(image);
+        msgs.push_back(std::move(msg));
+    }
+    return true;
 }
 
 } // namespace
@@ -2369,6 +2669,17 @@ static jlong load_impl(JNIEnv * env, jstring jpath, jstring jmmproj,
     if (!e->prompt->refusal().empty()) {
         LOGE("the live form of the history is off: %s", e->prompt->refusal().c_str());
     }
+    // QWEN_SAMPLER_SEED fixes the seed of the sampler of each answer, for a test that compares two answers. The
+    // app sets no value.
+    if (const char * seed = getenv("QWEN_SAMPLER_SEED")) {
+        e->sampler_seed = (uint32_t) strtoul(seed, nullptr, 10);
+    }
+    // QWEN_IMAGE_TEXT_ROWS=0 decodes the text before an image in its own batch, for an A/B measurement.
+    if (const char * rows = getenv("QWEN_IMAGE_TEXT_ROWS")) {
+        e->merge_image_text = atoi(rows) != 0;
+    }
+    // The token embedding of the two files is the same, thus the file that loaded gives the rows.
+    e->model_file = load_path;
     e->tok_think_open  = single_token(llama_model_get_vocab(e->model), "<think>");
     e->tok_think_close = single_token(llama_model_get_vocab(e->model), "</think>");
     rebuild_sampler(*e, false, 0.7f, 0.8f);
@@ -2456,46 +2767,13 @@ static jint chat_start_impl(JNIEnv * env, jclass native_class, jlong handle,
     // roles and the contents release theirs inside array_string.
     std::vector<PromptMessage> msgs;
     std::vector<jbyteArray>    image_of;
-    LocalRefs refs(env);
-    const jsize n = env->GetArrayLength(roles);
-    if (env->GetArrayLength(contents) != n || (images != nullptr && env->GetArrayLength(images) != n)) {
-        throw_java(env, "The roles, contents and images arrays have different lengths");
-        return -1;
-    }
-    // The table of a thread holds a small number of references. A conversation
-    // with an image in every message needs one for each, thus the capacity is
-    // requested before the loop.
-    if (images != nullptr && env->EnsureLocalCapacity(n + kLocalRefHeadroom) != JNI_OK) {
-        throw_java(env, "The local reference table cannot hold " + std::to_string(n) + " images");
-        return -1;
-    }
-    msgs.reserve((size_t) n);
-    image_of.reserve((size_t) n);
-    for (jsize i = 0; i < n; ++i) {
-        PromptMessage msg;
-        msg.role    = array_string(env, roles, i);
-        msg.content = array_string(env, contents, i);
-        if (env->ExceptionCheck()) {
-            // A string did not read (OutOfMemoryError). That exception goes to the app.
-            return -1;
+    LocalRefs   refs(env);
+    std::string error;
+    if (!read_messages(env, roles, contents, images, refs, msgs, image_of, error)) {
+        if (!error.empty()) {
+            throw_java(env, error);
         }
-        jbyteArray image = images ? (jbyteArray) env->GetObjectArrayElement(images, i) : nullptr;
-        if (image != nullptr) {
-            refs.keep(image);
-            // The identity of an image is the SHA-256 of its file bytes: the
-            // record of the memory and the cache of the encoder find it by that.
-            const jsize len = env->GetArrayLength(image);
-            jbyte * bytes = env->GetByteArrayElements(image, nullptr);
-            if (bytes == nullptr) {
-                throw_java(env, "The image bytes are not readable");
-                return -1;
-            }
-            msg.image_id = cache_io::sha256_hex(bytes, (size_t) len);
-            env->ReleaseByteArrayElements(image, bytes, JNI_ABORT);
-            msg.content = std::string(mtmd_default_marker()) + "\n" + msg.content;
-        }
-        image_of.push_back(image);
-        msgs.push_back(std::move(msg));
+        return -1;
     }
 
     rebuild_sampler(*e, thinking, temperature, top_p);
@@ -2512,11 +2790,30 @@ static jint chat_start_impl(JNIEnv * env, jclass native_class, jlong handle,
     e->policy.reset();
     clear_queue(*e);
 
-    std::string error;
     PromptPlan plan;
     if (!plan_prompt(env, native_class, *e, msgs, image_of, thinking == JNI_TRUE, plan, error)) {
         throw_java(env, error);
         return -1;
+    }
+    // The memory can hold a staged part: the stage of an attached image. The
+    // prefill keeps it when the prompt extends it. Else a continuation needs
+    // the memory before the part, and the other prompts find their prefix in
+    // the prefill.
+    if (e->staged.active()) {
+        const bool extends = e->cache.size() < plan.items.size() && is_item_prefix(e->cache, plan.items);
+        if (extends) {
+            e->turn.staged_tokens = e->staged.tokens;
+            e->turn.staged_us     = e->staged.us;
+            e->staged             = StagedPart{};
+        } else if (!plan.tp.continuation) {
+            e->staged = StagedPart{};
+        } else if (!unstage(*e)) {
+            // The memory and the record are empty: the prompt renders the whole conversation. plan_prompt writes each field.
+            if (!plan_prompt(env, native_class, *e, msgs, image_of, thinking == JNI_TRUE, plan, error)) {
+                throw_java(env, error);
+                return -1;
+            }
+        }
     }
     const std::vector<MemItem> & items = plan.items;
     if (items.empty() || (uint64_t) plan.n_tokens + kContextHeadroom >= llama_n_ctx(e->ctx)) {
@@ -2572,6 +2869,189 @@ Java_ai_airi_qwenmobile_LlamaNative_chatStart(JNIEnv * env, jclass native_class,
     return jni_guard<jint>(env, -1, [&] {
         return chat_start_impl(env, native_class, handle, roles, contents, images,
                                thinking, temperature, top_p);
+    });
+}
+
+/**
+ * The stage of an attached image (LlamaNative.stageImage). The messages are
+ * the request of the next turn as the app will send it, with the image in the
+ * last user message and any text. The prompt of that turn decodes into the
+ * memory up to and including that image, which the encoder encodes into the
+ * image cache on the way. The memory then holds a staged part (StagedPart),
+ * and chatStart decodes only the rest of its prompt when that prompt extends
+ * the part. The memory before the part goes into the snapshot store when it
+ * is not there, thus chatStart can put it back for a different message. The
+ * hybrid backend only encodes the image: its prompt decodes on a second
+ * context at the send. The record of the conversation and the counters of
+ * the last turn stay. Returns the tokens of the staged part (0 when the
+ * request has nothing to stage), or -1 with a Java exception.
+ */
+static jint stage_image_impl(JNIEnv * env, jclass native_class, jlong handle, jobjectArray roles,
+                             jobjectArray contents, jobjectArray images, jboolean thinking) {
+    const std::shared_ptr<Engine> engine = engine_of(handle);
+    if (engine == nullptr) {
+        throw_java(env, "No model is loaded");
+        return -1;
+    }
+    Engine * e = engine.get();
+    std::lock_guard<std::mutex> lock(e->mutex);
+    if (e->mmproj.empty()) {
+        return 0;
+    }
+    std::vector<PromptMessage> msgs;
+    std::vector<jbyteArray>    image_of;
+    LocalRefs   refs(env);
+    std::string error;
+    if (!read_messages(env, roles, contents, images, refs, msgs, image_of, error)) {
+        if (!error.empty()) {
+            throw_java(env, error);
+        }
+        return -1;
+    }
+    if (msgs.empty() || msgs.back().role != "user" || image_of.back() == nullptr) {
+        return 0;
+    }
+    TraceSection trace("stage-image");
+    const int64_t t0 = now_us();
+    // The stats line of the last answer stays: the prompt plan and the encoder write the counters of a turn.
+    struct KeepTurn {
+        Engine &  e;
+        TurnStats saved;
+        ~KeepTurn() { e.turn = saved; }
+    } keep_turn{*e, e->turn};
+    // An answer that the app stopped reading ends here: its last token must not decode after the staged part.
+    e->stop_requested = false;
+    e->answer_done    = true;
+    e->answer_ends    = false;
+    e->id_last        = LLAMA_TOKEN_NULL;
+    e->spec_feed      = true;
+    e->draft.clear();
+    clear_queue(*e);
+
+    PromptPlan plan;
+    if (!plan_prompt(env, native_class, *e, msgs, image_of, thinking == JNI_TRUE, plan, error, true)) {
+        throw_java(env, error);
+        return -1;
+    }
+    // The image of the last message is the last image of the prompt: an image of the memory has no chunk.
+    size_t end = plan.items.size();
+    while (end > 0 && plan.chunk_of[end - 1] == nullptr) {
+        --end;
+    }
+    if (end == 0 || end >= plan.items.size() ||
+        (uint64_t) plan.n_tokens + kContextHeadroom >= llama_n_ctx(e->ctx)) {
+        // No image to stage, or a prompt that the send refuses with its own message.
+        return 0;
+    }
+    if (e->ctx_pf != nullptr) {
+        if (image_embd(*e, plan.chunk_of[end - 1], error) == nullptr) {
+            throw_java(env, error);
+            return -1;
+        }
+        LOGI("staged image: encoded in %.0f ms, the hybrid backend decodes the prompt at the send",
+             (now_us() - t0) / 1000.0);
+        return 0;
+    }
+    if (e->staged.active()) {
+        if (e->cache.size() == end && is_item_prefix(e->cache, plan.items)) {
+            return (jint) e->staged.tokens;
+        }
+        if (!plan.tp.continuation) {
+            e->staged = StagedPart{};
+        } else if (!unstage(*e)) {
+            // The memory and the record are empty: the prompt renders the whole conversation. plan_prompt writes each field.
+            if (!plan_prompt(env, native_class, *e, msgs, image_of, thinking == JNI_TRUE, plan, error, true)) {
+                throw_java(env, error);
+                return -1;
+            }
+            end = plan.items.size();
+            while (end > 0 && plan.chunk_of[end - 1] == nullptr) {
+                --end;
+            }
+            if (end == 0 || end >= plan.items.size()) {
+                return 0;
+            }
+        }
+    }
+    const int64_t mem_tokens = e->mem_tokens;
+    PromptStart   ps;
+    if (!find_prompt_start(*e, e->ctx, e->cache, e->n_past, plan.items, end, plan.tp.continuation, ps)) {
+        // The memory does not hold the record of the continuation. The send finds its own prefix.
+        return 0;
+    }
+    if (!ps.kept_live) {
+        // The memory changed, thus the record of the conversation does not describe it.
+        e->prompt->forget();
+    }
+    // The memory before the staged part, for a send with a different message.
+    if (ps.kept_live && e->states->find(e->cache) == nullptr) {
+        std::shared_ptr<const cache_io::Blob> blob = take_state(e->ctx, error);
+        if (!blob) {
+            clear_all(*e);
+            throw_java(env, error);
+            return -1;
+        }
+        e->states->put(e->cache, e->n_past, std::move(blob));
+    }
+    const int64_t base_tokens = ps.kept_live ? mem_tokens : count_tokens(plan.chunk_of, 0, ps.start);
+    llama_pos     pos         = ps.pos;
+    const int64_t t1          = now_us();
+    const DecodeOutcome out = decode_items(*e, e->ctx, plan.items, plan.chunk_of, ps.start, end, pos, false, error);
+    if (out != DecodeOutcome::kDone) {
+        clear_all(*e);
+        if (out == DecodeOutcome::kFailed) {
+            throw_java(env, error);
+            return -1;
+        }
+        return 0;
+    }
+    const int64_t staged_tokens = count_tokens(plan.chunk_of, ps.start, end);
+    e->cache.insert(e->cache.end(), plan.items.begin() + (ptrdiff_t) ps.start, plan.items.begin() + (ptrdiff_t) end);
+    e->n_past     = pos;
+    e->mem_tokens = base_tokens + staged_tokens;
+    e->staged     = StagedPart{ps.start, base_tokens, staged_tokens, now_us() - t0};
+    sync_spec_prompt(*e);
+    LOGI("staged image: %lld tokens after %zu items (%s) in %.0f ms, of them the decode %.0f ms, memory %d positions",
+         (long long) staged_tokens, ps.start, ps.kept_live ? "kept" : ps.from_snapshot ? "restored" : "empty",
+         (now_us() - t0) / 1000.0, (now_us() - t1) / 1000.0, (int) e->n_past);
+    return (jint) staged_tokens;
+}
+
+/**
+ * Load the vision projector before the first image (LlamaNative.prepareVision):
+ * the app calls it when the user opens the photo menu, thus the time of the
+ * picker hides the load. Returns false when the engine has no projector or it
+ * did not load, with the reason in the log.
+ */
+static jboolean prepare_vision_impl(JNIEnv * env, jlong handle) {
+    const std::shared_ptr<Engine> engine = engine_of(handle);
+    if (engine == nullptr) {
+        throw_java(env, "No model is loaded");
+        return JNI_FALSE;
+    }
+    Engine * e = engine.get();
+    std::lock_guard<std::mutex> lock(e->mutex);
+    if (e->mmproj.empty()) {
+        return JNI_FALSE;
+    }
+    std::string error;
+    if (!ensure_vision(*e, error)) {
+        LOGE("the vision projector did not load before the image: %s", error.c_str());
+        return JNI_FALSE;
+    }
+    return JNI_TRUE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_ai_airi_qwenmobile_LlamaNative_prepareVision(JNIEnv * env, jclass, jlong handle) {
+    return jni_guard<jboolean>(env, JNI_FALSE, [&] { return prepare_vision_impl(env, handle); });
+}
+
+JNIEXPORT jint JNICALL
+Java_ai_airi_qwenmobile_LlamaNative_stageImage(JNIEnv * env, jclass native_class, jlong handle, jobjectArray roles,
+                                                jobjectArray contents, jobjectArray images, jboolean thinking) {
+    return jni_guard<jint>(env, -1, [&] {
+        return stage_image_impl(env, native_class, handle, roles, contents, images, thinking);
     });
 }
 
@@ -2690,7 +3170,8 @@ static jstring stats_impl(JNIEnv * env, jlong handle) {
     Engine * e = engine.get();
     std::lock_guard<std::mutex> lock(e->mutex);
     const TurnStats & t = e->turn;
-    char line[512];
+    // The line holds about 350 characters with every part, and snprintf cuts a longer one.
+    char line[768];
     const double pp = t.prefill_us > 0 ? t.prefill_tokens * 1e6 / t.prefill_us : 0.0;
     const double tg = t.gen_us > 0 ? t.gen_tokens * 1e6 / t.gen_us : 0.0;
     const char * pf_dev = e->device_pf ? ggml_backend_dev_name(e->device_pf) : e->device ? ggml_backend_dev_name(e->device) : "CPU";
@@ -2701,6 +3182,10 @@ static jstring stats_impl(JNIEnv * env, jlong handle) {
         if (t.from_snapshot) {
             extra += " in " + std::to_string(t.restore_us / 1000) + " ms";
         }
+    }
+    if (t.staged_tokens > 0) {
+        // The part of the reused tokens that the stage of the attached image decoded before the send.
+        extra += ", " + std::to_string(t.staged_tokens) + " tok at attach in " + std::to_string(t.staged_us / 1000) + " ms";
     }
     if (t.snapshot_us > 0) {
         extra += ", snapshot " + std::to_string(t.snapshot_us / 1000) + " ms";

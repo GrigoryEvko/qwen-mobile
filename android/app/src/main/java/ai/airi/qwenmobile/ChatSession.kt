@@ -58,6 +58,19 @@ internal fun modelHistory(
 }
 
 /**
+ * The messages of the stage of an attached image: the history that
+ * [ChatSession.send] makes for a new message with the image, with [text] in
+ * the place of the text that the user did not write yet. The prompt up to and
+ * including the image does not depend on that text. O(n).
+ */
+internal fun stageHistory(
+    messages: List<ChatMessage>,
+    image: ByteArray,
+    text: String,
+    systemPrompt: String = "",
+): List<ChatMessage> = modelHistory(messages + ChatMessage("user", text, image), systemPrompt)
+
+/**
  * The conversation of the process: the messages, the running answer, and
  * the model life cycle. It lives in an application scope, thus an answer
  * continues while the app is in the background or on another tab. The
@@ -108,6 +121,10 @@ object ChatSession {
     private lateinit var app: Context
     private lateinit var store: ConversationStore
     private var generation: Job? = null
+    /** The stage of the image that the composer holds, while it waits for the engine or runs. */
+    private var staging: Job? = null
+    /** The load of the vision projector while the user selects a photo. */
+    private var visionLoad: Job? = null
     private var restore: Job? = null
     private var reload: Job? = null
     private var load: Job? = null
@@ -293,6 +310,67 @@ object ChatSession {
     }
 
     // --- the turn ---
+
+    /**
+     * Load the vision projector while the user selects a photo
+     * ([LlamaEngine.prepareVision]), thus the first image of a model does not
+     * wait for it. The load waits for a running answer or load. A second call
+     * while one waits or runs does nothing.
+     */
+    fun prepareVision() {
+        if (visionLoad?.isActive == true) {
+            return
+        }
+        visionLoad = scope.launch {
+            engineLock.withLock {
+                if (LlamaEngine.state.value == null) {
+                    return@withLock
+                }
+                try {
+                    LlamaEngine.prepareVision()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.w(TAG, "The vision projector did not load before the image", e)
+                }
+            }
+        }
+    }
+
+    /**
+     * Stage the attached image of the next message ([LlamaEngine.stageImage]):
+     * the encoder and the prefill of the image run while the user writes the
+     * text, thus the send decodes only that text. The stage waits for a
+     * running answer or load, and it builds the history when it runs. A later
+     * call or [dropStagedImage] cancels a stage that waits. A failure costs
+     * only time: the send decodes the image itself.
+     */
+    fun stageImage(image: ByteArray) {
+        staging?.cancel()
+        staging = scope.launch {
+            engineLock.withLock {
+                if (LlamaEngine.state.value == null) {
+                    return@withLock
+                }
+                val s = SettingsStore.of(app).state.value
+                val history = stageHistory(messages, image, app.getString(R.string.describe_image), s.systemPrompt)
+                try {
+                    val tokens = LlamaEngine.stageImage(history, s.thinking)
+                    Log.i(TAG, "The attached image is staged: $tokens prompt tokens")
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.w(TAG, "The stage of the attached image failed, the send decodes the image", e)
+                }
+            }
+        }
+    }
+
+    /** Cancel a stage that waits for the engine. A stage that runs ends, and the send puts the memory back when its message differs. */
+    fun dropStagedImage() {
+        staging?.cancel()
+        staging = null
+    }
 
     /** Cancel the running answer, if any. The engine stops before the coroutine cancels, thus the stop is immediate. */
     fun stop() {

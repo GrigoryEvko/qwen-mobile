@@ -106,6 +106,13 @@ public:
     TurnPrompt make(const std::vector<PromptMessage> & msgs, bool thinking, size_t mem_items, llama_token mem_last);
 
     /**
+     * The prompt that make() gives for the same arguments, without a change of
+     * the record. The engine uses it for a message that is not sent yet (an
+     * attached image), thus the record stays for the turn that sends it.
+     */
+    TurnPrompt plan(const std::vector<PromptMessage> & msgs, bool thinking, size_t mem_items, llama_token mem_last) const;
+
+    /**
      * The end of the answer of the last make(). With clean true, the memory
      * holds the prompt of that turn, the tokens of the answer and the end token
      * of the template, and nothing more: the request of that turn and the answer

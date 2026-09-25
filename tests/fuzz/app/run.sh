@@ -84,7 +84,7 @@ bdir() {
     echo "$REPO/build/fuzz/app-$PROFILE-$1"
 }
 TARGETS="fuzz_jni_api fuzz_jni_threads fuzz_jni_threads_free fuzz_caches fuzz_spec_policy"
-SCENARIOS="image-shape image-twice jni-pending spec-disable spec-parity spec-image snapshot-damage image-damage sampler-nan stop-free priority render-live live-turns spec-limit"
+SCENARIOS="image-shape image-twice jni-pending spec-disable spec-parity spec-image snapshot-damage image-damage sampler-nan stop-free priority render-live live-turns spec-limit image-stage"
 
 export FUZZ_APP_MODEL_DIR="$MODELS"
 export FUZZ_APP_WORK="$OUT/work"

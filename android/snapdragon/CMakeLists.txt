@@ -30,6 +30,7 @@ add_library(qwenmobile SHARED
     "${JNI_DIR}/perf_hint.cpp"
     "${JNI_DIR}/spec_policy.cpp"
     "${JNI_DIR}/state_cache.cpp"
+    "${JNI_DIR}/token_rows.cpp"
     "${JNI_DIR}/trace.cpp")
 
 target_include_directories(qwenmobile PRIVATE

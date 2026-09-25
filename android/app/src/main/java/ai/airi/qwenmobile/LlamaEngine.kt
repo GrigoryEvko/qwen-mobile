@@ -344,6 +344,30 @@ object LlamaEngine {
         ).flowOn(dispatcher)
     }
 
+    /** Load the vision projector before the first image ([LlamaNative.prepareVision]). Without a model it does nothing. */
+    suspend fun prepareVision(): Boolean = withContext(dispatcher) {
+        val h = handle
+        h != 0L && wake.around { LlamaNative.prepareVision(h) }
+    }
+
+    /**
+     * Decode the prompt of the next turn up to and including the image of its
+     * last message, before the user sends it ([LlamaNative.stageImage]). The
+     * send of the message then decodes only the text after the image. The
+     * messages are copied on the thread of the caller. Returns the number of
+     * prompt tokens that the memory holds for the message, 0 when there is
+     * nothing to stage or no model.
+     */
+    suspend fun stageImage(messages: List<ChatMessage>, thinking: Boolean): Int {
+        val roles = messages.map { it.role }.toTypedArray()
+        val contents = messages.map { it.content }.toTypedArray()
+        val images = messages.map { it.image }.toTypedArray()
+        return withContext(dispatcher) {
+            val h = handle
+            if (h == 0L) 0 else wake.around { LlamaNative.stageImage(h, roles, contents, images, thinking) }
+        }
+    }
+
     /**
      * Ask the running answer to stop at once. The call takes no lock and
      * runs on the thread of the caller, thus it does not wait for the
