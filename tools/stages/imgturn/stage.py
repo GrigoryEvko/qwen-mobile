@@ -249,6 +249,25 @@ OPBATCH_RE = re.compile(r"profile-op OPBATCH\|.*\|usec (\d+) cycles")
 # host time. The compute time of an HTP0 split is the time to send it, because the DSP runs it asynchronously.
 SCHED_RE = re.compile(r"hostprof: sched splits (\d+)(.*) us")
 SPLIT_RE = re.compile(r"\[(\S+) nodes (\d+) inputs \d+ copy (\d+) compute (\d+)\]")
+# The laptop runner log: the title line of a run, and the check of the caps after it. The runner reads the caps some
+# seconds after the run, thus it removes the short drop of the cap of cpu7 that the "after:" line of the gate file
+# shows at the end of each run.
+RUNNER_TITLE_RE = re.compile(r"^# REAL-MODEL \S+: (\S+),")
+RUNNER_CAPS_RE = re.compile(r"^CAPS .*CAPS-CHANGED")
+
+
+def runner_rejects(path: Path | None) -> set[str]:
+    """The names of the runs that the runner log marks CAPS-CHANGED. O(lines of the log)."""
+    if path is None:
+        return set()
+    rejected, name = set(), None
+    for line in path.read_text(errors="replace").splitlines():
+        m = RUNNER_TITLE_RE.match(line)
+        if m:
+            name = m.group(1)
+        elif name is not None and RUNNER_CAPS_RE.match(line):
+            rejected.add(name)
+    return rejected
 
 
 @dataclass
@@ -263,8 +282,9 @@ class Result:
     log: str
 
 
-def read_result(root: Path, run: Run) -> Result:
-    """Read the gate file, the stdout and the stderr of one run. O(size of the files)."""
+def read_result(root: Path, run: Run, rejected: set[str]) -> Result:
+    """Read the gate file, the stdout and the stderr of one run. A run in rejected (the runner marked its caps) does
+    not go into the tables. O(size of the files)."""
     gate_path, out_path, log_path = (root / f"{run.name}{s}" for s in ("-gate.txt", ".out", ".log"))
     gate = gate_path.read_text(errors="replace") if gate_path.exists() else ""
     before, after = GATE_RE.search(gate), AFTER_RE.search(gate)
@@ -287,6 +307,8 @@ def read_result(root: Path, run: Run) -> Result:
         removed.append(f"a cap of {min(cap_values)} kHz")
     if after and after.group(1) not in ("", "0"):
         removed.append(f"thermal {after.group(1)} after the run")
+    if run.name in rejected:
+        removed.append("the runner marked CAPS-CHANGED")
     out = out_path.read_text(errors="replace") if out_path.exists() else ""
     log = log_path.read_text(errors="replace") if log_path.exists() else ""
     if ok and re.search(r"GGML_ASSERT|dspqueue_read failed|did not load|did not decode|did not open|did not read|mtmd_tokenize gave", log):
@@ -444,12 +466,16 @@ def checks(results: dict[str, Result]) -> list[str]:
     return out
 
 
-def table(root: Path, include_all: bool) -> int:
+def table(root: Path, include_all: bool, runner_log: Path | None) -> int:
     """Print the tables."""
     if not root.is_dir():
         print(f"stage.py: {root} is not a directory. Pull the outputs of the stage first.", file=sys.stderr)
         return 1
-    results = {r.name: read_result(root, r) for r in all_runs() if (root / f"{r.name}-gate.txt").exists()}
+    if runner_log is not None and not runner_log.is_file():
+        print(f"stage.py: the runner log {runner_log} does not exist.", file=sys.stderr)
+        return 1
+    rejected = runner_rejects(runner_log)
+    results = {r.name: read_result(root, r, rejected) for r in all_runs() if (root / f"{r.name}-gate.txt").exists()}
     for part in (checks(results), turn_table(results, include_all), profile_table(results)):
         print("\n".join(part))
         print()
@@ -465,12 +491,13 @@ def main() -> int:
     t = sub.add_parser("table", help="print the tables from the pulled files")
     t.add_argument("--root", type=Path, default=STAGE_DIR / "phone-out")
     t.add_argument("--all", action="store_true", help="also use the runs with changed caps or heat")
+    t.add_argument("--runner-log", type=Path, help="the log of the laptop runner: its CAPS-CHANGED runs are removed")
     a = ap.parse_args()
     if a.cmd == "commands":
         n = write_commands(a.out)
         print(f"{a.out}: {n} lines, {len(all_runs())} runs")
         return 0
-    return table(a.root, a.all)
+    return table(a.root, a.all, a.runner_log)
 
 
 if __name__ == "__main__":
