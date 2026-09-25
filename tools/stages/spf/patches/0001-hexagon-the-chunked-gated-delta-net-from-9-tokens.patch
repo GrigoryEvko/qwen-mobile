@@ -1,13 +1,13 @@
-hexagon: a switch for the smallest batch of the chunked gated delta net
+hexagon: the chunked gated delta net from 9 tokens
 
 The cost
 
 A GATED_DELTA_NET batch of fewer than 32 tokens runs on the sequential kernel of gated-delta-net-ops.c.
 That kernel reads and writes the full state of each head (128 x 128 floats in VTCM) for each token. In the
-op profile of the 4B Q8_0 on the v79 NPU (the stage imgturn, the draft on), a batch of 22 tokens uses
-1.15 ms in each of the 24 layers, which is 28 ms of a prefill call of 22 tokens. Version 2 of the chunked
-kernel uses 3.4 to 3.6 us for each token at 744 and 1024 tokens (the same profile), thus one chunk of 64
-tokens uses approximately 0.23 ms.
+phone stage spf (the 4B Q8_0 on the v79 NPU, the app configuration, the depths 700 and 2300, the draft off
+and on), the sequential kernel uses 3.1, 5.6, 10.5, 20.4 and 28.2 ms of each call of 2, 4, 8, 16 and 22
+tokens: about 0.45 ms plus 1.24 ms for each token. Version 2 of the chunked kernel uses 10.4 to 11.0 ms for
+each call of 2 to 22 tokens, and 11.2 to 11.9 ms from 32 to 64 tokens. The two are equal at 8 tokens.
 
 The change
 
@@ -15,7 +15,7 @@ The change
   tokens outside the snapshot tail for version 2. The value 0 keeps the limit of the DSP,
   GDN_CH_MIN_TOKENS (32). Version 1 always keeps 32.
 - The host gives the value of GGML_HEXAGON_GDN_CHUNK_MIN in the params of each GATED_DELTA_NET op. The
-  preset value is 2, and a negative value gives 0. Thus an A/B run needs no other build.
+  preset value is 9, and a negative value gives 0. Thus an A/B run needs no other build.
 - A batch of fewer than 64 tokens is one partial chunk. gdn_c2_zero_tail sets the rows past the last token
   and their gate and beta to zero, thus they give no term. With the limit of 32, the op of 744 tokens has
   a partial chunk of 40 tokens.
@@ -23,7 +23,7 @@ The change
   loop, and the tail writes each of the K slots.
 - test-backend-ops gives the HTP backend the bound of the chunked kernel (2e-6) on the shapes that go to
   that kernel. Its predicate reads GGML_HEXAGON_GDN_CHUNK and GGML_HEXAGON_GDN_CHUNK_MIN with the rule of
-  the host, thus the cases of 2 to 31 tokens get that bound with the preset values.
+  the host.
 
 The results
 
@@ -44,10 +44,17 @@ float64 reference.
     22      4  -0.5    3.19e-07   6.52e-08   1.42e-07
     8       1  -30     3.31e-07   2.08e-07   -
     22      1  -30     3.06e-07   2.06e-07   -
-Each run gives only finite values and is less than the bound of 2e-6. The sequential kernel gives 1.68e-14
-and 9.87e-15 at 8 tokens: the chunked kernel has the f16 inputs of the HMX, as at 32 tokens and more. The
-simulator gives an exact zero for a qfloat product with a zero operand, and the v79 NPU does not. Thus the
-phone stage spf (tools/stages/spf) holds the KL check of the model and the time of each batch size.
+Each run gives only finite values and is less than the bound of 2e-6.
+
+The phone stage spf, with the limit 2 against HEAD (the limit 32):
+- The wall time of a call with the graph reused: 16 tokens -4.3 to -9.5 ms, 22 tokens -13.2 to -16.9 ms
+  (the draft off and on), 2 and 4 tokens +5.9 to +8.9 ms. The preset 9 keeps 2 to 8 tokens on the
+  sequential kernel.
+- The KL of the prefill path in ubatches of 16 tokens against naive-4B-q8.kld (4 chunks of 512):
+  0.000606 +- 0.000043 against 0.000586 +- 0.000044, maximum 0.0209 against 0.0222. In ubatches of
+  5 tokens: 0.000590 +- 0.000057.
+- test-backend-ops of GATED_DELTA_NET and CONCAT on HTP0: 107 of 107 cases pass on the two libraries.
+- llama-bench pp512 1144.3 against 1143.2 t/s.
 
 diff --git a/ggml/src/ggml-hexagon/htp/htp-gdn-params.h b/ggml/src/ggml-hexagon/htp/htp-gdn-params.h
 index e9c35f14c6cfa927b52e8c2a21797b5829e8a5ba..4bf73b68c16bdd804b3a1d8e0f932c6a5e29a52b 100644
@@ -111,23 +118,25 @@ index f8f13583139ad27fbcb7b60c9ba27688b7c3beb4..d674207fe3ad393f0e90d6643f655b46
          refuse = "the head size";
      }
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-index 292da7ef8966f2be60cdbbad1c771929f7dce97e..8efb628ad8d3a0859d08c2d37829d16b093df812 100644
+index 292da7ef8966f2be60cdbbad1c771929f7dce97e..99e8fbfdbe397614ff8df584d6029c12eeed0c0e 100644
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-@@ -131,6 +131,12 @@ static int opt_opfusion_state = -1; // GGML_HEXAGON_OPFUSION_STATE: -1 = follow
+@@ -131,6 +131,14 @@ static int opt_opfusion_state = -1; // GGML_HEXAGON_OPFUSION_STATE: -1 = follow
  // A/B run needs no other build.
  static int opt_gdn_chunk = 2;
  
 +// GGML_HEXAGON_GDN_CHUNK_MIN: the smallest batch, in tokens outside the snapshot tail, for version 2 of the
 +// chunked kernel. A smaller batch runs on the sequential kernel, which updates the full state of each head
 +// for each token. The host gives the value in the kernel params of each GATED_DELTA_NET op, thus an A/B run
-+// needs no other build. 0 gives the limit of the DSP (32 tokens).
-+static int opt_gdn_chunk_min = 2;
++// needs no other build. 0 gives the limit of the DSP (32 tokens). On the v79 NPU with the 4B (the phone stage spf),
++// the chunked kernel uses 10.4 to 11.0 ms for each call of 2 to 22 tokens, and the sequential kernel about 0.45 ms
++// plus 1.24 ms for each token: the two are equal at 8 tokens, thus the preset is 9.
++static int opt_gdn_chunk_min = 9;
 +
  // GGML_HEXAGON_GDN_CONV_DMA: 1 = GDN_CONV_CHUNK moves its rows with the DMA (the default), 0 = it
  // reads them with vector loads from DDR. The host gives the value in the kernel params of each op.
  static int opt_gdn_conv_dma = 1;
-@@ -7255,8 +7261,9 @@ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, co
+@@ -7255,8 +7263,9 @@ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, co
                  node.name   = "GATED_DELTA_NET+QKNORM";
                  node.inputs = { qm.q, qm.k, n->src[2], n->src[3], n->src[4], n->src[5] };
                  node.fused  = qm.members;
@@ -139,7 +148,7 @@ index 292da7ef8966f2be60cdbbad1c771929f7dce97e..8efb628ad8d3a0859d08c2d37829d16b
                  ggml_hexagon_gdn_qknorm_params(qm, node.kernel_params);
                  fu.at.emplace(i, std::move(node));
                  std::vector<ggml_tensor *> members = qm.members;
-@@ -7416,9 +7423,10 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -7416,9 +7425,10 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                      (struct htp_rope_kernel_params *)node.kernel_params
                  );
              } else if (node.opcode == HTP_OP_GATED_DELTA_NET) {
@@ -153,7 +162,7 @@ index 292da7ef8966f2be60cdbbad1c771929f7dce97e..8efb628ad8d3a0859d08c2d37829d16b
              }
              return node;
          };
-@@ -8860,6 +8868,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8860,6 +8870,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      const char * str_opfusion_state = getenv("GGML_HEXAGON_OPFUSION_STATE");
      const char * str_multirow = getenv("GGML_HEXAGON_MULTIROW");
      const char * str_gdn_chunk = getenv("GGML_HEXAGON_GDN_CHUNK");
@@ -161,7 +170,7 @@ index 292da7ef8966f2be60cdbbad1c771929f7dce97e..8efb628ad8d3a0859d08c2d37829d16b
      const char * str_gdn_conv_dma = getenv("GGML_HEXAGON_GDN_CONV_DMA");
      const char * str_gdn_qknorm   = getenv("GGML_HEXAGON_GDN_QKNORM");
      const char * str_fwht     = getenv("GGML_HEXAGON_FWHT");
-@@ -8941,6 +8950,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8941,6 +8952,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      opt_canary    = str_canary   ? atoi(str_canary)                       : opt_canary;
      opt_opfusion_state = str_opfusion_state ? atoi(str_opfusion_state)    : opt_opfusion_state;
      opt_gdn_chunk = str_gdn_chunk ? atoi(str_gdn_chunk)                   : opt_gdn_chunk;
@@ -170,7 +179,7 @@ index 292da7ef8966f2be60cdbbad1c771929f7dce97e..8efb628ad8d3a0859d08c2d37829d16b
      opt_gdn_conv_dma = str_gdn_conv_dma ? atoi(str_gdn_conv_dma)          : opt_gdn_conv_dma;
      opt_gdn_qknorm   = str_gdn_qknorm   ? atoi(str_gdn_qknorm)            : opt_gdn_qknorm;
      opt_fwht      = str_fwht     ? atoi(str_fwht)                         : opt_fwht;
-@@ -8968,6 +8979,10 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8968,6 +8981,10 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      if (!opt_fwht) {
          GGML_LOG_INFO("ggml-hex: the KV cache rotation stays MUL_MAT (GGML_HEXAGON_FWHT=0)\n");
      }
@@ -182,7 +191,7 @@ index 292da7ef8966f2be60cdbbad1c771929f7dce97e..8efb628ad8d3a0859d08c2d37829d16b
          GGML_LOG_INFO("ggml-hex: flash attention options 0x%x (GGML_HEXAGON_FA_OPT)\n", opt_fa_opt);
      }
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index b3ed0c106737c5eb8a61120b2c4bf54a0e8fffd4..25050b20a2829912f5be3f8c56a4836712af7819 100644
+index b3ed0c106737c5eb8a61120b2c4bf54a0e8fffd4..fbd6710ded09eddcb35d64540c9bfb01d1d59588 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -4751,11 +4751,30 @@ struct test_gated_delta_net : public test_case {
@@ -193,7 +202,7 @@ index b3ed0c106737c5eb8a61120b2c4bf54a0e8fffd4..25050b20a2829912f5be3f8c56a48367
 +    // The smallest token count of the gate follows the switches of the host (ggml-hexagon.cpp), which
 +    // the backend reads from the same environment: GGML_HEXAGON_GDN_CHUNK (0 = the sequential kernel
 +    // only, 1 = version 1 with 32 tokens, 2 = version 2, the preset) and GGML_HEXAGON_GDN_CHUNK_MIN
-+    // (the limit of version 2, preset 2, and 0 gives 32).
++    // (the limit of version 2, preset 9, and 0 gives 32).
 +    static int64_t htp_chunk_min_tokens() {
 +        const char * s_ver = getenv("GGML_HEXAGON_GDN_CHUNK");
 +        const char * s_min = getenv("GGML_HEXAGON_GDN_CHUNK_MIN");
@@ -204,7 +213,7 @@ index b3ed0c106737c5eb8a61120b2c4bf54a0e8fffd4..25050b20a2829912f5be3f8c56a48367
 +        if (ver != 2) {
 +            return 32;
 +        }
-+        const int lim = s_min ? std::max(0, atoi(s_min)) : 2;
++        const int lim = s_min ? std::max(0, atoi(s_min)) : 9;
 +        return lim > 0 ? lim : 32;
 +    }
 +

@@ -5,24 +5,30 @@ The cost
 op_concat sends each case to concat_generic, except a 2D concat along dimension 0 with a transposed src1.
 concat_generic calculates the four indices of each element with three fastdiv steps and copies one element
 at a time. The MTP draft context of Qwen3.5 concatenates two rows of 2560 floats for each token
-(mtp_concat). In the op profile of the 4B Q8_0 on the v79 NPU (the stage imgturn, the draft on), that op
-uses 29.3 ms for 1024 tokens, 16.6 ms for 623 tokens and 0.6 ms for 22 tokens.
+(mtp_concat). In the op profile of the 4B Q8_0 on the v79 NPU (the stages imgturn and spf, the draft on),
+that op uses 29.3 ms for 1024 tokens, 16.6 ms for 623 tokens, 0.60 ms for 22 tokens and 0.86 ms for 32
+tokens.
 
 The change
 
 concat_rows copies each row of dst with hvx_copy_uu: for dimension 0, the row of src0 and then the row of
 src1; for a different dimension, the row of the source that the index of the row selects. A thread gets a
 range of rows. op_concat uses concat_rows when src0, src1 and dst have the same type and contiguous rows
-(nb[0] is the size of one element), on one device. The transposed path and the path of more devices do
+(nb[0] is the size of one element), on one device. For one device, mdev_group_init of main.c gives the
+count 0, thus the condition is a count of 1 or less. The transposed path and the path of more devices do
 not change. The copy moves bits, thus the output has the bytes of concat_generic.
 
 The results
 
-The phone stage spf (tools/stages/spf) holds the checks: test-backend-ops -o CONCAT on HTP0 against the
-CPU backend, and the time of the op in the op profile with the draft on.
+The kernel lab (tools/htp-lab, target concat, the release flags with -flto, the functional mode, the device
+count 0): op_concat against a scalar reference, byte for byte, with a guard of 256 bytes after dst. 12 cases
+pass: the MTP concat at 1, 5, 22 and 1024 tokens, dimension 0 with odd rows in 4D, f16 and i32 with padded
+rows of src0, dimensions 1, 2 and 3, and a transposed src1 (the old path). The tree of HEAD gives the same
+bytes with concat_generic. The simulator runs the MTP concat of 22 tokens in 15252 cycles against 3608108
+cycles for concat_generic, with the jobs of the six threads one after the other.
 
 diff --git a/ggml/src/ggml-hexagon/htp/concat-ops.c b/ggml/src/ggml-hexagon/htp/concat-ops.c
-index 966e867b3976bac86d3f99b691517e39f758751e..1b2d63e292c9321751b7d1a680d7237709e4221d 100644
+index 966e867b3976bac86d3f99b691517e39f758751e..0cecdf18b1900dd03b128f8eb5f7d41c740f3796 100644
 --- a/ggml/src/ggml-hexagon/htp/concat-ops.c
 +++ b/ggml/src/ggml-hexagon/htp/concat-ops.c
 @@ -230,6 +230,51 @@ static void concat_generic(unsigned int nth, unsigned int ith, void * data) {
@@ -83,13 +89,13 @@ index 966e867b3976bac86d3f99b691517e39f758751e..1b2d63e292c9321751b7d1a680d72377
  
 +    // Rows that are contiguous in the three tensors go as whole rows (concat_rows). concat_generic calculates
 +    // the indices of each element and copies one element at a time: 29 ms for the MTP concat of 5120 x 1024
-+    // floats on the v79. One device only: the partition of more devices splits the elements at L2 lines, and
-+    // the row copy writes whole rows.
++    // floats on the v79. One device only (mdev_group_init of main.c gives a count of 0 to one device): the partition
++    // of more devices splits the elements at L2 lines, and the row copy writes whole rows.
 +    const bool rows_contiguous = src0->type == dst->type && src1->type == dst->type && src0->nb[0] == type_size &&
 +                                 src1->nb[0] == type_size && dst->nb[0] == type_size && dim >= 0 && dim <= 3;
 +    const uint32_t n_dst_rows  = dst->ne[1] * dst->ne[2] * dst->ne[3];
 +
-+    if (rows_contiguous && octx->ctx->mdev.count == 1) {
++    if (rows_contiguous && octx->ctx->mdev.count <= 1) {
 +        if (n_dst_rows == 0 || dst->ne[0] == 0) {
 +            return HTP_STATUS_OK;
 +        }

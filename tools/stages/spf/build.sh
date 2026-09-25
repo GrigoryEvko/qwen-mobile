@@ -2,10 +2,11 @@
 # Build the phone stage "spf": the time of a short prefill call of the 4B Q8_0 on HTP0 against its token count,
 # in the engine of the app, on the libraries of HEAD (the table) and on the libraries with the candidate patches.
 #
-#   JOBS=64 tools/stages/spf/build.sh
+#   JOBS=64 [STAGE=spf2] tools/stages/spf/build.sh
 #
-# The candidate patches are tools/stages/spf/patches/*.patch, in the order of their names. build/spf/build.sh is a
-# link to this file. The files of the stage go to build/spf.
+# The candidate patches are tools/stages/spf/patches/*.patch, in the order of their names. STAGE names the stage of
+# tools/stages/spf/stage.py (spf, the preset, or spf2), and the files of the stage go to build/STAGE.
+# build/STAGE/build.sh is a link to this file. The steps below name build/spf for the preset.
 #
 # The steps:
 #   1. tests/sanitizers/llama-copy.sh makes build/spf/base and build/spf/new, the llama.cpp tree of HEAD (the pin
@@ -29,9 +30,11 @@
 set -euo pipefail
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../../scripts/lib.sh"
 JOBS=${JOBS:-64}
+STAGE=${STAGE:-spf}
 cd "$REPO_ROOT"
 
-readonly stage=build/spf
+[[ $STAGE =~ ^spf[0-9]*$ ]] || die "STAGE must be spf or spf<N>, not $STAGE"
+readonly stage=build/$STAGE
 readonly out=$stage/phone
 readonly repro="-ffile-prefix-map=/workspace=. -fdebug-prefix-map=/workspace=. -Werror=date-time"
 readonly app_src=android/app/src/main/cpp
@@ -158,4 +161,4 @@ cp -f tools/phone/gate.sh "$out/bin/"
 cat "$out/SHA256SUMS"
 
 # 4. The command file
-python3 tools/stages/spf/stage.py commands
+python3 tools/stages/spf/stage.py --stage "$STAGE" commands

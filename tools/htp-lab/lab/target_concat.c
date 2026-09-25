@@ -217,7 +217,8 @@ int main(int argc, char ** argv) {
     g_ctx.n_threads_div = init_fastdiv_values(nth);
     g_ctx.vtcm_size     = lab_vtcm_size() - 4096;
     g_ctx.vtcm_base     = lab_vtcm_alloc(g_ctx.vtcm_size, 2048);
-    g_ctx.mdev.count    = 1;
+    // mdev_group_init of main.c gives one device the count 0
+    g_ctx.mdev.count    = 0;
 
     static const struct concat_case cases[] = {
         { "mtp 1 token",                  HTP_TYPE_F32, 0, { 2560, 1, 1, 1 },  { 2560, 1, 1, 1 },  0, 0 },

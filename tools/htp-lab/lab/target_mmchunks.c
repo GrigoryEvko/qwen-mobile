@@ -17,7 +17,10 @@
 //
 // The cases: Q8_0 tiles and F16 weights, token counts that give a partial last token chunk, weight row counts that
 // give a partial last weight chunk, the narrowest n chunk (32), one n chunk and two n chunks (the prologue of the
-// pipelined loop), and a request with a value of 0.
+// pipelined loop), and a request with a value of 0. A Q8_0 run on the pipelined layout also runs with the weight
+// streams PACKED and RINGS (hmx_wstream of the kernel params), which must give the same bytes. The DMA shim copies at
+// the push, and the work queue of the lab runs the workers one after the other, thus a worker that moves bytes into
+// the tiles of a different worker before that worker reads them changes the output.
 //
 // Arguments: --threads 6 --vtcm 1048576
 #pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
@@ -345,34 +348,46 @@ static void run_case(enum form f, int wtype, uint32_t k, uint32_t n, uint32_t m,
             }
             continue;
         }
-        for (uint32_t i = 0; i < n_weights; i++) {
-            memset(out[i], 0x5a, out_bytes + 256);
-        }
-        const int status = run_op(op, &kp, src, n_src, dst, n_weights);
-        g_runs++;
-        size_t diff = 0, tail = 0;
-        for (uint32_t i = 0; i < n_weights; i++) {
-            if (s == 0) {
-                memcpy(ref[i], out[i], out_bytes);
-                check_reference(f, wtype, k, n, m, &src[i], x,
-                                f == FORM_ADD ? (const float *) (uintptr_t) src[2].data : NULL, (const float *) ref[i]);
-            } else {
-                for (size_t b = 0; b < out_bytes; b += 4) {
-                    diff += memcmp(out[i] + b, ref[i] + b, 4) != 0;
+        // Each weight stream of the pipelined Q8_0 loop (hmx_wstream) must give the bytes of the reference. A tree
+        // without the field runs the one form of the loop.
+#ifdef HTP_MM_WSTREAM_RINGS
+        const int n_ws = wtype == HTP_TYPE_Q8_0 && kp.pipeline ? 3 : 1;
+#else
+        const int n_ws = 1;
+#endif
+        for (int ws = 0; ws < n_ws; ws++) {
+#ifdef HTP_MM_WSTREAM_RINGS
+            kp.hmx_wstream = ws;
+#endif
+            for (uint32_t i = 0; i < n_weights; i++) {
+                memset(out[i], 0x5a, out_bytes + 256);
+            }
+            const int status = run_op(op, &kp, src, n_src, dst, n_weights);
+            g_runs++;
+            size_t diff = 0, tail = 0;
+            for (uint32_t i = 0; i < n_weights; i++) {
+                if (s == 0 && ws == 0) {
+                    memcpy(ref[i], out[i], out_bytes);
+                    check_reference(f, wtype, k, n, m, &src[i], x,
+                                    f == FORM_ADD ? (const float *) (uintptr_t) src[2].data : NULL, (const float *) ref[i]);
+                } else {
+                    for (size_t b = 0; b < out_bytes; b += 4) {
+                        diff += memcmp(out[i] + b, ref[i] + b, 4) != 0;
+                    }
+                }
+                for (size_t b = 0; b < 256; b++) {
+                    tail += out[i][out_bytes + b] != 0x5a;
                 }
             }
-            for (size_t b = 0; b < 256; b++) {
-                tail += out[i][out_bytes + b] != 0x5a;
+            const uint32_t passes = (m + (uint32_t) kp.m_chunk - 1) / (uint32_t) kp.m_chunk;
+            const uint32_t chunks = passes * ((n + (uint32_t) kp.n_chunk - 1) / (uint32_t) kp.n_chunk);
+            printf("lab:   %-18s ws %d mc %4d nc %4d act %d %s passes %2u chunks %3u vtcm %7d: status %d, %zu values "
+                   "differ from old, %zu tail bytes changed%s\n",
+                   what, ws, kp.m_chunk, kp.n_chunk, kp.n_act_threads, kp.pipeline ? "pipe  " : "serial", passes, chunks,
+                   kp.vtcm_size, status, diff, tail, (status != HTP_STATUS_OK || diff || tail) ? "  FAIL" : "");
+            if (status != HTP_STATUS_OK || diff || tail) {
+                g_fail++;
             }
-        }
-        const uint32_t passes = (m + (uint32_t) kp.m_chunk - 1) / (uint32_t) kp.m_chunk;
-        const uint32_t chunks = passes * ((n + (uint32_t) kp.n_chunk - 1) / (uint32_t) kp.n_chunk);
-        printf("lab:   %-18s mc %4d nc %4d act %d %s passes %2u chunks %3u vtcm %7d: status %d, %zu values differ from "
-               "old, %zu tail bytes changed%s\n",
-               what, kp.m_chunk, kp.n_chunk, kp.n_act_threads, kp.pipeline ? "pipe  " : "serial", passes, chunks,
-               kp.vtcm_size, status, diff, tail, (status != HTP_STATUS_OK || diff || tail) ? "  FAIL" : "");
-        if (status != HTP_STATUS_OK || diff || tail) {
-            g_fail++;
         }
     }
 }
@@ -412,6 +427,14 @@ int main(int argc, char ** argv) {
     // One n chunk and two n chunks: the prologue of the pipelined loop pushes one or two weight chunks
     const struct request r_g[] = { { 0, 64 }, { 0, 32 }, { 32, 64 } };
     run_case(FORM_ADD, HTP_TYPE_Q8_0, 256, 64, 100, r_g, 3);
+    // The row counts of a short prefill call on the pipelined path (5 to 64 rows), with a partial last weight chunk
+    // (n 1056 is 33 column tiles) and the NX form: the weight streams of the Q8_0 loop
+    const struct request r_h[] = { { 0, 96 }, { 0, 160 } };
+    run_case(FORM_MM, HTP_TYPE_Q8_0, 2560, 1056, 22, r_h, 2);
+    run_case(FORM_ADD, HTP_TYPE_Q8_0, 2560, 1056, 8, r_h, 2);
+    run_case(FORM_NX, HTP_TYPE_Q8_0, 2560, 1056, 5, r_h, 2);
+    run_case(FORM_MM, HTP_TYPE_Q8_0, 1024, 1056, 64, r_h, 2);
+    run_case(FORM_NX, HTP_TYPE_Q8_0, 1024, 544, 32, r_h, 2);
 
     lab_report(TARGET, "cases", (double) g_cases, "cases");
     lab_report(TARGET, "runs", (double) g_runs, "runs");

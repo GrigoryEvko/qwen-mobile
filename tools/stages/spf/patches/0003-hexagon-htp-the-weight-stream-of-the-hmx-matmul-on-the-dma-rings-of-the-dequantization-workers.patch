@@ -1,0 +1,427 @@
+hexagon: htp: the weight stream of the HMX matmul on the DMA rings of the dequantization workers
+
+The cost
+
+From 5 rows the Q8_0 weight matmuls run on the pipelined HMX 2D loop. That loop moves each chunk of weight
+tiles on the DMA ring of the op thread, as rows of one tile (1088 bytes) at the VTCM pitch 1152. In the
+phone stage spf (the 4B Q8_0 on the v79 NPU, the depth 2300, the draft off), the weight matmuls use 62.3
+to 66.7 ms of a call at 1 to 4 rows (the HVX matvec: six rings, one DMA row for each column tile) and 76.9
+to 89.3 ms at 8 to 64 rows. At 22 rows one matmul of the attn_qkv shape uses 374 to 525 us against 357 to
+382 us at 1 row, and the slow layers are the same in the two calls. The PMU counters at 8 and 22 rows (the
+set dma-wait of tools/prof/pmu.py): the DMA is active 0.92 to 0.98 of the op, its read buffer is full 0.75
+to 0.83 of the op (0.12 to 0.21 at 1 row), and the threads poll the DMA 0.35 to 0.45 of the op. The phase
+trace at 22 rows: the dequantization uses 22 to 30 % of each op on each thread and the output 3 to 8 %, and
+thread 0 waits for the DMA in the remaining time. Thus the weight stream sets the time of the op, and not
+the conversion.
+
+The change
+
+The kernel param hmx_wstream (the slot of vtcm_src3_size, which no code read) selects the weight stream of
+the pipelined loop for Q8_0 weights in hmx_mm_2d_f32 and hmx_mm_nx_2d_f32 (hmx_mm_q8_0_stream):
+- 0, HTP_MM_WSTREAM_TILES: the loop as before.
+- 1, HTP_MM_WSTREAM_PACKED: the op thread moves each chunk as one DMA row, thus the tiles are at the pitch
+  of 1088 bytes in VTCM. dequantize_tiled_weight_to_fp16_task_q8_0_packed reads a tile with unaligned
+  loads.
+- 2, HTP_MM_WSTREAM_RINGS: the packed layout, and each dequantization worker moves its own tiles on its own
+  ring. Worker w owns the tiles [w * per, (w + 1) * per) of each chunk, where per is its share of a full
+  chunk. For a chunk it waits for its tiles on ctx->dma[w], dequantizes them, and then moves its tiles of
+  the chunk two steps later into the same bytes. Only the last chunk can have fewer tiles, and a chunk two
+  steps later exists only when the chunk is not the last, thus a worker writes only bytes of its own
+  range. Worker w is thread w of the work queue, thus each ring stays on one thread.
+The host gives the value of GGML_HEXAGON_MM_WSTREAM (the preset is 2, and a value outside 0 to 2 gives 0)
+in the params of each HMX matmul. The HMX jobs, the output transfers and their order do not change, and the
+packed task does the arithmetic of the aligned task, thus the output has the bits of the stream 0.
+
+The results
+
+The kernel lab (tools/htp-lab, target mmchunks, the release flags with -flto, the functional mode with the
+HMX, 1 MB of VTCM): MUL_MAT, MUL_MAT with src2 and MUL_MAT_NX with Q8_0 and F16 weights, 5 to 1000 rows,
+k from 256 to 2560, the chunks of the two solvers and of requests (partial last chunks included). Each of
+the 78 runs of the streams 1 and 2 gives the bytes of the stream 0, and no byte after dst changes (121
+runs in 12 cases, 0 failures). The DMA shim of the lab copies at the push and the work queue of the lab
+runs the workers one after the other, thus a worker that moves bytes into the range of a different worker
+before that worker reads them changes the output.
+
+diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.h b/ggml/src/ggml-hexagon/htp/matmul-ops.h
+index 06e653cbb462c002d2864a87094d341a39f1a28f..abfb1c943f709008fb4e80b47d7c623cbd577bd8 100644
+--- a/ggml/src/ggml-hexagon/htp/matmul-ops.h
++++ b/ggml/src/ggml-hexagon/htp/matmul-ops.h
+@@ -64,6 +64,16 @@ extern "C" {
+ // (tools/stages/mmsolve/plan.cpp sensitivity).
+ #define HTP_MM_HMX_CHUNK_NS              2000
+ 
++// --- The weight stream of the pipelined HMX 2D loop for Q8_0 weights (hmx_wstream of the kernel params) ---
++// TILES: the op thread moves each chunk on its DMA ring as rows of one tile (1088 bytes) at the VTCM pitch
++// aligned_tile_size (1152), and the dequantization reads aligned tiles.
++// PACKED: the op thread moves each chunk as one row, thus the tiles are at the pitch tile_size in the VTCM, and
++// the dequantization reads an odd tile with unaligned loads.
++// RINGS: the packed layout, and each dequantization worker moves its own tiles of each chunk on its own DMA ring.
++#define HTP_MM_WSTREAM_TILES  0
++#define HTP_MM_WSTREAM_PACKED 1
++#define HTP_MM_WSTREAM_RINGS  2
++
+ // --- DMA Activation Transfer Configuration ---
+ #define HTP_MM_DMA_ACT_ROWS_PER_STEP 2
+ #define HTP_MM_DMA_ACT_MULTIPLIER    (2 * HTP_MM_DMA_ACT_ROWS_PER_STEP)
+@@ -108,7 +118,7 @@ struct htp_mm_kernel_params {
+     int32_t  vtcm_src0_size;     // src0 scratchpad size in VTCM
+     int32_t  vtcm_src1_size;     // src1 scratchpad size in VTCM
+     int32_t  vtcm_src2_size;     // src2 scratchpad size in VTCM (fused only)
+-    int32_t  vtcm_src3_size;     // src3 scratchpad size in VTCM (fused only)
++    int32_t  hmx_wstream;        // HMX 2D with Q8_0 weights: the weight stream (HTP_MM_WSTREAM_*)
+     int32_t  vtcm_dst_size;      // dst scratchpad size in VTCM
+     int32_t  n_weights;          // Number of weights for fused NX
+ 
+diff --git a/ggml/src/ggml-hexagon/htp/hmx-mm-kernels-tiled.h b/ggml/src/ggml-hexagon/htp/hmx-mm-kernels-tiled.h
+index 48390a0311688751e3337847921e32bbd4e7cd75..96e51e06ad8175d37d85f5754674d33ed9d4740a 100644
+--- a/ggml/src/ggml-hexagon/htp/hmx-mm-kernels-tiled.h
++++ b/ggml/src/ggml-hexagon/htp/hmx-mm-kernels-tiled.h
+@@ -506,6 +506,37 @@ static void dequantize_tiled_weight_to_fp16_task_q8_0(
+     }
+ }
+ 
++// The task of dequantize_tiled_weight_to_fp16_task_q8_0 for the packed layout: tile t starts at t * tile_size
++// (1088 bytes), thus an odd tile starts 64 bytes after a vector edge and each load is an unaligned load. The
++// arithmetic and the order of the stores are those of the aligned task, thus the f16 tiles have the same bits. The
++// load of the scales reads the 64 bytes after the scales of a tile: the start of the next tile, or the pad of the
++// buffer after the last tile (a buffer holds its tiles at the pitch aligned_tile_size). The shuffle uses only the
++// scales. O(tiles).
++static void dequantize_tiled_weight_to_fp16_task_q8_0_packed(
++        const tiled_dequantize_state_t *state,
++        uint32_t start_tile, uint32_t end_tile) {
++
++    for (uint32_t t = start_tile; t < end_tile; t++) {
++        const uint8_t * tile_src = state->src + (size_t) t * state->tile_size;
++        __fp16 * dst_ptr = state->dst + t * HTP_MM_HMX_TILE_N_ELMS;
++
++        HVX_Vector v_sc = *(const HVX_UVector *) (tile_src + 1024);
++        HVX_Vector v_scale_duplicated = Q6_V_lo_W(Q6_W_vshuff_VVR(v_sc, v_sc, -2));
++
++        HVX_Vector vq[8];
++        for (int g = 0; g < 8; g++) {
++            vq[g] = *(const HVX_UVector *) (tile_src + g * 128);
++        }
++        for (int g = 0; g < 8; g++) {
++            HVX_VectorPair vp = Q6_Wh_vunpack_Vb(vq[g]);
++            hvx_vmem(dst_ptr + (2 * g + 0) * 64) =
++                Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_lo_W(vp)), v_scale_duplicated));
++            hvx_vmem(dst_ptr + (2 * g + 1) * 64) =
++                Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_hi_W(vp)), v_scale_duplicated));
++        }
++    }
++}
++
+ // Q6_K stores 6-bit weights and one fp16 scale per 16 k, see HTP_MM_WEIGHT_TILE_SIZE_Q6_K.
+ // A k-group holds 4 k per row, the HMX tile holds 2, so each group is dealt into two tiles.
+ static void dequantize_tiled_weight_to_fp16_task_q6_k(
+diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
+index 136fcac80ce155a91aa5cc321893bd553a594947..36fa7cbb77b131478dc100b463fc92f64667fac5 100644
+--- a/ggml/src/ggml-hexagon/htp/matmul-ops.c
++++ b/ggml/src/ggml-hexagon/htp/matmul-ops.c
+@@ -1959,6 +1959,7 @@ DEQUANTIZE_WORKER_LOOP_IMPL(q4_1)
+ DEQUANTIZE_WORKER_LOOP_IMPL(iq4_nl)
+ DEQUANTIZE_WORKER_LOOP_IMPL(mxfp4)
+ DEQUANTIZE_WORKER_LOOP_IMPL(q8_0)
++DEQUANTIZE_WORKER_LOOP_IMPL(q8_0_packed)
+ DEQUANTIZE_WORKER_LOOP_IMPL(q6_k)
+ 
+ static void convert_f16_worker_loop(unsigned int n, unsigned int i, void *data) {
+@@ -2801,6 +2802,184 @@ static inline void hmx_matmul_job_init(hmx_matmul_job_t * job,
+     job->n_dot_tiles = n_dot_tiles;
+ }
+ 
++// ---- The weight stream of the pipelined loop for Q8_0 weights (HTP_MM_WSTREAM_PACKED and HTP_MM_WSTREAM_RINGS)
++//
++// With RINGS, worker w of the dequantization owns the tiles [w * per, (w + 1) * per) of each chunk, where per is its
++// share of a full chunk. For a chunk it waits for its tiles on its own DMA ring (ctx->dma[w]: worker w is thread w of
++// the work queue, and the op thread is worker 0), dequantizes them, and then moves its tiles of the chunk two steps
++// later into the same bytes of the raw buffer. Only the last chunk can have fewer tiles, and a chunk two steps later
++// exists only when this chunk is not the last, thus a worker writes only bytes of its own range, which no other worker
++// reads. The pushes and the pops of one ring are in chunk order, thus each pop gets the transfer of its own chunk. No
++// other phase of the loop has a transfer in flight on these rings (the activation transfer ends before the loop, and
++// the output transfer uses no DMA).
++
++typedef struct {
++    struct htp_context *     ctx;
++    tiled_dequantize_state_t dq;          // src: the raw buffer of the chunk, dst: its f16 buffer, n_tot_tiles: its tiles
++    uint32_t                 per;         // the tiles of each worker in a full chunk
++    uint8_t *                raw[2];      // the raw buffers of the prologue
++    const uint8_t *          src[2];      // the first tile in DDR of each chunk of the prologue, or NULL
++    uint32_t                 tiles[2];    // the tiles of each chunk of the prologue
++    const uint8_t *          next_src;    // the first tile in DDR of the chunk two steps later, or NULL
++    uint32_t                 next_tiles;  // the tiles of that chunk
++} hmx_wring_state_t;
++
++// The tile range of worker i in a chunk of n_tiles tiles. O(1).
++static inline void hmx_wring_range(uint32_t per, uint32_t n_tiles, unsigned int i, uint32_t * lo, uint32_t * hi) {
++    const uint32_t a = i * per;
++    const uint32_t b = a + per;
++    *lo = a < n_tiles ? a : n_tiles;
++    *hi = b < n_tiles ? b : n_tiles;
++}
++
++// Push the tiles [lo, hi) of a chunk as one row at the pitch tile_size. A range with no tile gives no transfer. O(1).
++static inline void hmx_wring_push(dma_queue * q, uint8_t * raw, const uint8_t * src, uint32_t lo, uint32_t hi,
++                                  uint32_t tile_size) {
++    if (hi <= lo) {
++        return;
++    }
++    const size_t off   = (size_t) lo * tile_size;
++    const size_t bytes = (size_t) (hi - lo) * tile_size;
++    dma_queue_push(q, dma_make_ptr(raw + off, src + off), bytes, bytes, bytes, 1);
++}
++
++// The prologue: each worker moves its tiles of the first two chunks on its own ring.
++static void hmx_wring_prologue_worker(unsigned int n, unsigned int i, void * data) {
++    (void) n;
++    hmx_wring_state_t * st = (hmx_wring_state_t *) data;
++    for (int c = 0; c < 2; c++) {
++        if (st->src[c]) {
++            uint32_t lo, hi;
++            hmx_wring_range(st->per, st->tiles[c], i, &lo, &hi);
++            hmx_wring_push(st->ctx->dma[i], st->raw[c], st->src[c], lo, hi, st->dq.tile_size);
++        }
++    }
++}
++
++// One chunk step of one worker: wait for its tiles, dequantize them, and move its tiles of the chunk two steps later.
++// O(tiles of the worker).
++static void hmx_wring_step_worker(unsigned int n, unsigned int i, void * data) {
++    (void) n;
++    hmx_wring_state_t *       st = (hmx_wring_state_t *) data;
++    struct htp_thread_trace * tr = &st->ctx->trace[i];
++    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_W_DEQUANT, i);
++    uint32_t lo, hi;
++    hmx_wring_range(st->per, st->dq.n_tot_tiles, i, &lo, &hi);
++    if (hi > lo) {
++        dma_queue_pop(st->ctx->dma[i]);
++        dequantize_tiled_weight_to_fp16_task_q8_0_packed(&st->dq, lo, hi);
++    }
++    if (st->next_src) {
++        uint32_t nlo, nhi;
++        hmx_wring_range(st->per, st->next_tiles, i, &nlo, &nhi);
++        hmx_wring_push(st->ctx->dma[i], (uint8_t *) st->dq.src, st->next_src, nlo, nhi, st->dq.tile_size);
++    }
++    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_W_DEQUANT, i);
++}
++
++// The pipelined loop of one Q8_0 weight for one block of rows, with the weight stream mode (PACKED or RINGS), for
++// hmx_mm_2d_f32 and hmx_mm_nx_2d_f32. The order of the HMX jobs and of the output transfers is that of the TILES loop
++// of those functions, and the f16 tiles have the same bits, thus the output has the bits of that loop.
++// weight: the first tile of the weight in DDR, n: its columns, weight_stride: the bytes of one column in the tiled
++// layout, raw: the two raw buffers, wbuf: the two f16 buffers, obuf: the two output buffers, dst_rows and src2_rows:
++// the first row of the block in dst and in src2 (or NULL). O(n * k) bytes through the DMA.
++static void hmx_mm_q8_0_stream(struct htp_context * ctx, int mode, const uint8_t * weight, size_t n,
++                               size_t weight_stride, int k, int n_k_tiles, struct fastdiv_values n_k_tiles_div,
++                               size_t row_stride, size_t n_chunk_n_cols, int n_threads, __fp16 * raw[2],
++                               void * wbuf[2], void * obuf[2], __fp16 * act, __fp16 * scales, size_t n_rows,
++                               float * dst_rows, const float * src2_rows, size_t dst_stride, uint32_t src2_stride,
++                               int dst_cols, hmx_matmul_job_t job_slots[2]) {
++    const uint32_t tile_size   = HTP_MM_WEIGHT_TILE_SIZE_Q8_0;
++    const int      n_chunk_cnt = hmx_ceil_div(n, n_chunk_n_cols);
++    const uint32_t full_tiles  = (uint32_t) (n_chunk_n_cols / HTP_MM_HMX_TILE_N_COLS) * (uint32_t) n_k_tiles;
++
++    // The first tile in DDR and the tile count of chunk c
++#define WS_SRC(c)   (weight + (size_t) (c) * n_chunk_n_cols * weight_stride)
++#define WS_TILES(c) ((uint32_t) (hex_smin(n - (size_t) (c) * n_chunk_n_cols, n_chunk_n_cols) / HTP_MM_HMX_TILE_N_COLS) * \
++                     (uint32_t) n_k_tiles)
++
++    hmx_wring_state_t st;
++    memset(&st, 0, sizeof(st));
++    st.ctx                  = ctx;
++    st.per                  = (full_tiles + (uint32_t) n_threads - 1) / (uint32_t) n_threads;
++    st.dq.ctx               = ctx;
++    st.dq.traces            = ctx->trace;
++    st.dq.tile_size         = tile_size;
++    st.dq.aligned_tile_size = HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q8_0;
++    st.dq.n_k_tiles         = n_k_tiles;
++    st.dq.n_k_tiles_div     = n_k_tiles_div;
++    st.dq.k_block           = k;
++    st.dq.row_stride        = row_stride;
++    st.dq.weight_type       = HTP_TYPE_Q8_0;
++
++    if (mode == HTP_MM_WSTREAM_RINGS) {
++        st.raw[0]   = (uint8_t *) raw[0];
++        st.raw[1]   = (uint8_t *) raw[1];
++        st.src[0]   = WS_SRC(0);
++        st.tiles[0] = WS_TILES(0);
++        st.src[1]   = n_chunk_cnt > 1 ? WS_SRC(1) : NULL;
++        st.tiles[1] = n_chunk_cnt > 1 ? WS_TILES(1) : 0;
++        worker_pool_run_func(ctx->worker_pool, hmx_wring_prologue_worker, &st, n_threads);
++    } else {
++        hmx_wring_push(ctx->dma[0], (uint8_t *) raw[0], WS_SRC(0), 0, WS_TILES(0), tile_size);
++        if (n_chunk_cnt > 1) {
++            hmx_wring_push(ctx->dma[0], (uint8_t *) raw[1], WS_SRC(1), 0, WS_TILES(1), tile_size);
++        }
++    }
++
++    for (int i = 0; i < n_chunk_cnt; ++i) {
++        const size_t nc     = (size_t) i * n_chunk_n_cols;
++        const size_t n_cols = hex_smin(n - nc, n_chunk_n_cols);
++
++        if (mode == HTP_MM_WSTREAM_RINGS) {
++            st.dq.src         = (const uint8_t *) raw[i % 2];
++            st.dq.dst         = (__fp16 *) wbuf[i % 2];
++            st.dq.n_cols      = (uint32_t) n_cols;
++            st.dq.n_tot_tiles = WS_TILES(i);
++            st.next_src       = i + 2 < n_chunk_cnt ? WS_SRC(i + 2) : NULL;
++            st.next_tiles     = i + 2 < n_chunk_cnt ? WS_TILES(i + 2) : 0;
++            worker_pool_run_func(ctx->worker_pool, hmx_wring_step_worker, &st, n_threads);
++        } else {
++            void * curr_raw = dma_queue_pop(ctx->dma[0]).dst;
++            dequantize_tiled_weight_chunk_to_fp16_tiles(ctx, (__fp16 *) wbuf[i % 2], curr_raw, (int) n_cols, k,
++                                                        row_stride, HTP_TYPE_Q8_0, n_k_tiles, n_k_tiles_div,
++                                                        dequantize_tiled_worker_loop_q8_0_packed, n_threads);
++            if (i + 2 < n_chunk_cnt) {
++                hmx_wring_push(ctx->dma[0], (uint8_t *) curr_raw, WS_SRC(i + 2), 0, WS_TILES(i + 2), tile_size);
++            }
++        }
++
++        hmx_matmul_job_init(&job_slots[i % 2], (__fp16 *) obuf[i % 2], act, (__fp16 *) wbuf[i % 2], scales,
++                            hmx_ceil_div(n_rows, HTP_MM_HMX_TILE_N_ROWS), hmx_ceil_div(n_cols, HTP_MM_HMX_TILE_N_COLS),
++                            k / HTP_MM_HMX_TILE_N_ROWS);
++        hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_matmul_worker_fn, &job_slots[i % 2]));
++
++        if (i > 0) {
++            hmx_queue_pop(ctx->hmx_queue);
++            const size_t nc_prev     = nc - n_chunk_n_cols;
++            const size_t n_cols_prev = hex_smin(n - nc_prev, n_chunk_n_cols);
++            const int    cols        = dst_cols - (int) nc_prev;
++            if (cols > 0) {
++                transfer_output_chunk_threaded(ctx, dst_rows + nc_prev, src2_rows ? src2_rows + nc_prev : NULL,
++                                               obuf[(i - 1) % 2], n_rows, n_cols_prev, dst_stride, src2_stride, cols,
++                                               n_threads);
++            }
++        }
++    }
++
++    hmx_queue_pop(ctx->hmx_queue);
++    const size_t nc_last     = (size_t) (n_chunk_cnt - 1) * n_chunk_n_cols;
++    const size_t n_cols_last = hex_smin(n - nc_last, n_chunk_n_cols);
++    const int    cols        = dst_cols - (int) nc_last;
++    if (cols > 0) {
++        transfer_output_chunk_threaded(ctx, dst_rows + nc_last, src2_rows ? src2_rows + nc_last : NULL,
++                                       obuf[(n_chunk_cnt - 1) % 2], n_rows, n_cols_last, dst_stride, src2_stride, cols,
++                                       n_threads);
++    }
++#undef WS_SRC
++#undef WS_TILES
++}
++
+ static int hmx_mm_2d_f32(struct htp_context *ctx,
+                                   float *restrict dst,
+                                   const float *restrict src2,
+@@ -2824,7 +3003,8 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
+                                   const struct fastdiv_values * k_div,
+                                   int tile_size,
+                                   int aligned_tile_size,
+-                                  int vtcm_size) {
++                                  int vtcm_size,
++                                  int wstream) {
+     struct htp_thread_trace * tr = &ctx->trace[0];
+     htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);
+ 
+@@ -2929,6 +3109,15 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
+             };
+             transfer_activation_chunk_threaded(&act_params);
+ 
++            if (wstream != HTP_MM_WSTREAM_TILES && weight_type == HTP_TYPE_Q8_0) {
++                hmx_mm_q8_0_stream(ctx, wstream, weight, (size_t) n, (size_t) weight_stride, k, n_k_tiles,
++                                   n_k_tiles_div, row_stride, n_chunk_n_cols, n_threads, vtcm_weight_raw,
++                                   vtcm_weight_bufs, vtcm_output_bufs, vtcm_f16_act, vtcm_scales, n_rows,
++                                   dst + mr * dst_stride, src2 ? src2 + mr * src2_stride : NULL, (size_t) dst_stride,
++                                   src2_stride, dst_cols, job_slots);
++                continue;
++            }
++
+             // Prologue: push A0 and optionally A1 (if n_chunk_cnt > 1)
+             const size_t   n_cols_A0 = hex_smin(n - 0 * n_chunk_n_cols, n_chunk_n_cols);
+             const uint32_t height_A0 = is_quant ? (n_cols_A0 / 32) * n_k_tiles : n_cols_A0;
+@@ -3121,6 +3310,7 @@ static int hmx_mm_nx_2d_f32(struct htp_ops_context * octx, const struct htp_mm_k
+     const int m_chunk_n_rows  = kparams->m_chunk;
+     const int n_chunk_n_cols  = kparams->n_chunk;
+     const int pipeline        = kparams->pipeline;
++    const int wstream         = kparams->hmx_wstream;
+     const int n_threads       = octx->n_threads;
+     const int act_threads     = kparams->n_act_threads;
+     const struct fastdiv_values * act_threads_div = &kparams->div_n_act_threads;
+@@ -3217,6 +3407,14 @@ static int hmx_mm_nx_2d_f32(struct htp_ops_context * octx, const struct htp_mm_k
+ 
+                 const uint32_t dma_src_stride = is_quant ? tile_size : weight_stride;
+ 
++                if (wstream != HTP_MM_WSTREAM_TILES && weight_type == HTP_TYPE_Q8_0) {
++                    hmx_mm_q8_0_stream(ctx, wstream, weight, n, weight_stride, k, n_k_tiles, n_k_tiles_div, row_stride,
++                                       (size_t) n_chunk_n_cols, n_threads, vtcm_weight_raw, vtcm_weight_bufs,
++                                       vtcm_output_bufs, vtcm_f16_act, vtcm_scales, n_rows, dst_ptr + mr * dst_stride,
++                                       NULL, dst_stride, 0, dst_cols, job_slots);
++                    continue;
++                }
++
+                 const size_t   n_cols_A0 = hex_smin(n - 0 * n_chunk_n_cols, n_chunk_n_cols);
+                 const uint32_t height_A0 = is_quant ? (n_cols_A0 / 32) * n_k_tiles : n_cols_A0;
+                 dma_queue_push(ctx->dma[0], dma_make_ptr(vtcm_weight_raw[0], weight),
+@@ -3400,7 +3598,7 @@ static int hmx_mm_f16_f32_batched_simple(struct htp_context *ctx,
+                                            params->act_stride, params->weight_stride * (int)sizeof(__fp16),
+                                            HTP_TYPE_F16, params->k, params->dst_stride, params->src2_stride, params->n,
+                                            m_chunk, n_chunk, pipeline, n_threads, act_threads,
+-                                           act_threads_div, k_div, 0, 0, vtcm_size);
++                                           act_threads_div, k_div, 0, 0, vtcm_size, HTP_MM_WSTREAM_TILES);
+         }
+     }
+     return ret;
+@@ -3921,7 +4119,7 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
+             kparams->n_act_threads,
+             &kparams->div_n_act_threads,
+             &kparams->div_ne00_padded,
+-            kparams->tile_size, kparams->aligned_tile_size, kparams->vtcm_size
++            kparams->tile_size, kparams->aligned_tile_size, kparams->vtcm_size, kparams->hmx_wstream
+         );
+     }
+ 
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 99e8fbfdbe397614ff8df584d6029c12eeed0c0e..dea9c0c36c80545d52ec1ec4ba8027b418c35bec 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -139,6 +139,13 @@ static int opt_gdn_chunk = 2;
+ // plus 1.24 ms for each token: the two are equal at 8 tokens, thus the preset is 9.
+ static int opt_gdn_chunk_min = 9;
+ 
++// GGML_HEXAGON_MM_WSTREAM: the weight stream of the pipelined HMX 2D matmul with Q8_0 weights (HTP_MM_WSTREAM_* of
++// htp/matmul-ops.h). 0 = the op thread moves each chunk on its DMA ring as rows of one tile, 1 = the op thread moves
++// each chunk as one row, 2 = each dequantization worker moves its own tiles of each chunk as one row on its own ring
++// (the preset). The host gives the value in the kernel params of each HMX matmul, thus an A/B run needs no other
++// build. A value outside 0 to 2 gives 0.
++static int opt_mm_wstream = HTP_MM_WSTREAM_RINGS;
++
+ // GGML_HEXAGON_GDN_CONV_DMA: 1 = GDN_CONV_CHUNK moves its rows with the DMA (the default), 0 = it
+ // reads them with vector loads from DDR. The host gives the value in the kernel params of each op.
+ static int opt_gdn_conv_dma = 1;
+@@ -5347,6 +5354,7 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
+ 
+     kparams->n_hmx = 1;
+     kparams->pipeline = pipeline ? 1 : 0;
++    kparams->hmx_wstream = opt_mm_wstream;
+     kparams->m_chunk = m_chunk;
+     kparams->n_chunk = n_chunk;
+     kparams->n_threads = n_threads;
+@@ -8871,6 +8879,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     const char * str_multirow = getenv("GGML_HEXAGON_MULTIROW");
+     const char * str_gdn_chunk = getenv("GGML_HEXAGON_GDN_CHUNK");
+     const char * str_gdn_chunk_min = getenv("GGML_HEXAGON_GDN_CHUNK_MIN");
++    const char * str_mm_wstream    = getenv("GGML_HEXAGON_MM_WSTREAM");
+     const char * str_gdn_conv_dma = getenv("GGML_HEXAGON_GDN_CONV_DMA");
+     const char * str_gdn_qknorm   = getenv("GGML_HEXAGON_GDN_QKNORM");
+     const char * str_fwht     = getenv("GGML_HEXAGON_FWHT");
+@@ -8954,6 +8963,12 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     opt_gdn_chunk = str_gdn_chunk ? atoi(str_gdn_chunk)                   : opt_gdn_chunk;
+     // A negative value gives 0, the limit of the DSP
+     opt_gdn_chunk_min = str_gdn_chunk_min ? std::max(0, atoi(str_gdn_chunk_min)) : opt_gdn_chunk_min;
++    if (str_mm_wstream) {
++        const int v    = atoi(str_mm_wstream);
++        opt_mm_wstream = (v >= HTP_MM_WSTREAM_TILES && v <= HTP_MM_WSTREAM_RINGS) ? v : HTP_MM_WSTREAM_TILES;
++        GGML_LOG_INFO("ggml-hex: the weight stream of the HMX matmul of Q8_0 weights is %d (GGML_HEXAGON_MM_WSTREAM)\n",
++                      opt_mm_wstream);
++    }
+     opt_gdn_conv_dma = str_gdn_conv_dma ? atoi(str_gdn_conv_dma)          : opt_gdn_conv_dma;
+     opt_gdn_qknorm   = str_gdn_qknorm   ? atoi(str_gdn_qknorm)            : opt_gdn_qknorm;
+     opt_fwht      = str_fwht     ? atoi(str_fwht)                         : opt_fwht;

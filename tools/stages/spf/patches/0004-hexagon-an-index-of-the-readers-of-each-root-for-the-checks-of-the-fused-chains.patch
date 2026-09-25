@@ -1,0 +1,350 @@
+hexagon: an index of the readers of each root for the checks of the fused chains
+
+The cost
+
+Each prompt call of the app with a new token count builds a new graph, thus the host matches the fused
+chains again: the gate chains of each layer in graph_optimize (ggml_hexagon_gate_keep_inputs) and in
+graph_compute (ggml_hexagon_gate_match_all), and the state, conv and norm chains of each gated delta net
+layer (ggml_hexagon_match_gdn_fusions). For each candidate chain, ggml_hexagon_gdn_chain_is_private reads
+each source of each node of the graph. In the phone stage spf, the host part of a call with a new graph is
+15 to 25 ms (the pack 9 to 13 ms, the scheduler allocation 6 to 9 ms). On the build box (hexhost_graphs of
+tests/fuzz/hexhost with the 4B Q8_0 in the app configuration, calls of 22 tokens and of 1 token one after
+the other, each with a new graph), perf gives 11 % of all samples to ggml_hexagon_gdn_chain_is_private,
+which is about 30 % of the host work of such a call.
+
+The change
+
+ggml_hexagon_gdn_readers holds, for each root tensor of one graph, the (node, source slot) pairs whose
+source has that root, in node order. The three passes build it one time for each graph and give it to
+each chain check. With it, ggml_hexagon_gdn_chain_is_private visits only the sources whose root is the
+output or an intermediate of the chain, sorted in node order and source order. These are the only
+sources that the full scan acts on, thus the result and the text of a failed condition are the same. A
+caller without it (the harness of tests/fuzz/hexhost, for example) keeps the full scan. The passes do not
+change the node order while they use it.
+
+The results
+
+The build box, hexhost_graphs of HEAD against the tree with this patch and the three patches before it,
+the 4B Q8_0 in the app configuration (op fusion, the fused state step, batch 1024, Q8_0 K and V, flash
+attention on):
+- The supports_op decisions, the counts of the fused ops, the log, the hazard lists and the verbose text
+  of each candidate chain (540 to 971 lines) are the same for the decode, the prefill of 8, 22 and 512
+  tokens and the MTP draft step.
+- A call with a new graph: 6.46 to 6.89 ms against 5.87 to 5.99 ms. The pack 1.85 to 1.91 ms against
+  1.20 ms, the scheduler allocation 1.54 ms against 1.39 ms (the medians of 50 calls, two runs each).
+- tests/fuzz/hexhost, run.sh test asan --profile release on the tree with the four patches: 7 suites
+  and 0 findings. The graphs of the 2B and the 4B (decode, decode with 4 sequences, prefill, MTP, vision
+  576 and 768) give code 0 and the expected counts of the fused conv steps and state chains.
+
+diff --git a/ggml/src/ggml-hexagon/htp-gdn-match.h b/ggml/src/ggml-hexagon/htp-gdn-match.h
+index d7d2d30193d14f091b3356cc6e8ebf4b59ef9160..bf1eed87d185ebe1c9d99532269d67d97d449565 100644
+--- a/ggml/src/ggml-hexagon/htp-gdn-match.h
++++ b/ggml/src/ggml-hexagon/htp-gdn-match.h
+@@ -125,6 +125,29 @@ static inline std::unordered_map<const ggml_tensor *, int> ggml_hexagon_gdn_inde
+     return index;
+ }
+ 
++// The readers of each root tensor of one graph: for each root, the (node index, source slot) pairs whose source has
++// that root, in node order. A pass that checks many chains of one graph builds it one time, thus each chain check
++// visits only the readers of its own tensors and not each source of each node. The node order of the graph must not
++// change while a pass uses it. O(nodes * GGML_MAX_SRC) to build.
++struct ggml_hexagon_gdn_readers {
++    const ggml_cgraph * gf = nullptr;
++    std::unordered_map<const ggml_tensor *, std::vector<std::pair<int, int>>> by_root;
++};
++
++static inline void ggml_hexagon_gdn_readers_build(const ggml_cgraph * gf, ggml_hexagon_gdn_readers & r) {
++    r.gf = gf;
++    r.by_root.clear();
++    r.by_root.reserve(gf->n_nodes);
++    for (int i = 0; i < gf->n_nodes; i++) {
++        ggml_tensor * n = gf->nodes[i];
++        for (int s = 0; s < GGML_MAX_SRC; s++) {
++            if (n->src[s]) {
++                r.by_root[n->src[s]->view_src ? n->src[s]->view_src : n->src[s]].emplace_back(i, s);
++            }
++        }
++    }
++}
++
+ // The use count of t in the full graph, or -1 when the graph has no use count for t. The split that
+ // graph_compute gets is a view of the full graph (ggml_graph_view), and the view shares the hash set
+ // and the use counts of the full graph. Thus the count includes the uses in the other splits.
+@@ -142,11 +165,14 @@ static inline int32_t ggml_hexagon_gdn_graph_uses(const ggml_cgraph * gf, const
+ // Every node that reads an intermediate (also through a view) must be a member of the chain. A view of
+ // `out` is permitted for any node when the view lies in the first `out_head_bytes` bytes of `out`. No
+ // node of a different split can use an intermediate or `out`, or a member view of them.
+-// O(nodes * GGML_MAX_SRC * members).
++// With `readers` of this graph the check visits only the sources whose root is `out` or an intermediate, in
++// node order and source order, which are the only sources that the full scan acts on: the result is the same.
++// O(nodes * GGML_MAX_SRC * members) without `readers`, O(readers of the chain * members) with it.
+ static inline const char * ggml_hexagon_gdn_chain_is_private(const ggml_cgraph * gf,
+                                                              const std::vector<ggml_tensor *> & intermediates,
+                                                              const std::vector<ggml_tensor *> & members,
+-                                                             const ggml_tensor * out, size_t out_head_bytes) {
++                                                             const ggml_tensor * out, size_t out_head_bytes,
++                                                             const ggml_hexagon_gdn_readers * readers = nullptr) {
+     for (auto * t : intermediates) {
+         if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
+             return "an intermediate is a graph output";
+@@ -170,32 +196,66 @@ static inline const char * ggml_hexagon_gdn_chain_is_private(const ggml_cgraph *
+             u.second += u.first == src ? 1 : 0;
+         }
+     };
+-    for (int i = 0; i < gf->n_nodes; i++) {
+-        ggml_tensor * n = gf->nodes[i];
+-        for (int s = 0; s < GGML_MAX_SRC; s++) {
+-            ggml_tensor * src = n->src[s];
+-            if (!src) {
+-                continue;
++    // One source of one node. Returns the reason of a failure, or nullptr.
++    auto visit = [&](ggml_tensor * n, ggml_tensor * src) -> const char * {
++        ggml_tensor * root = ggml_hexagon_gdn_root(src);
++        if (out && root == out) {
++            count_use(src);
++            // The region that the reader touches: the view node itself when n is a view of out
++            // (its src is the whole tensor), else the view that n reads.
++            const ggml_tensor * region = (src == out && ggml_hexagon_gdn_is_view_op(n)) ? n : src;
++            if (region != out && region->view_offs + ggml_nbytes(region) <= out_head_bytes) {
++                return nullptr;
+             }
+-            ggml_tensor * root = ggml_hexagon_gdn_root(src);
+-            if (out && root == out) {
+-                count_use(src);
+-                // The region that the reader touches: the view node itself when n is a view of out
+-                // (its src is the whole tensor), else the view that n reads.
+-                const ggml_tensor * region = (src == out && ggml_hexagon_gdn_is_view_op(n)) ? n : src;
+-                if (region != out && region->view_offs + ggml_nbytes(region) <= out_head_bytes) {
+-                    continue;
+-                }
+-                if (ggml_hexagon_gdn_contains(members, n)) {
++            if (ggml_hexagon_gdn_contains(members, n)) {
++                return nullptr;
++            }
++            return "the state part of the output has a reader outside the chain";
++        }
++        if (ggml_hexagon_gdn_contains(intermediates, root)) {
++            if (!ggml_hexagon_gdn_contains(members, n)) {
++                return "an intermediate has a reader outside the chain";
++            }
++            count_use(src);
++        }
++        return nullptr;
++    };
++    if (readers && readers->gf == gf) {
++        // The sources whose root is `out` or an intermediate. Each source has one root, and the keys are
++        // distinct, thus no source comes twice. The sort restores the order of the full scan.
++        std::vector<const ggml_tensor *> keys;
++        if (out) {
++            keys.push_back(out);
++        }
++        for (const ggml_tensor * t : intermediates) {
++            if (!ggml_hexagon_gdn_contains(keys, t)) {
++                keys.push_back(t);
++            }
++        }
++        std::vector<std::pair<int, int>> visits;
++        for (const ggml_tensor * k : keys) {
++            const auto it = readers->by_root.find(k);
++            if (it != readers->by_root.end()) {
++                visits.insert(visits.end(), it->second.begin(), it->second.end());
++            }
++        }
++        std::sort(visits.begin(), visits.end());
++        for (const auto & v : visits) {
++            ggml_tensor * n = gf->nodes[v.first];
++            if (const char * reason = visit(n, n->src[v.second])) {
++                return reason;
++            }
++        }
++    } else {
++        for (int i = 0; i < gf->n_nodes; i++) {
++            ggml_tensor * n = gf->nodes[i];
++            for (int s = 0; s < GGML_MAX_SRC; s++) {
++                if (!n->src[s]) {
+                     continue;
+                 }
+-                return "the state part of the output has a reader outside the chain";
+-            }
+-            if (ggml_hexagon_gdn_contains(intermediates, root)) {
+-                if (!ggml_hexagon_gdn_contains(members, n)) {
+-                    return "an intermediate has a reader outside the chain";
++                if (const char * reason = visit(n, n->src[s])) {
++                    return reason;
+                 }
+-                count_use(src);
+             }
+         }
+     }
+@@ -313,7 +373,8 @@ static inline bool ggml_hexagon_gdn_is_conv_candidate(const ggml_tensor * t) {
+ 
+ static inline const char * ggml_hexagon_gdn_conv_chain_check(const ggml_cgraph * gf,
+                                                              const std::unordered_map<const ggml_tensor *, int> & index,
+-                                                             int is, ggml_hexagon_gdn_conv_match & m) {
++                                                             int is, ggml_hexagon_gdn_conv_match & m,
++                                                             const ggml_hexagon_gdn_readers * readers = nullptr) {
+     ggml_tensor * S = gf->nodes[is];
+     if (!ggml_hexagon_gdn_is_conv_candidate(S)) {
+         return "not a SILU of an SSM_CONV";
+@@ -486,7 +547,7 @@ static inline const char * ggml_hexagon_gdn_conv_chain_check(const ggml_cgraph *
+         members.push_back(n->src[0]);
+         members.push_back(n);
+     }
+-    if (const char * reason = ggml_hexagon_gdn_chain_is_private(gf, intermediates, members, nullptr, 0)) {
++    if (const char * reason = ggml_hexagon_gdn_chain_is_private(gf, intermediates, members, nullptr, 0, readers)) {
+         return reason;
+     }
+ 
+@@ -564,7 +625,8 @@ static inline const char * ggml_hexagon_gdn_conv_chain_check(const ggml_cgraph *
+ 
+ static inline const char * ggml_hexagon_gdn_state_chain_check(const ggml_cgraph * gf,
+                                                               const std::unordered_map<const ggml_tensor *, int> & index,
+-                                                              int ig, ggml_hexagon_gdn_state_match & m) {
++                                                              int ig, ggml_hexagon_gdn_state_match & m,
++                                                              const ggml_hexagon_gdn_readers * readers = nullptr) {
+     ggml_tensor * G = gf->nodes[ig];
+     if (G->op != GGML_OP_GATED_DELTA_NET) {
+         return "not a GATED_DELTA_NET";
+@@ -657,7 +719,7 @@ static inline const char * ggml_hexagon_gdn_state_chain_check(const ggml_cgraph
+ 
+     const std::vector<ggml_tensor *> intermediates = { R };
+     const std::vector<ggml_tensor *> members       = { R, st, G, tail, P };
+-    if (const char * reason = ggml_hexagon_gdn_chain_is_private(gf, intermediates, members, G, head_bytes)) {
++    if (const char * reason = ggml_hexagon_gdn_chain_is_private(gf, intermediates, members, G, head_bytes, readers)) {
+         return reason;
+     }
+ 
+diff --git a/ggml/src/ggml-hexagon/htp-gdn-qknorm.h b/ggml/src/ggml-hexagon/htp-gdn-qknorm.h
+index e0346bdd534ae9668e1569b72cd0f1138226dea6..ed6a35ac622937a03ce7a95a8caa050d64ed8430 100644
+--- a/ggml/src/ggml-hexagon/htp-gdn-qknorm.h
++++ b/ggml/src/ggml-hexagon/htp-gdn-qknorm.h
+@@ -97,11 +97,13 @@ static inline const char * ggml_hexagon_gdn_qknorm_chain(ggml_tensor * t, ggml_t
+ 
+ // The norm chains of q and k of the GATED_DELTA_NET node at graph index ig. extra_members are the
+ // other nodes that the caller replaces together with G (the members of a state chain), or empty.
+-// O(nodes * GGML_MAX_SRC * members).
++// `readers` of this graph makes the check of the private chain visit only the readers of the chain.
++// O(nodes * GGML_MAX_SRC * members), or O(readers of the chain * members) with `readers`.
+ static inline const char * ggml_hexagon_gdn_qknorm_check(const ggml_cgraph * gf,
+                                                          const std::unordered_map<const ggml_tensor *, int> & index,
+                                                          int ig, const std::vector<ggml_tensor *> & extra_members,
+-                                                         ggml_hexagon_gdn_qknorm_match & m) {
++                                                         ggml_hexagon_gdn_qknorm_match & m,
++                                                         const ggml_hexagon_gdn_readers * readers = nullptr) {
+     ggml_tensor * G = gf->nodes[ig];
+     if (G->op != GGML_OP_GATED_DELTA_NET) {
+         return "not a GATED_DELTA_NET";
+@@ -129,7 +131,7 @@ static inline const char * ggml_hexagon_gdn_qknorm_check(const ggml_cgraph * gf,
+     std::vector<ggml_tensor *> members = intermediates;
+     members.push_back(G);
+     members.insert(members.end(), extra_members.begin(), extra_members.end());
+-    if (const char * reason = ggml_hexagon_gdn_chain_is_private(gf, intermediates, members, nullptr, 0)) {
++    if (const char * reason = ggml_hexagon_gdn_chain_is_private(gf, intermediates, members, nullptr, 0, readers)) {
+         return reason;
+     }
+ 
+diff --git a/ggml/src/ggml-hexagon/htp-gate-fusion.h b/ggml/src/ggml-hexagon/htp-gate-fusion.h
+index 9175180cb71e9ffbe27289c483de2a5b7ed25f86..a3bf24d606f11c9a15fa9ca93f6113903585993b 100644
+--- a/ggml/src/ggml-hexagon/htp-gate-fusion.h
++++ b/ggml/src/ggml-hexagon/htp-gate-fusion.h
+@@ -240,12 +240,13 @@ static inline const char * ggml_hexagon_gate_chain(ggml_tensor * e, bool norm_on
+ // The checks of the chain in the graph of one split: the members are nodes of the split and are not
+ // part of a different fused op, no node outside the chain reads an intermediate, no node between the
+ // read of an input and the output writes a byte of the input, and the output shares no byte with an
+-// input unless the rows are the same. Needs the data of the allocated graph.
++// input unless the rows are the same. Needs the data of the allocated graph. `readers` of this graph makes the
++// check of the private chain visit only the readers of the chain.
+ // O(nodes * (GGML_MAX_SRC + members)) for each chain.
+ static inline const char * ggml_hexagon_gate_placement(const ggml_cgraph * gf,
+                                                        const std::unordered_map<const ggml_tensor *, int> & index,
+                                                        const std::vector<uint8_t> & skip, const ggml_hexagon_gate_match & m,
+-                                                       int * emit) {
++                                                       int * emit, const ggml_hexagon_gdn_readers * readers = nullptr) {
+     for (auto * t : m.members) {
+         auto it = index.find(t);
+         if (it == index.end()) {
+@@ -257,7 +258,7 @@ static inline const char * ggml_hexagon_gate_placement(const ggml_cgraph * gf,
+     }
+     *emit = index.at(m.out);
+ 
+-    const char * reason = ggml_hexagon_gdn_chain_is_private(gf, m.inter, m.members, nullptr, 0);
++    const char * reason = ggml_hexagon_gdn_chain_is_private(gf, m.inter, m.members, nullptr, 0, readers);
+     if (reason) {
+         return reason;
+     }
+@@ -318,11 +319,13 @@ static inline void ggml_hexagon_gate_keep_inputs(ggml_cgraph * gf, ggml_backend_
+     if (!params || !params->add_alloc_dep || (!norm_on && !attn_on)) {
+         return;
+     }
++    ggml_hexagon_gdn_readers readers;
++    ggml_hexagon_gdn_readers_build(gf, readers);
+     for (int i = 0; i < gf->n_nodes; i++) {
+         ggml_hexagon_gate_match m;
+         bool                    candidate = false;
+         if (ggml_hexagon_gate_chain(gf->nodes[i], norm_on, attn_on, m, &candidate) ||
+-            ggml_hexagon_gdn_chain_is_private(gf, m.inter, m.members, nullptr, 0)) {
++            ggml_hexagon_gdn_chain_is_private(gf, m.inter, m.members, nullptr, 0, &readers)) {
+             continue;
+         }
+         for (ggml_tensor * t : { m.in0, m.w, m.in1 }) {
+@@ -350,6 +353,8 @@ static inline void ggml_hexagon_gate_match_all(const ggml_cgraph * gf, uint32_t
+         return;
+     }
+     const auto index = ggml_hexagon_gdn_index(gf);
++    ggml_hexagon_gdn_readers readers;
++    ggml_hexagon_gdn_readers_build(gf, readers);
+ 
+     for (int i = 0; i < gf->n_nodes; i++) {
+         if (skip[i] || gf->nodes[i]->op != GGML_OP_MUL) {
+@@ -365,7 +370,7 @@ static inline void ggml_hexagon_gate_match_all(const ggml_cgraph * gf, uint32_t
+             continue;
+         }
+         if (!reason) {
+-            reason = ggml_hexagon_gate_placement(gf, index, skip, m, &emit);
++            reason = ggml_hexagon_gate_placement(gf, index, skip, m, &emit, &readers);
+         }
+         if (!reason && at.count(emit)) {
+             reason = "a different fused op has the same index";
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index dea9c0c36c80545d52ec1ec4ba8027b418c35bec..95ac51554fcf116e86de04df458d4b266db22054 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -7177,6 +7177,9 @@ struct ggml_hexagon_gdn_fusion {
+ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, const ggml_cgraph * gf,
+                                            ggml_hexagon_gdn_fusion & fu) {
+     const auto index = ggml_hexagon_gdn_index(gf);
++    // The readers of each root, for the private-chain check of each candidate (the graph does not change here)
++    ggml_hexagon_gdn_readers readers;
++    ggml_hexagon_gdn_readers_build(gf, readers);
+ 
+     // Marks the replaced nodes and records their graph indices in graph order under the emit index
+     auto skip_members = [&](int emit, const std::vector<ggml_tensor *> & members) {
+@@ -7202,7 +7205,7 @@ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, co
+ 
+         if (state_on && ggml_hexagon_gdn_is_conv_candidate(n)) {
+             ggml_hexagon_gdn_conv_match m;
+-            const char * reason = ggml_hexagon_gdn_conv_chain_check(gf, index, i, m);
++            const char * reason = ggml_hexagon_gdn_conv_chain_check(gf, index, i, m, &readers);
+             if (reason) {
+                 HEX_VERBOSE("ggml-hex: %s GDN_CONV_STEP candidate %s (node %d): %s\n", sess->name.c_str(), n->name, i, reason);
+                 continue;
+@@ -7246,7 +7249,8 @@ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, co
+                         (int) m.n_tokens, m.emit);
+         } else if (n->op == GGML_OP_GATED_DELTA_NET) {
+             ggml_hexagon_gdn_state_match m;
+-            const char * reason = state_on ? ggml_hexagon_gdn_state_chain_check(gf, index, i, m) : "the state fusion is off";
++            const char * reason = state_on ? ggml_hexagon_gdn_state_chain_check(gf, index, i, m, &readers)
++                                           : "the state fusion is off";
+             if (reason) {
+                 HEX_VERBOSE("ggml-hex: %s GDN_STATE_STEP candidate %s (node %d): %s\n", sess->name.c_str(), n->name, i, reason);
+             }
+@@ -7256,7 +7260,8 @@ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, co
+             ggml_hexagon_gdn_qknorm_match qm;
+             const char * qreason = "GGML_HEXAGON_GDN_QKNORM is 0";
+             if (ggml_hexagon_is_gdn_qknorm_enabled() && (n->src[2]->ne[2] == 1 || opt_gdn_chunk != 1)) {
+-                qreason = ggml_hexagon_gdn_qknorm_check(gf, index, i, reason ? std::vector<ggml_tensor *>() : m.members, qm);
++                qreason = ggml_hexagon_gdn_qknorm_check(gf, index, i, reason ? std::vector<ggml_tensor *>() : m.members, qm,
++                                                        &readers);
+             }
+             if (qreason) {
+                 HEX_VERBOSE("ggml-hex: %s QKNORM candidate %s (node %d): %s\n", sess->name.c_str(), n->name, i, qreason);

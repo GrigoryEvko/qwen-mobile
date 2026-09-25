@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""The phone stage "spf": the time of a short prefill call of the 4B Q8_0 on HTP0 against its token count.
+"""The phone stages "spf" and "spf2": the time of a short prefill call of the 4B Q8_0 on HTP0 against its token count
+(spf), and the checks of the candidate fixes for it (spf2).
 
 Usage:
-    stage.py commands [--out PATH]         write the phone command file (build/spf/phone-commands.txt)
-    stage.py table [--root DIR] [--all]    print the tables from the pulled files (build/spf/phone-out)
+    stage.py [--stage S] commands [--out PATH]         write the phone command file (build/S/phone-commands.txt)
+    stage.py [--stage S] table [--root DIR] [--all]    print the tables from the pulled files (build/S/phone-out)
+
+The stage S is spf or spf2. Without --stage, the directory of the invoked file names the stage when it is one
+(build/spf2/stage.py is a link to this file and gives spf2), else the stage is spf.
 
 The engine of each prefill run is memprobe (tools/memprobe/memprobe.cpp) in the context of the app: n_ctx 8192,
 4 threads in the thread pool of the app (low priority, no polling), Q8_0 K and V, flash attention AUTO, the
@@ -14,15 +18,17 @@ mode --sweep restores the state of a depth before each call, and the first call 
 run, and memprobe writes STAMP lines around each call.
 
 Two library sets: b is the tree of HEAD (the table), n is HEAD with the candidate patches of
-tools/stages/spf/patches (the switch GGML_HEXAGON_GDN_CHUNK_MIN with the preset 2, and the row copy of CONCAT).
+tools/stages/spf/patches. In spf the candidates were the switch GGML_HEXAGON_GDN_CHUNK_MIN with the preset 2 and the
+row copy of CONCAT; spf2 has the files of the patch directory at its build (refer to HEADER_SPF2).
 
-A run name is <block>-<lib>-<draft>, for example sw-b-s. Each run writes <name>-gate.txt (the conditions before
+A run name is <block>-<lib>-<variant>, for example sw-b-s or ws-n-w0. The variant is the draft key (n off, s on,
+- no model context) or a key of the switch or of the round. Each run writes <name>-gate.txt (the conditions before
 and after the run and the exit code), <name>.out and <name>.log to the phone directory out/. A run goes into the
 tables when its gate passed, its exit code is 0, the thermal status after it is 0 and no CPU cap before or after
 it is less than 3.0 GHz (--all also uses the other runs). The table only reads files. O(size of the files).
 
-This file is tools/stages/spf/stage.py, and build/spf/stage.py is a link to it. The files of the stage stay in
-build/spf. The log parser reuses the patterns of tools/stages/fixed/stage.py.
+This file is tools/stages/spf/stage.py, and build/S/stage.py is a link to it. The files of a stage stay in build/S.
+The log parser reuses the patterns of tools/stages/fixed/stage.py.
 """
 
 from __future__ import annotations
@@ -44,6 +50,8 @@ fixed = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(fixed)
 
 ADB = "adb -s 192.168.14.130:5555"
+# The stage of the run: select_stage sets PHONE, LAPTOP_STAGE, BOX, STAGE_DIR, LIBS, RUNS, HEADER and TABLE
+STAGE = "spf"
 PHONE = "/data/local/tmp/qwen/spf"
 MODELS = "/data/local/tmp/qwen/models"
 EVAL = "/data/local/tmp/qwen/eval"
@@ -95,7 +103,8 @@ LIBS = {
 @dataclass(frozen=True)
 class Run:
     """One phone run: the block, the library set, the draft (s on, n off, - no model context), the tool, its
-    arguments, the extra environment, the time limit in seconds, the MemAvailable gate and the text."""
+    arguments, the extra environment, the time limit in seconds, the MemAvailable gate, the text, and the variant
+    key of the name (the draft key when it is empty)."""
     block: str
     lib: str
     draft: str
@@ -105,21 +114,22 @@ class Run:
     limit: int
     gate_kb: int
     text: str
+    var: str = ""
 
     @property
     def name(self) -> str:
         """The run name, which is also the stem of its output files."""
-        return f"{self.block}-{self.lib}-{self.draft}"
+        return f"{self.block}-{self.lib}-{self.var or self.draft}"
 
 
-def _probe(block: str, lib: str, draft: str, args: str, env: str, limit: int, text: str) -> Run:
+def _probe(block: str, lib: str, draft: str, args: str, env: str, limit: int, text: str, var: str = "") -> Run:
     spec = " --spec" if draft == "s" else ""
-    return Run(block, lib, draft, "memprobe", f"{PROBE_ARGS}{spec} {args}", env, limit, GATE_KB, text)
+    return Run(block, lib, draft, "memprobe", f"{PROBE_ARGS}{spec} {args}", env, limit, GATE_KB, text, var)
 
 
 _SW = f"--sweep {_SIZES} --sweep-depths {_DEPTHS} --sweep-calls 3 --therm"
 _PF = f"--sweep {_SIZES} --sweep-depths {_DEPTHS} --sweep-calls 2"
-RUNS: list[Run] = [
+RUNS_SPF: list[Run] = [
     # The table (b) and the candidates (n), without the op profile: the wall time and the host timers
     _probe("sw", "b", "n", _SW, "", 100, f"the sweep {_SIZES} at the depths {_DEPTHS}, 3 calls each, draft off"),
     _probe("sw", "n", "n", _SW, "", 100, "the same, draft off"),
@@ -162,6 +172,65 @@ RUNS: list[Run] = [
 ]
 DRAFT_TEXT = {"n": "draft off", "s": "draft on (MTP, n_rs_seq 4)", "-": ""}
 
+# The stage spf2: the tg check of the GDN limit, the three candidates of tools/stages/spf/patches (the GDN limit 9,
+# the row copy of CONCAT for one device, the weight stream of the HMX matmul), and their switches on one library
+_BN2 = f"{BENCH_ARGS} -p 512,1024 -n 32 -d 0 -r 3"
+_BN2_TEXT = "llama-bench pp512, pp1024 and tg32 at the depth 0, 3 repetitions"
+_WS = "--sweep 1,8,22,64 --sweep-depths 2300 --sweep-calls 3"
+_WP = "--sweep 1,8,22,64 --sweep-depths 2300 --sweep-calls 2"
+_GP = "--sweep 8,9,10,12,16 --sweep-depths 2300 --sweep-calls 2"
+_CP = "--sweep 22,64 --sweep-depths 2300 --sweep-calls 2"
+_LG = "--sweep 512,1024 --sweep-depths 0 --sweep-calls 2"
+_HS = "--hash -p 512 -n 8"
+_PROF1 = "GGML_HEXAGON_PROFILE=1"
+_W0 = "GGML_HEXAGON_MM_WSTREAM=0"
+_W1 = "GGML_HEXAGON_MM_WSTREAM=1"
+_G0 = "GGML_HEXAGON_GDN_CHUNK_MIN=0"
+RUNS_SPF2: list[Run] = [
+    # pp512, pp1024 and tg32 of HEAD against the candidates, 3 rounds in alternated order
+    Run("bn", "b", "-", "llama-bench", _BN2, "", 100, GATE_KB, _BN2_TEXT, "1"),
+    Run("bn", "n", "-", "llama-bench", _BN2, "", 100, GATE_KB, _BN2_TEXT, "1"),
+    Run("bn", "n", "-", "llama-bench", _BN2, "", 100, GATE_KB, _BN2_TEXT, "2"),
+    Run("bn", "b", "-", "llama-bench", _BN2, "", 100, GATE_KB, _BN2_TEXT, "2"),
+    Run("bn", "b", "-", "llama-bench", _BN2, "", 100, GATE_KB, _BN2_TEXT, "3"),
+    Run("bn", "n", "-", "llama-bench", _BN2, "", 100, GATE_KB, _BN2_TEXT, "3"),
+    # The weight stream of the HMX matmul: the wall time of each stream on the same library, and HEAD
+    _probe("ws", "n", "n", _WS, "", 90, "the sweep 1,8,22,64 at the depth 2300, 3 calls each, draft off, the stream 2 "
+           "(the preset)", "w2"),
+    _probe("ws", "n", "n", _WS, _W0, 90, "the same, draft off, the stream 0 (GGML_HEXAGON_MM_WSTREAM=0)", "w0"),
+    _probe("ws", "n", "n", _WS, _W1, 90, "the same, draft off, the stream 1 (GGML_HEXAGON_MM_WSTREAM=1)", "w1"),
+    _probe("ws", "b", "n", _WS, "", 90, "the same, draft off"),
+    # The op profile of the streams 2 and 0, and the DMA counters of the stream 2
+    _probe("wp", "n", "n", _WP, _PROF1, 90, "op profile of the sweep 1,8,22,64 at the depth 2300, draft off, the "
+           "stream 2", "w2"),
+    _probe("wp", "n", "n", _WP, f"{_PROF1} {_W0}", 90, "the same, draft off, the stream 0", "w0"),
+    _probe("wm", "n", "n", "--sweep 8,22 --sweep-depths 2300 --sweep-calls 2", DMA_WAIT_ENV, 90,
+           "the DMA counters of each op (PMU set dma-wait), 8 and 22 tokens at the depth 2300, draft off, the stream 2",
+           "w2"),
+    # The crossover of the two GDN kernels: the limit 9 against the limit 32 on the same library
+    _probe("gp", "n", "n", _GP, _PROF1, 90, "op profile of 8, 9, 10, 12 and 16 tokens at the depth 2300, draft off, "
+           "the GDN limit 9 (the preset)", "g9"),
+    _probe("gp", "n", "n", _GP, f"{_PROF1} {_G0}", 90, "the same, draft off, the GDN limit 32 "
+           "(GGML_HEXAGON_GDN_CHUNK_MIN=0)", "g0"),
+    # The MTP concat with the draft on, in short calls and in the prefill of 512 and 1024 tokens
+    _probe("cp", "b", "s", _CP, _PROF1, 90, "op profile of 22 and 64 tokens at the depth 2300, draft on"),
+    _probe("cp", "n", "s", _CP, _PROF1, 90, "the same, draft on"),
+    _probe("lg", "b", "s", _LG, "", 90, "512 and 1024 tokens at the depth 0, 2 calls each, draft on"),
+    _probe("lg", "n", "s", _LG, "", 90, "the same, draft on"),
+    # The bits: the logits of a prompt of 512 tokens (the HMX matmuls) and of 8 decode tokens
+    _probe("hs", "b", "n", _HS, "", 90, "the logits hashes of a prompt of 512 tokens and 8 decode tokens, draft off"),
+    _probe("hs", "n", "n", _HS, "", 90, "the same, draft off, the stream 2", "w2"),
+    _probe("hs", "n", "n", _HS, _W0, 90, "the same, draft off, the stream 0", "w0"),
+    # The op tests against the CPU backend: the Q8_0 matmuls (the stream 2 on the HMX path from 5 rows), and CONCAT
+    # and GATED_DELTA_NET with the GDN limit 9
+    Run("tb", "b", "-", "test-backend-ops", "-o MUL_MAT -p type_a=q8_0 -b HTP0", "", 100, GATE_KB_OPS,
+        "test-backend-ops of the Q8_0 MUL_MAT cases on HTP0", "m"),
+    Run("tb", "n", "-", "test-backend-ops-new", "-o MUL_MAT -p type_a=q8_0 -b HTP0", "", 100, GATE_KB_OPS,
+        "test-backend-ops of the Q8_0 MUL_MAT cases on HTP0", "m"),
+    Run("tb", "n", "-", "test-backend-ops-new", "-o CONCAT,GATED_DELTA_NET -b HTP0", "", 100, GATE_KB_OPS,
+        "test-backend-ops of CONCAT and GATED_DELTA_NET on HTP0", "g"),
+]
+
 
 def run_lines(run: Run) -> list[str]:
     """The lines of one run: a title, the thermal line, the run and the pgrep line."""
@@ -178,7 +247,7 @@ def run_lines(run: Run) -> list[str]:
     return ["#", head, THERMAL, f"{ADB} shell '{cmd}'", PGREP]
 
 
-HEADER = """\
+HEADER_SPF = """\
 # Phone stage "spf": the time of a short prefill call (1 to 64 tokens) of the 4B Q8_0 on HTP0 at the depths 700 and
 # 2300, with the draft off and on, in the engine of the app, on the libraries of HEAD, and the first candidate fixes.
 #
@@ -209,6 +278,46 @@ HEADER = """\
 # Run from /home/grigory/airi/qwen-mobile on the laptop, in order. Time: about 14 minutes of tool time plus about
 # 8 s of gate and checks for each run, plus the waits for thermal status 0. The push is about 190 MB, the pull
 # about 150 MB (the profile logs). Then on the box: python3 build/spf/stage.py table
+"""
+
+HEADER_SPF2 = """\
+# Phone stage "spf2": the checks of four candidate patches for the short prefill call of the 4B Q8_0 on HTP0, in the
+# engine of the app, and pp512, pp1024 and tg32 in alternated rounds.
+#
+# The candidates (tools/stages/spf/patches, all in the libraries n):
+#   0001  the chunked gated delta net from 9 tokens (GGML_HEXAGON_GDN_CHUNK_MIN, preset 9, and 0 gives the limit 32)
+#   0002  the row copy of CONCAT, with the condition of one device corrected (the DSP gives one device the count 0,
+#         thus the row copy did not run in the stage spf)
+#   0003  the weight stream of the HMX matmul of Q8_0 weights (GGML_HEXAGON_MM_WSTREAM): 0 = one ring and rows of one
+#         tile (HEAD), 1 = one ring and one row for each chunk, 2 = each dequantization worker moves its own tiles on
+#         its own ring (the preset). The output has the same bits in each stream.
+#   0004  an index of the readers of each root tensor for the checks of the fused chains: the host part of a call
+#         with a new graph (the pack and the scheduler allocation). The fused ops are the same.
+#
+# The questions:
+#   1. tg32, pp512 and pp1024 of the libraries n against HEAD, 3 rounds in the order b n / n b / b n.
+#   2. The time of the weight matmuls at 1, 8, 22 and 64 tokens (depth 2300, draft off) with each weight stream, the
+#      wall time of the calls, the host part of the first call of each size (a new graph, 0004), and the DMA
+#      counters of the stream 2.
+#   3. The GDN time at 8, 9, 10, 12 and 16 tokens with the limit 9 against the limit 32 on the same library.
+#   4. The MTP concat with the draft on: its op time at 22 and 64 tokens, and the prefill of 512 and 1024 tokens.
+#   5. The bits: the logits hashes of a prompt of 512 tokens and 8 decode tokens on HEAD and with the streams 2 and 0,
+#      and the op tests of the Q8_0 MUL_MAT cases, of CONCAT and of GATED_DELTA_NET on HTP0.
+#
+# The files (tools/stages/spf/build.sh with STAGE=spf2): lib-base is the tree of HEAD, lib-new holds the libraries of
+# HEAD plus tools/stages/spf/patches that differ, bin holds memprobe, llama-bench, llama-perplexity, test-backend-ops
+# (HEAD) and test-backend-ops-new (the bound of the candidates).
+#
+# The runs, {n_runs}:
+{run_list}
+# Each run: the thermal line, then bin/gate.sh (the Qwen app stopped, the screen on, thermal 0, no charger,
+# MemAvailable 8 GB for a model run and 2 GB for test-backend-ops, and it prints the caps), the tool under
+# timeout -s KILL (110 s or less), the exit code and the conditions after the run, then the pgrep line.
+#
+# Put this file into /tmp/phone-timing-stages.txt: it is a timing stage (unlocked phone, screen on, no charger).
+# Run from /home/grigory/airi/qwen-mobile on the laptop, in order. Time: about 14 minutes of tool time plus about
+# 8 s of gate and checks for each run, plus the waits for thermal status 0. The push is about 190 MB, the pull
+# about 40 MB (the profile logs). Then on the box: python3 build/spf2/stage.py table
 """
 
 
@@ -502,11 +611,10 @@ def compare_table(root: Path, draft: str, include_all: bool) -> list[str]:
 _LAYER = re.compile(r"blk\.(\d+)\.(\w+)\.weight")
 
 
-def dma_table(root: Path, include_all: bool) -> list[str]:
-    """The weight matmuls of the run pm (the PMU set dma-wait) at each size: for each weight kind, the time, the
+def dma_table(root: Path, include_all: bool, name: str = "pm-b-n") -> list[str]:
+    """The weight matmuls of a run with the PMU set dma-wait at each size: for each weight kind, the time, the
     weight rate and the shares of the op cycles with the DMA active and with the DMA read buffer full, the median
     over the layers and the calls, and the slowest layer."""
-    name = "pm-b-n"
     if not usable(root, name, include_all):
         return [f"{name}: no usable run"]
     calls = read_calls(root, name, keep_ops=True)[0]
@@ -518,7 +626,7 @@ def dma_table(root: Path, include_all: bool) -> list[str]:
                 continue
             per[(c.tokens, m.group(2))].append((usec, int(m.group(1)), pmu[0] / cycles, pmu[3] / cycles,
                                                 pmu[1] / cycles))
-    out = ["pm-b-n: the weight matmuls at the depth 700, draft off, the PMU set dma-wait. us = the median op time, "
+    out = [f"{name}: the weight matmuls, draft off, the PMU set dma-wait. us = the median op time, "
            "active = UDMA_ACTIVE / op cycles, full = UDMA_RD_BUFFER_LEVEL_FULL / op cycles, poll = UDMA_DMPOLL / op "
            "cycles (medians), slowest = the layer and the time of the slowest op",
            f"  {'n':>3} {'weight':>12} | {'ops':>4} {'us':>6} {'min':>6} | {'active':>6} {'full':>6} {'poll':>6} | slowest"]
@@ -622,8 +730,8 @@ def ops_table(root: Path) -> list[str]:
     return out
 
 
-def table(root: Path, include_all: bool) -> int:
-    """Print the tables."""
+def table_spf(root: Path, include_all: bool) -> int:
+    """Print the tables of the stage spf."""
     if not root.is_dir():
         print(f"stage.py: {root} is not a directory. Pull the outputs of the stage first.", file=sys.stderr)
         return 1
@@ -643,21 +751,195 @@ def table(root: Path, include_all: bool) -> int:
     return 0
 
 
+# ---- The tables of the stage spf2 ----
+
+def _median_ms(calls: list, n: int, later: bool) -> float | None:
+    """The median wall ms of the calls of n tokens: the later calls (the graph reused) or the first call."""
+    return med(c.ms for c in calls if c.tokens == n and ((c.call > 0) if later else (c.call == 0)))
+
+
+def bench_rounds_table(root: Path, include_all: bool) -> list[str]:
+    """pp512, pp1024 and tg32 of each round of bn, and the median of the paired ratios n / b over the rounds."""
+    rates: dict[tuple, dict[str, dict[str, float]]] = defaultdict(lambda: defaultdict(dict))
+    for r in RUNS:
+        if r.block != "bn" or not usable(root, r.name, include_all):
+            continue
+        for line in (root / f"{r.name}.out").read_text(errors="replace").splitlines():
+            if line.startswith("{"):
+                rec = json.loads(line)
+                rates[(rec["n_prompt"], rec["n_gen"])][r.lib][r.var] = statistics.median(rec["samples_ts"])
+    out = ["bn: llama-bench t/s of each round (the median of 3 repetitions), b = HEAD, n = the candidates, and the median "
+           "change n / b over the paired rounds [range]" + ("" if include_all else " (--all also uses removed runs)")]
+    for key in sorted(rates):
+        per = rates[key]
+        rounds = sorted(set(per.get("b", {})) | set(per.get("n", {})))
+        cells = [f"r{k}: b {fmt(per['b'].get(k), 2)} n {fmt(per['n'].get(k), 2)}" for k in rounds]
+        ratios = [per["n"][k] / per["b"][k] for k in rounds if k in per.get("b", {}) and k in per.get("n", {})]
+        change = (f"{100 * (statistics.median(ratios) - 1):+.2f}% [{100 * (min(ratios) - 1):+.2f}, "
+                  f"{100 * (max(ratios) - 1):+.2f}], {len(ratios)} rounds") if ratios else "no pair"
+        label = f"pp{key[0]}" if key[1] == 0 else f"tg{key[1]}"
+        out.append(f"  {label:7s} " + " | ".join(cells) + f" | change {change}")
+    return out
+
+
+def stream_table(root: Path, include_all: bool) -> list[str]:
+    """The weight streams at 1, 8, 22 and 64 tokens (depth 2300, draft off): the wall ms of the first call and of the
+    later calls (ws), and the DSP ms of the weight matmuls (wp)."""
+    runs = [("ws-b-n", "HEAD"), ("ws-n-w0", "stream 0"), ("ws-n-w1", "stream 1"), ("ws-n-w2", "stream 2")]
+    data = {name: read_calls(root, name)[0] if usable(root, name, include_all) else [] for name, _ in runs}
+    prof = {name: read_calls(root, name)[0] if usable(root, name, include_all) else [] for name in ("wp-n-w0", "wp-n-w2")}
+    out = ["ws, wp: the weight streams, depth 2300, draft off. ms of the first call / the later calls (the median), and "
+           "the DSP ms of the class W MM and of the DSP batches (op profile, streams 0 and 2)",
+           f"  {'n':>3} | " + " | ".join(f"{label:>13}" for _, label in runs) + " | W MM w0  W MM w2 | DSP w0  DSP w2"]
+    for n in (1, 8, 22, 64):
+        cells = [f"{fmt(_median_ms(data[name], n, False)):>6}/{fmt(_median_ms(data[name], n, True)):>6}" for name, _ in runs]
+        wm = [fmt(med(c.classes.get("W MM", 0) / 1000 for c in prof[p] if c.tokens == n)) for p in ("wp-n-w0", "wp-n-w2")]
+        dsp = [fmt(med(c.dsp_us / 1000 for c in prof[p] if c.tokens == n)) for p in ("wp-n-w0", "wp-n-w2")]
+        out.append(f"  {n:>3} | " + " | ".join(cells) + f" | {wm[0]:>7} {wm[1]:>7} | {dsp[0]:>6} {dsp[1]:>6}")
+    out.append("  the host part of the first call of each size (a new graph): host = wall minus the DSP wait, pack and alloc "
+               "(ms), HEAD (ws-b-n) against the candidates (ws-n-w2)")
+    for n in (1, 8, 22, 64):
+        cells = []
+        for name in ("ws-b-n", "ws-n-w2"):
+            first = [c for c in data[name] if c.tokens == n and c.call == 0]
+            cells.append(f"{name}: host {fmt(med(c.host_ms for c in first))} pack {fmt(med(c.pack_us / 1000 for c in first), 2)} "
+                         f"alloc {fmt(med(c.alloc_us / 1000 for c in first), 2)}")
+        out.append(f"  {n:>3} | " + " | ".join(cells))
+    return out
+
+
+def gdn_cross_table(root: Path, include_all: bool) -> list[str]:
+    """The GDN class at 8, 9, 10, 12 and 16 tokens with the limit 9 (gp-n-g9) against the limit 32 (gp-n-g0)."""
+    data = {name: read_calls(root, name)[0] if usable(root, name, include_all) else [] for name in ("gp-n-g9", "gp-n-g0")}
+    out = ["gp: the DSP ms of the class GDN and of the DSP batches, depth 2300, draft off, the limit 9 against the limit 32",
+           f"  {'n':>3} | {'GDN 9':>6} {'GDN 32':>6} | {'DSP 9':>6} {'DSP 32':>6}"]
+    for n in (8, 9, 10, 12, 16):
+        g = [fmt(med(c.classes.get("GDN", 0) / 1000 for c in data[p] if c.tokens == n), 2) for p in ("gp-n-g9", "gp-n-g0")]
+        d = [fmt(med(c.dsp_us / 1000 for c in data[p] if c.tokens == n)) for p in ("gp-n-g9", "gp-n-g0")]
+        out.append(f"  {n:>3} | {g[0]:>6} {g[1]:>6} | {d[0]:>6} {d[1]:>6}")
+    return out
+
+
+def concat_table(root: Path, include_all: bool) -> list[str]:
+    """The MTP concat with the draft on: its op time and the DRAFT class at 22 and 64 tokens (cp), and the prefill of
+    512 and 1024 tokens (lg), HEAD against the candidates."""
+    out = ["cp, lg: the MTP concat, draft on. CONCAT us (the op mtp_concat) and DRAFT ms of the op profile at the depth "
+           "2300, and the ms of 512 and 1024 tokens at the depth 0 (call 0 / call 1)"]
+    for lib in "bn":
+        name = f"cp-{lib}-s"
+        calls = read_calls(root, name, keep_ops=True)[0] if usable(root, name, include_all) else []
+        cells = []
+        for n in (22, 64):
+            cc = [c for c in calls if c.tokens == n]
+            cat = med(sum(u for op, names, u, _, _ in c.ops if op == "CONCAT" and "mtp_concat" in names) for c in cc)
+            cells.append(f"n{n}: CONCAT {fmt(cat, 0)} us, DRAFT {fmt(med(c.classes.get('DRAFT', 0) / 1000 for c in cc))} ms")
+        lg = read_calls(root, f"lg-{lib}-s")[0] if usable(root, f"lg-{lib}-s", include_all) else []
+        long = ", ".join(f"n{n} {fmt(_median_ms(lg, n, False))}/{fmt(_median_ms(lg, n, True))}" for n in (512, 1024))
+        out.append(f"  {LIBS[lib].text:24s}: " + "; ".join(cells) + f" | {long}")
+    return out
+
+
+def hash_table(root: Path) -> list[str]:
+    """The HASH lines of the runs hs: each run must give the lines of hs-b-n."""
+    runs = [r.name for r in RUNS if r.block == "hs"]
+    got = {name: re.findall(r"^HASH (.*) ([0-9a-f]{16})$", (root / f"{name}.out").read_text(errors="replace"), re.M)
+           if (root / f"{name}.out").exists() else [] for name in runs}
+    ref = got.get("hs-b-n", [])
+    out = [f"hs: the logits hashes of a prompt of 512 tokens and 8 decode tokens against hs-b-n ({len(ref)} lines)"]
+    for name in runs:
+        same = sum(a == b for a, b in zip(got[name], ref))
+        out.append(f"  {name}: {len(got[name])} lines, {same} equal to hs-b-n" +
+                   (" (the same)" if got[name] and got[name] == ref else " (DIFFERENT)"))
+    return out
+
+
+def ops_table_spf2(root: Path) -> list[str]:
+    """The result lines of the op tests of spf2."""
+    out = ["tb: test-backend-ops on HTP0 against the CPU"]
+    for r in RUNS:
+        if r.block != "tb":
+            continue
+        p = root / f"{r.name}.out"
+        text = p.read_text(errors="replace") if p.exists() else ""
+        passed = re.findall(r"(\d+)/(\d+) tests passed", text)
+        fails = [line.strip() for line in text.splitlines() if "FAIL" in line][:12]
+        out.append(f"  {r.name} ({r.text}, {LIBS[r.lib].text}): " +
+                   (", ".join(f"{a}/{b} passed" for a, b in passed) or "no result line"))
+        out += [f"    {line[:200]}" for line in fails]
+    return out
+
+
+def table_spf2(root: Path, include_all: bool) -> int:
+    """Print the tables of the stage spf2."""
+    if not root.is_dir():
+        print(f"stage.py: {root} is not a directory. Pull the outputs of the stage first.", file=sys.stderr)
+        return 1
+    parts = [["The runs:"] + checks(root), bench_rounds_table(root, include_all), stream_table(root, include_all),
+             dma_table(root, include_all, "wm-n-w2"), gdn_cross_table(root, include_all), concat_table(root, include_all),
+             hash_table(root), ops_table_spf2(root)]
+    for part in parts:
+        print("\n".join(part))
+        print()
+    return 0
+
+
+@dataclass(frozen=True)
+class Stage:
+    """One phone stage of this file: its name, its runs, the header of its command file and its tables."""
+    name: str
+    runs: list
+    header: str
+    table: object
+
+
+STAGES = {
+    "spf": Stage("spf", RUNS_SPF, HEADER_SPF, table_spf),
+    "spf2": Stage("spf2", RUNS_SPF2, HEADER_SPF2, table_spf2),
+}
+
+
+def select_stage(name: str) -> None:
+    """Set the values of the stage name: the phone directory, the laptop and box directories, the library sets, the
+    runs, the header and the tables."""
+    global STAGE, PHONE, LAPTOP_STAGE, BOX, STAGE_DIR, LIBS, RUNS, HEADER, TABLE
+    st = STAGES[name]
+    STAGE        = name
+    PHONE        = f"/data/local/tmp/qwen/{name}"
+    LAPTOP_STAGE = f"build/{name}"
+    BOX          = f"grigory@10.10.20.200:airi/qwen-mobile/build/{name}"
+    STAGE_DIR    = Path(os.path.relpath(Path(__file__).resolve().parents[3] / LAPTOP_STAGE))
+    LIBS         = {
+        "b": Lib("b", f"{PHONE}/lib-base", f"{PHONE}/lib-base", "HEAD"),
+        "n": Lib("n", f"{PHONE}/lib-new:{PHONE}/lib-base", f"{PHONE}/lib-new", "HEAD plus the candidates"),
+    }
+    RUNS   = st.runs
+    HEADER = st.header
+    TABLE  = st.table
+
+
+select_stage(STAGE)
+
+
 def main() -> int:
-    """Run the subcommand of the command line."""
+    """Run the subcommand of the command line. The stage is --stage, or the name of the directory of the invoked file
+    when that is a stage (build/spf2/stage.py gives spf2), or spf."""
+    invoked = Path(sys.argv[0]).parent.name
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--stage", choices=sorted(STAGES), default=invoked if invoked in STAGES else "spf")
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("commands", help="write the phone command file")
-    c.add_argument("--out", type=Path, default=STAGE_DIR / "phone-commands.txt")
+    c.add_argument("--out", type=Path, default=None)
     t = sub.add_parser("table", help="print the tables from the pulled files")
-    t.add_argument("--root", type=Path, default=STAGE_DIR / "phone-out")
+    t.add_argument("--root", type=Path, default=None)
     t.add_argument("--all", action="store_true", help="also use the runs with changed caps or heat")
     a = ap.parse_args()
+    select_stage(a.stage)
     if a.cmd == "commands":
-        n = write_commands(a.out)
-        print(f"{a.out}: {n} lines, {len(RUNS)} runs")
+        out = a.out or STAGE_DIR / "phone-commands.txt"
+        n = write_commands(out)
+        print(f"{out}: {n} lines, {len(RUNS)} runs")
         return 0
-    return table(a.root, a.all)
+    return TABLE(a.root or STAGE_DIR / "phone-out", a.all)
 
 
 if __name__ == "__main__":
