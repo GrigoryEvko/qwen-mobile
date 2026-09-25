@@ -12,9 +12,11 @@
 #include "htp-ops.h"
 #include "matmul-ops.h"
 #include "gate-ops.h"
+#include "htp-gdn-params.h"
 
 #include <algorithm>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -164,6 +166,50 @@ bool is_view_op(ggml_op op) {
 }
 
 const int32_t ZERO_PARAMS[16] = {0};
+
+// The content of the q or k rows that GATED_DELTA_NET and GDN_STATE_STEP use when the host gives them the
+// raw rows and the four values of the L2 norm in kernel_params[HTP_GDN_KP_QKNORM] and the four params
+// after it (htp-gdn-qknorm.h). It is the content that the reference gives the norm ops of the graph:
+// L2_NORM(x, eps) when b is 0 (the host gives c = eps^2), else SCALE(RMS_NORM(x, b), s). raw is the
+// content of the raw rows and ne their shape. O(elements of the rows).
+val qknorm_content(const int32_t * kp, val raw, const int64_t ne[4]) {
+    float b, c, s;
+    memcpy(&b, &kp[HTP_GDN_KP_QKNORM + 2], sizeof(float));
+    memcpy(&c, &kp[HTP_GDN_KP_QKNORM + 3], sizeof(float));
+    memcpy(&s, &kp[HTP_GDN_KP_QKNORM + 4], sizeof(float));
+    const uint64_t n = nelements(ne);
+    int32_t        p[16] = {0};
+    if (b == 0.0f) {
+        // The square root of the rounded square gives eps back for the eps of the models and of the
+        // tests. A neighbour of the root takes its place when only that neighbour squares to c.
+        float eps = sqrtf(c);
+        for (float e : { eps, nextafterf(eps, 0.0f), nextafterf(eps, INFINITY) }) {
+            if (e * e == c) {
+                eps = e;
+                break;
+            }
+        }
+        memcpy(&p[0], &eps, sizeof(float));
+        return const_content(op_value(HTP_OP_L2_NORM, p, ne, GGML_TYPE_F32, { raw }, false), n);
+    }
+    memcpy(&p[0], &b, sizeof(float));
+    const val v_rms = op_value(HTP_OP_RMS_NORM, p, ne, GGML_TYPE_F32, { raw }, false);
+    int32_t   ps[16] = {0};
+    memcpy(&ps[0], &s, sizeof(float));  // op_params[1] is the bias of the SCALE, 0
+    return const_content(op_value(HTP_OP_SCALE, ps, ne, GGML_TYPE_F32, { const_content(v_rms, n) }, false), n);
+}
+
+// The contents of q and k of a gated delta net op: the norm of their raw rows when the host gives the
+// norm to the op, else the rows as they are
+void gdn_qk_contents(const fakedsp::op_record & op, val & q, val & k) {
+    if (op.kparams[HTP_GDN_KP_QKNORM] != 1) {
+        return;
+    }
+    const int64_t qne[4] = { op.src[0].ne[0], op.src[0].ne[1], op.src[0].ne[2], op.src[0].ne[3] };
+    const int64_t kne[4] = { op.src[1].ne[0], op.src[1].ne[1], op.src[1].ne[2], op.src[1].ne[3] };
+    q = qknorm_content(op.kparams, q, qne);
+    k = qknorm_content(op.kparams, k, kne);
+}
 
 } // namespace
 
@@ -625,8 +671,11 @@ void checker::dev_op(const fakedsp::op_record & op) {
             const int64_t D      = S_v * S_v * H;
             const val     v_r    = mix(T_ROW, dev_row_content(states, op.kparams[0]));
             int64_t       gne[4] = { d0.ne[0], d0.ne[1], d0.ne[2], d0.ne[3] };
+            val           v_q    = dev_content(op.src[0]);
+            val           v_k    = dev_content(op.src[1]);
+            gdn_qk_contents(op, v_q, v_k);
             const val     v_g    = op_value(HTP_OP_GATED_DELTA_NET, op.params, gne, GGML_TYPE_F32,
-                                            { dev_content(op.src[0]), dev_content(op.src[1]), dev_content(op.src[2]),
+                                            { v_q, v_k, dev_content(op.src[2]),
                                               dev_content(op.src[3]), dev_content(op.src[4]), const_content(v_r, (uint64_t) D) },
                                             false);
             dev_write_all(d0, v_g, 0);
@@ -643,6 +692,9 @@ void checker::dev_op(const fakedsp::op_record & op) {
                 if (op.src[i].present) {
                     c.push_back(dev_content(op.src[i]));
                 }
+            }
+            if (op.opcode == HTP_OP_GATED_DELTA_NET && c.size() >= 2) {
+                gdn_qk_contents(op, c[0], c[1]);
             }
             int64_t dne[4] = { d0.ne[0], d0.ne[1], d0.ne[2], d0.ne[3] };
             // An F16 dst of SWIGLU holds the value of its F32 output (htp-mm-fusion.h)

@@ -1,0 +1,539 @@
+hexagon: run the L2 norm of q and k inside the gated delta net ops
+
+The cost
+
+Each gated delta net layer of Qwen3.5 normalizes each head row of q and of
+k before GATED_DELTA_NET with build_gdn_l2_norm: SCALE(RMS_NORM(x, eps / n),
+1 / sqrt(n)). On HTP0 that is four f32 passes over q and k in DDR for each
+layer. On the phone (Qwen3.5-4B Q8_0, one prefill ubatch of 1024 tokens)
+the RMS_NORM ops of q and k take 15.9 ms and the SCALE ops 16.8 ms of the
+1044 ms of the ubatch. At one token they are four more small ops for each
+layer.
+
+The change
+
+htp-gdn-qknorm.h finds the norm chains of q and k of a GATED_DELTA_NET node:
+L2_NORM(x, eps), or SCALE(RMS_NORM(x, e), s) without a bias. The match
+needs the same norm for q and for k, an epsilon above zero, no other reader
+of a replaced tensor (also in another split), no node between a norm op
+and the GATED_DELTA_NET that writes the bytes of the raw rows, and no byte
+that the raw rows and the output of the op share. The host then
+removes the norm ops and gives the op the raw rows and the four values of
+the norm in the kernel params (htp/htp-gdn-params.h, the contract of
+htp/gdn-step.h):
+    r = s / sqrt(max(a * sum(x^2) + b, c))
+    L2_NORM(x, eps)          (a, b, c, s) = (1, 0, eps^2, 1)
+    SCALE(RMS_NORM(x, e), s) (a, b, c, s) = (1 / n, e, 0, s)
+A batch takes the norm with version 2 of the chunked kernel and with the
+sequential kernel. A token takes it in GATED_DELTA_NET and in the fused
+state step GDN_STATE_STEP. The unfused ops of a state step that the host
+runs in place of the fused op (a slot index that is not valid) keep the
+norm ops.
+
+GGML_HEXAGON_GDN_QKNORM=0 keeps the norm ops. The preset value is 1. The
+fusion also follows GGML_HEXAGON_OPFUSION, and a batch keeps the norm ops
+with GGML_HEXAGON_GDN_CHUNK=1, because version 1 of the chunked kernel has
+no norm.
+
+test-backend-ops: the cases of GATED_DELTA_NET get the form of the graph as
+an option (qk_form 1), and the state step gets the two forms of the norm.
+New cases hold the shapes of Qwen3.5-4B (16 k heads for 32 v heads, 128
+values): 1024 tokens, 512 tokens with a fast gate, 100 tokens with 5
+snapshot slots (the rollback of the MTP draft), and 20 tokens (the
+sequential kernel). The perf list gets the case of 1024 tokens.
+
+The results
+
+The functional runs of version 2 with the norm are in the patch before this
+one. The phone stage gdnk of 2026-09-25 (tools/stages/gdnk, HTP0,
+Qwen3.5-4B Q8_0) runs one build of the series with four switch settings.
+Variant D adds this patch to variant C (the conv DMA and version 2). The
+DSP op time of one prefill ubatch of 1024 tokens, the median of 6 graphs:
+                     C          D
+    RMS_NORM         45.5 ms    30.0 ms
+    SCALE            15.9 ms    0
+    GATED_DELTA_NET  93.0 ms    98.0 ms
+    all ops          1049.6 ms  1025.1 ms
+The RMS_NORM ops of D are the other norms of the model. At one token the
+RMS_NORM ops take 0.51 ms in place of 0.69 ms, the SCALE ops take 0 in place
+of 0.17 ms, and all ops take 92.6 ms in place of 95.3 ms.
+
+llama-bench, the median of the rounds that the runner accepts, with A (the
+kernels before the series) for comparison:
+                  A        C        D
+    pp512 t/s     1014.6   1061.5   1088.6
+    pp1024 t/s    963.9    999.3    1014.4
+    tg32 t/s      10.69    10.67    10.72
+    tg32 at 4096  10.26    10.30    10.34
+The KL divergence against the naive x86 base (4 chunks of 512 tokens) is
+0.000598 +- 0.000040 for D and 0.000584 +- 0.000040 for A. The decode path
+(1 chunk, one token for each batch) gives 0.000559 for D and 0.000557 for
+A. test-backend-ops passes the 82 cases of the gated delta net ops.
+
+test-backend-ops perf gives 217 us for the case of one token (32 heads) in
+place of 77 us. The perf mode puts the same node 8066 times into one graph,
+and the host does the norm match for each copy. Each match reads the whole
+graph, thus the host time increases as the square of the node count. This
+cause is a calculation from the source code, and not a measurement. A graph
+of the app has 24 GATED_DELTA_NET nodes, and tg32 does not become slower.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    ggml/src/ggml-hexagon/ggml-hexagon.cpp
+    ggml/src/ggml-hexagon/htp-gdn-qknorm.h
+    tests/test-backend-ops.cpp
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index aa72664..1c35fe3 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -54,6 +54,7 @@
+ #include "htp-opnode.h"
+ #include "htp-gdn-match.h"
+ #include "htp-gdn-params.h"
++#include "htp-gdn-qknorm.h"
+ #include "htp-gate-fusion.h"
+ #include "htp-ops.h"
+ #include "htp/matmul-ops.h"
+@@ -134,6 +135,11 @@ static int opt_gdn_chunk = 2;
+ // reads them with vector loads from DDR. The host gives the value in the kernel params of each op.
+ static int opt_gdn_conv_dma = 1;
+ 
++// GGML_HEXAGON_GDN_QKNORM: 1 = the L2 norm of q and k before a gated delta net op runs inside the op
++// (htp-gdn-qknorm.h), the default. 0 = the norm ops stay. A batch fuses the norm only with a
++// GGML_HEXAGON_GDN_CHUNK value other than 1, because version 1 of the chunked kernel has no norm.
++static int opt_gdn_qknorm = 1;
++
+ // GGML_HEXAGON_FWHT: 1 = the host sends a rotation of a quantized KV cache (a MUL_MAT with the hint
+ // GGML_HINT_SRC0_IS_HADAMARD) that ggml_hexagon_is_fwht accepts as HTP_OP_FWHT (the default), 0 = each
+ // such rotation stays HTP_OP_MUL_MAT. Thus an A/B run of the two forms needs no other build.
+@@ -188,6 +194,11 @@ static inline bool ggml_hexagon_is_gdn_state_fusion_enabled() {
+     return ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_GDN_STATE);
+ }
+ 
++// The L2 norm of q and k inside the gated delta net ops follows GGML_HEXAGON_OPFUSION and its own switch
++static inline bool ggml_hexagon_is_gdn_qknorm_enabled() {
++    return opt_opfusion > 0 && opt_gdn_qknorm != 0;
++}
++
+ static std::regex* opt_opfilter = NULL; // regex of ops to not claim
+ 
+ #define HEX_VERBOSE(...) \
+@@ -7073,13 +7084,15 @@ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, co
+         fu.members_at.emplace(emit, std::move(at));
+     };
+ 
++    const bool state_on = ggml_hexagon_is_gdn_state_fusion_enabled();
++
+     for (int i = 0; i < gf->n_nodes; i++) {
+         if (fu.skip[i]) {
+             continue;
+         }
+         ggml_tensor * n = gf->nodes[i];
+ 
+-        if (ggml_hexagon_gdn_is_conv_candidate(n)) {
++        if (state_on && ggml_hexagon_gdn_is_conv_candidate(n)) {
+             ggml_hexagon_gdn_conv_match m;
+             const char * reason = ggml_hexagon_gdn_conv_chain_check(gf, index, i, m);
+             if (reason) {
+@@ -7125,9 +7138,39 @@ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, co
+                         (int) m.n_tokens, m.emit);
+         } else if (n->op == GGML_OP_GATED_DELTA_NET) {
+             ggml_hexagon_gdn_state_match m;
+-            const char * reason = ggml_hexagon_gdn_state_chain_check(gf, index, i, m);
++            const char * reason = state_on ? ggml_hexagon_gdn_state_chain_check(gf, index, i, m) : "the state fusion is off";
+             if (reason) {
+                 HEX_VERBOSE("ggml-hex: %s GDN_STATE_STEP candidate %s (node %d): %s\n", sess->name.c_str(), n->name, i, reason);
++            }
++
++            // The L2 norm of q and k goes into the op. Version 1 of the chunked kernel has no norm, thus
++            // a batch keeps the norm ops with GGML_HEXAGON_GDN_CHUNK=1.
++            ggml_hexagon_gdn_qknorm_match qm;
++            const char * qreason = "GGML_HEXAGON_GDN_QKNORM is 0";
++            if (ggml_hexagon_is_gdn_qknorm_enabled() && (n->src[2]->ne[2] == 1 || opt_gdn_chunk != 1)) {
++                qreason = ggml_hexagon_gdn_qknorm_check(gf, index, i, reason ? std::vector<ggml_tensor *>() : m.members, qm);
++            }
++            if (qreason) {
++                HEX_VERBOSE("ggml-hex: %s QKNORM candidate %s (node %d): %s\n", sess->name.c_str(), n->name, i, qreason);
++                if (reason) {
++                    continue;
++                }
++            }
++
++            if (reason) {
++                // The op alone, with the raw rows of q and k
++                htp_opnode node(HTP_OP_GATED_DELTA_NET, n);
++                node.name   = "GATED_DELTA_NET+QKNORM";
++                node.inputs = { qm.q, qm.k, n->src[2], n->src[3], n->src[4], n->src[5] };
++                node.fused  = qm.members;
++                node.kernel_params[HTP_GDN_KP_SEQ]     = opt_gdn_chunk ? 0 : 1;
++                node.kernel_params[HTP_GDN_KP_VERSION] = opt_gdn_chunk;
++                ggml_hexagon_gdn_qknorm_params(qm, node.kernel_params);
++                fu.at.emplace(i, std::move(node));
++                std::vector<ggml_tensor *> members = qm.members;
++                members.push_back(n);
++                skip_members(i, members);
++                HEX_VERBOSE("ggml-hex: %s fused GATED_DELTA_NET+QKNORM %s at node %d\n", sess->name.c_str(), n->name, i);
+                 continue;
+             }
+ 
+@@ -7136,6 +7179,14 @@ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, co
+             node.inputs  = { m.q, m.k, m.v, m.g, m.beta, m.states, m.idx, m.slot };
+             node.outputs = { m.G, m.slot };
+             node.fused   = { m.R, m.P };
++            if (!qreason) {
++                node.name     += "+QKNORM";
++                node.inputs[0] = qm.q;
++                node.inputs[1] = qm.k;
++                node.fused.insert(node.fused.end(), qm.members.begin(), qm.members.end());
++                ggml_hexagon_gdn_qknorm_params(qm, node.kernel_params);
++                m.members.insert(m.members.end(), qm.members.begin(), qm.members.end());
++            }
+ 
+             fu.at.emplace(m.emit, std::move(node));
+             skip_members(m.emit, m.members);
+@@ -7224,7 +7275,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+         // Match the fused recurrent state steps (one op each) before the per-node pass
+         ggml_hexagon_gdn_fusion gdn_fu;
+         gdn_fu.skip.assign(graph->n_nodes, 0);
+-        if (ggml_hexagon_is_gdn_state_fusion_enabled() && sess->mdev.count == 1) {
++        if ((ggml_hexagon_is_gdn_state_fusion_enabled() || ggml_hexagon_is_gdn_qknorm_enabled()) && sess->mdev.count == 1) {
+             ggml_hexagon_match_gdn_fusions(sess, graph, gdn_fu);
+         }
+         // The gate chains of the Qwen3.5 layers (htp-gate-fusion.h)
+@@ -8717,6 +8768,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     const char * str_multirow = getenv("GGML_HEXAGON_MULTIROW");
+     const char * str_gdn_chunk = getenv("GGML_HEXAGON_GDN_CHUNK");
+     const char * str_gdn_conv_dma = getenv("GGML_HEXAGON_GDN_CONV_DMA");
++    const char * str_gdn_qknorm   = getenv("GGML_HEXAGON_GDN_QKNORM");
+     const char * str_fwht     = getenv("GGML_HEXAGON_FWHT");
+     const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
+     const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
+@@ -8796,6 +8848,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     opt_opfusion_state = str_opfusion_state ? atoi(str_opfusion_state)    : opt_opfusion_state;
+     opt_gdn_chunk = str_gdn_chunk ? atoi(str_gdn_chunk)                   : opt_gdn_chunk;
+     opt_gdn_conv_dma = str_gdn_conv_dma ? atoi(str_gdn_conv_dma)          : opt_gdn_conv_dma;
++    opt_gdn_qknorm   = str_gdn_qknorm   ? atoi(str_gdn_qknorm)            : opt_gdn_qknorm;
+     opt_fwht      = str_fwht     ? atoi(str_fwht)                         : opt_fwht;
+     opt_profile   = str_profile  ? atoi(str_profile)                      : 0;
+     opt_etm       = str_etm      ? atoi(str_etm)                          : 0;
+diff --git a/ggml/src/ggml-hexagon/htp-gdn-qknorm.h b/ggml/src/ggml-hexagon/htp-gdn-qknorm.h
+new file mode 100644
+index 0000000..e0346bd
+--- /dev/null
++++ b/ggml/src/ggml-hexagon/htp-gdn-qknorm.h
+@@ -0,0 +1,176 @@
++// The graph match of the L2 norm of q and k before a gated delta net op (host side).
++//
++// A gated delta net layer normalizes each head row of q and of k before GATED_DELTA_NET. Qwen3.5 does
++// it with build_gdn_l2_norm, SCALE(RMS_NORM(x, eps / n), 1 / sqrt(n)), and the tests of the op with
++// L2_NORM(x, eps). Each form is two or one extra passes over q and over k in DDR. The DSP ops
++// GATED_DELTA_NET and GDN_STATE_STEP can apply the norm when they load a row, thus the host removes
++// the norm ops and gives the op the raw rows and the four values of the norm (gdn-step.h):
++//   r = s / sqrt(max(a * sum(x^2) + b, c))
++//   L2_NORM(x, eps)                       (a, b, c, s) = (1, 0, eps^2, 1)
++//   SCALE(RMS_NORM(x, e), s), no bias     (a, b, c, s) = (1 / n, e, 0, s)
++// The CPU op L2_NORM divides by max(sqrt(sum), eps), which is the square root of max(sum, eps^2).
++//
++// The match needs the same norm for q and for k, the norm along ne[0] of the raw rows, an epsilon above
++// zero, no other reader of a replaced tensor (also in another split), no node between a norm op and the
++// GATED_DELTA_NET that writes the bytes of the raw rows, and no byte that the raw rows and the output of
++// the op share. This header depends on ggml and htp-gdn-match.h only.
++
++#ifndef HTP_GDN_QKNORM_H
++#define HTP_GDN_QKNORM_H
++
++#include "htp-gdn-match.h"
++#include "htp-gdn-params.h"
++
++#include <cmath>
++#include <cstring>
++
++struct ggml_hexagon_gdn_qknorm_match {
++    ggml_tensor * q = nullptr;              // the raw q rows, the input of the norm of q
++    ggml_tensor * k = nullptr;              // the raw k rows
++    float         a = 0.0f;
++    float         b = 0.0f;
++    float         c = 0.0f;
++    float         s = 0.0f;
++    std::vector<ggml_tensor *> members;     // the norm ops, in graph order of their chains
++};
++
++// One norm chain that ends in t: the raw input, the four values, and the nodes of the chain. Returns
++// nullptr when t is such a chain, or the first failed condition.
++static inline const char * ggml_hexagon_gdn_qknorm_chain(ggml_tensor * t, ggml_tensor ** raw, float v[4],
++                                                         std::vector<ggml_tensor *> & nodes) {
++    if (!t || t->type != GGML_TYPE_F32) {
++        return "the input is not F32";
++    }
++    if (t->op == GGML_OP_L2_NORM) {
++        float eps;
++        memcpy(&eps, t->op_params, sizeof(float));
++        *raw = t->src[0];
++        v[0] = 1.0f;
++        v[1] = 0.0f;
++        v[2] = eps * eps;
++        v[3] = 1.0f;
++        nodes = { t };
++    } else if (t->op == GGML_OP_SCALE) {
++        float sc, bias;
++        memcpy(&sc, &t->op_params[0], sizeof(float));
++        memcpy(&bias, &t->op_params[1], sizeof(float));
++        ggml_tensor * rn = t->src[0];
++        if (bias != 0.0f) {
++            return "the SCALE has a bias";
++        }
++        if (!rn || rn->op != GGML_OP_RMS_NORM || rn->type != GGML_TYPE_F32) {
++            return "the SCALE input is not an RMS_NORM";
++        }
++        float eps;
++        memcpy(&eps, rn->op_params, sizeof(float));
++        *raw = rn->src[0];
++        if (!*raw || (*raw)->ne[0] < 1) {
++            return "the RMS_NORM has no input row";
++        }
++        v[0] = 1.0f / (float) (*raw)->ne[0];
++        v[1] = eps;
++        v[2] = 0.0f;
++        v[3] = sc;
++        nodes = { rn, t };
++    } else {
++        return "not an L2_NORM or a SCALE of an RMS_NORM";
++    }
++    ggml_tensor * x = *raw;
++    if (!x || x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float)) {
++        return "the raw rows are not F32 with contiguous elements";
++    }
++    for (int d = 0; d < 4; d++) {
++        if (x->ne[d] != t->ne[d]) {
++            return "the norm changes the shape";
++        }
++    }
++    if (!(std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]) && std::isfinite(v[3]))) {
++        return "a value of the norm is not finite";
++    }
++    // The chunked kernel pads the last chunk with zero rows. Their factor is s / sqrt(max(b, c)), and a
++    // zero there gives an infinite factor and a NaN in the tiles of the chunk.
++    if (!(v[1] > 0.0f || v[2] > 0.0f)) {
++        return "the norm has no epsilon";
++    }
++    return nullptr;
++}
++
++// The norm chains of q and k of the GATED_DELTA_NET node at graph index ig. extra_members are the
++// other nodes that the caller replaces together with G (the members of a state chain), or empty.
++// O(nodes * GGML_MAX_SRC * members).
++static inline const char * ggml_hexagon_gdn_qknorm_check(const ggml_cgraph * gf,
++                                                         const std::unordered_map<const ggml_tensor *, int> & index,
++                                                         int ig, const std::vector<ggml_tensor *> & extra_members,
++                                                         ggml_hexagon_gdn_qknorm_match & m) {
++    ggml_tensor * G = gf->nodes[ig];
++    if (G->op != GGML_OP_GATED_DELTA_NET) {
++        return "not a GATED_DELTA_NET";
++    }
++    float vq[4], vk[4];
++    std::vector<ggml_tensor *> nq, nk;
++    ggml_tensor * q = nullptr;
++    ggml_tensor * k = nullptr;
++    if (const char * r = ggml_hexagon_gdn_qknorm_chain(G->src[0], &q, vq, nq)) {
++        return r;
++    }
++    if (const char * r = ggml_hexagon_gdn_qknorm_chain(G->src[1], &k, vk, nk)) {
++        return r;
++    }
++    if (memcmp(vq, vk, sizeof(vq)) != 0) {
++        return "q and k have different norms";
++    }
++    if (G->src[0] == G->src[1]) {
++        return "q and k are one tensor";
++    }
++
++    // The norm ops write the replaced tensors. Only G, or the chain that G is a part of, reads them.
++    std::vector<ggml_tensor *> intermediates = nq;
++    intermediates.insert(intermediates.end(), nk.begin(), nk.end());
++    std::vector<ggml_tensor *> members = intermediates;
++    members.push_back(G);
++    members.insert(members.end(), extra_members.begin(), extra_members.end());
++    if (const char * reason = ggml_hexagon_gdn_chain_is_private(gf, intermediates, members, nullptr, 0)) {
++        return reason;
++    }
++
++    // G reads the raw rows at its own index and not at the index of the norm op. No node between the
++    // two can write their bytes.
++    for (ggml_tensor * n : intermediates) {
++        auto it = index.find(n);
++        if (it == index.end()) {
++            return "a norm op is not a node of the graph";
++        }
++        if (it->second > ig) {
++            return "a norm op comes after the GATED_DELTA_NET";
++        }
++        ggml_tensor * raw = n->src[0];
++        if (!ggml_hexagon_gdn_move_is_safe(gf, ig, it->second, raw, false, members)) {
++            return "a node between a norm op and the GATED_DELTA_NET writes the bytes of the raw rows";
++        }
++    }
++    // The op reads the raw rows while it writes its output. The norm outputs kept them apart before.
++    if (ggml_hexagon_gdn_bytes_overlap(G, q) || ggml_hexagon_gdn_bytes_overlap(G, k)) {
++        return "the output of the GATED_DELTA_NET shares bytes with the raw rows";
++    }
++
++    m.q = q;
++    m.k = k;
++    m.a = vq[0];
++    m.b = vq[1];
++    m.c = vq[2];
++    m.s = vq[3];
++    m.members = intermediates;
++    return nullptr;
++}
++
++// The kernel params of the norm for GATED_DELTA_NET and GDN_STATE_STEP, from HTP_GDN_KP_QKNORM on
++// (htp-gdn-params.h). kp is the kernel params array of the op.
++static inline void ggml_hexagon_gdn_qknorm_params(const ggml_hexagon_gdn_qknorm_match & m, int32_t * kp) {
++    kp[HTP_GDN_KP_QKNORM] = 1;
++    memcpy(&kp[HTP_GDN_KP_QKNORM + 1], &m.a, sizeof(float));
++    memcpy(&kp[HTP_GDN_KP_QKNORM + 2], &m.b, sizeof(float));
++    memcpy(&kp[HTP_GDN_KP_QKNORM + 3], &m.c, sizeof(float));
++    memcpy(&kp[HTP_GDN_KP_QKNORM + 4], &m.s, sizeof(float));
++}
++
++#endif // HTP_GDN_QKNORM_H
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index c6c7af5..6173db5 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4670,16 +4670,23 @@ struct test_gated_delta_net : public test_case {
+     const bool    permuted;
+     const bool    kda;
+     const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
++    // The L2 norm of q and k: 0 = ggml_l2_norm, 1 = SCALE(RMS_NORM(x, eps / n), 1 / sqrt(n)), the form of
++    // build_gdn_l2_norm in the Qwen3.5 graph. A backend can run either form inside the op.
++    const int     qk_form;
+ 
+     std::string vars() override {
+-        return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
++        std::string s = VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
++        if (qk_form != 0) {
++            s += "," + VARS_TO_STR1(qk_form);
++        }
++        return s;
+     }
+ 
+     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
+             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
+-            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
++            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, int qk_form = 0)
+         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
+-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K) {}
++          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), qk_form(qk_form) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         ggml_tensor * q;
+@@ -4706,8 +4713,14 @@ struct test_gated_delta_net : public test_case {
+         ggml_set_name(beta,  "beta");
+         ggml_set_name(state, "state");
+         // q/k are L2-normalised in qwen35/kimi-linear before delta_net
+-        q = ggml_l2_norm(ctx, q, 1e-6f);
+-        k = ggml_l2_norm(ctx, k, 1e-6f);
++        if (qk_form == 1) {
++            const float n = (float) head_size;
++            q = ggml_scale(ctx, ggml_rms_norm(ctx, q, 1e-6f / n), 1.0f / sqrtf(n));
++            k = ggml_scale(ctx, ggml_rms_norm(ctx, k, 1e-6f / n), 1.0f / sqrtf(n));
++        } else {
++            q = ggml_l2_norm(ctx, q, 1e-6f);
++            k = ggml_l2_norm(ctx, k, 1e-6f);
++        }
+         ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+         return out;
+     }
+@@ -4763,8 +4776,9 @@ struct test_gated_delta_net_batch : public test_gated_delta_net {
+     const float gate_min;
+ 
+     test_gated_delta_net_batch(int64_t head_count, int64_t head_size, int64_t n_seq_tokens, int64_t n_seqs,
+-            int v_repeat = 1, bool permuted = false, float gate_min = -0.5f)
+-        : test_gated_delta_net(GGML_TYPE_F32, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, false, 1),
++            int v_repeat = 1, bool permuted = false, float gate_min = -0.5f, int64_t K = 1, int qk_form = 0)
++        : test_gated_delta_net(GGML_TYPE_F32, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, false, K,
++                               qk_form),
+           gate_min(gate_min) {}
+ 
+     std::string vars() override {
+@@ -4886,14 +4900,22 @@ struct test_gdn_state_fusion : public test_case {
+     const int64_t n_slots;
+     const int64_t src_slot;
+     const int64_t dst_slot;
++    // The L2 norm of q and k before the op: 0 = none, 1 = ggml_l2_norm, 2 = SCALE(RMS_NORM(x, eps / n),
++    // 1 / sqrt(n)), the form of the Qwen3.5 graph
++    const int     qknorm;
+ 
+     std::string vars() override {
+-        return VARS_TO_STR5(head_count, head_size, n_slots, src_slot, dst_slot);
++        std::string s = VARS_TO_STR5(head_count, head_size, n_slots, src_slot, dst_slot);
++        if (qknorm != 0) {
++            s += "," + VARS_TO_STR1(qknorm);
++        }
++        return s;
+     }
+ 
+     test_gdn_state_fusion(int64_t head_count = 4, int64_t head_size = 32, int64_t n_slots = 1,
+-            int64_t src_slot = 0, int64_t dst_slot = 0)
+-        : head_count(head_count), head_size(head_size), n_slots(n_slots), src_slot(src_slot), dst_slot(dst_slot) {}
++            int64_t src_slot = 0, int64_t dst_slot = 0, int qknorm = 0)
++        : head_count(head_count), head_size(head_size), n_slots(n_slots), src_slot(src_slot), dst_slot(dst_slot),
++          qknorm(qknorm) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         const int64_t S_v = head_size;
+@@ -4919,6 +4941,15 @@ struct test_gdn_state_fusion : public test_case {
+         ggml_tensor * st  = ggml_get_rows(ctx, ggml_reshape_2d(ctx, states, D, n_slots), idx);
+         st = ggml_reshape_4d(ctx, st, S_v, S_v, H, 1);
+ 
++        if (qknorm == 1) {
++            q = ggml_l2_norm(ctx, q, 1e-6f);
++            k = ggml_l2_norm(ctx, k, 1e-6f);
++        } else if (qknorm == 2) {
++            const float n = (float) S_v;
++            q = ggml_scale(ctx, ggml_rms_norm(ctx, q, 1e-6f / n), 1.0f / sqrtf(n));
++            k = ggml_scale(ctx, ggml_rms_norm(ctx, k, 1e-6f / n), 1.0f / sqrtf(n));
++        }
++
+         ggml_tensor * gdn = ggml_gated_delta_net(ctx, q, k, v, g, beta, st, 1);
+         ggml_set_name(gdn, "gdn_out");
+ 
+@@ -11600,6 +11631,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_gdn_state_fusion(16, 128, 1, 0, 0));
+     test_cases.emplace_back(new test_gdn_state_fusion(16, 128, 3, 2, 1));
+     test_cases.emplace_back(new test_gdn_state_fusion(4, 32, 2, 1, 1));
++    // the same step with the L2 norm of q and k before the op, which a backend can run inside it:
++    // the ggml_l2_norm form and the form of the Qwen3.5 graph
++    test_cases.emplace_back(new test_gdn_state_fusion(32, 128, 1, 0, 0, 1));
++    test_cases.emplace_back(new test_gdn_state_fusion(32, 128, 3, 2, 1, 2));
++    test_cases.emplace_back(new test_gdn_state_fusion(4, 16, 2, 1, 1, 2));
+     // the conv chain over a batch at the Qwen3.5-4B shape (8192 channels) and with an odd 32-channel block
+     test_cases.emplace_back(new test_gdn_conv_state_fusion(4, 8192, 1, 0, 0, 512));
+     test_cases.emplace_back(new test_gdn_conv_state_fusion(4, 8224, 2, 1, 0, 100));
+@@ -11653,6 +11689,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_gated_delta_net_batch(4, 96, 65, 1));
+     test_cases.emplace_back(new test_gated_delta_net_batch(4, 64, 64, 1, 2));
+     test_cases.emplace_back(new test_gated_delta_net_batch(4, 64, 66, 1, 1, true));
++    // The shapes of Qwen3.5-4B: 16 k heads that 32 v heads share, with the L2 norm of the graph
++    // (qk_form 1), which a backend can run inside the op. 1024 tokens is one prefill batch of the app,
++    // and 5 snapshot slots with 100 tokens is a batch with the rollback of the MTP draft.
++    test_cases.emplace_back(new test_gated_delta_net_batch(16, 128, 1024, 1, 2, false, -0.5f, 1, 1));
++    test_cases.emplace_back(new test_gated_delta_net_batch(16, 128, 512, 1, 2, false, -20.0f, 1, 1));
++    test_cases.emplace_back(new test_gated_delta_net_batch(16, 128, 100, 1, 2, false, -0.5f, 5, 1));
++    test_cases.emplace_back(new test_gated_delta_net_batch(16, 128, 20, 1, 2, false, -0.5f, 1, 1));
++    test_cases.emplace_back(new test_gated_delta_net_batch(4, 64, 70, 1, 1, false, -0.5f, 1, 1));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16, 1, 2, 1, false, true));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32, 4, 1, 1, false, true));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, false, true));
+@@ -12179,6 +12223,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
++    // Qwen3.5-4B, one prefill ubatch: 16 k heads for 32 v heads, the norm of q and k of the graph
++    test_cases.emplace_back(new test_gated_delta_net_batch(16, 128, 1024, 1, 2, false, -0.5f, 1, 1));
+ 
+     // lightning_indexer
+     for (int kv : { 256, 4096, 65536 }) {
