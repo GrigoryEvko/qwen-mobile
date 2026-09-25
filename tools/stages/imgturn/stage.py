@@ -7,8 +7,8 @@ Usage:
 
 The tool of each run is memprobe --image-turn (tools/memprobe/memprobe.cpp) in the context of the app (n_ctx 8192,
 4 threads, 5 output rows, the lazy token embedding, Q8_0 K and V, the fused state step), with the projector
-Qwen3.5-4B-Q8_0.mmproj.gguf on HTP0 and the photo of the chat of the user (the app file
-files/images/a2200d1a726ec0a8576b4a18dc2ef1aa4e4c797d.jpg, 130 KB). The memory holds 1647 positions before each image
+Qwen3.5-4B-Q8_0.mmproj.gguf on HTP0 and the photo of the chat of the user (the saved copy build/imgturn/photo.jpg,
+130 KB, sha1 a2200d1a726ec0a8576b4a18dc2ef1aa4e4c797d). The memory holds 1647 positions before each image
 turn, as in that chat. Each run makes three image turns in one process:
 
     turn 1  the first image of the engine: the load of the projector, the decode, the encoder, the prefill
@@ -41,7 +41,9 @@ PHONE = "/data/local/tmp/qwen/imgturn"
 MODEL_DIR = "/data/local/tmp/qwen/models"
 MODEL = "Qwen3.5-4B-Q8_0.gguf"
 MMPROJ = "Qwen3.5-4B-Q8_0.mmproj.gguf"
-APP_IMAGE = "files/images/a2200d1a726ec0a8576b4a18dc2ef1aa4e4c797d.jpg"
+# The saved copy of the photo of the chat of the user. A new chat of the app deletes its photos, thus the stage pushes it.
+PHOTO_COPY = "build/imgturn/photo.jpg"
+PHOTO_SHA1 = "a2200d1a726ec0a8576b4a18dc2ef1aa4e4c797d"
 PHOTO = f"{PHONE}/in/photo.jpg"
 DEPTH = 1647
 GATE_KB = 8388608
@@ -167,7 +169,7 @@ HEADER = """\
 # The files: build/ttft/phone of the box, the phone files of tools/stages/ttft/build.sh phone (the libraries of the
 # series of HEAD and memprobe with --image-turn). The phone must hold Qwen3.5-4B-Q8_0.gguf and
 # Qwen3.5-4B-Q8_0-draft32k.gguf in /data/local/tmp/qwen/models, and Qwen3.5-4B-Q8_0.mmproj.gguf there or in
-# /sdcard/qwen/models. The photo comes from the app with run-as.
+# /sdcard/qwen/models. The photo is the saved copy build/imgturn/photo.jpg (sha1 a2200d1a...), and adb push copies it.
 #
 # The runs, 9:
 #   it  x8   three image turns after 1647 positions of memory: s n m f / f m n s
@@ -183,6 +185,16 @@ HEADER = """\
 """
 
 
+def photo_lines() -> list[str]:
+    """The lines that copy the saved photo from the box, check its sha1, and push it into the stage directory."""
+    return [
+        f"mkdir -p {Path(PHOTO_COPY).parent} && rsync -a {BOX}/imgturn/photo.jpg {PHOTO_COPY}",
+        f"echo '{PHOTO_SHA1}  {PHOTO_COPY}' | sha1sum -c",
+        f"{ADB} push {PHOTO_COPY} {PHOTO}",
+        f"{ADB} shell 'ls -l {PHOTO} && sha1sum {PHOTO}'",
+    ]
+
+
 def setup_lines() -> list[str]:
     """The lines that copy the stage files and the photo to the phone and check them."""
     bins = " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in STAGE_FILES if f.startswith("bin/"))
@@ -193,10 +205,7 @@ def setup_lines() -> list[str]:
         # No "models/Qwen3.5" in these lines: the runner gates each line with that text as a model run.
         f"{ADB} shell 'ls -l {MODEL_DIR} /sdcard/qwen/models | grep -E \"Qwen3.5-4B-Q8_0(-draft32k|.mmproj)?.gguf\"'",
         f"{ADB} shell 'rm -rf {PHONE} && mkdir -p {PHONE}/bin {PHONE}/lib {PHONE}/out {PHONE}/in'",
-        # run-as writes the file of the app to stdout, and the shell of adb writes it into the stage directory.
-        f"{ADB} shell 'run-as ai.airi.qwenmobile cat {APP_IMAGE} > {PHOTO} && ls -l {PHOTO} && sha1sum {PHOTO}'",
-        f"{ADB} pull {PHOTO} {LAPTOP_STAGE}/photo.jpg",
-        f"rsync -a {LAPTOP_STAGE}/photo.jpg {BOX}/imgturn/photo.jpg",
+        *photo_lines(),
         f"{ADB} push {bins} {PHONE}/bin/",
         f"{ADB} push {libs} {PHONE}/lib/",
         f"{ADB} push {LAPTOP_STAGE}/phone/SHA256SUMS {PHONE}/",

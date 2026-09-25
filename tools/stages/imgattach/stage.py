@@ -49,7 +49,9 @@ PHONE = "/data/local/tmp/qwen/imgattach"
 MODEL_DIR = "/data/local/tmp/qwen/models"
 MODEL = "Qwen3.5-4B-Q8_0.gguf"
 MMPROJ = "Qwen3.5-4B-Q8_0.mmproj.gguf"
-APP_IMAGE = "files/images/a2200d1a726ec0a8576b4a18dc2ef1aa4e4c797d.jpg"
+# The saved copy of the photo of the chat of the user. A new chat of the app deletes its photos, thus the stage pushes it.
+PHOTO_COPY = "build/imgturn/photo.jpg"
+PHOTO_SHA1 = "a2200d1a726ec0a8576b4a18dc2ef1aa4e4c797d"
 PHOTO = f"{PHONE}/in/photo.jpg"
 GATE_KB = 8388608
 LAPTOP_STAGE = "build/imgattach"
@@ -126,7 +128,7 @@ HEADER = """\
 #
 # The files: build/imgattach/phone of the box (tools/stages/imgattach/build.sh). The phone must hold
 # Qwen3.5-4B-Q8_0.gguf, Qwen3.5-4B-Q8_0-draft32k.gguf and Qwen3.5-4B-Q8_0.mmproj.gguf in /data/local/tmp/qwen/models.
-# The photo comes from the app with run-as.
+# The photo is the saved copy build/imgturn/photo.jpg (sha1 a2200d1a...), and adb push copies it.
 #
 # The runs, 6:
 #   d1  draft off: send, send, send (the first image of the engine against the later ones)
@@ -146,6 +148,16 @@ HEADER = """\
 """
 
 
+def photo_lines() -> list[str]:
+    """The lines that copy the saved photo from the box, check its sha1, and push it into the stage directory."""
+    return [
+        f"mkdir -p {Path(PHOTO_COPY).parent} && rsync -a {BOX}/imgturn/photo.jpg {PHOTO_COPY}",
+        f"echo '{PHOTO_SHA1}  {PHOTO_COPY}' | sha1sum -c",
+        f"{ADB} push {PHOTO_COPY} {PHOTO}",
+        f"{ADB} shell 'ls -l {PHOTO} && sha1sum {PHOTO}'",
+    ]
+
+
 def setup_lines() -> list[str]:
     """The lines that copy the stage files and the photo to the phone and check them."""
     bins = " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in STAGE_FILES if f.startswith("bin/"))
@@ -156,8 +168,7 @@ def setup_lines() -> list[str]:
         # No "models/Qwen3.5" in these lines: the runner gates each line with that text as a model run.
         f"{ADB} shell 'ls -l {MODEL_DIR} | grep -E \"Qwen3.5-4B-Q8_0(-draft32k|.mmproj)?.gguf\"'",
         f"{ADB} shell 'rm -rf {PHONE} && mkdir -p {PHONE}/bin {PHONE}/lib {PHONE}/out {PHONE}/in {PHONE}/work'",
-        # run-as writes the file of the app to stdout, and the shell of adb writes it into the stage directory.
-        f"{ADB} shell 'run-as ai.airi.qwenmobile cat {APP_IMAGE} > {PHOTO} && ls -l {PHOTO} && sha1sum {PHOTO}'",
+        *photo_lines(),
         f"{ADB} push {bins} {PHONE}/bin/",
         f"{ADB} push {libs} {PHONE}/lib/",
         f"{ADB} push {LAPTOP_STAGE}/phone/SHA256SUMS {PHONE}/",
