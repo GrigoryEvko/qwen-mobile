@@ -123,7 +123,7 @@ V = {v.key: v for v in (
     Variant("ov", "test-backend-ops test -o VIT_BLOCK (the fused chains of the encoder)", tool="tbo",
             args="-o VIT_BLOCK", timing=False, embd=False),
     Variant("ov0", "test-backend-ops test -o VIT_BLOCK with the vision plans off", tool="tbo", args="-o VIT_BLOCK",
-            env=VIT_OFF, timing=False, embd=False),
+            env=VIT_OFF, timing=False, embd=False, limit=110),
     Variant("on", "test-backend-ops test -o NORM,GELU,FFN_SWIGLU", tool="tbo", args="-o NORM,GELU,FFN_SWIGLU",
             timing=False, embd=False),
     Variant("or", "test-backend-ops test -o ROPE", tool="tbo", args="-o ROPE", timing=False, embd=False),
@@ -155,6 +155,20 @@ V = {v.key: v for v in (
             env="GGML_HEXAGON_FUSE_VIT=2 GGML_HEXAGON_VIT_QKV_IO=7", timing=False, embd=False),
     Variant("ovc", "test-backend-ops test -o VIT_BLOCK, the LayerNorm op and ROPE_QKV io 0", tool="tbo",
             args="-o VIT_BLOCK", env="GGML_HEXAGON_FUSE_VIT=3 GGML_HEXAGON_VIT_QKV_IO=0", timing=False, embd=False),
+    # The landing check of candidate c: the preset plans are the LayerNorm op and ROPE_QKV io 3
+    Variant("ovd", "test-backend-ops test -o VIT_BLOCK with the preset plans (the LayerNorm op, ROPE_QKV io 3)",
+            tool="tbo", args="-o VIT_BLOCK", timing=False, embd=False, limit=110),
+    Variant("oq0", "test-backend-ops test -o VIT_BLOCK, the attention cases, ROPE_QKV io 0", tool="tbo",
+            args="-o VIT_BLOCK -p \"mode=(attn|qkv)\"", env="GGML_HEXAGON_FUSE_VIT=2 GGML_HEXAGON_VIT_QKV_IO=0",
+            timing=False, embd=False, limit=110),
+    Variant("oq7", "test-backend-ops test -o VIT_BLOCK, the attention cases, ROPE_QKV io 7", tool="tbo",
+            args="-o VIT_BLOCK -p \"mode=(attn|qkv)\"", env="GGML_HEXAGON_FUSE_VIT=2 GGML_HEXAGON_VIT_QKV_IO=7",
+            timing=False, embd=False, limit=110),
+    Variant("onx", "test-backend-ops test -o NORM,NORM_MUL_ADD,RMS_NORM,RMS_NORM_MUL_ADD,GELU,FFN_SWIGLU", tool="tbo",
+            args="-o NORM,NORM_MUL_ADD,RMS_NORM,RMS_NORM_MUL_ADD,GELU,FFN_SWIGLU", timing=False, embd=False),
+    Variant("q3s", "256 tokens, ROPE_QKV io 3 alone (the embeddings must have the bits of HEAD)", "photo", 256,
+            reps=3, env="GGML_HEXAGON_FUSE_VIT=2 GGML_HEXAGON_VIT_QKV_IO=3", timing=False),
+    Variant("u256", "the older test photo, 256 tokens, 2 encodes", "user", 256, reps=2, timing=False),
 )}
 
 
@@ -188,6 +202,16 @@ STAGES = {s.name: s for s in (
           [("b", "ov7", 1), ("b", "ovc", 1), ("b", "d7", 1), ("h", "t768", 1)] +
           [("b", k, 1) for k in ("f1", "f4", "q7", "q3", "q1", "q2", "q0", "c3", "c3s")] + [("h", "t256", 1)],
           minutes=8),
+    Stage("vit4", "the landing check of candidate c (the LayerNorm op and ROPE_QKV io 3 as the preset, no F16 "
+          "activations) against HEAD: the op tests with the error of each case for the plans off, the preset and "
+          "the paths io 0 and io 7 of ROPE_QKV, the encoder speed, the embeddings of two photos at 768 and 256 "
+          "tokens, the tensors of layer 0, the op profile and the text bench",
+          {"h": "phone-head", "c": "phone-c"},
+          [("c", "ovd", 1), ("c", "ov0", 1), ("c", "oq0", 1), ("c", "oq7", 1), ("c", "onx", 1), ("c", "or", 1)] +
+          runs_ab("hc", ["t768", "t256"], 2) + [("c", "q3s", 1)] +
+          [(s, v, 1) for v in ("u768", "u256", "d256") for s in "hc"] + [("c", "p768", 1)] +
+          runs_ab("hc", ["b"], 2),
+          tools_set="c", minutes=15),
 )}
 
 
@@ -506,8 +530,11 @@ def runner_marks(stage: Stage) -> dict[str, list[str]]:
     return marks
 
 
-# A case line: the op, its vars and the status, which the tool writes between two color codes
-TBO_CASE_RE = re.compile(r"^\s+([A-Z_0-9]+)\((.*)\): (?:\x1b\[[0-9;]*m)?(OK|FAIL|not supported)", re.M)
+# A case line: the error prints of the compared tensors (a failed tensor, or each tensor of a test that writes its
+# errors), the op, its vars and the status, which the tool writes between two color codes
+TBO_CASE_RE = re.compile(r"^((?:\[[^\]\n]*\] ERR = [0-9.e+-]+(?: > [0-9.e+-]+)? +)*)\s*([A-Z_0-9]+)\(([^\n]*)\): "
+                         r"(?:\x1b\[[0-9;]*m)?(OK|FAIL|not supported)", re.M)
+TBO_ERR_RE = re.compile(r"\[([^\]\n]*)\] ERR = ([0-9.e+-]+)")
 DUMP_RE_LINE = re.compile(r"^DUMP (\S+) nonfinite=(\d+) absmax=(\S+) rms=(\S+) hash=(\w+)", re.M)
 
 
@@ -541,14 +568,38 @@ def tbo_table(stage: Stage, results: dict[str, Result]) -> list[str]:
             out.append(f"  {name}: no files")
             continue
         cases = TBO_CASE_RE.findall(res.out)
-        cnt = Counter(c[2] for c in cases)
+        cnt = Counter(c[3] for c in cases)
         summ = TBO_SUM_RE.findall(res.out)
         mark = "" if res.ok else f"  ({', '.join(res.removed) or 'not ok'})"
         out.append(f"  {name:10s} {V[vk].text}: OK {cnt['OK']}, FAIL {cnt['FAIL']}, not supported {cnt['not supported']}"
                    f"{', summary ' + '/'.join(summ[-1]) if summ else ', no summary line'}{mark}")
-        for op, params, st in cases:
+        for errs, op, params, st in cases:
             if st == "FAIL":
-                out.append(f"      FAIL {op}({params[:150]})")
+                out.append(f"      FAIL {op}({params[:150]}) {errs.strip()}")
+    return out
+
+
+def err_table(stage: Stage, results: dict[str, Result]) -> list[str]:
+    """The error of each compared tensor of each VIT_BLOCK case (the NMSE against the phone CPU), one column for each
+    op test run. O(size of the outputs)."""
+    runs = [run_name(s, vk, r) for s, vk, r in stage.runs if V[vk].tool == "tbo" and "VIT_BLOCK" in V[vk].args]
+    cells: dict[str, dict[str, str]] = defaultdict(dict)
+    for name in runs:
+        res = results.get(name)
+        if res is None:
+            continue
+        for errs, op, params, st in TBO_CASE_RE.findall(res.out):
+            if op != "VIT_BLOCK":
+                continue
+            vals = ",".join(f"{float(e):.2e}" for _t, e in TBO_ERR_RE.findall(errs)) or "-"
+            cells[params][name] = vals + ("" if st == "OK" else f" {st}")
+    if not cells:
+        return []
+    width = max(12, *(len(v) for c in cells.values() for v in c.values()))
+    out = ["The NMSE of each VIT_BLOCK case against the phone CPU (res: the LayerNorm, the MLP and the residual output):",
+           f"  {'case':52s} " + " ".join(f"{n:>{width}s}" for n in runs)]
+    for params, row in cells.items():
+        out.append(f"  {params[:52]:52s} " + " ".join(f"{row.get(n, '')[:width]:>{width}s}" for n in runs))
     return out
 
 
@@ -612,6 +663,7 @@ def table(stage: Stage, include_all: bool) -> int:
     parts = [checks(stage, results), time_table(stage, results, include_all), hash_table(stage, results)]
     if any(V[vk].tool == "tbo" for _, vk, _ in stage.runs):
         parts.append(tbo_table(stage, results))
+        parts.append(err_table(stage, results))
     if any(V[vk].tool == "bench" for _, vk, _ in stage.runs):
         parts.append(bench_table(stage, results, include_all))
     if any("--dump -" in V[vk].args for _, vk, _ in stage.runs):
@@ -765,7 +817,35 @@ def cmp(stage: Stage) -> int:
             c_off, c_on, c_oo = compare(r_off, x, int(ne[0])), compare(r_on, x, int(ne[0])), compare(r_off, r_on, int(ne[0]))
             print(f"  {tname:16s} {'x'.join(ne):22s} {c_off['nmse']:11.3e} {c_off['rowcos_min']:10.6f} "
                   f"{c_off['maxerr_rms']:8.3f} {c_on['nmse']:11.3e} {c_oo['nmse']:13.3e}")
+    dump_pairs(stage, root, inputs)
     return 0
+
+
+def dump_pairs(stage: Stage, root: Path, inputs: dict[str, tuple[int, int, str]]) -> None:
+    """The tensors of the dump runs of one input against the tensors of the first such run of the stage: equal bits
+    or not, and the NMSE. O(size of the dump files)."""
+    groups: dict[str, list[str]] = defaultdict(list)
+    for s, vk, r in stage.runs:
+        name = run_name(s, vk, r)
+        if name in inputs and (root / f"{name}-dump").is_dir():
+            groups[inputs[name][2]].append(name)
+    for hsh, names in groups.items():
+        ref = names[0]
+        for name in names[1:]:
+            print(f"\nThe tensors of {name} against {ref} (the same input {hsh[:12]}):")
+            print(f"  {'tensor':16s} {'equal bits':>10} {'NMSE':>11}")
+            index = [ln.split() for ln in (root / f"{ref}-dump" / "index.txt").read_text().splitlines() if ln.strip()]
+            for tname, _type, *ne in index:
+                a_path, b_path = root / f"{ref}-dump" / f"{tname}.f32", root / f"{name}-dump" / f"{tname}.f32"
+                if not b_path.exists():
+                    print(f"  {tname:16s} not in {name}")
+                    continue
+                a, b = np.fromfile(a_path, dtype=np.float32), np.fromfile(b_path, dtype=np.float32)
+                if a.size != b.size:
+                    print(f"  {tname:16s} the sizes differ: {a.size}, {b.size}")
+                    continue
+                same = a.tobytes() == b.tobytes()
+                print(f"  {tname:16s} {'yes' if same else 'no':>10} {compare(a, b, int(ne[0]))['nmse']:11.3e}")
 
 
 def main() -> int:
