@@ -245,3 +245,4 @@ gdnk/0001-hexagon-stream-the-rows-of-gdn-conv-chunk-through-vtcm-with-the-dma.pa
 gdnk/0002-hexagon-version-2-of-the-chunked-gated-delta-net-kernel.patch
 gdnk/0003-hexagon-run-the-l2-norm-of-q-and-k-inside-the-gated-delta-net-ops.patch
 gdnk/0004-hexagon-fuse-the-conv-chain-of-the-verify-batch-of-a-draft-into-gdn-conv-chunk.patch
+hexagon-fa/0001-hexagon-a-flash-attention-kernel-whose-softmax-reads-the-hmx-tiles.patch

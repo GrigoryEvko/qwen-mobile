@@ -619,7 +619,7 @@ op_verdict model_rope(const dsp_ctx & ctx, const op_record & op) {
     return op_verdict();
 }
 
-// op_flash_attn_ext (flash-attn-ops.c:2365-2487) and hmx_flash_attn_ext (1771-1889)
+// op_flash_attn_ext, hmx_flash_attn_ext and hmx_flash_attn_ext_v2 (flash-attn-ops.c)
 op_verdict model_fa(const dsp_ctx & ctx, const op_record & op) {
     const tensor_ref & q = op.src[0];
     const tensor_ref & kt = op.src[1];
@@ -652,6 +652,29 @@ op_verdict model_fa(const dsp_ctx & ctx, const op_record & op) {
         hmx_fa_vtcm_layout_build(&L, k.G, q.ne[0], v.ne[0], k.Br, k.Bc, k.n_threads, k.u.hmx.pipeline != 0, k.is_q_fp32 != 0);
         if (L.total_bytes > ctx.vtcm_size) {
             return layout_too_large(L.total_bytes, ctx.vtcm_size, HTP_STATUS_VTCM_TOO_SMALL, "fa-hmx");
+        }
+        return op_verdict();
+    }
+    if (k.kernel_type == HTP_FA_KERNEL_HMX2) {
+        // hmx_flash_attn_ext_v2: the checks in their order, then the layout
+        const bool     has_mask = op.src[3].present;
+        const uint32_t DK = q.ne[0], DV = v.ne[0], nek1 = kt.ne[1];
+        if (!ctx.n_hmx) {
+            return fail(HTP_STATUS_NO_SUPPORT, "fa-hmx2: HMX off");
+        }
+        if (DK % 64 != 0 || DV % 64 != 0 || DK != DV || nek1 == 0 || (has_mask && op.src[3].ne[2] != 1)) {
+            return fail(HTP_STATUS_NO_SUPPORT, "fa-hmx2: DK %u DV %u, %u KV rows, mask heads %u", DK, DV, nek1,
+                        has_mask ? op.src[3].ne[2] : 0);
+        }
+        if (k.Br == 0 || k.Bc == 0 || k.G == 0 || k.u.hmx.g_br != hex_align_up((uint32_t) k.G * k.Br, 32) ||
+            k.n_kv_blocks != (nek1 + k.Bc - 1) / k.Bc || (uint32_t) k.G * kt.ne[2] != q.ne[2]) {
+            return fail(HTP_STATUS_INVAL_PARAMS, "fa-hmx2: Br %u Bc %u G %u g_br %u blocks %u do not agree with the shapes",
+                        k.Br, k.Bc, k.G, k.u.hmx.g_br, k.n_kv_blocks);
+        }
+        struct hmx_fa2_vtcm_layout L;
+        hmx_fa2_vtcm_layout_build(&L, k.G, DK, DV, k.Br, k.Bc, k.is_q_fp32 != 0);
+        if (L.total_bytes > ctx.vtcm_size) {
+            return layout_too_large(L.total_bytes, ctx.vtcm_size, HTP_STATUS_VTCM_TOO_SMALL, "fa-hmx2");
         }
         return op_verdict();
     }
