@@ -20,6 +20,8 @@
  *            [--turns K [--turn-first N] [--turn-message N] [--turn-answer N] [--turn-idle-ms MS] [--state-dir PATH]
  *                       [--render template|live] [--first-token early|late] [--turn-text words|random]]
  *            [--embd-warm on|off] [--draft-file auto|off] [--draft-ops] [--draft-passes call|all]
+ *            [--image-turn FILE --mmproj PATH [--image-tokens N] [--vision-dev NAME|none] [--image-depth N]
+ *             [--image-reps N]]
  *
  * With --reps N the tool decodes the prompt N times, each time into a cleared memory with the same
  * tokens, and prints one "TIME prefill" line with rep=I for each pass. The first pass also holds the
@@ -109,6 +111,12 @@
  * length of the policy: the cost of a drafter that does not stop at the draft length of the call, for an A/B
  * measurement. call (the preset) asks for the length of the policy.
  *
+ * --image-turn FILE runs --image-reps turns (preset 3) of one message with the photo FILE, as the app makes an image
+ * turn (run_image_turn): the projector of --mmproj loads on the first image on --vision-dev, the platform decoder
+ * (AImageDecoder on Android) decodes the file at the target size of --image-tokens, mtmd makes the chunks, the
+ * encoder runs, and the image tokens and the text decode after --image-depth positions of memory. Turn 2 encodes the
+ * image again, and the turns after it find it in the cache of the app. It prints one "TIME image-turn" line per turn.
+ *
  * Output lines start with a tag, thus a host script can parse them:
  *   MEM <stage> key=value ...        process memory in KiB
  *   MAP <stage> <group> rss pss      smaps totals by mapping group, in KiB
@@ -134,6 +142,7 @@
 #include "gguf.h"
 #include "llama-ext.h"
 #include "llama.h"
+#include "mtmd-helper.h"
 #include "mtmd.h"
 #include "spec_policy.h"
 #include "chat_prompt.h"
@@ -147,6 +156,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifdef __ANDROID__
+#include <android/imagedecoder.h>
+#include <dlfcn.h>
+#endif
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -157,6 +171,7 @@
 #include <fstream>
 #include <map>
 #include <tuple>
+#include <type_traits>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -1537,6 +1552,376 @@ void run_turns(AppEngine & e, const TurnOptions & o, std::mt19937 & rng) {
     fflush(stdout);
 }
 
+// ---- The image turn of the app (--image-turn) ----
+
+/** The options of the image turn mode. */
+struct ImageTurnOptions {
+    std::string path;             // the image file, the JPEG that the app stores for a message
+    std::string mmproj;           // the vision projector
+    std::string vision_dev;       // the device of the encoder, "none" for the CPU
+    int         max_tokens = 768; // the token limit of one image (the setting "Image detail")
+    int         depth      = 0;   // the positions that the memory holds before the turn
+    int         reps       = 3;   // the image turns of the process
+    int         n_threads  = 4;
+};
+
+/** A size in pixels, and the placement of the content inside a target (ImageGeometry.kt). */
+struct PixelSize {
+    int w = 0;
+    int h = 0;
+};
+struct PixelPlace {
+    int w = 0, h = 0, left = 0, top = 0;
+};
+
+/**
+ * The size that the preprocessor of mtmd selects for an image (ImageGeometry.targetSize in the app, the smart resize
+ * of Qwen3-VL): the sides rounded to 32, then floored to the pixel budget of max_tokens tokens, or raised to the budget
+ * of 8 tokens. Single precision, as the app. O(1).
+ */
+PixelSize image_target_size(int width, int height, int max_tokens) {
+    const int align = 32;
+    const int max_pixels = max_tokens * align * align;
+    const int min_pixels = 8 * align * align;
+    auto round_a = [&](float x) { return (int) std::lround(x / align) * align; };
+    auto floor_a = [&](float x) { return (int) std::floor(x / align) * align; };
+    auto ceil_a  = [&](float x) { return (int) std::ceil(x / align) * align; };
+    int w = std::max(align, round_a((float) width));
+    int h = std::max(align, round_a((float) height));
+    if (h * w > max_pixels) {
+        const float beta = std::sqrt((float) height * (float) width / (float) max_pixels);
+        h = std::max(align, floor_a((float) height / beta));
+        w = std::max(align, floor_a((float) width / beta));
+    } else if (h * w < min_pixels) {
+        const float beta = std::sqrt((float) min_pixels / ((float) height * (float) width));
+        h = ceil_a((float) height * beta);
+        w = ceil_a((float) width * beta);
+    }
+    return PixelSize{w, h};
+}
+
+/** The letterbox placement of an image inside the target (ImageGeometry.placement in the app). O(1). */
+PixelPlace image_placement(int width, int height, PixelSize target) {
+    const float scale = std::min((float) target.w / (float) width, (float) target.h / (float) height);
+    const int   w     = std::min((int) std::ceil((float) width * scale), target.w);
+    const int   h     = std::min((int) std::ceil((float) height * scale), target.h);
+    return PixelPlace{w, h, (target.w - w) / 2, (target.h - h) / 2};
+}
+
+#ifdef __ANDROID__
+/**
+ * The functions of AImageDecoder (API 30 or a subsequent version). memprobe opens libjnigraphics.so, a public library
+ * of the NDK, at run time, thus no build recipe of memprobe links it. The types come from the header, and decltype does
+ * not refer to the symbols. The library stays open until the process stops.
+ */
+struct ImageDecoderApi {
+    decltype(&AImageDecoder_createFromBuffer)       create     = nullptr;
+    decltype(&AImageDecoder_getHeaderInfo)          header     = nullptr;
+    decltype(&AImageDecoderHeaderInfo_getWidth)     width      = nullptr;
+    decltype(&AImageDecoderHeaderInfo_getHeight)    height     = nullptr;
+    decltype(&AImageDecoder_setAndroidBitmapFormat) set_format = nullptr;
+    decltype(&AImageDecoder_setTargetSize)          set_size   = nullptr;
+    decltype(&AImageDecoder_getMinimumStride)       min_stride = nullptr;
+    decltype(&AImageDecoder_decodeImage)            decode     = nullptr;
+    decltype(&AImageDecoder_delete)                 destroy    = nullptr;
+
+    /** True when each function is available. */
+    bool ok() const {
+        return create && header && width && height && set_format && set_size && min_stride && decode && destroy;
+    }
+};
+
+/** The AImageDecoder functions, loaded on the first call. A member is null when the library or its symbol is missing. */
+const ImageDecoderApi & image_decoder_api() {
+    static const ImageDecoderApi api = [] {
+        ImageDecoderApi a;
+        void * lib = dlopen("libjnigraphics.so", RTLD_NOW | RTLD_LOCAL);
+        if (lib == nullptr) {
+            fprintf(stderr, "memprobe: libjnigraphics.so did not open: %s\n", dlerror());
+            return a;
+        }
+        auto get = [lib](auto & fn, const char * name) {
+            fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(dlsym(lib, name));
+        };
+        get(a.create, "AImageDecoder_createFromBuffer");
+        get(a.header, "AImageDecoder_getHeaderInfo");
+        get(a.width, "AImageDecoderHeaderInfo_getWidth");
+        get(a.height, "AImageDecoderHeaderInfo_getHeight");
+        get(a.set_format, "AImageDecoder_setAndroidBitmapFormat");
+        get(a.set_size, "AImageDecoder_setTargetSize");
+        get(a.min_stride, "AImageDecoder_getMinimumStride");
+        get(a.decode, "AImageDecoder_decodeImage");
+        get(a.destroy, "AImageDecoder_delete");
+        if (!a.ok()) {
+            fprintf(stderr, "memprobe: libjnigraphics.so did not open with each AImageDecoder function\n");
+        }
+        return a;
+    }();
+    return api;
+}
+#endif
+
+/**
+ * The bitmap of an image for the encoder as the app makes it (ImageBytes.decodeForModel and decode_image in
+ * llama_jni.cpp): the decoder of the platform at the target size of the preprocessor, the content at the letterbox
+ * placement on black, then packed RGB. On Android the NDK decoder (AImageDecoder, the Skia codec of ImageDecoder)
+ * samples and scales the JPEG. On a host the stb decoder of mtmd reads it, which is the fallback of the app, and the
+ * preprocessor resizes it. Returns null on a failure. O(pixels).
+ */
+mtmd_bitmap * image_bitmap_for_model(mtmd_context * mctx, const std::vector<uint8_t> & bytes, int max_tokens) {
+#ifdef __ANDROID__
+    const ImageDecoderApi & api = image_decoder_api();
+    AImageDecoder * dec = nullptr;
+    if (!api.ok() || api.create(bytes.data(), bytes.size(), &dec) != ANDROID_IMAGE_DECODER_SUCCESS) {
+        return nullptr;
+    }
+    const AImageDecoderHeaderInfo * info = api.header(dec);
+    const int        ow     = api.width(info);
+    const int        oh     = api.height(info);
+    const PixelSize  target = image_target_size(ow, oh, max_tokens);
+    const PixelPlace place  = image_placement(ow, oh, target);
+    std::vector<uint8_t> rgba;
+    size_t stride = 0;
+    bool   ok     = api.set_format(dec, ANDROID_BITMAP_FORMAT_RGBA_8888) == ANDROID_IMAGE_DECODER_SUCCESS &&
+                    api.set_size(dec, place.w, place.h) == ANDROID_IMAGE_DECODER_SUCCESS;
+    if (ok) {
+        stride = api.min_stride(dec);
+        rgba.resize(stride * (size_t) place.h);
+        ok = api.decode(dec, rgba.data(), stride, rgba.size()) == ANDROID_IMAGE_DECODER_SUCCESS;
+    }
+    api.destroy(dec);
+    if (!ok) {
+        return nullptr;
+    }
+    std::vector<uint8_t> rgb((size_t) target.w * target.h * 3, 0);
+    for (int y = 0; y < place.h; ++y) {
+        const uint8_t * row = rgba.data() + (size_t) y * stride;
+        uint8_t *       out = rgb.data() + ((size_t) (place.top + y) * target.w + place.left) * 3;
+        for (int x = 0; x < place.w; ++x) {
+            out[x * 3 + 0] = row[x * 4 + 0];
+            out[x * 3 + 1] = row[x * 4 + 1];
+            out[x * 3 + 2] = row[x * 4 + 2];
+        }
+    }
+    return mtmd_bitmap_init((uint32_t) target.w, (uint32_t) target.h, rgb.data());
+#else
+    (void) max_tokens;
+    return mtmd_helper_bitmap_init_from_buf(mctx, bytes.data(), bytes.size(), false, mtmd_helper_init_opt_default()).bitmap;
+#endif
+}
+
+/**
+ * The image turns of --image-turn: a message with one photo, as chat_start_impl, tokenize_prompt, prefill and
+ * image_embd in llama_jni.cpp make it. The memory holds o.depth random tokens before each turn (a state blob restored
+ * before each turn). Each turn prints one "TIME image-turn" line with the time of each part:
+ *   vision_load_ms  the load of the projector on the first image of the engine (ensure_vision), 0 after it
+ *   sha_ms          the SHA-256 of the file, the key of the encoder cache
+ *   decode_ms       the decode of the file at the target size, and the RGB copy
+ *   tokenize_ms     the render of the message and the chunks of mtmd (the preprocessor)
+ *   pre_ms          the text before the image, encode_ms the vision encoder, image_ms the decode of the image
+ *                   tokens, post_ms the text after the image and the generation prompt with the synchronize,
+ *                   sample_ms the first sample, ttft_ms the sum from the start of the turn.
+ * Turn 1 is the first image of the engine. Turn 2 encodes the image again (the encoder without its first use). The
+ * turns after it find the image in the cache of the app: a placeholder bitmap with the known size, and the encoder
+ * output of turn 2, thus no decode and no encode. O(reps x (encoder + prefill)).
+ */
+void run_image_turn(AppEngine & e, const ImageTurnOptions & o, std::mt19937 & rng, int n_vocab) {
+    const llama_vocab * vocab = llama_model_get_vocab(e.model);
+    llama_memory_t      mem   = llama_get_memory(e.ctx);
+    std::vector<uint8_t> bytes;
+    if (!cache_io::read_file(o.path, bytes, 64u << 20) || bytes.empty()) {
+        fprintf(stderr, "memprobe: the image %s did not read\n", o.path.c_str());
+        return;
+    }
+    common_chat_templates_ptr tmpls;
+    try {
+        tmpls = common_chat_templates_init(e.model, "");
+    } catch (const std::exception & ex) {
+        fprintf(stderr, "memprobe: the chat template of the model did not parse: %s\n", ex.what());
+        return;
+    }
+    ChatPrompt prompt(tmpls.get(), vocab, HistoryForm::kLive);
+    // The memory before the turn.
+    std::vector<uint8_t> state;
+    if (o.depth > 0) {
+        std::uniform_int_distribution<int> pick(0, n_vocab - 1);
+        std::vector<llama_token> fill((size_t) o.depth);
+        for (auto & tok : fill) {
+            tok = pick(rng);
+        }
+        DecodeTimes tf;
+        llama_memory_clear(mem, true);
+        app_clear_draft(e);
+        const int rc = app_decode(e, fill.data(), o.depth, 0, false, tf);
+        app_sync(e, tf);
+        state.resize(llama_state_seq_get_size(e.ctx, 0));
+        const size_t got = rc == 0 ? llama_state_seq_get_data(e.ctx, state.data(), state.size(), 0) : 0;
+        state.resize(got);
+        if (got == 0) {
+            fprintf(stderr, "memprobe: the memory of depth %d did not form\n", o.depth);
+            return;
+        }
+    }
+    mtmd_context *     mctx = nullptr;
+    std::vector<float> cached;  // the encoder output of turn 2, for the turns that find the image in the cache
+    uint32_t           known_nx = 0, known_ny = 0;
+    const uint32_t     n_embd = (uint32_t) llama_model_n_embd_inp(e.model);
+    for (int rep = 1; rep <= o.reps; ++rep) {
+        if (o.depth > 0) {
+            app_restore(e.ctx, state.data(), state.size());
+        } else {
+            llama_memory_clear(mem, true);
+        }
+        app_clear_draft(e);
+        const bool is_cached = rep >= 3 && !cached.empty();
+        stamp("image-turn-begin rep=%d", rep);
+        const int64_t t_start = now_us();
+        // ensure_vision: the projector loads on the first image of the engine, on the device of the encoder.
+        double vision_ms = 0.0;
+        if (mctx == nullptr) {
+            mtmd_context_params mp = mtmd_context_params_default();
+            ggml_backend_dev_t  dev = o.vision_dev == "none" ? nullptr : ggml_backend_dev_by_name(o.vision_dev.c_str());
+            mp.use_gpu          = dev != nullptr;
+            mp.device           = dev;
+            mp.n_threads        = o.n_threads;
+            mp.print_timings    = false;
+            mp.warmup           = false;
+            mp.image_max_tokens = o.max_tokens;
+            mctx = mtmd_init_from_file(o.mmproj.c_str(), e.model, mp);
+            vision_ms = (now_us() - t_start) / 1000.0;
+            if (mctx == nullptr) {
+                fprintf(stderr, "memprobe: the projector %s did not load\n", o.mmproj.c_str());
+                return;
+            }
+        }
+        // tokenize_prompt: the key of the image, its bitmap, the render of the message and the chunks.
+        const int64_t     t_sha = now_us();
+        const std::string id    = cache_io::sha256_hex(bytes.data(), bytes.size());
+        const int64_t     t_dec = now_us();
+        mtmd_bitmap *     bmp   = is_cached ? mtmd_bitmap_init(known_nx, known_ny, nullptr)
+                                            : image_bitmap_for_model(mctx, bytes, o.max_tokens);
+        const int64_t     t_tok = now_us();
+        if (bmp == nullptr) {
+            fprintf(stderr, "memprobe: the image did not decode\n");
+            mtmd_free(mctx);
+            return;
+        }
+        known_nx = mtmd_bitmap_get_nx(bmp);
+        known_ny = mtmd_bitmap_get_ny(bmp);
+        mtmd_bitmap_set_id(bmp, id.c_str());
+        std::string text;
+        const std::vector<PromptMessage> msgs = {
+            PromptMessage{"user", std::string(mtmd_default_marker()) + "\nWhat is in the picture? Answer in one sentence.", id}};
+        prompt.render_live(msgs, text);
+        mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+        mtmd_input_text     in     = {text.c_str(), text.size(), true, true};
+        const mtmd_bitmap * bmps[1] = {bmp};
+        const int32_t       tk      = mtmd_tokenize(mctx, chunks, &in, bmps, 1);
+        const int64_t       t_pre   = now_us();
+        if (tk != 0) {
+            fprintf(stderr, "memprobe: mtmd_tokenize gave %d\n", tk);
+            mtmd_input_chunks_free(chunks);
+            mtmd_bitmap_free(bmp);
+            mtmd_free(mctx);
+            return;
+        }
+        // prefill (decode_items): the text runs in batches, the image through its encoder output.
+        llama_pos   pos = o.depth;
+        DecodeTimes t;
+        double      pre_ms = 0.0, encode_ms = 0.0, image_ms = 0.0;
+        size_t      pre_tokens = 0, post_tokens = 0, image_tokens = 0;
+        bool        after_image = false;
+        int         rc = 0;
+        std::vector<llama_token> run;
+        const size_t n_chunks = mtmd_input_chunks_size(chunks);
+        int64_t      t_post   = now_us();
+        for (size_t c = 0; c < n_chunks && rc == 0; ++c) {
+            const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, c);
+            if (mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+                size_t n = 0;
+                const llama_token * toks = mtmd_input_chunk_get_tokens_text(chunk, &n);
+                run.insert(run.end(), toks, toks + n);
+                continue;
+            }
+            // The text before the image, without logits.
+            const int64_t t0 = now_us();
+            if (!run.empty()) {
+                rc = app_decode(e, run.data(), (int) run.size(), pos, false, t);
+                pos += (llama_pos) run.size();
+                pre_tokens += run.size();
+                run.clear();
+            }
+            pre_ms += (now_us() - t0) / 1000.0;
+            // image_embd: the cache of the app, or one run of the encoder.
+            const uint32_t n_img = (uint32_t) mtmd_input_chunk_get_n_tokens(chunk);
+            const float *  embd  = nullptr;
+            if (is_cached && cached.size() == (size_t) n_img * n_embd) {
+                embd = cached.data();
+            } else {
+                stamp("image-encode-begin rep=%d", rep);
+                const int64_t te = now_us();
+                rc = mtmd_encode_chunk(mctx, chunk);
+                encode_ms += (now_us() - te) / 1000.0;
+                stamp("image-encode-end rep=%d", rep);
+                embd = mtmd_get_output_embd(mctx);
+                if (rep == 2) {
+                    cached.assign(embd, embd + (size_t) n_img * n_embd);
+                }
+            }
+            if (rc != 0) {
+                break;
+            }
+            stamp("image-decode-begin rep=%d tokens=%u", rep, n_img);
+            const int64_t ti      = now_us();
+            llama_pos     new_pos = pos;
+            rc = mtmd_helper_decode_image_chunk(mctx, e.ctx, chunk, const_cast<float *>(embd), pos, 0, e.n_batch, &new_pos,
+                                                nullptr, nullptr);
+            image_ms += (now_us() - ti) / 1000.0;
+            stamp("image-decode-end rep=%d", rep);
+            pos = new_pos;
+            image_tokens += n_img;
+            after_image = true;
+            t_post = now_us();
+        }
+        // The text after the image and the generation prompt, with the logits of the last token.
+        if (rc == 0 && !run.empty()) {
+            (after_image ? post_tokens : pre_tokens) += run.size();
+            rc = app_decode(e, run.data(), (int) run.size(), pos, true, t);
+            pos += (llama_pos) run.size();
+        }
+        if (rc == 0) {
+            app_sync(e, t);
+        }
+        const int64_t t_sample = now_us();
+        const double  post_ms  = (t_sample - t_post) / 1000.0;
+        llama_token   first    = LLAMA_TOKEN_NULL;
+        if (rc == 0) {
+            llama_sampler * smpl = app_sampler(e.model);
+            first = llama_sampler_sample(smpl, e.ctx, -1);
+            llama_sampler_free(smpl);
+        }
+        const int64_t t_end = now_us();
+        stamp("image-turn-end rep=%d", rep);
+        printf("TIME image-turn rep=%d cached=%d depth=%d nx=%u ny=%u vision_load_ms=%.1f sha_ms=%.1f decode_ms=%.1f "
+               "tokenize_ms=%.1f pre_tokens=%zu pre_ms=%.1f encode_ms=%.1f image_tokens=%zu image_ms=%.1f "
+               "post_tokens=%zu post_ms=%.1f sample_ms=%.1f ttft_ms=%.1f first=%d rc=%d\n",
+               rep, is_cached ? 1 : 0, o.depth, known_nx, known_ny, vision_ms, (t_dec - t_sha) / 1000.0,
+               (t_tok - t_dec) / 1000.0, (t_pre - t_tok) / 1000.0, pre_tokens, pre_ms, encode_ms, image_tokens, image_ms,
+               post_tokens, post_ms, (t_end - t_sample) / 1000.0, (t_end - t_start) / 1000.0, first, rc);
+        fflush(stdout);
+        mtmd_input_chunks_free(chunks);
+        mtmd_bitmap_free(bmp);
+        if (rc != 0) {
+            break;
+        }
+    }
+    if (mctx != nullptr) {
+        mtmd_free(mctx);
+    }
+    llama_memory_clear(mem, true);
+    app_clear_draft(e);
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -1548,6 +1933,8 @@ int main(int argc, char ** argv) {
     bool drop_cache = false, no_mmap = false, draft_ops = false, draft_all = false;
     std::string mmproj, vision_dev = "HTP0", embd_advise = "none", lazy = "auto", embd_warm = "off", draft_file = "auto";
     int image_w = 0, image_h = 0, image_tokens = 576;
+    std::string image_turn;
+    int image_depth = 0, image_reps = 3;
     // The options of --reps, of the log and of the app modes.
     bool log_ts = false, therm = false;
     int rest_ms = 0, cold = 0, sweep_calls = 4;
@@ -1576,6 +1963,9 @@ int main(int argc, char ** argv) {
         else if (a == "--mmproj") mmproj = next();
         else if (a == "--image") { const std::string v = next(); image_w = std::atoi(v.c_str()); image_h = std::atoi(v.c_str() + v.find('x') + 1); }
         else if (a == "--image-tokens") image_tokens = std::atoi(next().c_str());
+        else if (a == "--image-turn") image_turn = next();
+        else if (a == "--image-depth") image_depth = std::atoi(next().c_str());
+        else if (a == "--image-reps") image_reps = std::atoi(next().c_str());
         else if (a == "--vision-dev") vision_dev = next();
         else if (a == "--vision-warmup") vision_warmup = true;
         else if (a == "--grow") grow = true;
@@ -1640,9 +2030,15 @@ int main(int argc, char ** argv) {
     }
     const std::vector<int> sizes  = sweep_sizes.empty() ? std::vector<int>() : parse_int_list(sweep_sizes, "--sweep", 1);
     const std::vector<int> depths = parse_int_list(sweep_depths, "--sweep-depths", 0);
-    const bool app_mode = cold > 0 || !sizes.empty() || turn_opts.turns > 0;
-    if (app_mode && (n_prompt > 0 || n_gen > 0 || grow || !mmproj.empty())) {
-        fprintf(stderr, "--cold, --sweep and --turns do not go with -p, -n, --grow or --mmproj\n");
+    const bool app_mode = cold > 0 || !sizes.empty() || turn_opts.turns > 0 || !image_turn.empty();
+    if (app_mode && (n_prompt > 0 || n_gen > 0 || grow || (!mmproj.empty() && image_turn.empty()))) {
+        fprintf(stderr, "--cold, --sweep, --turns and --image-turn do not go with -p, -n or --grow, and --mmproj goes "
+                        "only with --image-turn in them\n");
+        return 2;
+    }
+    if (!image_turn.empty() && (mmproj.empty() || image_depth < 0 || image_reps < 1 || image_depth + 2048 > n_ctx)) {
+        fprintf(stderr, "--image-turn needs --mmproj, an --image-depth of 0 or more that leaves 2048 positions of -c, "
+                        "and --image-reps of 1 or more\n");
         return 2;
     }
     if (!sizes.empty() &&
@@ -1841,6 +2237,17 @@ int main(int argc, char ** argv) {
         if (cold > 0) run_cold(app, pool, cold);
         if (!sizes.empty()) run_sweep(app, pool, depths, sizes, sweep_calls, sweep_logits == "last", therm, rng, n_vocab);
         if (turn_opts.turns > 0) run_turns(app, turn_opts, rng);
+        if (!image_turn.empty()) {
+            ImageTurnOptions io;
+            io.path       = image_turn;
+            io.mmproj     = mmproj;
+            io.vision_dev = vision_dev;
+            io.max_tokens = image_tokens;
+            io.depth      = image_depth;
+            io.reps       = image_reps;
+            io.n_threads  = n_threads;
+            run_image_turn(app, io, rng, n_vocab);
+        }
         print_memory("app", model_path, smaps);
         if (draft_ops) {
             print_draft_ops();
@@ -1996,7 +2403,7 @@ int main(int argc, char ** argv) {
     }
 
     // The vision projector of ensure_vision and one image encode of image_embd in llama_jni.cpp.
-    if (!mmproj.empty()) {
+    if (!mmproj.empty() && image_turn.empty()) {
         ggml_backend_dev_t vdev = vision_dev == "none" ? nullptr : ggml_backend_dev_by_name(vision_dev.c_str());
         mtmd_context_params vp = mtmd_context_params_default();
         vp.use_gpu          = vdev != nullptr;
