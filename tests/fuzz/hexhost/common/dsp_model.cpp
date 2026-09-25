@@ -671,8 +671,12 @@ op_verdict model_fa(const dsp_ctx & ctx, const op_record & op) {
             return fail(HTP_STATUS_INVAL_PARAMS, "fa-hmx2: Br %u Bc %u G %u g_br %u blocks %u do not agree with the shapes",
                         k.Br, k.Bc, k.G, k.u.hmx.g_br, k.n_kv_blocks);
         }
+        const bool spans = k.u.hmx.spans != 0;
+        if (spans && q.ne[1] > k.Br) {
+            return fail(HTP_STATUS_INVAL_PARAMS, "fa-hmx2: spans with %u queries and Br %u", q.ne[1], k.Br);
+        }
         struct hmx_fa2_vtcm_layout L;
-        hmx_fa2_vtcm_layout_build(&L, k.G, DK, DV, k.Br, k.Bc, k.is_q_fp32 != 0);
+        hmx_fa2_vtcm_layout_build(&L, k.G, DK, DV, k.Br, k.Bc, k.n_threads, spans, k.is_q_fp32 != 0);
         if (L.total_bytes > ctx.vtcm_size) {
             return layout_too_large(L.total_bytes, ctx.vtcm_size, HTP_STATUS_VTCM_TOO_SMALL, "fa-hmx2");
         }
