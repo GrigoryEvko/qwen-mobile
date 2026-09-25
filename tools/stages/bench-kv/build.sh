@@ -14,7 +14,7 @@
 #      tree into build/bench-kv/android with the preset, the compiler flags (with -flto) and the
 #      build number and commit of scripts/build-native.sh. It builds the libraries of the app
 #      (LLAMA_LIBS of scripts/lib.sh), the DSP library v79 and llama-bench. The NDK clang++
-#      compiles tools/memprobe/memprobe.cpp with the three app sources that it calls, as
+#      compiles tools/memprobe/memprobe.cpp with the app sources that it calls, as
 #      tools/memprobe/build-phone.sh does.
 #   3. The script copies the files of the stage into build/bench-kv/phone, writes SHA256SUMS, and
 #      compares each library with build/hashes-native.txt (the libraries of the APK of 56ec1eb).
@@ -78,7 +78,8 @@ cmake --build "$BDIR" -j"$JOBS" --target $TARGETS
 cxx=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang++
 $cxx -O2 -std=c++17 $FLAGS_EXTRA -I"$TREE/include" -I"$TREE/common" -I"$TREE/src" -I"$TREE/ggml/include" \
     -I"$TREE/vendor" -I"$TREE/tools/mtmd" -I"$APP_SRC" tools/memprobe/memprobe.cpp "$APP_SRC/state_cache.cpp" \
-    "$APP_SRC/cache_io.cpp" "$APP_SRC/spec_policy.cpp" -o "$BDIR/bin/memprobe" \
+    "$APP_SRC/cache_io.cpp" "$APP_SRC/spec_policy.cpp" "$APP_SRC/chat_prompt.cpp" "$APP_SRC/engine_tasks.cpp" \
+    -o "$BDIR/bin/memprobe" \
     -L"$BDIR/bin" -lmtmd -lllama-common -lllama -lggml -lggml-cpu -lggml-base -Wl,-rpath,"\$ORIGIN/../lib"
 '
 ) 9> build/.container.lock > "$stage/build.log" 2>&1 || die "the build failed, refer to $stage/build.log"

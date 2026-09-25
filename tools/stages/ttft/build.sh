@@ -39,18 +39,27 @@ readonly patch=${TTFT_PATCH:-$stage/patch/0001-common-the-mtp-drafter-stops-at-t
 readonly repro="-ffile-prefix-map=/workspace=. -fdebug-prefix-map=/workspace=. -Werror=date-time"
 readonly mode=${1:-phone}
 
-# Make the tree of HEAD and add the patch when the series does not hold it.
+# git apply in the tree. The tree is in the work tree of this repository, and inside a repository git apply
+# takes the paths of the patch from the root of the repository and skips each file of the tree with no error.
+# The ceiling stops the search for a repository above the tree, thus the paths are relative to the tree.
+tree_apply() {
+    (cd "$tree" && GIT_CEILING_DIRECTORIES="$(cd .. && pwd)" git apply "$@")
+}
+
+# Make the tree of HEAD and add the patch when the series does not hold it. Then make sure that the tree holds
+# the patch.
 make_tree() {
     tests/sanitizers/llama-copy.sh "$tree"
     [[ -f $patch ]] || die "the patch $patch does not exist (TTFT_PATCH)"
-    if (cd "$tree" && git apply --check "$REPO_ROOT/$patch" 2> /dev/null); then
-        (cd "$tree" && git apply "$REPO_ROOT/$patch")
+    if tree_apply --check "$REPO_ROOT/$patch" 2> /dev/null; then
+        tree_apply "$REPO_ROOT/$patch"
         echo "ttft: $tree has the series of HEAD and $patch"
-    elif (cd "$tree" && git apply --reverse --check "$REPO_ROOT/$patch" 2> /dev/null); then
+    elif tree_apply --reverse --check "$REPO_ROOT/$patch" 2> /dev/null; then
         echo "ttft: the series of HEAD holds $patch"
     else
         die "$patch does not apply to the series of HEAD"
     fi
+    tree_apply --reverse --check "$REPO_ROOT/$patch" 2> /dev/null || die "$tree does not hold $patch after the apply"
     cp -f android/snapdragon/CMakeUserPresets.json "$tree/CMakeUserPresets.json"
 }
 

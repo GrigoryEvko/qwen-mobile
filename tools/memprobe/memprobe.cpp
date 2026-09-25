@@ -17,7 +17,9 @@
  *            [--grow] [--mmap | --no-mmap] [--embd-advise none|random|willneed|touch] [--lazy off|auto|on]
  *            [--hash] [--drop-cache] [--reps N [--rest-ms MS]] [--log-ts] [--therm]
  *            [--cold N] [--sweep N1,N2,.. [--sweep-depths D1,D2,..] [--sweep-calls C] [--sweep-logits last|none]]
- *            [--turns K [--turn-first N] [--turn-message N] [--turn-answer N] [--turn-idle-ms MS] [--state-dir PATH]]
+ *            [--turns K [--turn-first N] [--turn-message N] [--turn-answer N] [--turn-idle-ms MS] [--state-dir PATH]
+ *                       [--render template|live] [--first-token early|late] [--turn-text words|random]]
+ *            [--embd-warm on|off] [--draft-file auto|off] [--draft-ops] [--draft-passes call|all]
  *
  * With --reps N the tool decodes the prompt N times, each time into a cleared memory with the same
  * tokens, and prints one "TIME prefill" line with rep=I for each pass. The first pass also holds the
@@ -86,7 +88,26 @@
  * --turn-first tokens (preset 500), each later message --turn-message tokens (preset 40), and an answer
  * stops at the end token or after --turn-answer tokens (preset 32). The answer text goes into the
  * history of the next turn. --turn-idle-ms waits before each turn, outside the times, as a user who reads
- * and writes. The dist sampler has a fixed seed, thus two rounds give the same answers.
+ * and writes. The dist sampler has a fixed seed, thus two rounds give the same answers. --turn-text random
+ * makes each message from random normal tokens of the vocabulary and not from about 40 filler words, thus a
+ * message reads a new embedding row for almost each token.
+ *
+ * --render selects the form of the history (chat_prompt.h, the preset is live, as the app): live continues
+ * the memory after a complete answer and copies the state after the answer on a background thread, template
+ * renders the whole conversation and restores the snapshot before the last generation prompt.
+ * --first-token early (the preset, as the app) gives each token to the caller before its decode. late
+ * decodes it first and then gives it, for an A/B measurement.
+ *
+ * --embd-warm on reads the token embedding of the file into the page cache on a background thread after the load
+ * (POSIX_FADV_WILLNEED on its byte range). The app does not do it: on the phone the first message of 512 random
+ * tokens after a cold load was only 8 to 13 ms faster with it. off is the preset.
+ * --draft-file auto (the preset) loads "<stem>-draft32k.gguf" next to the file with --spec, as the app
+ * does. The line "MODEL <path>" gives the file that loaded. --draft-ops counts the matrix products of the MTP
+ * draft graph by weight and prints "DRAFTOP weight=<name> rows=<n> inputs=<m> count=<calls>" at the end of the app modes, thus
+ * a run shows which head a draft pass reads. inputs is the number of activation rows of the product. It is a check, not
+ * a timing run. --draft-passes all asks the MTP drafter for SpecPolicy::kDraftMax tokens at each step and keeps the
+ * length of the policy: the cost of a drafter that does not stop at the draft length of the call, for an A/B
+ * measurement. call (the preset) asks for the length of the policy.
  *
  * Output lines start with a tag, thus a host script can parse them:
  *   MEM <stage> key=value ...        process memory in KiB
@@ -101,8 +122,8 @@
  *   TIME cold|sweep|sweep-fill|turn|turn-store key=value ...   the app modes, times in ms
  *   (stderr) memprobe: STAMP <event> key=value ...           with --log-ts, the steps of the app modes and of --reps
  *
- * The app modes compile the sources of the app that have no llama.cpp and no Android dependency
- * (state_cache.cpp, cache_io.cpp and spec_policy.cpp in android/app/src/main/cpp).
+ * The app modes compile the sources of the app that have no Android dependency (state_cache.cpp,
+ * cache_io.cpp, spec_policy.cpp, chat_prompt.cpp and engine_tasks.cpp in android/app/src/main/cpp).
  */
 
 #include "chat.h"
@@ -110,10 +131,13 @@
 #include "fit.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "gguf.h"
 #include "llama-ext.h"
 #include "llama.h"
 #include "mtmd.h"
 #include "spec_policy.h"
+#include "chat_prompt.h"
+#include "engine_tasks.h"
 #include "speculative.h"
 #include "state_cache.h"
 
@@ -124,6 +148,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -131,6 +156,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <tuple>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -342,6 +368,47 @@ void advise_model_mappings(const std::string & model_path, const std::string & m
     fflush(stdout);
 }
 
+/**
+ * Tell the kernel to read the bytes of token_embd.weight of a GGUF file into the page cache (POSIX_FADV_WILLNEED,
+ * the read-ahead of madvise(MADV_WILLNEED) on a mapping of that range), for --embd-warm. The pages stay file pages
+ * that the kernel can reclaim. Prints "TIME embd-warm" when the reads are in the queue of the kernel: the time of
+ * the header read and of the call, and the time since t_load. O(header of the file).
+ */
+void warm_token_embedding(const std::string & model_path, double t_load) {
+    const double t0 = now_ms();
+    uint64_t     offset = 0, size = 0;
+    std::string  error;
+    gguf_init_params params;
+    params.no_alloc = true;
+    params.ctx      = nullptr;
+    gguf_context * g = gguf_init_from_file(model_path.c_str(), params);
+    const int64_t id = g != nullptr ? gguf_find_tensor(g, "token_embd.weight") : -1;
+    if (g == nullptr) {
+        error = "the GGUF header did not read";
+    } else if (id < 0) {
+        error = "the file has no token_embd.weight";
+    } else {
+        offset = (uint64_t) gguf_get_data_offset(g) + (uint64_t) gguf_get_tensor_offset(g, id);
+        size   = (uint64_t) gguf_get_tensor_size(g, id);
+    }
+    if (g != nullptr) {
+        gguf_free(g);
+    }
+    if (error.empty()) {
+        const int fd = open(model_path.c_str(), O_RDONLY | O_CLOEXEC);
+        const int rc = fd >= 0 ? posix_fadvise(fd, (off_t) offset, (off_t) size, POSIX_FADV_WILLNEED) : -1;
+        if (fd >= 0) {
+            close(fd);
+        }
+        if (rc != 0) {
+            error = "posix_fadvise(WILLNEED) failed with code " + std::to_string(rc);
+        }
+    }
+    printf("TIME embd-warm ms=%.1f since_load_ms=%.1f mib=%.2f ok=%d error=\"%s\"\n", now_ms() - t0, now_ms() - t_load,
+           size / 1048576.0, error.empty() ? 1 : 0, error.c_str());
+    fflush(stdout);
+}
+
 void stamp(const char * fmt, ...) __attribute__((format(printf, 1, 2)));
 
 /** Decode tokens in batches of n_batch into sequence 0 from pos0. Logits only for the last token. */
@@ -473,6 +540,34 @@ void print_therm(const std::string & label) {
     fflush(stdout);
 }
 
+/** The matrix products of the draft graph by weight name and row count (--draft-ops), and their lock. */
+std::mutex                              g_draft_ops_mutex;
+std::map<std::tuple<std::string, int64_t, int64_t>, long> g_draft_ops;
+
+/**
+ * The graph callback of the draft context with --draft-ops: it counts each MUL_MAT of the MTP graph that
+ * reads a weight (the MTP block, the head, the reduced draft head) by the name and the rows of the weight.
+ * It asks for no tensor data, thus the scheduler splits no graph. O(1) for each node.
+ */
+bool draft_ops_cb(ggml_tensor * t, bool ask, void * /*user_data*/) {
+    if (ask && t->op == GGML_OP_MUL_MAT && t->src[0] != nullptr && t->src[0]->name[0] != '\0') {
+        std::lock_guard<std::mutex> lock(g_draft_ops_mutex);
+        const int64_t cols = t->src[1] != nullptr ? t->src[1]->ne[1] : -1;
+        g_draft_ops[{ t->src[0]->name, t->src[0]->ne[1], cols }] += 1;
+    }
+    return false;
+}
+
+/** Print one line "DRAFTOP" for each weight that a matrix product of the draft graph read. */
+void print_draft_ops() {
+    std::lock_guard<std::mutex> lock(g_draft_ops_mutex);
+    for (const auto & [key, count] : g_draft_ops) {
+        printf("DRAFTOP weight=%s rows=%lld inputs=%lld count=%ld\n", std::get<0>(key).c_str(), (long long) std::get<1>(key),
+               (long long) std::get<2>(key), count);
+    }
+    fflush(stdout);
+}
+
 /** The values of a comma-separated list of integers from min_value to 1000000. Exits with a message on a bad list. O(length). */
 std::vector<int> parse_int_list(const std::string & text, const char * option, int min_value) {
     std::vector<int> out;
@@ -508,6 +603,7 @@ struct AppEngine {
     common_speculative * spec    = nullptr;  // null without --spec, or after a failure of the draft context
     llama_batch *        batch   = nullptr;
     int                  n_batch = 0;
+    bool                 draft_all = false;  // --draft-passes all: each draft asks for kDraftMax tokens
 };
 
 /** The wall times of the parts of one prompt decode or of the steps of one answer, in milliseconds. */
@@ -723,8 +819,11 @@ struct TurnOptions {
     int         message = 40;   // the tokens of each later message
     int         answer  = 32;   // the most tokens of an answer
     int         idle_ms = 0;    // the wait before each turn, outside the times
+    bool        random_text = false;  // the messages from random tokens of the vocabulary (--turn-text random)
     bool        therm   = false;
     std::string state_dir;      // the disk tier of the snapshot store, or empty for none
+    HistoryForm form  = HistoryForm::kLive;  // the history form of the app (--render)
+    bool        early = true;                // the first token before its decode (--first-token early)
 };
 
 /** The words of the filler text of the chat messages. */
@@ -738,14 +837,27 @@ const char * const kFillerWords[] = {
 /**
  * A message of about n_tokens tokens: filler words from the random generator, cut to the tokens that the
  * question at its end leaves, then the question. In the template the tokens at the joints can differ by
- * one or two. O(n_tokens).
+ * one or two. With random_tokens the text is the text of random normal tokens of the vocabulary, thus its
+ * tokens are almost all different (the filler words give about 60 different tokens). O(n_tokens).
  */
-std::string message_text(const llama_vocab * vocab, int n_tokens, const std::string & question, std::mt19937 & rng) {
+std::string message_text(const llama_vocab * vocab, int n_tokens, const std::string & question, std::mt19937 & rng,
+                         bool random_tokens) {
     const int n_question = (int) common_tokenize(vocab, question, false, false).size();
     const int n_filler   = std::max(1, n_tokens - n_question);
     std::uniform_int_distribution<size_t> pick(0, sizeof(kFillerWords) / sizeof(kFillerWords[0]) - 1);
     std::string              text;
     std::vector<llama_token> toks;
+    if (random_tokens) {
+        // Normal tokens of the whole vocabulary: a text with almost one new embedding row for each token.
+        std::uniform_int_distribution<llama_token> pick_token(0, llama_vocab_n_tokens(vocab) - 1);
+        while ((int) toks.size() < n_filler) {
+            const llama_token t = pick_token(rng);
+            if (llama_vocab_get_attr(vocab, t) == LLAMA_TOKEN_ATTR_NORMAL) {
+                toks.push_back(t);
+            }
+        }
+        return common_detokenize(vocab, toks, false) + question;
+    }
     while ((int) toks.size() < n_filler) {
         for (int i = 0; i < n_filler; ++i) {
             if (!text.empty()) {
@@ -815,6 +927,10 @@ struct AppChat {
     int64_t                  accepted       = 0;
     int64_t                  t_first_sample = 0;  // the time of the first sample of the answer, 0 before it
     DecodeTimes              steps;               // the decodes, follows and drafts of the answer
+    std::string              answer_text;         // the pieces of the tokens that the caller received
+    bool                     tagged = false;      // true when a thinking tag was one of those tokens
+    /** The lock of the engine (Engine::mutex): a turn and the snapshot task after an answer take it. */
+    std::mutex               mutex;
 
     AppChat() = default;
     AppChat(const AppChat &)             = delete;
@@ -857,16 +973,22 @@ llama_token app_sample(AppChat & c, llama_context * ctx, int32_t idx) {
     return id;
 }
 
-/** One step of the answer without a draft (plain_step in llama_jni.cpp). Returns false on a decode error. */
-bool app_plain_step(AppEngine & e, AppChat & c) {
+/**
+ * One step of the answer without a draft (plain_step in llama_jni.cpp). With early, the sampled token goes to the
+ * caller before its decode, and the next step decodes it. Without it, the step decodes the token before it returns,
+ * for an A/B measurement. decoded tells if the step decoded a token. Returns false on a decode error.
+ */
+bool app_plain_step(AppEngine & e, AppChat & c, bool early, bool & decoded) {
     const llama_vocab * vocab = llama_model_get_vocab(e.model);
-    // The drafts stopped in a step that gave its last token to the caller: that token decodes first.
+    decoded                   = false;
+    // The token of the last step went to the caller, and the memory does not hold it: it decodes first.
     if (c.id_last != LLAMA_TOKEN_NULL) {
         const llama_token pending = c.id_last;
         c.id_last                 = LLAMA_TOKEN_NULL;
         if (app_decode_one(e, c, pending) != 0) {
             return false;
         }
+        decoded = true;
     }
     const llama_token token = app_sample(c, e.ctx, -1);
     if (llama_vocab_is_eog(vocab, token)) {
@@ -874,33 +996,48 @@ bool app_plain_step(AppEngine & e, AppChat & c) {
         c.answer_ends = true;
         return true;
     }
-    if (app_decode_one(e, c, token) != 0) {
-        return false;
-    }
     c.out_queue.push_back(token);
-    c.policy.record(0, 0, 1);
+    if (early) {
+        c.id_last = token;
+    } else {
+        if (app_decode_one(e, c, token) != 0) {
+            return false;
+        }
+        decoded = true;
+    }
+    if (decoded) {
+        c.policy.record(0, 0, 1);
+    }
     return true;
 }
 
 /**
  * One step of the answer with a draft (spec_step in llama_jni.cpp): the MTP block drafts the length that
  * the policy selects, one decode verifies the draft, the sampler accepts the drafted tokens that it
- * selects itself, and the rejected positions roll back. Returns false on a decode or rollback error.
+ * selects itself, and the rejected positions roll back. With early, the first call of an answer only samples
+ * the first token (sampled_only), and its draft and verify run in the next call. Returns false on a decode or
+ * rollback error.
  */
-bool app_spec_step(AppEngine & e, AppChat & c) {
+bool app_spec_step(AppEngine & e, AppChat & c, bool early, bool & sampled_only) {
     const llama_vocab * vocab   = llama_model_get_vocab(e.model);
     llama_memory_t      mem     = llama_get_memory(e.ctx);
     llama_memory_t      mem_dft = llama_get_memory(e.ctx_dft);
+    sampled_only                = false;
 
     if (c.id_last == LLAMA_TOKEN_NULL) {
         const llama_token first = app_sample(c, e.ctx, -1);
         if (llama_vocab_is_eog(vocab, first)) {
             app_decode_one(e, c, first);
             c.answer_ends = true;
+            sampled_only  = early;
             return true;
         }
         c.out_queue.push_back(first);
         c.id_last = first;
+        if (early) {
+            sampled_only = true;
+            return true;
+        }
     }
 
     const llama_pos pos0    = c.n_past;
@@ -910,18 +1047,25 @@ bool app_spec_step(AppEngine & e, AppChat & c) {
     if (n_draft > 0) {
         stamp("draft-begin n=%d", n_draft);
         const int64_t t0 = now_us();
+        // With --draft-passes all the driver drafts kDraftMax tokens and the step keeps n_draft of them: the cost
+        // of a drafter that does not stop at the length of the call, on libraries with a drafter that stops.
         common_speculative_get_draft_params(e.spec, 0) = {
             /* .drafting = */ true,
-            /* .n_max    = */ n_draft,
+            /* .n_max    = */ e.draft_all ? SpecPolicy::kDraftMax : n_draft,
             /* .pos0     = */ pos0,
             /* .id_last  = */ c.id_last,
             /* .prompt   = */ &c.spec_prompt,
             /* .result   = */ &c.draft,
         };
         common_speculative_draft(e.spec);
+        if (c.draft.size() > (size_t) n_draft) {
+            c.draft.resize((size_t) n_draft);
+        }
+        // The passes of the MTP block: one cell of the draft context for each pass, before the rollback.
+        const llama_pos dmax = llama_memory_seq_pos_max(mem_dft, 0);
         llama_memory_seq_rm(mem_dft, 0, pos0, -1);
         c.steps.draft += (now_us() - t0) / 1000.0;
-        stamp("draft-end got=%zu", c.draft.size());
+        stamp("draft-end got=%zu passes=%d", c.draft.size(), dmax >= pos0 ? (int) (dmax - pos0 + 1) : 0);
     }
 
     llama_batch & b = *e.batch;
@@ -1009,17 +1153,64 @@ bool app_spec_step(AppEngine & e, AppChat & c) {
     return true;
 }
 
+/**
+ * The snapshot after an answer of the live form (schedule_answer_snapshot in llama_jni.cpp): a task on the
+ * background thread copies the state into the store under the lock of the engine, unless the memory changed
+ * before it runs. Prints "TIME answer-snapshot". O(items) here, and the copy of the state on the thread.
+ */
+void app_schedule_snapshot(AppEngine & e, AppChat & c, StateCache & states, TaskThread & worker, int k) {
+    if (c.cache.empty() || states.find(c.cache) != nullptr) {
+        return;
+    }
+    auto            items = std::make_shared<std::vector<MemItem>>(c.cache);
+    const llama_pos n_pos = c.n_past;
+    AppChat *       cp    = &c;
+    StateCache *    sp    = &states;
+    llama_context * ctx   = e.ctx;
+    worker.post([cp, sp, ctx, items, n_pos, k] {
+        std::lock_guard<std::mutex> lock(cp->mutex);
+        if (cp->n_past != n_pos || cp->cache != *items) {
+            printf("TIME answer-snapshot k=%d skipped=1\n", k);
+            fflush(stdout);
+            return;
+        }
+        stamp("answer-snapshot-begin k=%d", k);
+        const int64_t                         t0   = now_us();
+        std::shared_ptr<const cache_io::Blob> blob = app_take_state(ctx);
+        const int64_t                         t1   = now_us();
+        if (!blob) {
+            fprintf(stderr, "memprobe: the state after the answer of turn %d did not copy out\n", k);
+            return;
+        }
+        const size_t bytes = blob->size;
+        sp->put(std::move(*items), n_pos, blob);
+        stamp("answer-snapshot-end k=%d", k);
+        printf("TIME answer-snapshot k=%d skipped=0 ms=%.1f get_ms=%.1f mib=%.2f\n", k, (now_us() - t0) / 1000.0,
+               (t1 - t0) / 1000.0, bytes / 1048576.0);
+        fflush(stdout);
+    });
+}
+
 /** The questions at the end of the first message and of each later message. */
 const char * const kFirstQuestion = " Summarize the text above in one sentence.";
 const char * const kQuestion      = " Answer in one short sentence.";
 
 /**
- * A chat of o.turns turns in the engine of the app (--turns). Each turn follows chat_start_impl, prefill
- * and generate_next_impl in llama_jni.cpp and prints one "TIME turn" line with the time of each part.
- * ttft_ms is the time from the start of the turn to the end of the first step, when the app gives the
- * first token. first_sample_ms is the time to the first sample of the answer, when the token is known.
- * tokenize_ms holds the new sampler chain, the tokens of the whole conversation and the base length, in
- * the order of chat_start_impl.
+ * A chat of o.turns turns in the engine of the app (--turns). Each turn follows chat_start_impl, prefill,
+ * generate_next_impl and finish_answer in llama_jni.cpp, with the prompt of chat_prompt.cpp in the form o.form,
+ * and prints one "TIME turn" line with the time of each part.
+ *
+ * The live form continues the memory after a complete answer: the prompt of the turn is only the new message
+ * and the generation prompt, and it decodes in one call. After the answer a background task copies the state
+ * into the store ("TIME answer-snapshot"). The template form renders the whole conversation, restores the
+ * snapshot before the last generation prompt, decodes the rest of the prompt, takes the snapshot before the
+ * generation prompt, and decodes the generation prompt.
+ *
+ * ttft_ms is the time from the start of the turn to the end of the first call that gives a token to the
+ * caller. With o.early that call only samples the token. first_sample_ms is the time to the first sample.
+ * lock_ms is the wait for the lock of the engine at the start of the turn (a snapshot task that still runs).
+ * template_ms holds the render of the prompt, tokenize_ms the new sampler chain, the tokens and the base
+ * length, in the order of chat_start_impl.
  * An answer that reaches o.answer tokens stops there, and its text still goes into the history. At the
  * end it prints "TIME turn-store". O(turns x (prompt + answer)) decodes.
  */
@@ -1032,10 +1223,23 @@ void run_turns(AppEngine & e, const TurnOptions & o, std::mt19937 & rng) {
         fprintf(stderr, "memprobe: the chat template of the model did not parse: %s\n", ex.what());
         return;
     }
-    StateCache                   states(256u << 20, o.state_dir.empty() ? 0 : 256u << 20, o.state_dir);
-    AppChat                      c;
-    std::vector<common_chat_msg> msgs;
-    llama_memory_t               mem = llama_get_memory(e.ctx);
+    StateCache                 states(256u << 20, o.state_dir.empty() ? 0 : 256u << 20, o.state_dir);
+    AppChat                    c;
+    std::vector<PromptMessage> msgs;
+    llama_memory_t             mem = llama_get_memory(e.ctx);
+    const int64_t              t_p = now_us();
+    ChatPrompt                 prompt(tmpls.get(), vocab, o.form);
+    printf("TIME render-form asked=%s used=%s probe_ms=%.1f refusal=\"%s\"\n",
+           o.form == HistoryForm::kLive ? "live" : "template", prompt.form() == HistoryForm::kLive ? "live" : "template",
+           (now_us() - t_p) / 1000.0, prompt.refusal().c_str());
+    fflush(stdout);
+    const std::vector<llama_token> think_open  = common_tokenize(vocab, "<think>", false, true);
+    const std::vector<llama_token> think_close = common_tokenize(vocab, "</think>", false, true);
+    auto is_tag = [&](llama_token t) {
+        return (think_open.size() == 1 && t == think_open[0]) || (think_close.size() == 1 && t == think_close[0]);
+    };
+    // The last member to go: its destructor runs the queued snapshot tasks, which read c and states.
+    TaskThread worker;
 
     for (int k = 1; k <= o.turns; ++k) {
         if (o.idle_ms > 0) {
@@ -1044,36 +1248,21 @@ void run_turns(AppEngine & e, const TurnOptions & o, std::mt19937 & rng) {
         if (o.therm) {
             print_therm("turn-" + std::to_string(k));
         }
-        common_chat_msg user;
+        PromptMessage user;
         user.role    = "user";
-        user.content = message_text(vocab, k == 1 ? o.first : o.message, k == 1 ? kFirstQuestion : kQuestion, rng);
+        user.content = message_text(vocab, k == 1 ? o.first : o.message, k == 1 ? kFirstQuestion : kQuestion, rng,
+                                    o.random_text);
         msgs.push_back(user);
 
         stamp("turn-begin k=%d", k);
-        const int64_t t_start = now_us();
+        const int64_t                t_start = now_us();
+        std::unique_lock<std::mutex> lock(c.mutex);
+        const int64_t                t_locked = now_us();
 
-        // chat_start_impl: the prompt, and the generation prompt at its end.
-        common_chat_templates_inputs inputs;
-        inputs.messages              = msgs;
-        inputs.add_generation_prompt = true;
-        inputs.use_jinja             = true;
-        inputs.enable_thinking       = false;
-        std::string prompt;
-        std::string tail;
+        // chat_start_impl: the prompt of the turn.
+        TurnPrompt tp;
         try {
-            common_chat_params params = common_chat_templates_apply(tmpls.get(), inputs);
-            prompt                    = std::move(params.prompt);
-            tail                      = std::move(params.generation_prompt);
-            if (tail.empty() || prompt.size() < tail.size() ||
-                prompt.compare(prompt.size() - tail.size(), tail.size(), tail) != 0) {
-                inputs.add_generation_prompt = false;
-                const std::string base       = common_chat_templates_apply(tmpls.get(), inputs).prompt;
-                size_t            m          = 0;
-                while (m < base.size() && m < prompt.size() && base[m] == prompt[m]) {
-                    ++m;
-                }
-                tail = prompt.substr(m);
-            }
+            tp = prompt.make(msgs, false, c.cache.size(), c.cache.empty() ? LLAMA_TOKEN_NULL : c.cache.back().token);
         } catch (const std::exception & ex) {
             fprintf(stderr, "memprobe: the chat template failed: %s\n", ex.what());
             return;
@@ -1093,15 +1282,27 @@ void run_turns(AppEngine & e, const TurnOptions & o, std::mt19937 & rng) {
         c.accepted       = 0;
         c.t_first_sample = 0;
         c.steps          = DecodeTimes();
+        c.answer_text.clear();
+        c.tagged = false;
 
-        const std::vector<llama_token> toks = common_tokenize(vocab, prompt, true, true);
-        std::vector<MemItem>           items;
-        items.reserve(toks.size());
+        const std::vector<llama_token> toks = common_tokenize(vocab, tp.text, !tp.continuation, true);
+        std::vector<MemItem>           fresh;
+        fresh.reserve(toks.size());
         for (const llama_token t : toks) {
-            items.push_back(MemItem{ t, {} });
+            fresh.push_back(MemItem{ t, {} });
         }
-        size_t base_len = app_base_length(vocab, prompt, tail, items);
-        if (base_len == items.size()) {
+        const size_t         offset  = tp.continuation ? c.cache.size() : 0;
+        const size_t         tail_at = offset + app_base_length(vocab, tp.text, tp.tail, fresh);
+        std::vector<MemItem> items;
+        if (tp.continuation) {
+            items.reserve(offset + fresh.size());
+            items = c.cache;
+            items.insert(items.end(), fresh.begin(), fresh.end());
+        } else {
+            items = std::move(fresh);
+        }
+        size_t base_len = tp.base_snapshot ? tail_at : items.size();
+        if (tp.base_snapshot && base_len == items.size()) {
             base_len -= 1;
         }
         const int64_t t_tokenize = now_us();
@@ -1110,20 +1311,23 @@ void run_turns(AppEngine & e, const TurnOptions & o, std::mt19937 & rng) {
             return;
         }
 
-        // prefill: the longest prefix from the live memory or from the snapshot store.
-        app_clear_draft(e);
+        // prefill: the memory of the last answer, or the longest prefix from the live memory or the snapshot store.
+        if (!tp.continuation) {
+            app_clear_draft(e);
+        }
         const size_t limit = std::min(base_len, items.size() - 1);
         size_t       start = 0;
         llama_pos    pos   = 0;
         const char * reuse = "none";
         stamp("restore-begin");
         const int64_t    t_r0    = now_us();
-        const Snapshot * snap    = states.best_prefix(items, limit);
-        const bool       live_ok = !c.cache.empty() && c.cache.size() <= limit && is_item_prefix(c.cache, items);
+        const Snapshot * snap    = tp.continuation ? nullptr : states.best_prefix(items, limit);
+        const bool       live_ok = !c.cache.empty() && c.cache.size() <= limit &&
+                             (tp.continuation || is_item_prefix(c.cache, items));
         if (live_ok && (snap == nullptr || c.cache.size() >= snap->items.size())) {
             start = c.cache.size();
             pos   = c.n_past;
-            reuse = "live";
+            reuse = tp.continuation ? "continued" : "live";
         } else if (snap != nullptr) {
             const size_t                          n_items = snap->items.size();
             const llama_pos                       n_pos   = snap->n_pos;
@@ -1138,23 +1342,30 @@ void run_turns(AppEngine & e, const TurnOptions & o, std::mt19937 & rng) {
         }
         const int64_t t_r1 = now_us();
         stamp("restore-end reuse=%s", reuse);
+        if (tp.continuation && start != c.cache.size()) {
+            fprintf(stderr, "memprobe: turn %d continues a memory of %zu items that it cannot extend\n", k, c.cache.size());
+            return;
+        }
         if (start == 0) {
             llama_memory_clear(mem, true);
             pos = 0;
         }
         const int64_t t_clear = now_us();
-        c.cache.assign(items.begin(), items.begin() + (ptrdiff_t) start);
+        if (strcmp(reuse, "live") != 0 && strcmp(reuse, "continued") != 0) {
+            c.cache.assign(items.begin(), items.begin() + (ptrdiff_t) start);
+        }
         c.n_past = pos;
 
-        // The prompt without the generation prompt: no logits.
+        // The prompt without the generation prompt (template form, no logits), or the whole rest (live form).
+        const size_t             base_end = tp.base_snapshot ? base_len : items.size();
         std::vector<llama_token> base_toks;
-        for (size_t i = start; i < base_len; ++i) {
+        for (size_t i = start; i < base_end; ++i) {
             base_toks.push_back(items[i].token);
         }
         DecodeTimes tb;
         stamp("base-begin tokens=%zu pos=%d", base_toks.size(), (int) pos);
         const int64_t t_b0 = now_us();
-        int rc = base_toks.empty() ? 0 : app_decode(e, base_toks.data(), (int) base_toks.size(), pos, false, tb);
+        int rc = base_toks.empty() ? 0 : app_decode(e, base_toks.data(), (int) base_toks.size(), pos, !tp.base_snapshot, tb);
         if (rc == 0) {
             app_sync(e, tb);
         }
@@ -1165,13 +1376,13 @@ void run_turns(AppEngine & e, const TurnOptions & o, std::mt19937 & rng) {
             return;
         }
         pos += (llama_pos) base_toks.size();
-        c.cache.assign(items.begin(), items.begin() + (ptrdiff_t) base_len);
+        c.cache.insert(c.cache.end(), items.begin() + (ptrdiff_t) start, items.begin() + (ptrdiff_t) base_end);
         c.n_past = pos;
 
-        // The snapshot of the state before the generation prompt, when the store does not hold it.
+        // The template form: the snapshot of the state before the generation prompt, when the store does not hold it.
         double snap_ms = 0.0, snap_get_ms = 0.0;
         size_t snap_bytes = 0;
-        {
+        if (tp.base_snapshot) {
             std::vector<MemItem> key(items.begin(), items.begin() + (ptrdiff_t) base_len);
             if (base_len > 0 && states.find(key) == nullptr) {
                 stamp("snapshot-begin");
@@ -1190,26 +1401,28 @@ void run_turns(AppEngine & e, const TurnOptions & o, std::mt19937 & rng) {
             }
         }
 
-        // The generation prompt: the logits of its last token.
+        // The template form: the generation prompt, with the logits of its last token.
         std::vector<llama_token> tail_toks;
-        for (size_t i = base_len; i < items.size(); ++i) {
+        for (size_t i = base_end; i < items.size(); ++i) {
             tail_toks.push_back(items[i].token);
         }
         DecodeTimes tt;
-        stamp("tail-begin tokens=%zu pos=%d", tail_toks.size(), (int) pos);
         const int64_t t_t0 = now_us();
-        rc                 = app_decode(e, tail_toks.data(), (int) tail_toks.size(), pos, true, tt);
-        if (rc == 0) {
-            app_sync(e, tt);
+        if (!tail_toks.empty()) {
+            stamp("tail-begin tokens=%zu pos=%d", tail_toks.size(), (int) pos);
+            rc = app_decode(e, tail_toks.data(), (int) tail_toks.size(), pos, true, tt);
+            if (rc == 0) {
+                app_sync(e, tt);
+            }
+            stamp("tail-end rc=%d", rc);
         }
         const int64_t t_t1 = now_us();
-        stamp("tail-end rc=%d", rc);
         if (rc != 0) {
             fprintf(stderr, "memprobe: the generation prompt of turn %d did not decode (rc %d)\n", k, rc);
             return;
         }
         pos += (llama_pos) tail_toks.size();
-        c.cache  = items;
+        c.cache.insert(c.cache.end(), items.begin() + (ptrdiff_t) base_end, items.end());
         c.n_past = pos;
         if (e.spec != nullptr) {
             c.spec_prompt.clear();
@@ -1226,57 +1439,99 @@ void run_turns(AppEngine & e, const TurnOptions & o, std::mt19937 & rng) {
         // generate_next_impl: one step for each call that finds the queue empty.
         std::vector<llama_token> answer;
         int                      steps         = 0;
+        int                      calls         = 0;
         int64_t                  gen_us        = 0;
-        int64_t                  first_step_us = 0;
+        int64_t                  first_call_us = 0;
         int64_t                  t_first_token = 0;
         bool                     failed        = false;
         while (!c.answer_ends && (int) answer.size() < o.answer && (uint32_t) c.n_past < llama_n_ctx(e.ctx)) {
             const bool with_draft = e.spec != nullptr;
-            stamp("step-begin i=%d draft=%d", steps, with_draft ? 1 : 0);
-            const int64_t t0 = now_us();
-            const bool    ok = with_draft ? app_spec_step(e, c) : app_plain_step(e, c);
+            stamp("step-begin i=%d draft=%d", calls, with_draft ? 1 : 0);
+            const int64_t t0   = now_us();
+            bool          step = true;
+            bool          ok   = false;
+            if (with_draft) {
+                bool sampled_only = false;
+                ok                = app_spec_step(e, c, o.early, sampled_only);
+                step              = !sampled_only;
+            } else {
+                ok = app_plain_step(e, c, o.early, step);
+            }
             const int64_t t1 = now_us();
-            stamp("step-end i=%d", steps);
+            stamp("step-end i=%d", calls);
             if (!ok) {
                 failed = true;
                 break;
             }
-            c.policy.observe(t1 - t0);
-            gen_us += t1 - t0;
-            if (steps == 0) {
-                first_step_us = t1 - t0;
+            if (step) {
+                c.policy.observe(t1 - t0);
+                steps += 1;
             }
-            steps += 1;
+            gen_us += t1 - t0;
+            if (calls == 0) {
+                first_call_us = t1 - t0;
+            }
+            calls += 1;
             if (!c.out_queue.empty() && t_first_token == 0) {
                 t_first_token = t1;
             }
-            answer.insert(answer.end(), c.out_queue.begin(), c.out_queue.end());
+            for (const llama_token t : c.out_queue) {
+                answer.push_back(t);
+                if (is_tag(t)) {
+                    c.tagged = true;
+                } else {
+                    c.answer_text += common_token_to_piece(vocab, t, true);
+                }
+            }
             c.out_queue.clear();
         }
+        // canon: the generated tokens of the answer are the tokens of its text, thus the memory of a turn that
+        // continues it holds what a full render gives. edge_ws: the text has white space at its start or end, which
+        // the template trims in a full render.
+        const bool canon   = !c.tagged && common_tokenize(vocab, c.answer_text, false, true) == answer;
+        const bool edge_ws = !c.answer_text.empty() && (isspace((unsigned char) c.answer_text.front()) != 0 ||
+                                                        isspace((unsigned char) c.answer_text.back()) != 0);
+        // finish_answer: an answer that ended with its end token becomes the record of the memory in the live
+        // form, and its state goes into the store on the background thread.
+        bool recorded = false;
+        if (c.answer_ends && !failed && !c.cache.empty()) {
+            recorded = prompt.answer_ended(c.answer_text, !c.tagged, c.cache.size(), c.cache.back().token);
+            if (recorded) {
+                app_schedule_snapshot(e, c, states, worker, k);
+            }
+        }
+        lock.unlock();
         stamp("turn-end k=%d", k);
-        printf("TIME turn k=%d draft=%d items=%zu reuse=%s start=%zu depth=%d template_ms=%.1f tokenize_ms=%.1f "
-               "restore_ms=%.1f clear_ms=%.1f base_tokens=%zu base_ms=%.1f base_decode_ms=%.1f base_follow_ms=%.1f "
-               "base_sync_ms=%.1f snapshot_ms=%.1f snapshot_get_ms=%.1f snapshot_mib=%.2f tail_tokens=%zu tail_ms=%.1f "
-               "tail_decode_ms=%.1f tail_follow_ms=%.1f tail_sync_ms=%.1f prompt_ms=%.1f first_sample_ms=%.1f "
-               "first_step_ms=%.1f ttft_ms=%.1f gen_tokens=%zu gen_ms=%.1f steps=%d step_decode_ms=%.1f "
-               "step_follow_ms=%.1f step_draft_ms=%.1f sample_ms=%.1f drafted=%lld accepted=%lld eog=%d failed=%d\n",
-               k, e.spec != nullptr ? 1 : 0, items.size(), reuse, start, (int) c.n_past, (t_template - t_start) / 1000.0,
-               (t_tokenize - t_template) / 1000.0, (t_r1 - t_r0) / 1000.0, (t_clear - t_r1) / 1000.0, base_toks.size(),
-               (t_b1 - t_b0) / 1000.0, tb.decode, tb.follow, tb.sync, snap_ms, snap_get_ms, snap_bytes / 1048576.0,
-               tail_toks.size(), (t_t1 - t_t0) / 1000.0, tt.decode, tt.follow, tt.sync, (t_ready - t_start) / 1000.0,
-               c.t_first_sample > 0 ? (c.t_first_sample - t_start) / 1000.0 : -1.0, first_step_us / 1000.0,
+        printf("TIME turn k=%d draft=%d form=%s early=%d cont=%d items=%zu reuse=%s start=%zu depth=%d lock_ms=%.1f "
+               "template_ms=%.1f tokenize_ms=%.1f restore_ms=%.1f clear_ms=%.1f base_tokens=%zu base_ms=%.1f "
+               "base_decode_ms=%.1f base_follow_ms=%.1f base_sync_ms=%.1f snapshot_ms=%.1f snapshot_get_ms=%.1f "
+               "snapshot_mib=%.2f tail_tokens=%zu tail_ms=%.1f tail_decode_ms=%.1f tail_follow_ms=%.1f tail_sync_ms=%.1f "
+               "prompt_ms=%.1f first_sample_ms=%.1f first_step_ms=%.1f ttft_ms=%.1f gen_tokens=%zu gen_ms=%.1f steps=%d "
+               "step_decode_ms=%.1f step_follow_ms=%.1f step_draft_ms=%.1f sample_ms=%.1f drafted=%lld accepted=%lld "
+               "eog=%d recorded=%d canon=%d edge_ws=%d failed=%d\n",
+               k, e.spec != nullptr ? 1 : 0, prompt.form() == HistoryForm::kLive ? "live" : "template", o.early ? 1 : 0,
+               tp.continuation ? 1 : 0, items.size(), reuse, start, (int) c.n_past, (t_locked - t_start) / 1000.0,
+               (t_template - t_locked) / 1000.0, (t_tokenize - t_template) / 1000.0, (t_r1 - t_r0) / 1000.0,
+               (t_clear - t_r1) / 1000.0, base_toks.size(), (t_b1 - t_b0) / 1000.0, tb.decode, tb.follow, tb.sync,
+               snap_ms, snap_get_ms, snap_bytes / 1048576.0, tail_toks.size(), (t_t1 - t_t0) / 1000.0, tt.decode,
+               tt.follow, tt.sync, (t_ready - t_start) / 1000.0,
+               c.t_first_sample > 0 ? (c.t_first_sample - t_start) / 1000.0 : -1.0, first_call_us / 1000.0,
                t_first_token > 0 ? (t_first_token - t_start) / 1000.0 : -1.0, answer.size(), gen_us / 1000.0, steps,
                c.steps.decode, c.steps.follow, c.steps.draft, c.sample_us / 1000.0, (long long) c.drafted,
-               (long long) c.accepted, c.answer_ends ? 1 : 0, failed ? 1 : 0);
+               (long long) c.accepted, c.answer_ends ? 1 : 0, recorded ? 1 : 0, canon ? 1 : 0, edge_ws ? 1 : 0,
+               failed ? 1 : 0);
         fflush(stdout);
         if (failed) {
             return;
         }
-        common_chat_msg reply;
+        // The content of the answer as the app keeps it: the pieces of the tokens, without the white space at the start.
+        PromptMessage reply;
         reply.role    = "assistant";
-        reply.content = common_detokenize(vocab, answer, false);
+        const size_t text_start = c.answer_text.find_first_not_of(" \t\n\r\f\v");
+        reply.content = text_start == std::string::npos ? std::string() : c.answer_text.substr(text_start);
         msgs.push_back(reply);
     }
+    worker.stop();
     printf("TIME turn-store snapshots=%zu ram_mib=%.1f disk_mib=%.1f\n", states.count(), states.ram_bytes() / 1048576.0,
            states.disk_bytes() / 1048576.0);
     fflush(stdout);
@@ -1290,8 +1545,8 @@ int main(int argc, char ** argv) {
     int n_ctx = 8192, n_batch = 1024, n_prompt = 0, n_gen = 0, n_threads = 4, n_outputs_max = 0, reps = 1;
     ggml_type tk = GGML_TYPE_F16, tv = GGML_TYPE_F16;
     bool spec = false, smaps = false, vision_warmup = false, grow = false, use_mmap = false, hash = false;
-    bool drop_cache = false, no_mmap = false;
-    std::string mmproj, vision_dev = "HTP0", embd_advise = "none", lazy = "auto";
+    bool drop_cache = false, no_mmap = false, draft_ops = false, draft_all = false;
+    std::string mmproj, vision_dev = "HTP0", embd_advise = "none", lazy = "auto", embd_warm = "off", draft_file = "auto";
     int image_w = 0, image_h = 0, image_tokens = 576;
     // The options of --reps, of the log and of the app modes.
     bool log_ts = false, therm = false;
@@ -1344,7 +1599,29 @@ int main(int argc, char ** argv) {
         else if (a == "--turn-message") turn_opts.message = std::atoi(next().c_str());
         else if (a == "--turn-answer") turn_opts.answer = std::atoi(next().c_str());
         else if (a == "--turn-idle-ms") turn_opts.idle_ms = std::atoi(next().c_str());
+        else if (a == "--turn-text") {
+            const std::string v = next();
+            if (v != "words" && v != "random") { fprintf(stderr, "--turn-text takes words or random, not %s\n", v.c_str()); return 2; }
+            turn_opts.random_text = v == "random";
+        }
         else if (a == "--state-dir") turn_opts.state_dir = next();
+        else if (a == "--render") {
+            const std::string v = next();
+            if (!parse_history_form(v, turn_opts.form)) { fprintf(stderr, "--render takes template or live, not %s\n", v.c_str()); return 2; }
+        }
+        else if (a == "--first-token") {
+            const std::string v = next();
+            if (v != "early" && v != "late") { fprintf(stderr, "--first-token takes early or late, not %s\n", v.c_str()); return 2; }
+            turn_opts.early = v == "early";
+        }
+        else if (a == "--embd-warm") embd_warm = next();
+        else if (a == "--draft-file") draft_file = next();
+        else if (a == "--draft-ops") draft_ops = true;
+        else if (a == "--draft-passes") {
+            const std::string v = next();
+            if (v != "call" && v != "all") { fprintf(stderr, "--draft-passes takes call or all, not %s\n", v.c_str()); return 2; }
+            draft_all = v == "all";
+        }
         else { fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
     if (reps < 1) {
@@ -1374,6 +1651,22 @@ int main(int argc, char ** argv) {
         return 2;
     }
     log_ts = log_ts || app_mode;
+    if (embd_warm != "on" && embd_warm != "off") {
+        fprintf(stderr, "--embd-warm takes on or off, not %s\n", embd_warm.c_str());
+        return 2;
+    }
+    if (draft_file != "auto" && draft_file != "off") {
+        fprintf(stderr, "--draft-file takes auto or off, not %s\n", draft_file.c_str());
+        return 2;
+    }
+    // A speculative engine of the app loads "<stem>-draft32k.gguf" when it is next to the file (load_impl).
+    if (spec && draft_file == "auto") {
+        const std::string with_head = draft_head_file(model_path);
+        if (!with_head.empty()) {
+            model_path = with_head;
+        }
+    }
+    printf("MODEL %s\n", model_path.c_str());
     if (lazy != "off" && lazy != "auto" && lazy != "on") {
         fprintf(stderr, "--lazy takes off, auto or on, not %s\n", lazy.c_str());
         return 2;
@@ -1446,7 +1739,15 @@ int main(int argc, char ** argv) {
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mp);
     if (model == nullptr) { fprintf(stderr, "the model did not load\n"); return 1; }
     printf("TIME model-load %.1f\n", now_ms() - t0);
+    fflush(stdout);
     if (embd_advise != "none") advise_model_mappings(model_path, embd_advise);
+    // --embd-warm: the read of the token embedding into the page cache on a background thread after the load.
+    std::unique_ptr<TaskThread> warm_worker;
+    if (embd_warm == "on") {
+        warm_worker = std::make_unique<TaskThread>();
+        const double t_warm = now_ms();
+        warm_worker->post([model_path, t_warm] { warm_token_embedding(model_path, t_warm); });
+    }
     print_memory("model", model_path, smaps);
 
     llama_context_params cp = llama_context_default_params();
@@ -1488,6 +1789,9 @@ int main(int argc, char ** argv) {
         params.cpuparams_batch.n_threads = n_threads;
         params.speculative.types         = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
         params.speculative.draft.n_max   = SpecPolicy::kDraftMax;
+        if (draft_ops) {
+            params.cb_eval = draft_ops_cb;
+        }
         t0 = now_ms();
         common_params params_dft = common_base_params_to_speculative(params);
         spec_init = common_speculative_init_from_params(params_dft, model, ctx);
@@ -1519,6 +1823,7 @@ int main(int argc, char ** argv) {
         app.ctx_dft = ctx_dft;
         app.batch   = &batch;
         app.n_batch = n_batch;
+        app.draft_all = draft_all;
         if (ctx_dft != nullptr) {
             params.speculative.draft.ctx_tgt = ctx;
             params.speculative.draft.ctx_dft = ctx_dft;
@@ -1537,6 +1842,9 @@ int main(int argc, char ** argv) {
         if (!sizes.empty()) run_sweep(app, pool, depths, sizes, sweep_calls, sweep_logits == "last", therm, rng, n_vocab);
         if (turn_opts.turns > 0) run_turns(app, turn_opts, rng);
         print_memory("app", model_path, smaps);
+        if (draft_ops) {
+            print_draft_ops();
+        }
     }
 
     if (n_prompt > 0) {
@@ -1727,6 +2035,9 @@ int main(int argc, char ** argv) {
         print_memory("vision-free", model_path, smaps);
     }
 
+    if (warm_worker) {
+        warm_worker->stop();
+    }
     common_memory_breakdown_print(ctx);
     llama_batch_free(batch);
     // The order of ~Engine in llama_jni.cpp: the driver, then the draft context, then the target context, then the pool.

@@ -5,17 +5,22 @@ Usage:
     stage.py commands [--out PATH]         write the phone command file (build/ttft/phone-commands.txt)
     stage.py table [--root DIR] [--all]    print the tables from the pulled files (build/ttft/phone-out)
 
+    Both take --name NAME --only BLOCK[:VARIANTS],... for a partial stage: only those runs, the phone directory
+    /data/local/tmp/qwen/ttft-NAME, the command file build/ttft/phone-commands-NAME.txt and the outputs
+    build/ttft/phone-out-NAME. For example: stage.py commands --name fix --only tn:ns,fm
+
 The tool of each run is memprobe (tools/memprobe/memprobe.cpp) in the context of the app (n_ctx 8192, 4 threads, 5 output
 rows, the lazy token embedding, Q8_0 K and V, flash attention AUTO, the fused state step). Its switches select the
 engine of the app before the changes of the chat turn (old) or after them (new):
 
-    old: --render template --first-token late --embd-warm off --draft-file off --draft-passes all
-    new: --render live --first-token early --embd-warm on --draft-file auto --draft-passes call
+    old: --render template --first-token late --draft-file off --draft-passes all
+    new: --render live --first-token early --draft-file auto --draft-passes call
 
 The template render with its snapshot before the generation prompt against the live form (chat_prompt.h), the first
-token after its decode against before it, no read of the token embedding at the load against a read on a background
-thread, the standard file against Qwen3.5-4B-Q8_0-draft32k.gguf next to it (the 32768-row draft head), and a drafter
-that runs 4 MTP passes for each draft against one that stops at the draft length of the step.
+token after its decode against before it, the standard file against Qwen3.5-4B-Q8_0-draft32k.gguf next to it (the
+32768-row draft head), and a drafter that runs 4 MTP passes for each draft against one that stops at the draft length
+of the step. The block fm measures a read of the token embedding into the page cache after the load (--embd-warm),
+which the app does not do.
 
 A run name is 4b-<block>-<round>-<variant>, for example 4b-tn-2-s. Each run writes three files to the phone directory
 out/: <name>-gate.txt (the conditions before and after the run and the exit code), <name>.out (the stdout of memprobe)
@@ -39,6 +44,8 @@ from pathlib import Path
 
 ADB = "adb -s 192.168.14.130:5555"
 PHONE = "/data/local/tmp/qwen/ttft"
+# The directory of the outputs below build/ttft, on the laptop and on the box.
+OUT_NAME = "phone-out"
 MODEL_DIR = "/data/local/tmp/qwen/models"
 MODEL = "Qwen3.5-4B-Q8_0.gguf"
 DRAFT_MODEL = "Qwen3.5-4B-Q8_0-draft32k.gguf"
@@ -71,8 +78,8 @@ AFTER = ('echo "after: thermal=$(dumpsys thermalservice | grep "Thermal Status" 
 # A run with a CPU cap of less than this value (kHz) before or after it stays out of the tables.
 CAP_MIN_KHZ = 3000000
 
-OLD = "--render template --first-token late --embd-warm off"
-NEW = "--render live --first-token early --embd-warm on"
+OLD = "--render template --first-token late"
+NEW = "--render live --first-token early"
 
 
 @dataclass(frozen=True)
@@ -104,10 +111,11 @@ VARIANTS = {v.key: v for v in (
             f"--spec {OLD} --draft-file off --draft-passes all"),
     Variant("s", "new engine, draft on (the draft-head file, the passes of the draft length)",
             f"--spec {NEW} --draft-file auto --draft-passes call"),
-    Variant("k", "no read of the embedding, 3 s after the load", f"{NEW.replace('--embd-warm on', '--embd-warm off')} "
-            "--turn-idle-ms 3000"),
-    Variant("m", "the embedding read on a background thread, 3 s after the load", f"{NEW} --turn-idle-ms 3000"),
-    Variant("i", "the embedding read on a background thread, at once after the load", f"{NEW} --turn-idle-ms 0"),
+    Variant("k", "no read of the embedding, 3 s after the load", f"{NEW} --embd-warm off --turn-idle-ms 3000"),
+    Variant("m", "the embedding read on a background thread, 3 s after the load",
+            f"{NEW} --embd-warm on --turn-idle-ms 3000"),
+    Variant("i", "the embedding read on a background thread, at once after the load",
+            f"{NEW} --embd-warm on --turn-idle-ms 0"),
     Variant("d", "the draft graph of the draft-head file", f"--spec {NEW} --draft-file auto"),
     Variant("f", "the draft graph of the standard file", f"--spec {NEW} --draft-file off"),
 )}
@@ -115,8 +123,8 @@ BLOCKS = {b.key: b for b in (
     Block("tn", "--turns 6 --turn-first 500 --turn-message 40 --turn-answer 64 --turn-idle-ms 1000 --therm", "onps", 3,
           100, True, "a chat of 6 turns: 500 tokens, then 5 messages of 40 tokens, answers of up to 64 tokens, "
           "1 s of idle before each turn"),
-    Block("fm", "--drop-cache --turns 1 --turn-first 512 --turn-answer 8", "kmi", 2, 90, False,
-          "the model file dropped from the page cache before the load, then a first message of 512 tokens"),
+    Block("fm", "--drop-cache --turns 1 --turn-first 512 --turn-answer 8 --turn-text random", "kmi", 2, 90, False,
+          "the model file dropped from the page cache before the load, then a first message of 512 random tokens"),
     Block("dh", "--draft-ops --turns 2 --turn-first 100 --turn-message 20 --turn-answer 32", "df", 1, 90, False,
           "a check, not a timing run: the matrix products that the MTP draft graph reads (DRAFTOP)"),
 )}
@@ -138,17 +146,39 @@ class Run:
         return f"4b-{self.block.key}-{self.round}-{self.variant.key}"
 
 
+# The runs of a partial stage (--only BLOCK:VARIANTS,...), or None for all runs.
+ONLY: dict[str, str] | None = None
+
+
+def configure(name: str, only: str) -> None:
+    """Give a partial stage its own phone directory and output directory (--name), thus a later stage does not
+    replace the files of an earlier one, and keep the runs of --only."""
+    global PHONE, OUT_NAME, LIB_ENV, ONLY
+    if name:
+        PHONE = f"/data/local/tmp/qwen/ttft-{name}"
+        OUT_NAME = f"phone-out-{name}"
+        LIB_ENV = (f"LD_LIBRARY_PATH={PHONE}/lib ADSP_LIBRARY_PATH={PHONE}/lib GGML_HEXAGON_OPFUSION=1 "
+                   "GGML_HEXAGON_OPFUSION_STATE=1")
+    if only:
+        ONLY = {}
+        for item in only.split(","):
+            block, _, variants = item.partition(":")
+            if block not in BLOCKS or any(v not in BLOCKS[block].variants for v in variants):
+                raise SystemExit(f"stage.py: --only {item} names a block or a variant that the stage does not have")
+            ONLY[block] = variants or BLOCKS[block].variants
+
+
 def all_runs() -> list[Run]:
-    """The runs of the stage in their order. O(runs)."""
+    """The runs of the stage in their order, only those of ONLY when it is set. O(runs)."""
     out = []
     for group in GROUPS:
         for rnd in range(1, max(BLOCKS[k].rounds for k in group) + 1):
             for key in group:
                 block = BLOCKS[key]
-                if rnd > block.rounds:
+                if rnd > block.rounds or (ONLY is not None and key not in ONLY):
                     continue
                 order = block.variants if rnd % 2 else block.variants[::-1]
-                out.extend(Run(block, rnd, VARIANTS[v]) for v in order)
+                out.extend(Run(block, rnd, VARIANTS[v]) for v in order if ONLY is None or v in ONLY[key])
     return out
 
 
@@ -231,10 +261,10 @@ def output_lines() -> list[str]:
         "#",
         THERMAL,
         f"{ADB} shell 'pgrep -x memprobe; ls {PHONE}/out | wc -l; du -sh {PHONE}/out'",
-        f"rm -rf {LAPTOP_STAGE}/phone-out",
-        f"{ADB} pull {PHONE}/out {LAPTOP_STAGE}/phone-out",
-        f"rsync -a --delete {LAPTOP_STAGE}/phone-out/ {BOX}/phone-out/",
-        f"test \"$(ls {LAPTOP_STAGE}/phone-out | wc -l)\" -eq "
+        f"rm -rf {LAPTOP_STAGE}/{OUT_NAME}",
+        f"{ADB} pull {PHONE}/out {LAPTOP_STAGE}/{OUT_NAME}",
+        f"rsync -a --delete {LAPTOP_STAGE}/{OUT_NAME}/ {BOX}/{OUT_NAME}/",
+        f"test \"$(ls {LAPTOP_STAGE}/{OUT_NAME} | wc -l)\" -eq "
         f"\"$({ADB} shell 'ls {PHONE}/out | wc -l' | tr -d '\\r')\" "
         f"&& {ADB} shell 'rm -rf {PHONE}' && echo removed {PHONE}",
     ]
@@ -243,7 +273,12 @@ def output_lines() -> list[str]:
 def write_commands(path: Path) -> int:
     """Write the command file and return its line count."""
     runs = all_runs()
-    lines = HEADER.rstrip("\n").split("\n") + setup_lines()
+    lines = HEADER.rstrip("\n").split("\n")
+    if ONLY is not None:
+        lines += [f"# THIS FILE IS A PARTIAL STAGE: {len(runs)} runs ({', '.join(f'{b} {v}' for b, v in ONLY.items())}), "
+                  f"the phone directory {PHONE}, the outputs {LAPTOP_STAGE}/{OUT_NAME}. Time: about "
+                  f"{sum(r.block.limit for r in runs) * 45 // 100 // 60 + 1} minutes."]
+    lines += setup_lines()
     lines += ["#", f"# ==== {MODEL.removesuffix('.gguf')}: {len(runs)} runs ===="]
     for run in runs:
         lines += run_lines(run)
@@ -541,16 +576,21 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("commands", help="write the phone command file")
-    c.add_argument("--out", type=Path, default=STAGE_DIR / "phone-commands.txt")
+    c.add_argument("--out", type=Path, help="the command file (preset build/ttft/phone-commands[-NAME].txt)")
     t = sub.add_parser("table", help="print the tables from the pulled files")
-    t.add_argument("--root", type=Path, default=STAGE_DIR / "phone-out")
+    t.add_argument("--root", type=Path, help="the outputs (preset build/ttft/phone-out[-NAME])")
     t.add_argument("--all", action="store_true", help="also use the runs with changed caps or heat")
+    for p in (c, t):
+        p.add_argument("--name", default="", help="a partial stage: its own phone directory and outputs")
+        p.add_argument("--only", default="", help="the runs of a partial stage, for example tn:ns,fm")
     a = ap.parse_args()
+    configure(a.name, a.only)
     if a.cmd == "commands":
-        n = write_commands(a.out)
-        print(f"{a.out}: {n} lines, {len(all_runs())} runs")
+        out = a.out or STAGE_DIR / (f"phone-commands-{a.name}.txt" if a.name else "phone-commands.txt")
+        n = write_commands(out)
+        print(f"{out}: {n} lines, {len(all_runs())} runs")
         return 0
-    return table(a.root, a.all)
+    return table(a.root or STAGE_DIR / OUT_NAME, a.all)
 
 
 if __name__ == "__main__":

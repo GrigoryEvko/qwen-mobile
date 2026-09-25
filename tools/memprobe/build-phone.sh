@@ -7,7 +7,8 @@
 #
 # TREE is the private llama.cpp tree and BDIR its Android build directory. Make the tree of HEAD
 # with tests/sanitizers/llama-copy.sh TREE. The NDK clang++ compiles tools/memprobe/memprobe.cpp
-# with the three sources of the app that it calls (state_cache.cpp, cache_io.cpp, spec_policy.cpp),
+# with the sources of the app that it calls (state_cache.cpp, cache_io.cpp, spec_policy.cpp,
+# chat_prompt.cpp, engine_tasks.cpp),
 # and tools/memprobe/kvkl.cpp. The stage also holds the gate tools/phone/gate.sh.
 set -euo pipefail
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../scripts/lib.sh"
@@ -32,6 +33,7 @@ cmake --build $bdir -j$JOBS --target $LLAMA_LIBS llama-bench llama-completion ll
 cxx=\$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang++
 \$cxx -O2 -std=c++17 -I$tree/include -I$tree/common -I$tree/src -I$tree/ggml/include -I$tree/vendor -I$tree/tools/mtmd \
     -I$app_src tools/memprobe/memprobe.cpp $app_src/state_cache.cpp $app_src/cache_io.cpp $app_src/spec_policy.cpp \
+    $app_src/chat_prompt.cpp $app_src/engine_tasks.cpp \
     -o $bdir/bin/memprobe -L$bdir/bin -lmtmd -lllama-common -lllama -lggml -lggml-cpu -lggml-base \
     -Wl,-rpath,'\$ORIGIN/../lib'
 \$cxx -O2 -std=c++17 -I$tree/include -I$tree/common -I$tree/ggml/include -I$tree/vendor \

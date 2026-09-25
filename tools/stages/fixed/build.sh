@@ -8,8 +8,8 @@
 # build/fixed/build.sh is a link to this file. The files of the stage go to build/fixed.
 #
 # phone: the NDK clang++ of the Snapdragon container compiles tools/memprobe/memprobe.cpp with the
-# three sources of the app that have no llama.cpp and no Android dependency (state_cache.cpp,
-# cache_io.cpp, spec_policy.cpp), with the recipe of tools/stages/bench-kv/build.sh, and links it against the
+# sources of the app that have no Android dependency (state_cache.cpp, cache_io.cpp, spec_policy.cpp,
+# chat_prompt.cpp, engine_tasks.cpp), with the recipe of tools/stages/bench-kv/build.sh, and links it against the
 # libraries in build/bench-kv/android/bin. The libraries of the stage are the files of
 # build/bench-kv/phone/lib: the llama.cpp tree of the patches tree f473cad (the pin plus patches/series)
 # with the switch GGML_HEXAGON_FWHT at its preset value, thus the code of the app. The container step
@@ -17,7 +17,7 @@
 #
 # host: CMake builds llama, llama-common, mtmd and ggml-cpu of build/bench-kv/src for the CPU of the box,
 # then g++ builds build/fixed/host/memprobe (-O2) and build/fixed/host/memprobe-asan (AddressSanitizer on
-# the code of memprobe and of the three app sources). The host run of the 4B Q8_0 on the CPU tests the
+# the code of memprobe and of the app sources). The host run of the 4B Q8_0 on the CPU tests the
 # logic of the modes, not the phone times.
 #
 # Time: phone about 1 minute, host about 5 minutes with JOBS=24.
@@ -30,7 +30,7 @@ readonly stage=build/fixed
 readonly tree=build/bench-kv/src
 readonly bdir=build/bench-kv/android
 readonly app_src=android/app/src/main/cpp
-readonly app_files="$app_src/state_cache.cpp $app_src/cache_io.cpp $app_src/spec_policy.cpp"
+readonly app_files="$app_src/state_cache.cpp $app_src/cache_io.cpp $app_src/spec_policy.cpp $app_src/chat_prompt.cpp $app_src/engine_tasks.cpp"
 readonly memprobe_src=tools/memprobe/memprobe.cpp
 readonly mode=${1:-phone}
 
