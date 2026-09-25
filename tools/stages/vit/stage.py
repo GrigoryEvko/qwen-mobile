@@ -57,6 +57,9 @@ REPO = Path(__file__).resolve().parents[3]
 STAGE_ROOT = Path(os.path.relpath(REPO / "build/vit"))
 BASE_ENV = "GGML_HEXAGON_OPFUSION=1 GGML_HEXAGON_OPFUSION_STATE=1"
 PROFILE_ENV = "GGML_HEXAGON_PROFILE=1 LLAMA_HOSTPROF=1"
+# The phase events of each DSP thread (profile level 3). The preset trace size (256 events for each op of the
+# largest batch, 327680 for each thread) holds the events of one encode.
+TRACE_ENV = "GGML_HEXAGON_PROFILE=3 LLAMA_HOSTPROF=1"
 THERMAL = f"{ADB} shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
 # The kernel keeps 15 characters of a process name: test-backend-ops is test-backend-op
 PGREP = f"{ADB} shell 'pgrep -x vitprobe; pgrep -x llama-bench; pgrep -x test-backend-op; echo pgrep-done'"
@@ -179,6 +182,21 @@ V = {v.key: v for v in (
             env=f"{PROFILE_ENV} GGML_HEXAGON_FUSE_VIT=1", args="--log-ts", embd=False, timing=False),
     Variant("pf2", "the op profile, 768 tokens, 2 encodes, ROPE_QKV only", "photo", 768, reps=2,
             env=f"{PROFILE_ENV} GGML_HEXAGON_FUSE_VIT=2", args="--log-ts", embd=False, timing=False),
+    # The QKV matmul with the two plans on: the paths of ROPE_QKV, the phases of each DSP thread (trace) and the PMU
+    # counters, against ROPE_QKV alone
+    *(Variant(f"pq{io}", f"the op profile, 768 tokens, 2 encodes, the two plans, ROPE_QKV io {io}", "photo", 768,
+              reps=2, env=f"{PROFILE_ENV} GGML_HEXAGON_VIT_QKV_IO={io}", args="--log-ts", embd=False, timing=False)
+      for io in (0, 1, 2)),
+    *(Variant(f"tr{b}", f"the phase trace, 768 tokens, 2 encodes, plans {b}", "photo", 768, reps=2,
+              env=f"{TRACE_ENV} GGML_HEXAGON_FUSE_VIT={b}", args="--log-ts", embd=False, timing=False, limit=110)
+      for b in (1, 2, 3)),
+    *(Variant(f"{key}{b}", f"the PMU set {text}, 768 tokens, 2 encodes, plans {b}", "photo", 768, reps=2,
+              env=f"GGML_HEXAGON_PROFILE={ids} LLAMA_HOSTPROF=1 GGML_HEXAGON_FUSE_VIT={b}", args="--log-ts",
+              embd=False, timing=False)
+      for key, text, ids in (("ms", "stalls", "0x3,0x2A,0xE9,0xEB,0xED,0xE8,0xEA,0xEF"),
+                             ("mm", "memory", "0x240,0x245,0x262,0x269,0x256,0x7D,0x8C,0x108"),
+                             ("ma", "AXI", "0x40,0x3F,0xCD,0x42,0x46,0x55,0x7F,0x3"))
+      for b in (2, 3)),
 )}
 
 
@@ -231,6 +249,14 @@ STAGES = {s.name: s for s in (
           [("e", "pf0", 1), ("e", "pf1", 1), ("e", "pf2", 1)] + runs_ab("he", ["t768", "t256"], 2) +
           [("e", "u768", 1), ("e", "u256", 1), ("h", "d256", 1), ("e", "d256", 1)] + runs_ab("he", ["b"], 3),
           tools_set="e", minutes=16),
+    Stage("vit6", "why the QKV matmul is slower with the two plans of the vision encoder on than with one plan: the "
+          "op profile with the ROPE_QKV paths io 0, 1 and 2, the phases of each DSP thread (trace) and three PMU "
+          "sets, each with the two plans and with ROPE_QKV alone (the landed series, build/vit/phone-e)",
+          {"e": "phone-e"},
+          [("e", "p768", 1), ("e", "pf2", 1)] + [("e", f"pq{io}", 1) for io in (0, 1, 2)] +
+          [("e", f"tr{b}", 1) for b in (3, 2, 1)] +
+          [("e", f"{k}{b}", 1) for k in ("ms", "mm", "ma") for b in (3, 2)] + [("e", "p768", 2), ("e", "pf2", 2)],
+          minutes=4),
 )}
 
 
@@ -564,6 +590,106 @@ def profile_summary(stage: Stage, results: dict[str, Result]) -> list[str]:
     return out
 
 
+PMU_RE = re.compile(r"pmu \[([\d,]+)\]")
+# The names of the PMU events of the stage variants (tools/prof/pmu.py has the full list)
+PMU_NAMES = {0x3: "PKT_ANY", 0x2A: "INSTS", 0xE8: "IU_NO_PKT", 0xE9: "DU_CACHE_MISS", 0xEA: "DU_BUSY_OTHER",
+             0xEB: "CU_BUSY", 0xED: "COPROC_BUSY", 0xEF: "SYSTEM_BUSY", 0x240: "UDMA_ACTIVE", 0x245: "UDMA_DMPOLL",
+             0x262: "UDMA_NONCOH_RD", 0x269: "UDMA_RDBUF_FULL", 0x256: "L2_UDMA_BYP_RD", 0x40: "AXI_RD",
+             0x3F: "AXI_RD128", 0xCD: "AXI_RD256", 0x42: "AXI_WR", 0x46: "AXI_WR128", 0x55: "AXI_WR256",
+             0x7D: "L2_DU_RD_MISS", 0x8C: "L2_DU_ST_MISS", 0x7F: "L2FETCH_MISS", 0x108: "HVX_ST_FULL",
+             0x103: "HVX_LD_L2_OUT"}
+
+
+def profile_ids(env: str) -> list[int]:
+    """The 8 PMU event ids of a profile environment, or an empty list for a profile without PMU events."""
+    m = re.search(r"GGML_HEXAGON_PROFILE=(\S+)", env)
+    parts = m.group(1).split(",") if m else []
+    return [int(p, 0) for p in parts] if len(parts) == 8 else []
+
+
+def last_encode_lines(res: Result) -> list[str]:
+    """The log lines of the last encode window of a profile run, or an empty list."""
+    lines, start, last = res.log.splitlines(), None, None
+    for i, line in enumerate(lines):
+        m = STAMP_RE.search(line)
+        if m and m.group(1) == "encode-begin":
+            start = i
+        elif m and m.group(1) == "encode-end" and start is not None:
+            last = (start, i)
+    return lines[last[0]:last[1] + 1] if last else []
+
+
+def pmu_summary(stage: Stage, results: dict[str, Result]) -> list[str]:
+    """For each PMU run: the sum of each counter over the ops of each matmul kind of the last encode, in millions,
+    and the op time of the kind. O(size of the logs)."""
+    out = []
+    for s, vk, r in stage.runs:
+        ids = profile_ids(V[vk].env)
+        name = run_name(s, vk, r)
+        res = results.get(name)
+        if not ids or res is None or not res.ok:
+            continue
+        sums: dict[str, list[int]] = defaultdict(lambda: [0] * 9)
+        for line in last_encode_lines(res):
+            mo, mp = OP_RE.search(line), PMU_RE.search(line)
+            if mo and mp and mo.group(1) != "OPBATCH":
+                row = sums[profile_kind(mo.group(1), mo.group(2))]
+                for i, v in enumerate(mp.group(1).split(",")):
+                    row[i] += int(v)
+                row[8] += int(mo.group(5))
+        labels = [PMU_NAMES.get(i, hex(i)) for i in ids]
+        out.append(f"PMU counters of {name} ({V[vk].text}), millions, by kind:")
+        out.append(f"  {'kind':7s} {'ms':>7s} " + " ".join(f"{lb:>15s}" for lb in labels))
+        for kind in ("qkv", "up", "o", "down", "ln", "rope", "fa"):
+            if kind in sums:
+                row = sums[kind]
+                out.append(f"  {kind:7s} {row[8] / 1000:7.1f} " + " ".join(f"{v / 1e6:15.2f}" for v in row[:8]))
+    return out
+
+
+def trace_summary(stage: Stage, results: dict[str, Result]) -> list[str]:
+    """For each trace run (GGML_HEXAGON_PROFILE=3): the thread time of each phase inside the ops of each matmul kind
+    of the last vision batch, in ms summed over the threads. tools/trace/htp_trace.py parses the log.
+    O(events * log(ops))."""
+    import bisect
+    sys.path.insert(0, str(REPO / "tools/trace"))
+    import htp_trace  # noqa: E402 (the module is in a directory of the repository)
+    out = []
+    for s, vk, r in stage.runs:
+        if "GGML_HEXAGON_PROFILE=3" not in V[vk].env:
+            continue
+        name = run_name(s, vk, r)
+        res = results.get(name)
+        if res is None or not res.ok:
+            continue
+        log = htp_trace.parse_lines(res.log.splitlines(), name)
+        batches = [b for sess in log.sessions.values() for b in sess.batches if b.n_ops > 100]
+        if not batches:
+            out.append(f"{name}: no vision batch")
+            continue
+        b = batches[-1]
+        phases, n_open, n_stop = htp_trace.pair_phases(b)
+        starts = [op.abs_cycles for op in b.ops]
+        sums: dict[str, Counter] = defaultdict(Counter)
+        wall: Counter = Counter()
+        for op in b.ops:
+            wall[profile_kind(op.name, op.names)] += op.cycles / b.clock_mhz
+        for ph in phases:
+            k = bisect.bisect_right(starts, ph.start_cycles) - 1
+            if k < 0:
+                continue
+            op = b.ops[k]
+            sums[profile_kind(op.name, op.names)][ph.name] += (ph.end_cycles - ph.start_cycles) / b.clock_mhz
+        names = sorted({n for kind in ("qkv", "up", "o", "down") for n in sums[kind]})
+        out.append(f"The phases of {name} ({V[vk].text}), last vision batch of {b.n_ops} ops, ms of thread time "
+                   f"({n_open} starts and {n_stop} stops without a pair):")
+        out.append(f"  {'kind':6s} {'op ms':>7s} " + " ".join(f"{n[:14]:>14s}" for n in names))
+        for kind in ("qkv", "up", "o", "down"):
+            out.append(f"  {kind:6s} {wall[kind] / 1000:7.1f} " +
+                       " ".join(f"{sums[kind][n] / 1000:14.1f}" for n in names))
+    return out
+
+
 def checks(stage: Stage, results: dict[str, Result]) -> list[str]:
     """The conditions of the runs."""
     names = [run_name(*r) for r in stage.runs]
@@ -741,6 +867,10 @@ def table(stage: Stage, include_all: bool) -> int:
         parts.append(dump_table(stage, results))
     if any(PROFILE_ENV in V[vk].env for _, vk, _ in stage.runs):
         parts.append(profile_summary(stage, results))
+    if any(profile_ids(V[vk].env) for _, vk, _ in stage.runs):
+        parts.append(pmu_summary(stage, results))
+    if any("GGML_HEXAGON_PROFILE=3" in V[vk].env for _, vk, _ in stage.runs):
+        parts.append(trace_summary(stage, results))
     for s, vk, r in stage.runs:
         if PROFILE_ENV in V[vk].env:
             parts.append(profile_table(results, run_name(s, vk, r)))
