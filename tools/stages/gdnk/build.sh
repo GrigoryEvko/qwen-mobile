@@ -4,12 +4,17 @@
 # the patches (GGML_HEXAGON_GDN_CONV_DMA, GGML_HEXAGON_GDN_CHUNK, GGML_HEXAGON_GDN_QKNORM) give the old
 # and the new paths on the same libraries.
 #
-#   JOBS=24 [GDNK_STAGE=build/gdnk] tools/stages/gdnk/build.sh PATCH...
+#   JOBS=24 [GDNK_STAGE=build/gdnk] [GDNK_PART=all|hexagon] tools/stages/gdnk/build.sh [PATCH...]
 #
 # PATCH is a llama.cpp patch file that is not yet in patches/ (wip/gdnk/NNNN-*.patch, a path relative to
-# the root of the repository), applied in the order of the command line. build/gdnk/build.sh is a link
-# to this file. The files of the stage go to GDNK_STAGE (the preset value is build/gdnk). A second stage
-# directory keeps the files of a stage that the phone runs while a different set builds.
+# the root of the repository), applied in the order of the command line. With no PATCH the stage is the
+# tree of HEAD. build/gdnk/build.sh is a link to this file. The files of the stage go to GDNK_STAGE (the
+# preset value is build/gdnk). A second stage directory keeps the files of a stage that the phone runs
+# while a different set builds.
+#
+# GDNK_PART selects the files: "all" (the preset value) builds each library and program of the stage.
+# "hexagon" builds only libggml-hexagon.so and libggml-htp-v79.so, a second backend for the libraries of
+# an "all" stage (LD_LIBRARY_PATH and ADSP_LIBRARY_PATH put its directory first on the phone).
 #
 # The steps:
 #   1. tests/sanitizers/llama-copy.sh makes GDNK_STAGE/src, the llama.cpp tree of HEAD (the pin plus
@@ -19,23 +24,30 @@
 #      GDNK_STAGE/android with the preset, the flags (with -flto) and the build number and commit of
 #      scripts/build-native.sh, and builds the libraries of the app (LLAMA_LIBS of scripts/lib.sh), the DSP
 #      library v79, llama-bench, llama-perplexity and test-backend-ops.
-#   3. The script copies the files of the stage into GDNK_STAGE/phone and writes SHA256SUMS. It stops if a
-#      program or a library of the stage needs a llama, ggml or mtmd library (readelf, NEEDED) that is not
-#      in phone/lib.
+#   3. The script copies the files of the stage into GDNK_STAGE/phone and writes SHA256SUMS. For the part
+#      "all" it stops if a program or a library of the stage needs a llama, ggml or mtmd library
+#      (readelf, NEEDED) that is not in phone/lib.
 #
-# Time: about 15 minutes with JOBS=24 (the LTO links take most of it). Disk: about 2 GB.
+# Time: about 15 minutes with JOBS=24 for the part "all" (the LTO links take most of it), about 3 minutes
+# for "hexagon". Disk: about 2 GB.
 set -euo pipefail
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../../scripts/lib.sh"
 JOBS=${JOBS:-24}
 cd "$REPO_ROOT"
 
-[[ $# -ge 1 ]] || die "give the patch files of the stage, in order"
 for p in "$@"; do
     [[ -f $p ]] || die "no patch file $p"
 done
 
 readonly stage=${GDNK_STAGE:-build/gdnk}
 [[ $stage == build/* ]] || die "GDNK_STAGE must be a directory below build/, not $stage"
+readonly part=${GDNK_PART:-all}
+case $part in
+    all) targets="$LLAMA_LIBS htp-v79 llama-bench llama-perplexity test-backend-ops" ;;
+    hexagon) targets="ggml-hexagon htp-v79" ;;
+    *) die "GDNK_PART must be all or hexagon, not $part" ;;
+esac
+readonly targets
 readonly tree=$stage/src
 readonly bdir=$stage/android
 readonly out=$stage/phone
@@ -62,7 +74,7 @@ echo "gdnk: SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH JOBS=$JOBS"
         -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
         -e LLAMA_BUILD_NUMBER="$LLAMA_BUILD_NUMBER" \
         -e LLAMA_BUILD_COMMIT_SHORT="${LLAMA_COMMIT:0:7}" \
-        -e TARGETS="$LLAMA_LIBS htp-v79 llama-bench llama-perplexity test-backend-ops" \
+        -e TARGETS="$targets" \
         -e JOBS="$JOBS" \
         -e FLAGS_EXTRA="$repro $remap" \
         -e TREE="$tree" -e BDIR="$bdir" \
@@ -90,7 +102,14 @@ cmake --build "$BDIR" -j"$JOBS" --target $TARGETS
 
 # 3. The stage files.
 rm -rf "$out"
-mkdir -p "$out/bin" "$out/lib"
+mkdir -p "$out/lib"
+if [[ $part == hexagon ]]; then
+    cp -f "$bdir/bin/libggml-hexagon.so" "$bdir/ggml/src/ggml-hexagon/libggml-htp-v79.so" "$out/lib/"
+    (cd "$out" && sha256sum lib/* > SHA256SUMS)
+    cat "$out/SHA256SUMS"
+    exit 0
+fi
+mkdir -p "$out/bin"
 for lib in $LLAMA_LIBS llama-bench-impl llama-perplexity-impl; do
     cp -f "$bdir/bin/lib$lib.so" "$out/lib/"
 done
