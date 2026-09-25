@@ -1101,6 +1101,9 @@ DecodeOutcome decode_items(Engine & e, llama_context * lctx, const std::vector<M
         if (e.stop_requested.load()) {
             return DecodeOutcome::kStopped;
         }
+        // A batch of the text before the image can still run on the device. The wait makes sure that the encoder
+        // never runs at the same time as a batch of the context, thus its output does not depend on one.
+        llama_synchronize(lctx);
         const float * embd = image_embd(e, chunk, error);
         if (embd == nullptr) {
             return DecodeOutcome::kFailed;

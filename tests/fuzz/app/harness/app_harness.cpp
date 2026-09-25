@@ -1996,6 +1996,12 @@ struct StageFlowSpec {
     /** The thinking of the stages and of the send. */
     bool         stage_thinking;
     bool         send_thinking;
+    /**
+     * The first message is longer than one batch, and the prompt decodes from
+     * its start: the text before the image is longer than the room in the batch
+     * of the image, thus a text batch decodes before the encoder runs.
+     */
+    bool         long_text = false;
 };
 
 /** The result of one flow. */
@@ -2043,6 +2049,9 @@ const std::vector<StageFlowSpec> & stage_flows() {
         {"stage-first", "send-first", false, {0}, false, 0, false, false},
         {"reset-send", nullptr, true, {}, true, 0, false, false},
         {"stage-reset", "reset-send", true, {0}, true, 0, false, false},
+        // With thinking the template form renders the whole conversation, thus the prompt decodes from its start.
+        {"long-think", nullptr, true, {}, false, 0, true, true, true},
+        {"stage-long", "long-think", true, {0}, false, 0, true, true, true},
     };
     return flows;
 }
@@ -2146,7 +2155,7 @@ float logit_distance(const std::vector<float> & a, const std::vector<float> & b)
  * QWEN_SAMPLER_SEED). O(prompt + n_tokens) decodes.
  */
 StageFlowResult run_stage_flow(Program & p, jlong h, const StageFlowSpec & f, const std::u16string & first_text,
-                               int n_tokens, const char * what) {
+                               const std::u16string & long_text, int n_tokens, const char * what) {
     const std::u16string first_answer = u"I read the log. Every step finished with no error.";
     const std::u16string send_text    = u"What is in the picture? Answer in two sentences.";
     const std::u16string stage_text   = u"Describe the image.";
@@ -2160,7 +2169,7 @@ StageFlowResult run_stage_flow(Program & p, jlong h, const StageFlowSpec & f, co
     r.compute0_mib = compute_mib(h);
     std::vector<Msg> history;
     if (f.turn1) {
-        history.push_back(Msg{"user", first_text, -1});
+        history.push_back(Msg{"user", f.long_text ? long_text : first_text, -1});
         if (api_chat_start(p, h, history, false, 0.7f, 0.8f, false, false) < 0) {
             fail("%s: flow %s: the first turn did not start", what, f.name);
         }
@@ -2169,6 +2178,13 @@ StageFlowResult run_stage_flow(Program & p, jlong h, const StageFlowSpec & f, co
         // The snapshot after a complete answer runs on the background thread.
         sp->worker->drain();
         history.push_back(Msg{"assistant", first_answer, -1});
+        if (f.long_text) {
+            std::lock_guard<std::mutex> lock(sp->mutex);
+            if (sp->cache.size() <= (size_t) kBatch) {
+                fail("%s: flow %s: the first turn holds %zu items, not more than one batch of %d", what, f.name,
+                     sp->cache.size(), kBatch);
+            }
+        }
     }
     for (const int image : f.stages) {
         std::vector<Msg> msgs = history;
@@ -2179,6 +2195,10 @@ StageFlowResult run_stage_flow(Program & p, jlong h, const StageFlowSpec & f, co
         check_engine(h, "stageImage of a scenario");
         if (r.staged <= 0) {
             fail("%s: flow %s: stageImage gave %d, it must stage the image", what, f.name, r.staged);
+        }
+        if (f.long_text && r.staged <= kBatch) {
+            fail("%s: flow %s: the stage decoded %d tokens, thus no text batch decoded before the encoder", what,
+                 f.name, r.staged);
         }
     }
     // The staged part and the end of it: the send decodes from there when it extends the part.
@@ -2276,6 +2296,17 @@ int check_image_stage(Program & p, LoadSpec s, bool speculative) {
         first_text += u"Step " + fakejni::new_string_utf8(std::to_string(i + 1))->chars + u" finished with no error. ";
     }
     first_text += u"Did any step fail?";
+    // The first message of the long flows: more than one batch of tokens with each model.
+    std::u16string long_text = u"Here is the long log of the tool. ";
+    const int long_lines = real ? 160 : 48;
+    for (int i = 0; i < long_lines; ++i) {
+        long_text += u"Step " + fakejni::new_string_utf8(std::to_string(i + 1))->chars + u" finished with no error. ";
+    }
+    long_text += u"Did any step fail?";
+    if (!real) {
+        // Room for the long first message of the tiny model and its image turn.
+        s.n_ctx = 4096;
+    }
     p.images.clear();
     if (real) {
         s.model            = opt.real_model;
@@ -2360,7 +2391,7 @@ int check_image_stage(Program & p, LoadSpec s, bool speculative) {
             ++index;
             continue;
         }
-        const StageFlowResult r = run_stage_flow(p, h, *f, first_text, n_tokens, what);
+        const StageFlowResult r = run_stage_flow(p, h, *f, first_text, long_text, n_tokens, what);
         if (dump != nullptr) {
             const std::string path = std::string(dump) + "-" + std::to_string(index) + "-" + f->name + ".f32";
             if (!cache_io::write_file_atomic(path, {{r.logits.data(), r.logits.size() * sizeof(float)}})) {
