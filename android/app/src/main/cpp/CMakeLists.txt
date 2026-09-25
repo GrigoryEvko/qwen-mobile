@@ -40,6 +40,8 @@ find_package(OpenCL REQUIRED)
 
 add_library(qwenmobile SHARED
     cache_io.cpp
+    chat_prompt.cpp
+    engine_tasks.cpp
     image_cache.cpp
     llama_jni.cpp
     perf_hint.cpp

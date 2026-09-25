@@ -16,12 +16,43 @@ object ModelFiles {
     /** The app-private external directory. No permission is necessary. */
     fun privateDir(context: Context): File? = context.getExternalFilesDir("models")
 
-    /** All GGUF language models from the two directories, sorted by name. Projector files are not models. */
+    /**
+     * All GGUF language models from the two directories, sorted by name.
+     * Projector files are not models, and the draft-head file of a model is
+     * not a model of its own.
+     */
     fun list(context: Context): List<File> {
         val dirs = listOfNotNull(publicDir(), privateDir(context))
         return dirs.flatMap { dir ->
-            dir.listFiles { file -> file.isFile && isGguf(file) && !isProjector(file) }?.toList().orEmpty()
+            dir.listFiles { file -> file.isFile && isGguf(file) && !isProjector(file) && !isDraftHeadTwin(file) }
+                ?.toList().orEmpty()
         }.sortedBy { it.name }
+    }
+
+    /**
+     * The name suffix of the file of a model with the reduced draft head of
+     * its MTP block (quant/draftset.py): "<stem>-draft32k.gguf" next to
+     * "<stem>.gguf". The two files hold the same model weights.
+     */
+    const val DRAFT_HEAD_SUFFIX = "-draft32k"
+
+    /**
+     * The file with the reduced draft head next to a model file, or null. A
+     * speculative engine loads it in the place of the model (load_impl in
+     * llama_jni.cpp), thus a draft pass reads 89 MB of head and not 675 MB.
+     */
+    fun draftHeadFile(model: File): File? {
+        if (model.nameWithoutExtension.endsWith(DRAFT_HEAD_SUFFIX)) {
+            return null
+        }
+        val twin = File(model.parentFile, model.nameWithoutExtension + DRAFT_HEAD_SUFFIX + ".gguf")
+        return if (twin.isFile) twin else null
+    }
+
+    /** True when the file is the draft-head file of a model file in the same directory. */
+    fun isDraftHeadTwin(file: File): Boolean {
+        val stem = file.nameWithoutExtension
+        return stem.endsWith(DRAFT_HEAD_SUFFIX) && File(file.parentFile, stem.removeSuffix(DRAFT_HEAD_SUFFIX) + ".gguf").isFile
     }
 
     /**

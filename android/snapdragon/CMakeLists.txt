@@ -23,6 +23,8 @@ endforeach()
 set(JNI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../app/src/main/cpp")
 add_library(qwenmobile SHARED
     "${JNI_DIR}/cache_io.cpp"
+    "${JNI_DIR}/chat_prompt.cpp"
+    "${JNI_DIR}/engine_tasks.cpp"
     "${JNI_DIR}/image_cache.cpp"
     "${JNI_DIR}/llama_jni.cpp"
     "${JNI_DIR}/perf_hint.cpp"

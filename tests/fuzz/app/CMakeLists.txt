@@ -240,6 +240,8 @@ add_library(app_harness STATIC
     harness/app_harness.cpp
     harness/fake_jni.cpp
     ${APP_CACHE_SOURCES}
+    "${APP_CPP_DIR}/chat_prompt.cpp"
+    "${APP_CPP_DIR}/engine_tasks.cpp"
     "${APP_CPP_DIR}/perf_hint.cpp"
     "${APP_CPP_DIR}/spec_policy.cpp"
     "${APP_CPP_DIR}/trace.cpp")

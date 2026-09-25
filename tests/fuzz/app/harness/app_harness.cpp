@@ -22,8 +22,8 @@
  *   The same for the prefill context of the hybrid backend.
  * - The draft context holds no position at or after n_past, and the prompt
  *   of the draft driver is the text of the items.
- * - A token that went to the app is in the memory: an engine without a
- *   draft driver has no token of a step (id_last) in an open answer.
+ * - A token that went to the app is in the memory, or it is the token of the
+ *   last step (id_last), which the next step decodes.
  * - The exactness oracle: the state of the engine, restored
  *   into a new context, gives the same logits for a probe token as a new
  *   context that decodes the items of the engine from the start.
@@ -723,7 +723,7 @@ void check_engine(jlong h, const char * after) {
 /**
  * The tokens that generateNext gave to the app must be the tokens of the
  * answer in the memory, in order: the memory holds each token that the app
- * received, and the last token of a speculative step (id_last) until the next
+ * received, and the last token of a step (id_last) until the next
  * step decodes it. The end token is in the memory and does not go to the
  * app. The check holds while the memory holds the prompt of the turn; a
  * benchmark or a reset ends the turn. O(answer).
@@ -1460,6 +1460,459 @@ int damage_data(const std::string & dir, const std::string & suffix) {
     return n;
 }
 
+/**
+ * The render of the chat template with the empty think block after each
+ * "<|im_start|>assistant\n" that has no think block: the live form of the
+ * Qwen3.5 template, made without chat_prompt.cpp. O(length).
+ */
+std::string empty_blocks_in(const std::string & stock) {
+    static const std::string open  = "<|im_start|>assistant\n";
+    static const std::string block = "<think>\n\n</think>\n\n";
+    std::string out;
+    size_t at = 0;
+    for (;;) {
+        const size_t k = stock.find(open, at);
+        if (k == std::string::npos) {
+            out += stock.substr(at);
+            return out;
+        }
+        out += stock.substr(at, k + open.size() - at);
+        at = k + open.size();
+        if (stock.compare(at, 7, "<think>") != 0) {
+            out += block;
+        }
+    }
+}
+
+/** The first index where two item sequences differ, or the length of the shorter one. */
+size_t first_difference(const std::vector<MemItem> & a, const std::vector<MemItem> & b) {
+    size_t at = 0;
+    while (at < a.size() && at < b.size() && a[at] == b[at]) {
+        ++at;
+    }
+    return at;
+}
+
+/**
+ * The scenario render-live: the items of the prompt of each turn
+ * (plan_prompt) must equal the tokens of the full render of the form of the
+ * turn, with every image. A turn that follows a complete answer continues
+ * the memory, and the full render of the live form must equal the render of
+ * the template with the empty think blocks. The chat has a system message,
+ * three images, an interrupted turn (the app removes its question) and a turn
+ * with thinking. The memory after an answer is the prompt, the tokens of the
+ * answer text and the end token, without a decode. With FUZZ_APP_REAL_MODEL
+ * and FUZZ_APP_REAL_MMPROJ the scenario takes that model on the CPU.
+ */
+int check_render_live(Program & p, LoadSpec s) {
+    const Options & opt = *p.opt;
+    if (!opt.real_model.empty()) {
+        s.model  = opt.real_model;
+        s.mmproj = opt.real_mmproj;
+        s.device.clear();
+        s.n_ctx  = 8192;
+    }
+    s.speculative = false;
+    for (int i = 0; i < 3; ++i) {
+        p.images.push_back(make_bmp(24 + 8 * i, 24, 21 + (uint32_t) i));
+    }
+    // Each decode of an image in the app gives 96 x 64 pixels: the tape of decodeImage repeats one decode.
+    p.tape = {0, 95, 63};
+    const jlong h = api_load(s);
+    if (h == 0) {
+        fail("scenario render-live: the model did not load");
+    }
+    const std::shared_ptr<Engine> sp = engine_of(h);
+    struct Turn {
+        const char * user;
+        int          image;
+        const char * answer;
+        bool         thinking;
+        bool         interrupted;
+    };
+    const Turn turns[] = {
+        {"Describe the first picture.", 0, "A small square with a pattern of colored dots.", false, false},
+        {"What colors are there?", -1, "Red, green and blue.\n\n- red\n- green\n- blue", false, false},
+        {"And this one?", 1, "Another pattern: rows of gray and white.", false, false},
+        {"Write a word in Russian.", -1, "Привет! 日本語 is Japanese.", false, false},
+        {"Stop here.", -1, "This answer stops", false, true},
+        {"Think about the third picture.", 2, "It shows stripes.", true, false},
+        {"Now without thinking, one line.", -1, "One line.", false, false},
+        {"The last question?", -1, "Yes, the last one.", false, false},
+    };
+    int checks = 0;
+    int continued = 0;
+    jni_call("render-live", [&](JNIEnv * env) {
+        Engine & e = *sp;
+        std::lock_guard<std::mutex> lock(e.mutex);
+        if (e.prompt->form() != HistoryForm::kLive) {
+            fail("scenario render-live: the live form is off: %s", e.prompt->refusal().c_str());
+        }
+        const llama_vocab * vocab = llama_model_get_vocab(e.model);
+        const jclass        cls   = native_class(env);
+        std::vector<jbyteArray>  arrays;
+        std::vector<std::string> ids;
+        for (const std::vector<uint8_t> & img : p.images) {
+            arrays.push_back(reinterpret_cast<jbyteArray>(fakejni::arg(env, fakejni::new_byte_array(img.data(), img.size()))));
+            ids.push_back(cache_io::sha256_hex(img.data(), img.size()));
+        }
+        std::vector<PromptMessage> history = {PromptMessage{"system", "You are a helpful assistant.", ""}};
+        std::vector<jbyteArray>    history_images = {nullptr};
+        const llama_token          eog = e.prompt->eog_token();
+        bool                       expect_cont = false;
+        for (size_t k = 0; k < sizeof(turns) / sizeof(turns[0]); ++k) {
+            const Turn & t = turns[k];
+            std::vector<PromptMessage> msgs     = history;
+            std::vector<jbyteArray>    image_of = history_images;
+            PromptMessage u{"user", t.user, ""};
+            jbyteArray    arr = nullptr;
+            if (t.image >= 0) {
+                u.content  = std::string(mtmd_default_marker()) + "\n" + u.content;
+                u.image_id = ids[(size_t) t.image];
+                arr        = arrays[(size_t) t.image];
+            }
+            msgs.push_back(u);
+            image_of.push_back(arr);
+            // The references: the full render of the form of the turn, and its tokens with every image.
+            std::string ref_text;
+            std::string tail;
+            if (t.thinking) {
+                e.prompt->render_template(msgs, true, ref_text, tail);
+            } else {
+                if (!e.prompt->render_live(msgs, ref_text)) {
+                    fail("scenario render-live: turn %zu has no full render of the live form", k + 1);
+                }
+                std::string stock;
+                e.prompt->render_template(msgs, false, stock, tail);
+                if (empty_blocks_in(stock) != ref_text) {
+                    fail("scenario render-live: turn %zu: the full render of the live form differs from the render of "
+                         "the template with the empty think blocks",
+                         k + 1);
+                }
+            }
+            std::vector<jbyteArray>  all_images;
+            std::vector<std::string> all_ids;
+            for (size_t i = 0; i < msgs.size(); ++i) {
+                if (image_of[i] != nullptr) {
+                    all_images.push_back(image_of[i]);
+                    all_ids.push_back(msgs[i].image_id);
+                }
+            }
+            mtmd::input_chunks                    ref_chunks;
+            std::vector<MemItem>                  ref_items;
+            std::vector<const mtmd_input_chunk *> ref_chunk_of;
+            std::string                           error;
+            if (!tokenize_prompt(env, cls, e, ref_text, all_images, all_ids, true, ref_chunks, ref_items, ref_chunk_of,
+                                 error)) {
+                fail("scenario render-live: turn %zu: the reference did not tokenize: %s", k + 1, error.c_str());
+            }
+            // The items of the engine.
+            PromptPlan plan;
+            if (!plan_prompt(env, cls, e, msgs, image_of, t.thinking, plan, error)) {
+                fail("scenario render-live: turn %zu: plan_prompt failed: %s", k + 1, error.c_str());
+            }
+            if (plan.tp.continuation != expect_cont || plan.tp.base_snapshot != t.thinking) {
+                fail("scenario render-live: turn %zu: continuation %d and base snapshot %d, want %d and %d", k + 1,
+                     (int) plan.tp.continuation, (int) plan.tp.base_snapshot, (int) expect_cont, (int) t.thinking);
+            }
+            if (plan.items != ref_items) {
+                const size_t at = first_difference(plan.items, ref_items);
+                fail("scenario render-live: turn %zu (continuation %d): %zu items against %zu of the full render, first "
+                     "difference at %zu: %d against %d",
+                     k + 1, (int) plan.tp.continuation, plan.items.size(), ref_items.size(), at,
+                     at < plan.items.size() ? plan.items[at].token : -2, at < ref_items.size() ? ref_items[at].token : -2);
+            }
+            const int64_t ref_tokens = count_tokens(ref_chunk_of, 0, ref_chunk_of.size());
+            if (plan.n_tokens != ref_tokens) {
+                fail("scenario render-live: turn %zu: %lld tokens against %lld of the full render", k + 1,
+                     (long long) plan.n_tokens, (long long) ref_tokens);
+            }
+            checks += 1;
+            continued += plan.tp.continuation ? 1 : 0;
+            // The memory after the answer, as the decode leaves it: the prompt, the answer, and the end token of a
+            // complete answer. The thinking of a thinking turn is part of the answer tokens.
+            const std::string        generated = t.thinking ? std::string("Some thought.\n</think>\n\n") + t.answer : t.answer;
+            const std::vector<llama_token> ans = common_tokenize(vocab, generated, false, true);
+            e.cache = plan.items;
+            for (const llama_token tok : ans) {
+                e.cache.push_back(MemItem{tok, {}});
+            }
+            if (!t.interrupted) {
+                e.cache.push_back(MemItem{eog, {}});
+            }
+            e.mem_tokens = plan.n_tokens + (int64_t) ans.size() + (t.interrupted ? 0 : 1);
+            e.n_past     = (llama_pos) e.cache.size();
+            if (!t.interrupted) {
+                const bool recorded = e.prompt->answer_ended(t.answer, !t.thinking, e.cache.size(), e.cache.back().token);
+                if (recorded == t.thinking) {
+                    fail("scenario render-live: turn %zu: the record after the answer is %d", k + 1, (int) recorded);
+                }
+                history.push_back(u);
+                history_images.push_back(arr);
+                history.push_back(PromptMessage{"assistant", t.answer, ""});
+                history_images.push_back(nullptr);
+            }
+            expect_cont = !t.interrupted && !t.thinking;
+        }
+        // The memory of the context is empty: the record and the items go.
+        clear_all(e);
+    });
+    api_free(h);
+    if (continued < 4) {
+        fail("scenario render-live: only %d of %d turns continued the memory", continued, checks);
+    }
+    fprintf(stderr, "scenario render-live: %d turns, %d continued, the items of each turn equal the full render of its "
+                    "form (%s)\n",
+            checks, continued, opt.real_model.empty() ? "tiny model" : opt.real_model.c_str());
+    return 0;
+}
+
+/**
+ * Generate the answer as the app keeps it (AnswerStream in Thinking.kt): the
+ * text after the thinking, without the white space at its start. Returns the
+ * count of pieces. O(limit) generateNext calls.
+ */
+int drain_content(LiveEngine & le, int limit, std::string & content) {
+    bool thinking = false;
+    int  n        = 0;
+    content.clear();
+    for (; n < limit; ++n) {
+        std::vector<int8_t> piece;
+        const int64_t given = given_tokens(le);
+        const int r = api_generate_next(le.handle, piece);
+        check_engine(le.handle, "one generateNext of a scenario");
+        note_delivered(le, given);
+        check_delivered(le, "one generateNext of a scenario");
+        if (r != 1) {
+            break;
+        }
+        if (piece.size() > 1 && !thinking) {
+            content.append(reinterpret_cast<const char *>(piece.data()) + 1, piece.size() - 1);
+        }
+        if (piece[0] == 1) {
+            if (content.empty()) {
+                thinking = true;
+            } else {
+                content += "<think>";
+            }
+        } else if (piece[0] == 2) {
+            thinking = false;
+        }
+    }
+    const size_t first = content.find_first_not_of(" \t\n\r\f\v");
+    content = first == std::string::npos ? std::string() : content.substr(first);
+    return n;
+}
+
+/**
+ * Put a complete answer into the engine as the model gives it: the tokens of
+ * text and the end token of the template decode (decode_one, which the draft
+ * context follows), and the next generateNext ends the answer
+ * (finish_answer). The tiny model does not frequently end an answer without
+ * a thinking tag, thus the scenario gives some answers this way.
+ */
+void inject_answer(jlong h, const std::string & text, const char * what) {
+    const std::shared_ptr<Engine> sp = engine_of(h);
+    {
+        std::lock_guard<std::mutex> lock(sp->mutex);
+        Engine & e = *sp;
+        const llama_vocab * vocab = llama_model_get_vocab(e.model);
+        for (const llama_token t : common_tokenize(vocab, text, false, true)) {
+            if (decode_one(e, t) != 0) {
+                fail("%s: a token of the injected answer did not decode", what);
+            }
+        }
+        if (decode_one(e, e.prompt->eog_token()) != 0) {
+            fail("%s: the end token of the injected answer did not decode", what);
+        }
+        e.answer_text = text;
+        e.answer_ends = true;
+        e.id_last     = LLAMA_TOKEN_NULL;
+    }
+    std::vector<int8_t> piece;
+    if (api_generate_next(h, piece) != 0) {
+        fail("%s: the injected answer did not end", what);
+    }
+}
+
+/**
+ * The scenario live-turns: a chat in the live form with decodes. A turn after
+ * a complete answer continues the memory, the state after each complete
+ * answer goes into the store on the background thread, the exactness oracle
+ * holds after each turn, and a new engine on the same cache directory (a
+ * restart of the app) restores the snapshot after the last complete answer.
+ * The even turns get an answer that inject_answer puts into the engine,
+ * with the end token at its end. The odd turns get the answer of the model.
+ */
+int check_live_turns(Program & p, LoadSpec s, bool speculative) {
+    s.speculative = speculative;
+    s.cache       = p.dir + (speculative ? "/live-s" : "/live-n");
+    if (p.images.empty()) {
+        p.images.push_back(make_bmp(32, 32, 31));
+    }
+    const char * what = speculative ? "scenario live-turns (draft)" : "scenario live-turns";
+    jlong h = api_load(s);
+    if (h == 0) {
+        fail("%s: the tiny model did not load", what);
+    }
+    const char16_t * questions[] = {u"Hello, how are you? Tell me about the cat.", u"And the dog?",
+                                    u"What is in the picture?", u"Thanks. One more word?", u"Bye.", u"Really?"};
+    const char * answers[] = {"The cat sits on the mat.", "", "A square of gray dots.", "", "Goodbye, and thank you.", ""};
+    std::vector<Msg> chat;
+    int continued = 0;
+    int snapshots = 0;
+    bool last_complete = false;
+    for (int k = 0; k < 6; ++k) {
+        const std::shared_ptr<Engine> sp = engine_of(h);
+        bool expect = false;
+        {
+            std::lock_guard<std::mutex> lock(sp->mutex);
+            expect = sp->prompt->has_record();
+        }
+        chat.push_back(Msg{"user", questions[k], k == 2 ? 0 : -1});
+        if (api_chat_start(p, h, chat, false, 0.0f, 0.8f, false, false) < 0) {
+            fail("%s: chatStart of turn %d failed", what, k + 1);
+        }
+        {
+            std::lock_guard<std::mutex> lock(sp->mutex);
+            if (sp->turn.continued != expect) {
+                fail("%s: turn %d continued %d, the record said %d", what, k + 1, (int) sp->turn.continued, (int) expect);
+            }
+            continued += sp->turn.continued ? 1 : 0;
+        }
+        std::string content;
+        if (k % 2 == 0) {
+            content = answers[k];
+            inject_answer(h, content, what);
+        } else {
+            LiveEngine le;
+            le.handle = h;
+            start_tracking(le);
+            drain_content(le, 64, content);
+        }
+        // The snapshot task of a complete answer runs on the background thread.
+        sp->worker->drain();
+        {
+            std::lock_guard<std::mutex> lock(sp->mutex);
+            last_complete = sp->prompt->has_record();
+            if (last_complete) {
+                if (sp->states->find(sp->cache) == nullptr) {
+                    fail("%s: turn %d: no snapshot of the memory after a complete answer", what, k + 1);
+                }
+                snapshots += 1;
+            }
+        }
+        std::string why;
+        if (!oracle(h, why)) {
+            fail("%s: turn %d: exactness oracle: %s", what, k + 1, why.c_str());
+        }
+        chat.push_back(Msg{"assistant", fakejni::new_string_utf8(content)->chars, -1});
+    }
+    // A restart: a new engine on the same directory restores the state after the last complete answer.
+    api_free(h);
+    h = api_load(s);
+    if (h == 0) {
+        fail("%s: the second load failed", what);
+    }
+    chat.push_back(Msg{"user", u"After the restart?", -1});
+    if (api_chat_start(p, h, chat, false, 0.0f, 0.8f, false, false) < 0) {
+        fail("%s: chatStart after the restart failed", what);
+    }
+    bool restored = false;
+    {
+        const std::shared_ptr<Engine> sp = engine_of(h);
+        std::lock_guard<std::mutex> lock(sp->mutex);
+        restored = sp->turn.from_snapshot;
+    }
+    if (snapshots > 0 && !restored) {
+        fail("%s: the turn after the restart did not restore the snapshot after the last complete answer", what);
+    }
+    if (continued < 3) {
+        fail("%s: %d turns continued the memory, and each of the three injected answers must give one", what,
+             continued);
+    }
+    LiveEngine le;
+    le.handle = h;
+    start_tracking(le);
+    std::string content;
+    drain_content(le, 32, content);
+    std::string why;
+    if (!oracle(h, why)) {
+        fail("%s: after the restart: exactness oracle: %s", what, why.c_str());
+    }
+    api_free(h);
+    fprintf(stderr, "%s: 6 turns, %d continued, %d snapshots after an answer, restart %s (last answer %s)\n", what,
+            continued, snapshots, restored ? "restored" : "decoded the prompt", last_complete ? "complete" : "not complete");
+    return 0;
+}
+
+/**
+ * The scenario spec-limit: the MTP drafter stops at the draft length of the
+ * call (the n_max of common_speculative_draft_params). A draft of n tokens
+ * runs n passes of the MTP block, each writes one cell of the draft context,
+ * and it gives the first n tokens of the longest draft.
+ */
+int check_spec_limit(Program & p, LoadSpec s) {
+    s.speculative = true;
+    s.mmproj.clear();
+    const jlong h = api_load(s);
+    if (h == 0) {
+        fail("scenario spec-limit: the tiny model did not load");
+    }
+    if (api_chat_start(p, h, {Msg{"user", u"Hello, how are you? Tell me about the cat.", -1}}, false, 0.0f, 0.8f, false,
+                       false) < 0) {
+        fail("scenario spec-limit: chatStart failed");
+    }
+    LiveEngine le;
+    le.handle = h;
+    start_tracking(le);
+    // The first call samples the first token: the draft of the next step starts from it.
+    drain_answer(le, 1);
+    int passes[SpecPolicy::kDraftMax + 1] = {};
+    std::vector<llama_tokens> drafts(SpecPolicy::kDraftMax + 1);
+    {
+        const std::shared_ptr<Engine> sp = engine_of(h);
+        Engine & e = *sp;
+        std::lock_guard<std::mutex> lock(e.mutex);
+        if (e.spec == nullptr || e.id_last == LLAMA_TOKEN_NULL) {
+            fail("scenario spec-limit: no draft driver, or no token to draft from");
+        }
+        llama_memory_t  mem_dft = llama_get_memory(e.ctx_dft);
+        const llama_pos pos0    = e.n_past;
+        for (int n = SpecPolicy::kDraftMax; n >= 1; --n) {
+            common_speculative_get_draft_params(e.spec, kSeqMain) = {
+                /* .drafting = */ true,
+                /* .n_max    = */ n,
+                /* .pos0     = */ pos0,
+                /* .id_last  = */ e.id_last,
+                /* .prompt   = */ &e.spec_prompt,
+                /* .result   = */ &drafts[(size_t) n],
+            };
+            common_speculative_draft(e.spec);
+            const llama_pos dmax = llama_memory_seq_pos_max(mem_dft, kSeqMain);
+            passes[n] = dmax >= pos0 ? (int) (dmax - pos0 + 1) : 0;
+            llama_memory_seq_rm(mem_dft, kSeqMain, pos0, -1);
+        }
+    }
+    const llama_tokens & longest = drafts[SpecPolicy::kDraftMax];
+    for (int n = 1; n <= SpecPolicy::kDraftMax; ++n) {
+        const llama_tokens & d = drafts[(size_t) n];
+        if (passes[n] > n) {
+            fail("scenario spec-limit: a draft of at most %d tokens ran %d passes of the MTP block", n, passes[n]);
+        }
+        if (d.size() > (size_t) n || !std::equal(d.begin(), d.end(), longest.begin())) {
+            fail("scenario spec-limit: the draft of at most %d tokens (%zu tokens) is not a prefix of the draft of %d",
+                 n, d.size(), SpecPolicy::kDraftMax);
+        }
+    }
+    // The answer continues after the drafts.
+    drain_answer(le, 24);
+    api_free(h);
+    fprintf(stderr, "scenario spec-limit: passes %d %d %d %d for the limits 1 to 4, each draft a prefix of the longest\n",
+            passes[1], passes[2], passes[3], passes[4]);
+    return 0;
+}
+
 }  // namespace
 
 int run_scenario(const Options & opt, const std::string & name) {
@@ -1580,6 +2033,10 @@ int run_scenario(const Options & opt, const std::string & name) {
     } else if (name == "snapshot-damage" || name == "image-damage") {
         // A file of the cache with damaged data and an intact header: the next load
         // reads it, and its answer must be the answer of a load without a cache.
+        // The template form writes the snapshot before the generation prompt of
+        // each turn. The live form writes one only after a complete answer, which
+        // the tiny model does not frequently give: live-turns tests that store.
+        setenv("QWEN_HISTORY_FORM", "template", 1);
         const bool image = name == "image-damage";
         if (image) {
             p.images.push_back(make_bmp(32, 32, 13));
@@ -1616,6 +2073,7 @@ int run_scenario(const Options & opt, const std::string & name) {
         }
         fprintf(stderr, "scenario %s: %d files damaged, %zu bytes, the same text as without a cache\n", name.c_str(), n,
                 got.size());
+        unsetenv("QWEN_HISTORY_FORM");
     } else if (name == "sampler-nan") {
         // A NaN temperature (a damaged settings file can hold one) reaches the sampler chain.
         s.mmproj.clear();
@@ -1681,10 +2139,19 @@ int run_scenario(const Options & opt, const std::string & name) {
                 (unsigned long long) requests, kRounds);
     } else if (name == "priority") {
         result = check_priority(opt);
+    } else if (name == "render-live") {
+        result = check_render_live(p, s);
+    } else if (name == "live-turns") {
+        result = check_live_turns(p, s, false);
+        if (result == 0) {
+            result = check_live_turns(p, s, true);
+        }
+    } else if (name == "spec-limit") {
+        result = check_spec_limit(p, s);
     } else {
         fprintf(stderr,
                 "unknown scenario %s: image-shape, image-twice, jni-pending, spec-disable, spec-parity, spec-image, "
-                "snapshot-damage, image-damage, sampler-nan, stop-free, priority\n",
+                "snapshot-damage, image-damage, sampler-nan, stop-free, priority, render-live, live-turns, spec-limit\n",
                 name.c_str());
         result = 2;
     }

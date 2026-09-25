@@ -63,6 +63,16 @@ class MemoryBudgetTest {
     }
 
     @Test
+    fun aSpeculativeEngineCountsTheDraftHeadFile() {
+        val model = folder.newFile("head.gguf").also { it.writeBytes(ByteArray(1_000)) }
+        folder.newFile("head-draft32k.gguf").also { it.writeBytes(ByteArray(1_090)) }
+        val plain = EngineConfig(model.absolutePath, Backend.NPU, 4, 8192)
+        // The engine loads the file with the reduced draft head only for speculative decoding.
+        assertEquals(1_000L, MemoryBudget.weightBytes(plain))
+        assertEquals(1_090L, MemoryBudget.weightBytes(plain.copy(speculative = true)))
+    }
+
+    @Test
     fun theHybridBackendDraftsNothing() {
         val model = folder.newFile("hybrid.gguf").also { it.writeBytes(ByteArray(1_000)) }
         // The prompt of the hybrid backend runs on a second model, thus the draft block cannot follow it.

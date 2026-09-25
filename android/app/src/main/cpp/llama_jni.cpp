@@ -6,16 +6,27 @@
  * engine against a second caller.
  *
  * The model memory of Qwen3.5 is a recurrent state plus a KV cache. A
- * recurrent state cannot roll back, thus the engine keeps snapshots of the
- * state: after each prompt, before its generation prompt, the state of
- * sequence 0 goes as bytes into a store (state_cache.h) with the exact
- * items that it holds. The chat template renders the previous answer
- * differently from the generated tokens, thus the next prompt extends the
- * snapshot of the previous prompt and not the answer: only the rendered
- * answer and the new message decode. An earlier turn or a repeated
- * question restores its snapshot without a decode. The hybrid backend
- * prefills on the prefill context and moves the same bytes to the decode
- * context.
+ * recurrent state cannot roll back, thus the prompt of a turn must extend
+ * what the memory holds, or the engine restores a snapshot: the state of
+ * sequence 0 as bytes in a store (state_cache.h) with the exact items that
+ * it holds. The history of the conversation has two forms (chat_prompt.h).
+ *
+ * In the live form an earlier answer keeps the empty think block of its
+ * generation prompt, thus a turn after a complete answer continues the
+ * memory: only the new message and the generation prompt decode, in one
+ * batch. After each such answer a background thread copies the state into
+ * the store, for a restart of the app or a conversation that the app
+ * changed. In the template form, and with thinking on, the chat template
+ * renders an earlier answer differently from the generated tokens. Thus the
+ * state before each generation prompt goes into the store, and the next
+ * prompt extends that snapshot: only the rendered answer and the new message
+ * decode. An earlier turn or a repeated question restores its snapshot
+ * without a decode. The hybrid backend uses the template form: it prefills
+ * on the prefill context and moves the same bytes to the decode context.
+ *
+ * generateNext gives each token to the app before the decode of that token,
+ * and the next call decodes it. Thus the app shows a token while the model
+ * decodes it, and the first token of an answer comes one decode earlier.
  *
  * The output of the vision encoder goes into a second store
  * (image_cache.h) by the hash of the image file, in RAM and on disk. A
@@ -63,7 +74,9 @@
 
 #include "cache_io.h"
 #include "chat.h"
+#include "chat_prompt.h"
 #include "common.h"
+#include "engine_tasks.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "image_cache.h"
@@ -163,6 +176,8 @@ struct TurnStats {
     /** The tokens of the prompt that the memory held already. From a snapshot, or from the live memory. */
     int64_t reused_tokens  = 0;
     bool    from_snapshot  = false;
+    /** True when the prompt continued the memory of the last answer (the live form), without a search of the store. */
+    bool    continued      = false;
     /** The restore of a snapshot into the prefill context, the snapshot of the new prompt state, the move to the decode context. */
     int64_t restore_us     = 0;
     int64_t snapshot_us    = 0;
@@ -256,6 +271,8 @@ struct Engine {
     llama_token tok_think_open  = LLAMA_TOKEN_NULL;
     llama_token tok_think_close = LLAMA_TOKEN_NULL;
     common_chat_templates_ptr tmpls;
+    /** The prompt of each turn, and the record of the conversation that the memory holds. */
+    std::unique_ptr<ChatPrompt> prompt;
     std::unique_ptr<PerfHintSession> hint;
     std::mutex mutex;
 
@@ -263,6 +280,11 @@ struct Engine {
     std::vector<MemItem> cache;
     /** The number of positions that the conversation sequence holds. */
     llama_pos n_past = 0;
+    /**
+     * The number of tokens that the conversation sequence holds. Each token
+     * takes one cell of the KV cache, and an image item holds many tokens.
+     */
+    int64_t mem_tokens = 0;
     /** The hybrid backend: the items that sequence 0 of the prefill context holds, and its positions. */
     std::vector<MemItem> pf_cache;
     llama_pos pf_n_past = 0;
@@ -299,6 +321,15 @@ struct Engine {
     llama_token id_last = LLAMA_TOKEN_NULL;
     /** True when the queue holds the last tokens of the answer. */
     bool answer_ends = false;
+    /** The UTF-8 bytes of the answer that the app received, and true when the app received a thinking tag in it. */
+    std::string answer_text;
+    bool        answer_tagged = false;
+
+    /**
+     * The background thread of the engine: the snapshot after an answer. The
+     * destructor stops it first, thus no task runs while the contexts go away.
+     */
+    std::unique_ptr<TaskThread> worker;
 
     int  n_threads  = 4;
     int  gpu_layers = 0;
@@ -312,6 +343,10 @@ struct Engine {
 
     /** Release every native object, in the order of their dependencies. */
     ~Engine() {
+        // A task reads the contexts and the stores: the queued tasks run to their end first.
+        if (worker) {
+            worker->stop();
+        }
         hint.reset();
         // The driver releases the backend samplers of the draft context, thus it goes first.
         if (spec != nullptr) common_speculative_free(spec);
@@ -447,13 +482,17 @@ size_t utf8_complete_prefix(const std::string & s) {
     return i;
 }
 
-/** Append the text of a token to the pending UTF-8 bytes, without a heap allocation for the usual token. */
+/**
+ * Append the text of a token to the pending UTF-8 bytes and to the text of the
+ * answer, without a heap allocation for the usual token.
+ */
 void append_piece(Engine & e, llama_token token) {
     const llama_vocab * vocab = llama_model_get_vocab(e.model);
     char buf[128];
     int32_t n = llama_token_to_piece(vocab, token, buf, sizeof(buf), 0, true);
     if (n >= 0) {
         e.utf8_pending.append(buf, (size_t) n);
+        e.answer_text.append(buf, (size_t) n);
         return;
     }
     // The piece is longer than the buffer: the negative value is its length.
@@ -461,6 +500,7 @@ void append_piece(Engine & e, llama_token token) {
     n = llama_token_to_piece(vocab, token, big.data(), (int32_t) big.size(), 0, true);
     if (n > 0) {
         e.utf8_pending.append(big.data(), (size_t) n);
+        e.answer_text.append(big.data(), (size_t) n);
     }
 }
 
@@ -581,6 +621,7 @@ int decode_text(Engine & e, llama_context * lctx, const llama_token * tokens, in
 void commit_token(Engine & e, llama_token token) {
     e.cache.push_back(MemItem{token, {}});
     e.n_past += 1;
+    e.mem_tokens += 1;
     if (e.spec != nullptr) {
         e.spec_prompt.push_back(token);
     }
@@ -607,9 +648,13 @@ void clear_all(Engine & e) {
     }
     e.cache.clear();
     e.n_past = 0;
+    e.mem_tokens = 0;
     e.pf_cache.clear();
     e.pf_n_past = 0;
     e.spec_prompt.clear();
+    if (e.prompt) {
+        e.prompt->forget();
+    }
 }
 
 /**
@@ -947,14 +992,21 @@ int64_t count_tokens(const std::vector<const mtmd_input_chunk *> & chunk_of, siz
 }
 
 /**
- * Decode a prompt. The items [0, base_len) are the prompt without the
- * generation prompt, the rest is the generation prompt. The longest
- * reusable prefix comes from the live memory of the prefill context, or
- * from the snapshot store, and only the remaining items decode. The state
- * before the generation prompt goes into the store, and on the hybrid
- * backend also into the decode context. Gives kFailed with the error
- * text set, or kStopped after a stop request, and then the memory is
- * empty.
+ * Decode a prompt of n_tokens tokens. The longest reusable prefix comes from
+ * the live memory of the prefill context, or from the snapshot store, and
+ * only the remaining items decode. With continuation, chat_start_impl built
+ * the items from the live memory, thus that memory is the prefix and the
+ * call does not search the store.
+ *
+ * With base_snapshot (the template form), the items [0, base_len) are the
+ * prompt without the generation prompt, and the rest is the generation
+ * prompt. The state before the generation prompt goes into the store, and on
+ * the hybrid backend also into the decode context. Without it (the live
+ * form), all remaining items decode in one call, and base_len is the number
+ * of items.
+ *
+ * Gives kFailed with the error text set, or kStopped after a stop request,
+ * and then the memory is empty.
  *
  * Exactness: a snapshot holds the state after exactly its items, with the
  * positions of each KV cell (the M-RoPE x and y of an image token
@@ -964,17 +1016,21 @@ int64_t count_tokens(const std::vector<const mtmd_input_chunk *> & chunk_of, siz
  * whole prompt on the same device.
  */
 DecodeOutcome prefill(Engine & e, const std::vector<MemItem> & items,
-                      const std::vector<const mtmd_input_chunk *> & chunk_of, size_t base_len, std::string & error) {
+                      const std::vector<const mtmd_input_chunk *> & chunk_of, size_t base_len, bool base_snapshot,
+                      bool continuation, int64_t n_tokens, std::string & error) {
     TraceSection trace("prefill");
     // The draft context cannot follow a prompt that a snapshot restores or
     // that an image gives, because it reads the hidden state of each token
     // from a decode of the target context. Thus it starts each turn empty and
     // follows the decodes of this turn: its attention then reads only cells
-    // that hold tokens of this conversation.
-    if (e.ctx_dft != nullptr) {
+    // that hold tokens of this conversation. A turn that continues the live
+    // memory keeps it: the draft context followed each decode of that memory.
+    if (e.ctx_dft != nullptr && !continuation) {
         llama_memory_clear(llama_get_memory(e.ctx_dft), false);
     }
     const bool hybrid = e.ctx_pf != nullptr;
+    // The hybrid backend moves the state at base_len, thus it always splits the prompt there.
+    const bool split = base_snapshot || hybrid;
     llama_context * pctx = hybrid ? e.ctx_pf : e.ctx;
     // What sequence kSeqMain of the prefill context holds at this time.
     std::vector<MemItem> & live     = hybrid ? e.pf_cache : e.cache;
@@ -986,8 +1042,18 @@ DecodeOutcome prefill(Engine & e, const std::vector<MemItem> & items,
     // The longest prefix that exists already: the live memory when it is at least as long as the best snapshot.
     size_t    start = 0;
     llama_pos pos   = 0;
-    const Snapshot * snap = e.states->best_prefix(items, limit);
-    const bool live_ok = !live.empty() && live.size() <= limit && is_item_prefix(live, items);
+    const Snapshot * snap = continuation ? nullptr : e.states->best_prefix(items, limit);
+    const bool live_ok = !live.empty() && live.size() <= limit &&
+                         (continuation || is_item_prefix(live, items));
+    if (continuation && !live_ok) {
+        // The items of a continuation hold the images of the memory without their chunks, thus they cannot decode again.
+        error = "The prompt continues a memory of " + std::to_string(live.size()) + " items that it cannot extend";
+        clear_all(e);
+        return DecodeOutcome::kFailed;
+    }
+    e.turn.continued = continuation;
+    // The live memory holds tokens, but the chunks of its images are gone: the count of its tokens is the one of the memory.
+    const int64_t live_tokens = e.mem_tokens;
     if (live_ok && (snap == nullptr || live.size() >= snap->items.size())) {
         start = live.size();
         pos   = live_pos;
@@ -1010,11 +1076,34 @@ DecodeOutcome prefill(Engine & e, const std::vector<MemItem> & items,
         llama_memory_clear(llama_get_memory(pctx), true);
         pos = 0;
     }
-    live.assign(items.begin(), items.begin() + (ptrdiff_t) start);
+    const bool kept_live = start > 0 && start == live.size() && !e.turn.from_snapshot;
+    e.turn.reused_tokens = kept_live && !hybrid ? live_tokens : count_tokens(chunk_of, 0, start);
+    if (!kept_live) {
+        live.assign(items.begin(), items.begin() + (ptrdiff_t) start);
+    }
     live_pos = pos;
-    e.turn.reused_tokens = count_tokens(chunk_of, 0, start);
 
     const int64_t t1 = now_us();
+    if (!split) {
+        // The live form: the rest of the prompt and its generation prompt decode in one call.
+        const DecodeOutcome all = decode_items(e, e.ctx, items, chunk_of, start, items.size(), pos, true, error);
+        if (all != DecodeOutcome::kDone) {
+            clear_all(e);
+            return all;
+        }
+        e.cache.insert(e.cache.end(), items.begin() + (ptrdiff_t) start, items.end());
+        e.n_past     = pos;
+        e.mem_tokens = n_tokens;
+        e.turn.prefill_tokens = count_tokens(chunk_of, start, items.size());
+        e.turn.prefill_us     = now_us() - t1;
+        LOGI("prefill: %zu of %zu items %s (%lld tokens, %.0f ms), %lld tokens decoded in %.0f ms on %s in one call, "
+             "images %d (%d known, %d cached, %d encoded), memory %d positions",
+             start, items.size(), e.turn.from_snapshot ? "restored" : e.turn.continued ? "continued" : "kept",
+             (long long) e.turn.reused_tokens, e.turn.restore_us / 1000.0, (long long) e.turn.prefill_tokens,
+             e.turn.prefill_us / 1000.0, e.device ? ggml_backend_dev_name(e.device) : "CPU", e.turn.images_total,
+             e.turn.images_known, e.turn.images_cached, e.turn.images_encoded, (int) e.n_past);
+        return DecodeOutcome::kDone;
+    }
     const DecodeOutcome base = decode_items(e, pctx, items, chunk_of, start, base_len, pos, false, error);
     if (base != DecodeOutcome::kDone) {
         clear_all(e);
@@ -1071,8 +1160,9 @@ DecodeOutcome prefill(Engine & e, const std::vector<MemItem> & items,
         clear_all(e);
         return tail;
     }
-    e.cache  = items;
-    e.n_past = pos;
+    e.cache      = items;
+    e.n_past     = pos;
+    e.mem_tokens = n_tokens;
     e.turn.tail_tokens = count_tokens(chunk_of, base_len, items.size());
     e.turn.tail_us     = now_us() - t4;
     LOGI("prefill: %zu of %zu items %s (%lld tokens, %.0f ms), %lld tokens decoded in %.0f ms on %s "
@@ -1118,17 +1208,20 @@ std::string context_full_text(const Engine & e) {
 }
 
 /**
- * One step of the answer without a draft: sample the next token from the
- * logits of the context, decode it, and put it in the queue. Returns false
- * with the error text set.
+ * One step of the answer without a draft: decode the token of the last step,
+ * sample the next token from the logits of the context, and put it in the
+ * queue. The new token decodes in the next step, thus the app gets it one
+ * decode earlier and shows it while the model decodes it. decoded tells if
+ * the step decoded a token. Returns false with the error text set.
  */
-bool plain_step(Engine & e, std::string & error) {
+bool plain_step(Engine & e, bool & decoded, std::string & error) {
     const llama_vocab * vocab = llama_model_get_vocab(e.model);
-    // The draft driver went off (spec_disable) in a step that gave its last
-    // token to the app. That token is not in the memory, and the logits of
-    // the context belong to the last position of the verified batch. Thus
-    // the token decodes first, and the sample reads its logits: the answer
-    // is the answer of a decode without a draft.
+    decoded = false;
+    // The app has the token of the last step, and the memory does not hold
+    // it. The token decodes first, and the sample reads its logits. The same
+    // holds after the draft driver stopped (spec_disable) in a step that gave
+    // its last token to the app: the answer is the answer of a decode without
+    // a draft.
     if (e.id_last != LLAMA_TOKEN_NULL) {
         const llama_token pending = e.id_last;
         e.id_last = LLAMA_TOKEN_NULL;
@@ -1137,6 +1230,7 @@ bool plain_step(Engine & e, std::string & error) {
             error = "llama_decode failed during generation with code " + std::to_string(rc);
             return false;
         }
+        decoded = true;
         if ((uint32_t) e.n_past >= llama_n_ctx(e.ctx)) {
             error = context_full_text(e);
             return false;
@@ -1155,13 +1249,11 @@ bool plain_step(Engine & e, std::string & error) {
         e.answer_ends = true;
         return true;
     }
-    const int rc = decode_one(e, token);
-    if (rc != 0) {
-        error = "llama_decode failed during generation with code " + std::to_string(rc);
-        return false;
-    }
     e.out_queue.push_back(token);
-    e.policy.record(0, 0, 1);
+    e.id_last = token;
+    if (decoded) {
+        e.policy.record(0, 0, 1);
+    }
     return true;
 }
 
@@ -1177,13 +1269,19 @@ bool plain_step(Engine & e, std::string & error) {
  * go away before the step returns, thus the model memory holds exactly the
  * tokens of the answer and the snapshot of the next turn is exact.
  *
+ * The first call of an answer only samples the first token from the logits
+ * of the prompt and gives it to the app, with sampled_only set. The draft
+ * and the verify of that token run in the next call, thus the app gets the
+ * first token without the time of a step.
+ *
  * Returns false with the error text set.
  */
-bool spec_step(Engine & e, std::string & error) {
+bool spec_step(Engine & e, bool & sampled_only, std::string & error) {
     TraceSection trace("spec-step");
     const llama_vocab * vocab   = llama_model_get_vocab(e.model);
     llama_memory_t      mem     = llama_get_memory(e.ctx);
     llama_memory_t      mem_dft = llama_get_memory(e.ctx_dft);
+    sampled_only = false;
 
     // The first step of an answer samples from the logits of the prompt.
     if (e.id_last == LLAMA_TOKEN_NULL) {
@@ -1194,6 +1292,7 @@ bool spec_step(Engine & e, std::string & error) {
             first = llama_sampler_sample(e.smpl, e.ctx, -1);
             e.turn.sample_us += now_us() - t0;
         }
+        sampled_only = true;
         if (llama_vocab_is_eog(vocab, first)) {
             decode_one(e, first);
             e.answer_ends = true;
@@ -1201,6 +1300,7 @@ bool spec_step(Engine & e, std::string & error) {
         }
         e.out_queue.push_back(first);
         e.id_last = first;
+        return true;
     }
 
     const llama_pos pos0 = e.n_past;
@@ -1283,6 +1383,7 @@ bool spec_step(Engine & e, std::string & error) {
             e.cache.resize(e.cache.size() - drop);
             e.spec_prompt.resize(e.spec_prompt.size() - drop);
             e.n_past -= (llama_pos) drop;
+            e.mem_tokens -= (int64_t) drop;
         }
     }
 
@@ -1421,16 +1522,23 @@ mtmd_bitmap * decode_image(JNIEnv * env, jclass native_class, Engine & e, jbyteA
 /**
  * Tokenize the prompt. With images, mtmd replaces each media marker with
  * the chunk of the image in order, and chunk_of points at the image chunks.
- * native_class is LlamaNative, for the decode of a new image in the app.
- * Returns false with the error text set.
+ * ids holds the SHA-256 of the bytes of each image. native_class is
+ * LlamaNative, for the decode of a new image in the app. add_special is false
+ * for a prompt that continues the memory. Returns false with the error text
+ * set.
  */
 bool tokenize_prompt(JNIEnv * env, jclass native_class, Engine & e, const std::string & prompt,
-                     const std::vector<jbyteArray> & images, mtmd::input_chunks & chunks, std::vector<MemItem> & items,
+                     const std::vector<jbyteArray> & images, const std::vector<std::string> & ids, bool add_special,
+                     mtmd::input_chunks & chunks, std::vector<MemItem> & items,
                      std::vector<const mtmd_input_chunk *> & chunk_of, std::string & error) {
     items.clear();
     chunk_of.clear();
+    if (ids.size() != images.size()) {
+        error = "The image identities do not match the images";
+        return false;
+    }
     if (images.empty()) {
-        const std::vector<llama_token> tokens = common_tokenize(llama_model_get_vocab(e.model), prompt, true, true);
+        const std::vector<llama_token> tokens = common_tokenize(llama_model_get_vocab(e.model), prompt, add_special, true);
         items.reserve(tokens.size());
         for (llama_token t : tokens) {
             items.push_back(MemItem{t, {}});
@@ -1467,15 +1575,9 @@ bool tokenize_prompt(JNIEnv * env, jclass native_class, Engine & e, const std::s
         e.turn_images.clear();
         e.turn.images_total = (int) images.size();
         e.turn.images_known = 0;
-        for (jbyteArray image : images) {
-            const jsize len = env->GetArrayLength(image);
-            jbyte * bytes = env->GetByteArrayElements(image, nullptr);
-            if (bytes == nullptr) {
-                error = "The image bytes are not readable";
-                return false;
-            }
-            const std::string id = cache_io::sha256_hex(bytes, (size_t) len);
-            env->ReleaseByteArrayElements(image, bytes, JNI_ABORT);
+        for (size_t k = 0; k < images.size(); ++k) {
+            jbyteArray image = images[k];
+            const std::string & id = ids[k];
             ImageInfo info;
             mtmd_bitmap * bitmap = nullptr;
             const auto seen = decoded.find(id);
@@ -1504,7 +1606,7 @@ bool tokenize_prompt(JNIEnv * env, jclass native_class, Engine & e, const std::s
         mtmd_input_text text;
         text.text          = prompt.c_str();
         text.text_len      = prompt.size();
-        text.add_special   = true;
+        text.add_special   = add_special;
         text.parse_special = true;
         const std::vector<const mtmd_bitmap *> ptrs = bitmaps.c_ptr();
         const int32_t tk = mtmd_tokenize(e.mctx, chunks.ptr.get(), &text, ptrs.data(), ptrs.size());
@@ -1583,6 +1685,83 @@ size_t base_length(const Engine & e, const std::string & prompt, const std::stri
         }
     }
     return base;
+}
+
+/** The prompt of a turn as items, before its decode. */
+struct PromptPlan {
+    TurnPrompt tp;
+    /** The chunks that chunk_of points at. */
+    mtmd::input_chunks chunks;
+    /** The items of the whole prompt. With a continuation, the items of the memory come first. */
+    std::vector<MemItem> items;
+    /** The image chunk of each item, or null for a text item and for an item of the memory. */
+    std::vector<const mtmd_input_chunk *> chunk_of;
+    /** The tokens of the whole prompt: one KV cell each. */
+    int64_t n_tokens = 0;
+    /** The first item of the generation prompt. */
+    size_t tail_at = 0;
+    /** The split of the prefill (refer to prefill), items.size() without a base snapshot. */
+    size_t base_len = 0;
+};
+
+/**
+ * The items of the prompt of a turn: the render of chat_prompt.h and its
+ * tokens. image_of holds the image of each message or null. The call changes
+ * no memory, thus a host test calls it without a decode. Returns false with
+ * the error text set.
+ */
+bool plan_prompt(JNIEnv * env, jclass native_class, Engine & e, const std::vector<PromptMessage> & msgs,
+                 const std::vector<jbyteArray> & image_of, bool thinking, PromptPlan & plan, std::string & error) {
+    // With the live form after a complete answer, only the new message and the generation prompt.
+    try {
+        plan.tp = e.prompt->make(msgs, thinking, e.cache.size(), e.cache.empty() ? LLAMA_TOKEN_NULL : e.cache.back().token);
+    } catch (const std::exception & ex) {
+        error = std::string("The chat template failed: ") + ex.what();
+        return false;
+    }
+    const TurnPrompt & tp = plan.tp;
+    // The images of the messages that the text renders.
+    std::vector<jbyteArray>  images_new;
+    std::vector<std::string> ids_new;
+    for (size_t i = tp.first_message; i < msgs.size(); ++i) {
+        if (image_of[i] != nullptr) {
+            images_new.push_back(image_of[i]);
+            ids_new.push_back(msgs[i].image_id);
+        }
+    }
+    std::vector<MemItem> fresh;
+    std::vector<const mtmd_input_chunk *> fresh_chunk_of;
+    if (!tokenize_prompt(env, native_class, e, tp.text, images_new, ids_new, !tp.continuation, plan.chunks, fresh,
+                         fresh_chunk_of, error)) {
+        return false;
+    }
+    const int64_t fresh_tokens = count_tokens(fresh_chunk_of, 0, fresh.size());
+    e.turn.image_tokens = fresh_tokens - (int64_t) std::count(fresh_chunk_of.begin(), fresh_chunk_of.end(), nullptr);
+    const size_t offset = tp.continuation ? e.cache.size() : 0;
+    plan.tail_at  = offset + base_length(e, tp.text, tp.tail, fresh);
+    plan.n_tokens = fresh_tokens;
+    if (tp.continuation) {
+        // The memory holds the items before the new message. Its image items
+        // have no chunk here: the prefill decodes only the new items.
+        plan.items.reserve(offset + fresh.size());
+        plan.items = e.cache;
+        plan.items.insert(plan.items.end(), fresh.begin(), fresh.end());
+        plan.chunk_of.assign(offset, nullptr);
+        plan.chunk_of.insert(plan.chunk_of.end(), fresh_chunk_of.begin(), fresh_chunk_of.end());
+        plan.n_tokens += e.mem_tokens;
+    } else {
+        plan.items    = std::move(fresh);
+        plan.chunk_of = std::move(fresh_chunk_of);
+    }
+    plan.base_len = tp.base_snapshot ? plan.tail_at : plan.items.size();
+    if (tp.base_snapshot && !plan.items.empty() && plan.base_len == plan.items.size()) {
+        // The decode context must decode the last item itself: the state
+        // transfer of the hybrid backend carries no logits, and on every
+        // backend an empty tail leaves a context that holds no logits, which
+        // the sampler reads as a null pointer and aborts the process.
+        plan.base_len -= 1;
+    }
+    return true;
 }
 
 /** Mean and sample standard deviation of the values. */
@@ -1753,10 +1932,56 @@ jbyteArray pack_piece(JNIEnv * env, Engine & e, int kind) {
 }
 
 /**
- * The last result of an answer: the close of the thinking one time when the
- * answer ended inside it, else null.
+ * Copy the state of the memory into the snapshot store on the background
+ * thread, for a restart of the app or a conversation that the app changed.
+ * The task takes the lock of the engine, thus it never runs during a decode.
+ * When the memory changed before the task runs (a new turn started first),
+ * the task copies nothing, and the answer of that turn takes its own
+ * snapshot. O(items) here, and the copy of the state on the thread.
+ */
+void schedule_answer_snapshot(Engine & e) {
+    if (!e.worker || e.ctx_pf != nullptr || e.cache.empty() || e.states->find(e.cache) != nullptr) {
+        return;
+    }
+    auto items = std::make_shared<std::vector<MemItem>>(e.cache);
+    const llama_pos n_pos = e.n_past;
+    Engine * ep = &e;
+    e.worker->post([ep, items, n_pos] {
+        std::lock_guard<std::mutex> lock(ep->mutex);
+        if (ep->n_past != n_pos || ep->cache != *items) {
+            return;
+        }
+        const int64_t t0 = now_us();
+        std::string error;
+        std::shared_ptr<const cache_io::Blob> blob;
+        {
+            TraceSection trace("answer-snapshot");
+            blob = take_state(ep->ctx, error);
+        }
+        if (!blob) {
+            LOGE("the snapshot after the answer did not copy: %s", error.c_str());
+            return;
+        }
+        const size_t n_items = items->size();
+        ep->states->put(std::move(*items), n_pos, blob);
+        LOGI("snapshot after the answer, in the background: %zu items, %d positions, %.1f MB in %.0f ms, store %zu "
+             "snapshots, %.0f MB in RAM, %.0f MB on disk",
+             n_items, (int) n_pos, blob->size / 1048576.0, (now_us() - t0) / 1000.0, ep->states->count(),
+             ep->states->ram_bytes() / 1048576.0, ep->states->disk_bytes() / 1048576.0);
+    });
+}
+
+/**
+ * The last result of an answer that ended with its end token: the close of
+ * the thinking one time when the answer ended inside it, else null. In the
+ * live form the conversation of the turn becomes the record of the memory,
+ * and the state goes into the store in the background.
  */
 jbyteArray finish_answer(JNIEnv * env, Engine & e) {
+    if (e.prompt && !e.cache.empty() &&
+        e.prompt->answer_ended(e.answer_text, !e.answer_tagged, e.cache.size(), e.cache.back().token)) {
+        schedule_answer_snapshot(e);
+    }
     e.answer_done = true;
     e.id_last     = LLAMA_TOKEN_NULL;
     if (e.think_open) {
@@ -1961,6 +2186,14 @@ static jlong load_impl(JNIEnv * env, jstring jpath, jstring jmmproj,
     // cannot read, thus it decodes one token at a time.
     const bool want_spec = jspeculative == JNI_TRUE && !hybrid;
 
+    // A speculative engine loads "<stem>-draft32k.gguf" when it is next to the
+    // file: the same model with the 32768-row draft head of the MTP block,
+    // thus a draft pass reads 89 MB of head and not 675 MB. The target
+    // weights of the two files are the same, thus the caches keep the
+    // namespace of the file of the app.
+    const std::string draft_file = want_spec ? draft_head_file(path) : std::string();
+    const std::string load_path  = draft_file.empty() ? path : draft_file;
+
     // The device by its ggml name: GPUOpenCL for the Adreno, HTP0 for the Hexagon NPU.
     std::vector<ggml_backend_dev_t> devices;
     llama_model_params mp = llama_model_default_params();
@@ -1981,12 +2214,15 @@ static jlong load_impl(JNIEnv * env, jstring jpath, jstring jmmproj,
         mp.devices = devices.data();
         e->device  = dev;
     }
-    e->model = llama_model_load_from_file(path.c_str(), mp);
+    e->model = llama_model_load_from_file(load_path.c_str(), mp);
     if (e->model == nullptr) {
         // A file that names MTP layers but holds no MTP tensors fails only with want_spec.
-        throw_java(env, "The model did not load: " + path +
+        throw_java(env, "The model did not load: " + load_path +
                             (want_spec ? " (with its MTP block. Set the speculative switch to off for this file.)" : ""));
         return 0;
+    }
+    if (!draft_file.empty()) {
+        LOGI("the speculative engine loads the file with the reduced draft head: %s", draft_file.c_str());
     }
 
     // The decode context. One sequence: the snapshots of the prompt states are bytes in the store.
@@ -2106,7 +2342,7 @@ static jlong load_impl(JNIEnv * env, jstring jpath, jstring jmmproj,
     // The MTP tensors of the file, and a backend that can use them. The app
     // asks with hasMtp, thus its switch is available for this model.
     e->mtp_ready = llama_model_n_layer_nextn(e->model) > 0 && !hybrid;
-    if (want_spec && e->mtp_ready && !setup_speculative(*e, path)) {
+    if (want_spec && e->mtp_ready && !setup_speculative(*e, load_path)) {
         LOGE("the engine decodes without a draft");
     }
 
@@ -2116,10 +2352,31 @@ static jlong load_impl(JNIEnv * env, jstring jpath, jstring jmmproj,
         throw_java(env, std::string("The chat template of the model did not parse: ") + ex.what());
         return 0;
     }
+    // The form of the history (chat_prompt.h). QWEN_HISTORY_FORM=template
+    // selects the render of the chat template for an A/B measurement. The
+    // hybrid backend moves the state of each prompt from its prefill context,
+    // thus it keeps the template form.
+    HistoryForm form = HistoryForm::kLive;
+    if (const char * name = getenv("QWEN_HISTORY_FORM")) {
+        if (!parse_history_form(name, form)) {
+            LOGE("QWEN_HISTORY_FORM=%s is not template or live, the engine uses the live form", name);
+        }
+    }
+    if (hybrid) {
+        form = HistoryForm::kTemplate;
+    }
+    e->prompt = std::make_unique<ChatPrompt>(e->tmpls.get(), llama_model_get_vocab(e->model), form);
+    if (!e->prompt->refusal().empty()) {
+        LOGE("the live form of the history is off: %s", e->prompt->refusal().c_str());
+    }
     e->tok_think_open  = single_token(llama_model_get_vocab(e->model), "<think>");
     e->tok_think_close = single_token(llama_model_get_vocab(e->model), "</think>");
     rebuild_sampler(*e, false, 0.7f, 0.8f);
     open_stores(*e, cache, path);
+
+    // The background thread starts after the listing of the pool threads, thus
+    // it is not one of them. It inherits the compute priority of this thread.
+    e->worker = std::make_unique<TaskThread>();
 
     LOGI("model loaded: %s, device=%s, prefill=%s, gpu_layers=%d, threads=%d, n_ctx=%u, kv=%s, mmproj=%s, image tokens %d, draft %s",
          path.c_str(), device.empty() ? "cpu" : device.c_str(), prefill.empty() ? "same" : prefill.c_str(),
@@ -2197,8 +2454,8 @@ static jint chat_start_impl(JNIEnv * env, jclass native_class, jlong handle,
     // The reference of an image lives until tokenize_prompt has read its
     // bytes, thus LocalRefs releases them all at the end of this call. The
     // roles and the contents release theirs inside array_string.
-    common_chat_templates_inputs inputs;
-    std::vector<jbyteArray> image_refs;
+    std::vector<PromptMessage> msgs;
+    std::vector<jbyteArray>    image_of;
     LocalRefs refs(env);
     const jsize n = env->GetArrayLength(roles);
     if (env->GetArrayLength(contents) != n || (images != nullptr && env->GetArrayLength(images) != n)) {
@@ -2212,8 +2469,10 @@ static jint chat_start_impl(JNIEnv * env, jclass native_class, jlong handle,
         throw_java(env, "The local reference table cannot hold " + std::to_string(n) + " images");
         return -1;
     }
+    msgs.reserve((size_t) n);
+    image_of.reserve((size_t) n);
     for (jsize i = 0; i < n; ++i) {
-        common_chat_msg msg;
+        PromptMessage msg;
         msg.role    = array_string(env, roles, i);
         msg.content = array_string(env, contents, i);
         if (env->ExceptionCheck()) {
@@ -2222,41 +2481,27 @@ static jint chat_start_impl(JNIEnv * env, jclass native_class, jlong handle,
         }
         jbyteArray image = images ? (jbyteArray) env->GetObjectArrayElement(images, i) : nullptr;
         if (image != nullptr) {
-            msg.content = std::string(mtmd_default_marker()) + "\n" + msg.content;
-            image_refs.push_back(image);
             refs.keep(image);
-        }
-        inputs.messages.push_back(std::move(msg));
-    }
-    inputs.add_generation_prompt = true;
-    inputs.use_jinja             = true;
-    inputs.enable_thinking       = thinking;
-
-    // The prompt, and the generation prompt at its end. The template gives
-    // the tail directly, or the render without it gives the common prefix.
-    std::string prompt;
-    std::string tail;
-    try {
-        common_chat_params params = common_chat_templates_apply(e->tmpls.get(), inputs);
-        prompt = std::move(params.prompt);
-        tail   = std::move(params.generation_prompt);
-        if (tail.empty() || prompt.size() < tail.size() ||
-            prompt.compare(prompt.size() - tail.size(), tail.size(), tail) != 0) {
-            inputs.add_generation_prompt = false;
-            const std::string base = common_chat_templates_apply(e->tmpls.get(), inputs).prompt;
-            size_t k = 0;
-            while (k < base.size() && k < prompt.size() && base[k] == prompt[k]) {
-                ++k;
+            // The identity of an image is the SHA-256 of its file bytes: the
+            // record of the memory and the cache of the encoder find it by that.
+            const jsize len = env->GetArrayLength(image);
+            jbyte * bytes = env->GetByteArrayElements(image, nullptr);
+            if (bytes == nullptr) {
+                throw_java(env, "The image bytes are not readable");
+                return -1;
             }
-            tail = prompt.substr(k);
+            msg.image_id = cache_io::sha256_hex(bytes, (size_t) len);
+            env->ReleaseByteArrayElements(image, bytes, JNI_ABORT);
+            msg.content = std::string(mtmd_default_marker()) + "\n" + msg.content;
         }
-    } catch (const std::exception & ex) {
-        throw_java(env, std::string("The chat template failed: ") + ex.what());
-        return -1;
+        image_of.push_back(image);
+        msgs.push_back(std::move(msg));
     }
 
     rebuild_sampler(*e, thinking, temperature, top_p);
     e->utf8_pending.clear();
+    e->answer_text.clear();
+    e->answer_tagged  = false;
     e->turn           = TurnStats{};
     // The answer stays done until the prompt is in the memory: a failure below leaves no logits to sample.
     e->answer_done    = true;
@@ -2268,34 +2513,24 @@ static jint chat_start_impl(JNIEnv * env, jclass native_class, jlong handle,
     clear_queue(*e);
 
     std::string error;
-    mtmd::input_chunks chunks;
-    std::vector<MemItem> items;
-    std::vector<const mtmd_input_chunk *> chunk_of;
-    if (!tokenize_prompt(env, native_class, *e, prompt, image_refs, chunks, items, chunk_of, error)) {
+    PromptPlan plan;
+    if (!plan_prompt(env, native_class, *e, msgs, image_of, thinking == JNI_TRUE, plan, error)) {
         throw_java(env, error);
         return -1;
     }
-    const int64_t n_tokens = count_tokens(chunk_of, 0, items.size());
-    if (items.empty() || (uint64_t) n_tokens + kContextHeadroom >= llama_n_ctx(e->ctx)) {
-        throw_java(env, "The conversation is longer than the context (" + std::to_string(n_tokens) + " tokens)");
+    const std::vector<MemItem> & items = plan.items;
+    if (items.empty() || (uint64_t) plan.n_tokens + kContextHeadroom >= llama_n_ctx(e->ctx)) {
+        throw_java(env, "The conversation is longer than the context (" + std::to_string(plan.n_tokens) + " tokens)");
         return -1;
     }
-    e->turn.image_tokens = n_tokens - (int64_t) std::count(chunk_of.begin(), chunk_of.end(), nullptr);
-    size_t base_len = base_length(*e, prompt, tail, items);
-    if (base_len == items.size()) {
-        // The decode context must decode the last item itself: the state
-        // transfer of the hybrid backend carries no logits, and on every
-        // backend an empty tail leaves a context that holds no logits, which
-        // the sampler reads as a null pointer and aborts the process.
-        base_len -= 1;
-    }
-    if (chunk_of.back() != nullptr) {
+    if (plan.chunk_of.back() != nullptr) {
         throw_java(env, "The prompt ends with an image, thus it gives no logits");
         return -1;
     }
     // The thinking is open when the last tag of the generation prompt opens it.
     e->think_open = false;
-    for (size_t i = base_len; i < items.size() && e->tok_think_open != LLAMA_TOKEN_NULL; ++i) {
+    const size_t scan_from = std::min(plan.tail_at, items.size() - 1);
+    for (size_t i = scan_from; i < items.size() && e->tok_think_open != LLAMA_TOKEN_NULL; ++i) {
         if (items[i].token == e->tok_think_open) {
             e->think_open = true;
         } else if (items[i].token == e->tok_think_close) {
@@ -2303,7 +2538,8 @@ static jint chat_start_impl(JNIEnv * env, jclass native_class, jlong handle,
         }
     }
 
-    switch (prefill(*e, items, chunk_of, base_len, error)) {
+    switch (prefill(*e, items, plan.chunk_of, plan.base_len, plan.tp.base_snapshot, plan.tp.continuation,
+                    plan.n_tokens, error)) {
         case DecodeOutcome::kFailed:
             throw_java(env, error);
             return -1;
@@ -2353,7 +2589,9 @@ static jbyteArray generate_next_impl(JNIEnv * env, jlong handle) {
     if (e->stop_requested.exchange(false)) {
         // The answer stops here. A speculative step can hold tokens that the
         // app did not receive: they stay in the model memory, which the
-        // snapshot of the next prompt does not read.
+        // snapshot of the next prompt does not read. The last token that the
+        // app received (id_last) is not in the memory, and it stays out: the
+        // answer did not end, thus the next turn does not continue this memory.
         clear_queue(*e);
         e->answer_done = true;
         e->id_last     = LLAMA_TOKEN_NULL;
@@ -2379,7 +2617,16 @@ static jbyteArray generate_next_impl(JNIEnv * env, jlong handle) {
         // One step gives one token, or up to kSpecDraftMax + 1 tokens with a draft.
         const int64_t t0 = now_us();
         std::string error;
-        const bool ok = e->spec != nullptr ? spec_step(*e, error) : plain_step(*e, error);
+        // A call that only sampled (the first token of an answer) is not a step of the policy.
+        bool step = true;
+        bool ok   = false;
+        if (e->spec != nullptr) {
+            bool sampled_only = false;
+            ok   = spec_step(*e, sampled_only, error);
+            step = !sampled_only;
+        } else {
+            ok   = plain_step(*e, step, error);
+        }
         const int64_t step_us = now_us() - t0;
         e->turn.gen_us += step_us;
         if (!ok) {
@@ -2387,11 +2634,13 @@ static jbyteArray generate_next_impl(JNIEnv * env, jlong handle) {
             throw_java(env, error);
             return nullptr;
         }
-        // The policy predicts the throughput of each draft length from the
-        // measured step time and acceptance, thus the step that ran must give
-        // it its time.
-        e->policy.observe(step_us);
-        e->turn.gen_steps += 1;
+        if (step) {
+            // The policy predicts the throughput of each draft length from the
+            // measured step time and acceptance, thus the step that ran must give
+            // it its time.
+            e->policy.observe(step_us);
+            e->turn.gen_steps += 1;
+        }
         if (e->out_queue.empty()) {
             return finish_answer(env, *e);
         }
@@ -2403,7 +2652,8 @@ static jbyteArray generate_next_impl(JNIEnv * env, jlong handle) {
     if (kind == 0) {
         append_piece(*e, token);
     } else {
-        e->think_open = kind == 1;
+        e->think_open    = kind == 1;
+        e->answer_tagged = true;
     }
     e->turn.gen_tokens += 1;
     return pack_piece(env, *e, kind);
@@ -2446,7 +2696,8 @@ static jstring stats_impl(JNIEnv * env, jlong handle) {
     const char * pf_dev = e->device_pf ? ggml_backend_dev_name(e->device_pf) : e->device ? ggml_backend_dev_name(e->device) : "CPU";
     std::string extra;
     if (t.reused_tokens > 0) {
-        extra += ", " + std::to_string(t.reused_tokens) + " tok " + (t.from_snapshot ? "restored" : "kept");
+        extra += ", " + std::to_string(t.reused_tokens) + " tok " +
+                 (t.from_snapshot ? "restored" : t.continued ? "continued" : "kept");
         if (t.from_snapshot) {
             extra += " in " + std::to_string(t.restore_us / 1000) + " ms";
         }
@@ -2509,6 +2760,8 @@ static void reset_chat_impl(jlong handle) {
     e->images->clear(false);
     e->turn_images.clear();
     e->utf8_pending.clear();
+    e->answer_text.clear();
+    e->answer_tagged  = false;
     e->turn           = TurnStats{};
     e->think_open     = false;
     e->answer_done    = true;

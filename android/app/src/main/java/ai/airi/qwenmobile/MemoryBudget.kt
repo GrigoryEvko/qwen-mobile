@@ -66,10 +66,14 @@ object MemoryBudget {
 
     /**
      * The bytes of the weights that the backend holds in memory. The hybrid
-     * backend holds one copy for the NPU and one for the GPU.
+     * backend holds one copy for the NPU and one for the GPU. A speculative
+     * engine loads the draft-head file next to the model when it is there
+     * (ModelFiles.draftHeadFile), which holds 89 MB more for the 4B.
      */
     fun weightBytes(config: EngineConfig): Long {
-        val model = File(config.path).length()
+        val file = File(config.path)
+        val loaded = if (config.speculativeReady) ModelFiles.draftHeadFile(file) ?: file else file
+        val model = loaded.length()
         val projector = config.mmproj?.let { File(it).length() } ?: 0L
         val copies = if (config.backend.prefillDeviceName != null) 2 else 1
         return model * copies + projector
