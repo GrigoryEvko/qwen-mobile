@@ -134,7 +134,7 @@ class Variant:
     text: str
 
 
-VARIANTS = {v.key: v for v in (
+FAK_VARIANTS = {v.key: v for v in (
     Variant("a", 0, "HEAD: HTP_FA_KERNEL_HMX, hmx_fa_find_chunk_size"),
     Variant("b", 1, "the chunk cost model alone"),
     Variant("t", 2, "the tile softmax alone (HMX2 streaming for the prefill shapes, the old chunk model)"),
@@ -144,6 +144,13 @@ VARIANTS = {v.key: v for v in (
     Variant("d", 7, "C plus the resident K and V"),
     Variant("e", 15, "D plus the decode spans (the preset value)"),
 )}
+# The variants of fak3, with the bits of the re-split candidate: HTP_FA_OPT_TILE_SMX 1, HTP_FA_OPT_DECODE 2
+FAK3_VARIANTS = {v.key: v for v in (
+    Variant("a", 0, "HEAD: HTP_FA_KERNEL_HMX for each shape"),
+    Variant("p", 1, "HTP_FA_KERNEL_HMX2 for the prefill shapes"),
+    Variant("e", 3, "HTP_FA_KERNEL_HMX2 for the prefill and the decode shapes (the preset value)"),
+)}
+VARIANTS = FAK_VARIANTS
 # The column order of the rate table
 TABLE_KEYS = "abcde"
 
@@ -241,6 +248,43 @@ FAK2_BLOCKS = {b.key: b for b in (
     Block("prof", "llama-bench", "-p 1024 -n 8 -d 3072 -r 1 -v", "ace", 1, 60, "q8_0", True, MODEL_KB,
           "GGML_HEXAGON_PROFILE=1 (with -v): one 1024-token ubatch at the depth 3072, then 8 decode tokens"),
 )}
+# The stage fak3: the FA suites of test-backend-ops for A and E, for the head sizes that the HMX kernels
+# take (a multiple of 64), and the tests of the re-split candidate (the prefill kernel, then the decode
+# spans) that fak2 did not run on its code: the op tests, the KL, and the decode rates in 2 rounds with the
+# release rule.
+FAK3_SUITES = (("s64", "64"), ("s128", "128"), ("s256", "192|256"), ("s320", "320"), ("s576", "512|576"))
+FAK3_BLOCKS = {b.key: b for b in (
+    *(Block(key, "test-backend-ops test", f"-o FLASH_ATTN_EXT -p \"hsk={hs},\"", "ae", 1, 100, "", False, OPS_KB,
+            f"test-backend-ops test -b HTP0, the FLASH_ATTN_EXT suite, head sizes {hs.replace('|', ' and ')}")
+      for key, hs in FAK3_SUITES),
+    Block("ops", "test-backend-ops test", "fa4s", "pe", 1, 45, "", False, OPS_KB,
+          "test-backend-ops test -b HTP0, the small FLASH_ATTN_EXT cases of the 4B and of its encoder "
+          "(tests/fa4s.txt)"),
+    Block("opl", "test-backend-ops test", "fa4l", "e", 1, 75, "", False, OPS_KB,
+          "test-backend-ops test -b HTP0, the large FLASH_ATTN_EXT cases of the 4B and of its encoder "
+          "(tests/fa4l.txt)"),
+    Block("faperf", "test-backend-ops perf", "faperf", "ae", 1, 60, "", False, OPS_KB,
+          "test-backend-ops perf -b HTP0, the FLASH_ATTN_EXT ops of the 4B (tests/faperf.txt)"),
+    Block("klp", "llama-perplexity", f"-c 512 -b 512 --chunks 4 --kl-divergence-base {KLD_BASE} --kl-divergence",
+          "e", 1, 90, "q8_0", False, MODEL_KB, "the prefill KL (-b 512, 4 chunks) against the naive oracle"),
+    Block("kld", "llama-perplexity",
+          f"-c 512 -b 1 -ub 1 --chunks 1 --kl-divergence-base {KLD_BASE} --kl-divergence",
+          "ae", 1, 100, "q8_0", False, MODEL_KB, "the decode KL (-b 1, 1 chunk) against the naive oracle"),
+    FAK_BLOCKS["kl16"],
+    Block("t", "llama-bench", "-p 0 -n 32 -d 0,4096 -r 1", "ae", 2, 45, "q8_0", False, MODEL_KB,
+          "llama-bench tg32 at the depths 0 and 4096, 1 repetition"),
+    Block("l", "llama-bench", "-p 0 -n 32 -d 16384 -r 1", "ae", 2, 70, "q8_0", False, MODEL_KB,
+          "llama-bench tg32 at the depth 16384, 1 repetition"),
+    Block("f", "llama-bench", "-p 0 -n 32 -d 4096,16384 -r 1", "e", 2, 90, "f16", False, MODEL_KB,
+          "llama-bench tg32 with an F16 cache at the depths 4096 and 16384, 1 repetition (the release rule)"),
+    Block("prof", "llama-bench", "-p 1024 -n 8 -d 3072 -r 1 -v", "e", 1, 60, "q8_0", True, MODEL_KB,
+          "GGML_HEXAGON_PROFILE=1 (with -v): one 1024-token ubatch at the depth 3072, then 8 decode tokens"),
+)}
+FAK3_GROUPS = (tuple(key for key, _ in FAK3_SUITES) + ("ops", "opl", "faperf"), ("klp", "kld", "kl16"),
+               ("t", "l", "f"), ("prof",))
+FAK3_EST_S = {**{key: 60 for key, _ in FAK3_SUITES}, "ops": 25, "opl": 50, "faperf": 30, "klp": 40, "kld": 60,
+              "kl16": 90, "t": 15, "l": 30, "f": 37, "prof": 20}
+
 FAK2_GROUPS = (("ops", "opl", "vit", "faperf"), ("klp", "kld", "kl16"), ("p", "q", "t", "l", "f"), ("prof",))
 FAK2_EST_S = {"ops": 25, "opl": 50, "vit": 15, "faperf": 30, "klp": 40, "kld": 60, "kl16": 90, "p": 11, "q": 12,
               "t": 15, "l": 30, "f": 37, "prof": 20}
@@ -249,18 +293,23 @@ FAK2_EST_S = {"ops": 25, "opl": 50, "vit": 15, "faperf": 30, "klp": 40, "kld": 6
 @dataclass(frozen=True)
 class StageDef:
     """One stage: its blocks, their groups, the estimate of the tool time of each block (s), the column
-    order of the rate table, and the logcat flag (save the DSP lines of logcat after each run)."""
+    order of the rate table, the logcat flag (save the DSP lines of logcat after each run), the variants
+    and the preset value of GGML_HEXAGON_FA_OPT in the library of the stage."""
     blocks: dict
     groups: tuple
     est_s: dict
     table_keys: str
     logcat: bool
+    variants: dict
+    preset: int
 
 
 STAGES = {
-    "fak": StageDef(FAK_BLOCKS, FAK_GROUPS, FAK_EST_S, "abcde", False),
-    "fak2": StageDef(FAK2_BLOCKS, FAK2_GROUPS, FAK2_EST_S, "acde", True),
+    "fak": StageDef(FAK_BLOCKS, FAK_GROUPS, FAK_EST_S, "abcde", False, FAK_VARIANTS, 15),
+    "fak2": StageDef(FAK2_BLOCKS, FAK2_GROUPS, FAK2_EST_S, "acde", True, FAK_VARIANTS, 15),
+    "fak3": StageDef(FAK3_BLOCKS, FAK3_GROUPS, FAK3_EST_S, "ae", True, FAK3_VARIANTS, 3),
 }
+PRESET = 15
 BLOCKS = FAK_BLOCKS
 GROUPS = FAK_GROUPS
 EST_S = FAK_EST_S
@@ -273,7 +322,7 @@ def use_stage(name: str) -> None:
     Raises:
         KeyError: If the name is not in STAGES
     """
-    global STAGE, HERE, PHONE, LAPTOP_STAGE, BOX, LIB_ENV, BLOCKS, GROUPS, EST_S, TABLE_KEYS, LOGCAT
+    global STAGE, HERE, PHONE, LAPTOP_STAGE, BOX, LIB_ENV, BLOCKS, GROUPS, EST_S, TABLE_KEYS, LOGCAT, VARIANTS, PRESET
     sdef = STAGES[name]
     STAGE = name
     HERE = REPO / "build" / name
@@ -285,6 +334,7 @@ def use_stage(name: str) -> None:
                "GGML_HEXAGON_OPFUSION=1 GGML_HEXAGON_OPFUSION_STATE=1")
     BLOCKS, GROUPS, EST_S = sdef.blocks, sdef.groups, sdef.est_s
     TABLE_KEYS, LOGCAT = sdef.table_keys, sdef.logcat
+    VARIANTS, PRESET = sdef.variants, sdef.preset
 
 
 @dataclass(frozen=True)
@@ -409,11 +459,10 @@ def ggml_op_value(name: str) -> int:
 # ---- The command file ----
 
 HEADER = """\
-# Phone stage "{stage}": the flash attention of HTP0 (the chunk cost model, the tile softmax HTP_FA_KERNEL_HMX2, the
-# resident K and V, the decode spans) against the flash attention of HEAD, on one library set. The switch
-# GGML_HEXAGON_FA_OPT selects the parts: A 0 (HEAD), B 1 (chunk model alone), T 2 (tile softmax alone), R 6 (tile
-# softmax with resident K and V), S 8 (decode spans alone), C 3 (B + T), D 7 (C + resident), E 15 (D + decode spans,
-# the preset). The op tests and the KL runs come first, thus a failure on the chip shows early and names its part.
+# Phone stage "{stage}": the flash attention of HTP0 (the tile softmax HTP_FA_KERNEL_HMX2 and its forms) against the
+# flash attention of HEAD, on one library set. The switch GGML_HEXAGON_FA_OPT selects the parts:
+{variant_text}
+# The op tests and the KL runs come first, thus a failure on the chip shows early and names its part.
 # The 4B Q8_0 model, the Q8_0 cache with the FWHT rotation, n_batch = n_ubatch = 1024, 4 threads, flash attention on
 # HTP0 (the flags of bench-kv variant b). The op tests also have the flash attention of the vision encoder.
 #{note}
@@ -436,6 +485,13 @@ HEADER = """\
 # The text of the header for each stage (after the first paragraph)
 STAGE_NOTES = {
     "fak": "",
+    "fak3": """
+# The stage fak3 after the probe fak2, on the re-split candidate: the prefill kernel (HTP_FA_OPT_TILE_SMX = 1) and the
+# decode spans (HTP_FA_OPT_DECODE = 2), without the chunk cost model and the resident K and V (fak2 measured them
+# slower). The variants: A 0 (HEAD), P 1 (the prefill kernel alone), E 3 (both, the preset). The FA suites of
+# test-backend-ops run for A and E with each head size that the HMX kernels take, thus a failure that A does not
+# have names a case of the new kernel. The suite draws new random inputs for each run: compare the FAIL families.
+#""",
     "fak2": """
 # The probe fak2 after the stage fak. In fak each real-model run of C, D and E stopped at the kill, and the op tests
 # of T, R and E stopped at the first prefill case: the thread of the op had DMA transfers in flight on two queues at
@@ -575,8 +631,9 @@ def write_files() -> int:
                          for b in BLOCKS.values())
     lc_note = ("\n# With logcat: logcat -c before the tool, then the DSP lines of logcat -d into <run>.lc (the outputs\n"
                "# have four files for each run).") if LOGCAT else ""
+    variant_text = "\n".join(f"#   {v.key.upper()} {v.opt:2d}  {v.text}" for v in VARIANTS.values())
     head = HEADER.format(stage=STAGE, note=STAGE_NOTES[STAGE], lc_note=lc_note, n_runs=len(runs), run_text=run_text,
-                         tool_min=tool / 60, total_min=(tool + 10 * len(runs)) / 60)
+                         variant_text=variant_text, tool_min=tool / 60, total_min=(tool + 10 * len(runs)) / 60)
     out = head.rstrip("\n").split("\n") + setup_lines()
     for run in runs:
         out += run_lines(run)
@@ -879,7 +936,7 @@ def checks(results: dict[str, Result]) -> list[str]:
         bad = [ln for ln in r.lc.splitlines() if re.search(r"(?i)error|fatal|crash|exception|died|fail|abort", ln)]
         if bad:
             out.append(f"  {r.run.name}: logcat: {len(bad)} error lines, the first: {bad[0].strip()[:200]}")
-        if r.ok and r.run.variant.opt != 15 and f"options 0x{r.run.variant.opt:x}" not in r.log \
+        if r.ok and r.run.variant.opt != PRESET and f"options 0x{r.run.variant.opt:x}" not in r.log \
                 and not r.run.block.tool.startswith("test-backend-ops") and not r.run.block.profile:
             out.append(f"  {r.run.name}: the log has no line of GGML_HEXAGON_FA_OPT={r.run.variant.opt}")
     return out
