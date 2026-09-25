@@ -56,6 +56,12 @@ The phone stage spf, with the limit 2 against HEAD (the limit 32):
 - test-backend-ops of GATED_DELTA_NET and CONCAT on HTP0: 107 of 107 cases pass on the two libraries.
 - llama-bench pp512 1144.3 against 1143.2 t/s.
 
+The phone stage spf2 (the library with the four candidates, the limit 9 against the limit 32 with
+GGML_HEXAGON_GDN_CHUNK_MIN=0, the depth 2300, the draft off): the GDN class of the op profile uses 10.44
+against 10.53 ms at 8 tokens (the sequential kernel in the two), 10.71 against 11.77 ms at 9 tokens,
+10.74 against 12.92 ms at 10, 10.66 against 15.42 ms at 12 and 10.78 against 20.34 ms at 16. The logits
+hashes of a prompt of 512 tokens and 8 decode tokens are those of HEAD.
+
 diff --git a/ggml/src/ggml-hexagon/htp/htp-gdn-params.h b/ggml/src/ggml-hexagon/htp/htp-gdn-params.h
 index e9c35f14c6cfa927b52e8c2a21797b5829e8a5ba..4bf73b68c16bdd804b3a1d8e0f932c6a5e29a52b 100644
 --- a/ggml/src/ggml-hexagon/htp/htp-gdn-params.h
@@ -118,7 +124,7 @@ index f8f13583139ad27fbcb7b60c9ba27688b7c3beb4..d674207fe3ad393f0e90d6643f655b46
          refuse = "the head size";
      }
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-index 292da7ef8966f2be60cdbbad1c771929f7dce97e..99e8fbfdbe397614ff8df584d6029c12eeed0c0e 100644
+index b2c1b21fd750672b12ad380d4151accea2c1cba4..afb85ca6bf7e6fa8818a701ba69d537a50a875ca 100644
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 @@ -131,6 +131,14 @@ static int opt_opfusion_state = -1; // GGML_HEXAGON_OPFUSION_STATE: -1 = follow
@@ -136,7 +142,7 @@ index 292da7ef8966f2be60cdbbad1c771929f7dce97e..99e8fbfdbe397614ff8df584d6029c12
  // GGML_HEXAGON_GDN_CONV_DMA: 1 = GDN_CONV_CHUNK moves its rows with the DMA (the default), 0 = it
  // reads them with vector loads from DDR. The host gives the value in the kernel params of each op.
  static int opt_gdn_conv_dma = 1;
-@@ -7255,8 +7263,9 @@ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, co
+@@ -7261,8 +7269,9 @@ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, co
                  node.name   = "GATED_DELTA_NET+QKNORM";
                  node.inputs = { qm.q, qm.k, n->src[2], n->src[3], n->src[4], n->src[5] };
                  node.fused  = qm.members;
@@ -148,7 +154,7 @@ index 292da7ef8966f2be60cdbbad1c771929f7dce97e..99e8fbfdbe397614ff8df584d6029c12
                  ggml_hexagon_gdn_qknorm_params(qm, node.kernel_params);
                  fu.at.emplace(i, std::move(node));
                  std::vector<ggml_tensor *> members = qm.members;
-@@ -7416,9 +7425,10 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -7424,9 +7433,10 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                      (struct htp_rope_kernel_params *)node.kernel_params
                  );
              } else if (node.opcode == HTP_OP_GATED_DELTA_NET) {
@@ -162,7 +168,7 @@ index 292da7ef8966f2be60cdbbad1c771929f7dce97e..99e8fbfdbe397614ff8df584d6029c12
              }
              return node;
          };
-@@ -8860,6 +8870,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8870,6 +8880,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      const char * str_opfusion_state = getenv("GGML_HEXAGON_OPFUSION_STATE");
      const char * str_multirow = getenv("GGML_HEXAGON_MULTIROW");
      const char * str_gdn_chunk = getenv("GGML_HEXAGON_GDN_CHUNK");
@@ -170,7 +176,7 @@ index 292da7ef8966f2be60cdbbad1c771929f7dce97e..99e8fbfdbe397614ff8df584d6029c12
      const char * str_gdn_conv_dma = getenv("GGML_HEXAGON_GDN_CONV_DMA");
      const char * str_gdn_qknorm   = getenv("GGML_HEXAGON_GDN_QKNORM");
      const char * str_fwht     = getenv("GGML_HEXAGON_FWHT");
-@@ -8941,6 +8952,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8951,6 +8962,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      opt_canary    = str_canary   ? atoi(str_canary)                       : opt_canary;
      opt_opfusion_state = str_opfusion_state ? atoi(str_opfusion_state)    : opt_opfusion_state;
      opt_gdn_chunk = str_gdn_chunk ? atoi(str_gdn_chunk)                   : opt_gdn_chunk;
@@ -179,7 +185,7 @@ index 292da7ef8966f2be60cdbbad1c771929f7dce97e..99e8fbfdbe397614ff8df584d6029c12
      opt_gdn_conv_dma = str_gdn_conv_dma ? atoi(str_gdn_conv_dma)          : opt_gdn_conv_dma;
      opt_gdn_qknorm   = str_gdn_qknorm   ? atoi(str_gdn_qknorm)            : opt_gdn_qknorm;
      opt_fwht      = str_fwht     ? atoi(str_fwht)                         : opt_fwht;
-@@ -8968,6 +8981,10 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8978,6 +8991,10 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      if (!opt_fwht) {
          GGML_LOG_INFO("ggml-hex: the KV cache rotation stays MUL_MAT (GGML_HEXAGON_FWHT=0)\n");
      }
@@ -191,10 +197,10 @@ index 292da7ef8966f2be60cdbbad1c771929f7dce97e..99e8fbfdbe397614ff8df584d6029c12
          GGML_LOG_INFO("ggml-hex: flash attention options 0x%x (GGML_HEXAGON_FA_OPT)\n", opt_fa_opt);
      }
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index b3ed0c106737c5eb8a61120b2c4bf54a0e8fffd4..fbd6710ded09eddcb35d64540c9bfb01d1d59588 100644
+index 19a1a6d8a563a382feac739be85d539e78a86067..37ac820d9216dd066546b46a0d33113a36001636 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -4751,11 +4751,30 @@ struct test_gated_delta_net : public test_case {
+@@ -4758,11 +4758,30 @@ struct test_gated_delta_net : public test_case {
      // With K > 1 the kernel stops the chunk loop K tokens early and runs those tokens one by one in
      // f32, one snapshot slot each. Thus the tail is tighter than the chunk, and the bound of the
      // chunk holds for the whole output. The gate of the kernel is the token count outside that tail.

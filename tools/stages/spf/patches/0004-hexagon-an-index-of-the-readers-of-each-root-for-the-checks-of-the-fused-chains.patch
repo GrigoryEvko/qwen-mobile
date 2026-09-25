@@ -35,6 +35,11 @@ attention on):
 - tests/fuzz/hexhost, run.sh test asan --profile release on the tree with the four patches: 7 suites
   and 0 findings. The graphs of the 2B and the 4B (decode, decode with 4 sequences, prefill, MTP, vision
   576 and 768) give code 0 and the expected counts of the fused conv steps and state chains.
+- The phone stage spf2 (the 4B Q8_0 on the v79 NPU, the depth 2300, the draft off), the host part of the
+  first call of a size (the wall time minus the wait for the DSP), HEAD against the library with the four
+  candidates: 15.6 against 14.5 ms at 1 token, 26.5 against 19.4 ms at 8, 25.7 against 21.9 ms at 22 and
+  32.4 against 24.3 ms at 64. The pack 5.06, 12.20, 11.51 and 11.36 ms against 3.68, 8.02, 7.98 and
+  6.74 ms.
 
 diff --git a/ggml/src/ggml-hexagon/htp-gdn-match.h b/ggml/src/ggml-hexagon/htp-gdn-match.h
 index d7d2d30193d14f091b3356cc6e8ebf4b59ef9160..bf1eed87d185ebe1c9d99532269d67d97d449565 100644
@@ -306,10 +311,10 @@ index 9175180cb71e9ffbe27289c483de2a5b7ed25f86..a3bf24d606f11c9a15fa9ca93f611390
          if (!reason && at.count(emit)) {
              reason = "a different fused op has the same index";
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-index dea9c0c36c80545d52ec1ec4ba8027b418c35bec..95ac51554fcf116e86de04df458d4b266db22054 100644
+index 1002388e9134b5018080128ac37ef8eb46b83a5d..89ef6ef15bb96dbbca18b68dfcf2508ac0e7f7b0 100644
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-@@ -7177,6 +7177,9 @@ struct ggml_hexagon_gdn_fusion {
+@@ -7190,6 +7190,9 @@ struct ggml_hexagon_gdn_fusion {
  static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, const ggml_cgraph * gf,
                                             ggml_hexagon_gdn_fusion & fu) {
      const auto index = ggml_hexagon_gdn_index(gf);
@@ -319,7 +324,7 @@ index dea9c0c36c80545d52ec1ec4ba8027b418c35bec..95ac51554fcf116e86de04df458d4b26
  
      // Marks the replaced nodes and records their graph indices in graph order under the emit index
      auto skip_members = [&](int emit, const std::vector<ggml_tensor *> & members) {
-@@ -7202,7 +7205,7 @@ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, co
+@@ -7215,7 +7218,7 @@ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, co
  
          if (state_on && ggml_hexagon_gdn_is_conv_candidate(n)) {
              ggml_hexagon_gdn_conv_match m;
@@ -328,7 +333,7 @@ index dea9c0c36c80545d52ec1ec4ba8027b418c35bec..95ac51554fcf116e86de04df458d4b26
              if (reason) {
                  HEX_VERBOSE("ggml-hex: %s GDN_CONV_STEP candidate %s (node %d): %s\n", sess->name.c_str(), n->name, i, reason);
                  continue;
-@@ -7246,7 +7249,8 @@ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, co
+@@ -7259,7 +7262,8 @@ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, co
                          (int) m.n_tokens, m.emit);
          } else if (n->op == GGML_OP_GATED_DELTA_NET) {
              ggml_hexagon_gdn_state_match m;
@@ -338,7 +343,7 @@ index dea9c0c36c80545d52ec1ec4ba8027b418c35bec..95ac51554fcf116e86de04df458d4b26
              if (reason) {
                  HEX_VERBOSE("ggml-hex: %s GDN_STATE_STEP candidate %s (node %d): %s\n", sess->name.c_str(), n->name, i, reason);
              }
-@@ -7256,7 +7260,8 @@ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, co
+@@ -7269,7 +7273,8 @@ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, co
              ggml_hexagon_gdn_qknorm_match qm;
              const char * qreason = "GGML_HEXAGON_GDN_QKNORM is 0";
              if (ggml_hexagon_is_gdn_qknorm_enabled() && (n->src[2]->ne[2] == 1 || opt_gdn_chunk != 1)) {

@@ -28,8 +28,11 @@ the pipelined loop for Q8_0 weights in hmx_mm_2d_f32 and hmx_mm_nx_2d_f32 (hmx_m
   the chunk two steps later into the same bytes. Only the last chunk can have fewer tiles, and a chunk two
   steps later exists only when the chunk is not the last, thus a worker writes only bytes of its own
   range. Worker w is thread w of the work queue, thus each ring stays on one thread.
+The packed task reads two tiles from an even tile (17 vectors, 2176 bytes) with aligned loads, and puts the
+vectors of the odd tile together with valign. A tile with no partner in its range goes alone.
 The host gives the value of GGML_HEXAGON_MM_WSTREAM (the preset is 2, and a value outside 0 to 2 gives 0)
-in the params of each HMX matmul. The HMX jobs, the output transfers and their order do not change, and the
+in the params of each HMX matmul of GGML_HEXAGON_MM_WSTREAM_ROWS rows or fewer (the preset is 32), and the
+stream 0 to a larger matmul. The HMX jobs, the output transfers and their order do not change, and the
 packed task does the arithmetic of the aligned task, thus the output has the bits of the stream 0.
 
 The results
@@ -41,6 +44,27 @@ the 78 runs of the streams 1 and 2 gives the bytes of the stream 0, and no byte 
 runs in 12 cases, 0 failures). The DMA shim of the lab copies at the push and the work queue of the lab
 runs the workers one after the other, thus a worker that moves bytes into the range of a different worker
 before that worker reads them changes the output.
+
+The kernel lab, the Q8_0 dequantization task of one thread on 480 tiles in VTCM (target mmchunks with
+--dq_tiles 480, the timing mode): 72.0 cycles for each tile with the aligned task and 74.0 cycles with the
+packed task, and the same f16 bytes, also for ranges that start at an odd tile and end at an even tile. A packed task
+with unaligned loads and loops that the compiler does not unroll keeps the 8 vectors of a tile on the
+stack and uses 144.0 cycles.
+
+The phone stage spf2 (the 4B Q8_0 on the v79 NPU, the library with the four candidates and the packed task
+of 144 cycles, the stream on each HMX matmul, the depth 2300, the draft off). The wall time of a later call
+(the median of 2 calls) and the W MM class of the op profile, the stream 2 against the stream 0 on the
+same library:
+    tokens  wall ms          W MM ms
+    8       106.8 / 115.2    73.4 / 76.1
+    22      115.3 / 122.3    73.0 / 77.7
+    64      138.3 / 137.6    85.2 / 84.6
+llama-bench pp512 was 3.4 % slower than HEAD in 3 paired rounds [-5.6, -2.1] and the logits prefill of 512
+tokens took 520.4 ms against 510.1 ms with the stream 0: with many rows the HMX and the dequantization set
+the time of the op, and the packed task used two times the cycles of the aligned task. The limit of 32
+rows keeps pp512 and pp1024 on the stream 0. The logits hashes of a prompt of 512 tokens and 8 decode
+tokens with the streams 0 and 2 are those of HEAD, and test-backend-ops of the Q8_0 MUL_MAT cases on HTP0
+gives 43 of 43 passes.
 
 diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.h b/ggml/src/ggml-hexagon/htp/matmul-ops.h
 index 06e653cbb462c002d2864a87094d341a39f1a28f..abfb1c943f709008fb4e80b47d7c623cbd577bd8 100644
@@ -73,41 +97,85 @@ index 06e653cbb462c002d2864a87094d341a39f1a28f..abfb1c943f709008fb4e80b47d7c623c
      int32_t  n_weights;          // Number of weights for fused NX
  
 diff --git a/ggml/src/ggml-hexagon/htp/hmx-mm-kernels-tiled.h b/ggml/src/ggml-hexagon/htp/hmx-mm-kernels-tiled.h
-index 48390a0311688751e3337847921e32bbd4e7cd75..96e51e06ad8175d37d85f5754674d33ed9d4740a 100644
+index 48390a0311688751e3337847921e32bbd4e7cd75..c1f3f9a33f01648d0c79ff117ecfdd27456492b8 100644
 --- a/ggml/src/ggml-hexagon/htp/hmx-mm-kernels-tiled.h
 +++ b/ggml/src/ggml-hexagon/htp/hmx-mm-kernels-tiled.h
-@@ -506,6 +506,37 @@ static void dequantize_tiled_weight_to_fp16_task_q8_0(
+@@ -506,6 +506,81 @@ static void dequantize_tiled_weight_to_fp16_task_q8_0(
      }
  }
  
-+// The task of dequantize_tiled_weight_to_fp16_task_q8_0 for the packed layout: tile t starts at t * tile_size
-+// (1088 bytes), thus an odd tile starts 64 bytes after a vector edge and each load is an unaligned load. The
-+// arithmetic and the order of the stores are those of the aligned task, thus the f16 tiles have the same bits. The
-+// load of the scales reads the 64 bytes after the scales of a tile: the start of the next tile, or the pad of the
-+// buffer after the last tile (a buffer holds its tiles at the pitch aligned_tile_size). The shuffle uses only the
-+// scales. O(tiles).
++// One Q8_0 tile of the packed layout from its 8 vectors of int8 values and the vector whose first 64 bytes are its 32
++// f16 scales: the arithmetic of dequantize_tiled_weight_to_fp16_task_q8_0, thus the f16 tile has the same bits.
++static inline __attribute__((always_inline)) void dequantize_q8_0_packed_tile(const HVX_Vector vq[8], HVX_Vector v_sc,
++                                                                              __fp16 * dst_ptr) {
++    const HVX_Vector v_scale_duplicated = Q6_V_lo_W(Q6_W_vshuff_VVR(v_sc, v_sc, -2));
++#pragma unroll
++    for (int g = 0; g < 8; g++) {
++        HVX_VectorPair vp = Q6_Wh_vunpack_Vb(vq[g]);
++        hvx_vmem(dst_ptr + (2 * g + 0) * 64) =
++            Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_lo_W(vp)), v_scale_duplicated));
++        hvx_vmem(dst_ptr + (2 * g + 1) * 64) =
++            Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_hi_W(vp)), v_scale_duplicated));
++    }
++}
++
++// The task of dequantize_tiled_weight_to_fp16_task_q8_0 for the packed layout: tile t starts at t * tile_size (1088
++// bytes) in a buffer that starts at a vector edge, thus an even tile starts at a vector edge and an odd tile 64 bytes
++// after one. Two tiles from an even tile are 17 vectors (2176 bytes): the task reads them with 17 aligned loads, and
++// puts the vectors of the odd tile together with valign. A tile with no partner in the range (an odd first tile, an
++// even last tile) goes alone. The scales of a lone odd tile end 64 bytes before the end of its last aligned vector: the
++// start of the next tile, or the pad of the buffer after the last tile (a buffer holds its tiles at the pitch
++// aligned_tile_size). The loops have a fixed count and the compiler unrolls them: the kernel lab measures 144 cycles
++// for each tile when the 8 vectors of a tile go to the stack, against 72 for the aligned task. The shuffle uses only
++// the scales. O(tiles).
 +static void dequantize_tiled_weight_to_fp16_task_q8_0_packed(
 +        const tiled_dequantize_state_t *state,
 +        uint32_t start_tile, uint32_t end_tile) {
 +
-+    for (uint32_t t = start_tile; t < end_tile; t++) {
++    uint32_t t = start_tile;
++    while (t < end_tile) {
 +        const uint8_t * tile_src = state->src + (size_t) t * state->tile_size;
-+        __fp16 * dst_ptr = state->dst + t * HTP_MM_HMX_TILE_N_ELMS;
++        __fp16 *        dst_ptr  = state->dst + t * HTP_MM_HMX_TILE_N_ELMS;
++        const uint32_t  off      = (uint32_t) ((uintptr_t) tile_src & (VLEN - 1));
++        HVX_Vector      vq[8];
 +
-+        HVX_Vector v_sc = *(const HVX_UVector *) (tile_src + 1024);
-+        HVX_Vector v_scale_duplicated = Q6_V_lo_W(Q6_W_vshuff_VVR(v_sc, v_sc, -2));
++        if (off == 0 && t + 1 < end_tile) {
++            const HVX_Vector * a = (const HVX_Vector *) tile_src;
++            HVX_Vector         v[17];
++#pragma unroll
++            for (int i = 0; i < 17; i++) {
++                v[i] = a[i];
++            }
++            dequantize_q8_0_packed_tile(v, v[8], dst_ptr);
++#pragma unroll
++            for (int g = 0; g < 8; g++) {
++                vq[g] = Q6_V_valign_VVR(v[g + 9], v[g + 8], 64);
++            }
++            dequantize_q8_0_packed_tile(vq, Q6_V_vror_VR(v[16], 64), dst_ptr + HTP_MM_HMX_TILE_N_ELMS);
++            t += 2;
++            continue;
++        }
 +
-+        HVX_Vector vq[8];
-+        for (int g = 0; g < 8; g++) {
-+            vq[g] = *(const HVX_UVector *) (tile_src + g * 128);
++        HVX_Vector v_sc;
++        if (off == 0) {
++#pragma unroll
++            for (int g = 0; g < 8; g++) {
++                vq[g] = hvx_vmem(tile_src + g * 128);
++            }
++            v_sc = hvx_vmem(tile_src + 1024);
++        } else {
++            const HVX_Vector * base = (const HVX_Vector *) (tile_src - off);
++            HVX_Vector         prev = base[0];
++#pragma unroll
++            for (int g = 0; g < 8; g++) {
++                const HVX_Vector next = base[g + 1];
++                vq[g]                 = Q6_V_valign_VVR(next, prev, off);
++                prev                  = next;
++            }
++            v_sc = Q6_V_valign_VVR(base[9], prev, off);
 +        }
-+        for (int g = 0; g < 8; g++) {
-+            HVX_VectorPair vp = Q6_Wh_vunpack_Vb(vq[g]);
-+            hvx_vmem(dst_ptr + (2 * g + 0) * 64) =
-+                Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_lo_W(vp)), v_scale_duplicated));
-+            hvx_vmem(dst_ptr + (2 * g + 1) * 64) =
-+                Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_hi_W(vp)), v_scale_duplicated));
-+        }
++        dequantize_q8_0_packed_tile(vq, v_sc, dst_ptr);
++        t++;
 +    }
 +}
 +
@@ -379,10 +447,10 @@ index 136fcac80ce155a91aa5cc321893bd553a594947..36fa7cbb77b131478dc100b463fc92f6
      }
  
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-index 99e8fbfdbe397614ff8df584d6029c12eeed0c0e..dea9c0c36c80545d52ec1ec4ba8027b418c35bec 100644
+index afb85ca6bf7e6fa8818a701ba69d537a50a875ca..1002388e9134b5018080128ac37ef8eb46b83a5d 100644
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-@@ -139,6 +139,13 @@ static int opt_gdn_chunk = 2;
+@@ -139,6 +139,20 @@ static int opt_gdn_chunk = 2;
  // plus 1.24 ms for each token: the two are equal at 8 tokens, thus the preset is 9.
  static int opt_gdn_chunk_min = 9;
  
@@ -393,26 +461,34 @@ index 99e8fbfdbe397614ff8df584d6029c12eeed0c0e..dea9c0c36c80545d52ec1ec4ba8027b4
 +// build. A value outside 0 to 2 gives 0.
 +static int opt_mm_wstream = HTP_MM_WSTREAM_RINGS;
 +
++// GGML_HEXAGON_MM_WSTREAM_ROWS: the weight streams 1 and 2 apply only to a matmul of this many rows (tokens) or
++// fewer, and a larger matmul uses the stream 0. 0 gives the stream 0 to each matmul. With few rows the weight stream
++// sets the time of the op, and the DMA rings of the workers move the weights faster. With many rows the HMX and the
++// dequantization set it, and in the phone stage spf2 (the 4B Q8_0 on the v79 NPU) the stream 2 made pp512 3 % slower.
++// The stream 2 gives the same time as the stream 0 at 64 rows and is faster at 8 and 22 rows, thus the preset is 32.
++static int opt_mm_wstream_rows = 32;
++
  // GGML_HEXAGON_GDN_CONV_DMA: 1 = GDN_CONV_CHUNK moves its rows with the DMA (the default), 0 = it
  // reads them with vector loads from DDR. The host gives the value in the kernel params of each op.
  static int opt_gdn_conv_dma = 1;
-@@ -5347,6 +5354,7 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
+@@ -5350,6 +5364,7 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
  
      kparams->n_hmx = 1;
      kparams->pipeline = pipeline ? 1 : 0;
-+    kparams->hmx_wstream = opt_mm_wstream;
++    kparams->hmx_wstream = ne11 <= opt_mm_wstream_rows ? opt_mm_wstream : HTP_MM_WSTREAM_TILES;
      kparams->m_chunk = m_chunk;
      kparams->n_chunk = n_chunk;
      kparams->n_threads = n_threads;
-@@ -8871,6 +8879,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8881,6 +8896,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      const char * str_multirow = getenv("GGML_HEXAGON_MULTIROW");
      const char * str_gdn_chunk = getenv("GGML_HEXAGON_GDN_CHUNK");
      const char * str_gdn_chunk_min = getenv("GGML_HEXAGON_GDN_CHUNK_MIN");
 +    const char * str_mm_wstream    = getenv("GGML_HEXAGON_MM_WSTREAM");
++    const char * str_mm_wstream_rows = getenv("GGML_HEXAGON_MM_WSTREAM_ROWS");
      const char * str_gdn_conv_dma = getenv("GGML_HEXAGON_GDN_CONV_DMA");
      const char * str_gdn_qknorm   = getenv("GGML_HEXAGON_GDN_QKNORM");
      const char * str_fwht     = getenv("GGML_HEXAGON_FWHT");
-@@ -8954,6 +8963,12 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8964,6 +8981,17 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      opt_gdn_chunk = str_gdn_chunk ? atoi(str_gdn_chunk)                   : opt_gdn_chunk;
      // A negative value gives 0, the limit of the DSP
      opt_gdn_chunk_min = str_gdn_chunk_min ? std::max(0, atoi(str_gdn_chunk_min)) : opt_gdn_chunk_min;
@@ -421,6 +497,11 @@ index 99e8fbfdbe397614ff8df584d6029c12eeed0c0e..dea9c0c36c80545d52ec1ec4ba8027b4
 +        opt_mm_wstream = (v >= HTP_MM_WSTREAM_TILES && v <= HTP_MM_WSTREAM_RINGS) ? v : HTP_MM_WSTREAM_TILES;
 +        GGML_LOG_INFO("ggml-hex: the weight stream of the HMX matmul of Q8_0 weights is %d (GGML_HEXAGON_MM_WSTREAM)\n",
 +                      opt_mm_wstream);
++    }
++    if (str_mm_wstream_rows) {
++        opt_mm_wstream_rows = std::max(0, atoi(str_mm_wstream_rows));
++        GGML_LOG_INFO("ggml-hex: the weight streams 1 and 2 apply to a matmul of %d rows or fewer "
++                      "(GGML_HEXAGON_MM_WSTREAM_ROWS)\n", opt_mm_wstream_rows);
 +    }
      opt_gdn_conv_dma = str_gdn_conv_dma ? atoi(str_gdn_conv_dma)          : opt_gdn_conv_dma;
      opt_gdn_qknorm   = str_gdn_qknorm   ? atoi(str_gdn_qknorm)            : opt_gdn_qknorm;

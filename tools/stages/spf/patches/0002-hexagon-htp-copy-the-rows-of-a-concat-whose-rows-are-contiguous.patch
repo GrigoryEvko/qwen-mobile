@@ -27,6 +27,10 @@ rows of src0, dimensions 1, 2 and 3, and a transposed src1 (the old path). The t
 bytes with concat_generic. The simulator runs the MTP concat of 22 tokens in 15252 cycles against 3608108
 cycles for concat_generic, with the jobs of the six threads one after the other.
 
+The phone stage spf2 (the 4B Q8_0 on the v79 NPU, the depth 2300, the draft on): the MTP concat uses 34 us
+against 597 us at 22 tokens and 90 us against 1722 us at 64 tokens. test-backend-ops of CONCAT and
+GATED_DELTA_NET on HTP0: 107 of 107 cases pass.
+
 diff --git a/ggml/src/ggml-hexagon/htp/concat-ops.c b/ggml/src/ggml-hexagon/htp/concat-ops.c
 index 966e867b3976bac86d3f99b691517e39f758751e..0cecdf18b1900dd03b128f8eb5f7d41c740f3796 100644
 --- a/ggml/src/ggml-hexagon/htp/concat-ops.c

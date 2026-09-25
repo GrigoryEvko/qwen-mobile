@@ -22,7 +22,10 @@
 // the push, and the work queue of the lab runs the workers one after the other, thus a worker that moves bytes into
 // the tiles of a different worker before that worker reads them changes the output.
 //
-// Arguments: --threads 6 --vtcm 1048576
+// With --dq_tiles N the program only measures the Q8_0 dequantization task of one thread on N tiles, aligned against
+// packed (dq_bench), in the timing mode.
+//
+// Arguments: --threads 6 --vtcm 1048576 [--dq_tiles 480]
 #pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
 #pragma clang diagnostic ignored "-Wunused-function"
 #pragma clang diagnostic ignored "-Wunused-variable"
@@ -392,10 +395,86 @@ static void run_case(enum form f, int wtype, uint32_t k, uint32_t n, uint32_t m,
     }
 }
 
+#ifdef HTP_MM_WSTREAM_RINGS
+// The cycles of the Q8_0 dequantization task of one thread on n_tiles tiles in VTCM: the aligned task on tiles at the
+// pitch aligned_tile_size (the streams TILES), and the packed task on tiles at the pitch tile_size (the streams PACKED
+// and RINGS, half of the tiles start 64 bytes after a vector edge). The two tasks must give the same f16 bytes. Run it
+// in the timing mode: it uses no HMX. O(n_tiles * iters).
+static void dq_bench(uint32_t n_tiles, int iters) {
+    const uint32_t ts  = HTP_MM_WEIGHT_TILE_SIZE_Q8_0;
+    const uint32_t ats = HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q8_0;
+    uint8_t *      raw_a = (uint8_t *) lab_vtcm_alloc((size_t) n_tiles * ats, 128);
+    uint8_t *      raw_p = (uint8_t *) lab_vtcm_alloc((size_t) n_tiles * ats, 128);
+    __fp16 *       out_a = (__fp16 *) lab_vtcm_alloc((size_t) n_tiles * HTP_MM_HMX_TILE_N_ELMS * sizeof(__fp16), 128);
+    __fp16 *       out_p = (__fp16 *) lab_vtcm_alloc((size_t) n_tiles * HTP_MM_HMX_TILE_N_ELMS * sizeof(__fp16), 128);
+    uint8_t        tile[HTP_MM_WEIGHT_TILE_SIZE_Q8_0];
+
+    for (uint32_t t = 0; t < n_tiles; t++) {
+        lab_fill_u8(tile, 1024);
+        for (int s = 0; s < 32; s++) {  // finite f16 scales in [0.5, 1)
+            const uint16_t h = lab_f32_to_hf(lab_rand_f32(0.5f, 1.0f));
+            memcpy(tile + 1024 + 2 * s, &h, 2);
+        }
+        memcpy(raw_a + (size_t) t * ats, tile, ts);
+        memcpy(raw_p + (size_t) t * ts, tile, ts);
+    }
+    tiled_dequantize_state_t st;
+    memset(&st, 0, sizeof(st));
+    st.tile_size         = ts;
+    st.aligned_tile_size = ats;
+    uint64_t best_a = UINT64_MAX, best_p = UINT64_MAX;
+    for (int it = 0; it < iters; it++) {
+        st.src = raw_a;
+        st.dst = out_a;
+        LAB_BARRIER();
+        uint64_t c0 = lab_cycles();
+        dequantize_tiled_weight_to_fp16_task_q8_0(&st, 0, n_tiles);
+        LAB_BARRIER();
+        uint64_t c1 = lab_cycles();
+        best_a      = c1 - c0 < best_a ? c1 - c0 : best_a;
+        st.src      = raw_p;
+        st.dst      = out_p;
+        LAB_BARRIER();
+        c0 = lab_cycles();
+        dequantize_tiled_weight_to_fp16_task_q8_0_packed(&st, 0, n_tiles);
+        LAB_BARRIER();
+        c1     = lab_cycles();
+        best_p = c1 - c0 < best_p ? c1 - c0 : best_p;
+    }
+    bool same = memcmp(out_a, out_p, (size_t) n_tiles * HTP_MM_HMX_TILE_N_ELMS * sizeof(__fp16)) == 0;
+    // The ranges of the workers: a range can start at an odd tile and end at an even tile
+    if (n_tiles > 8) {
+        memset(out_p, 0, (size_t) n_tiles * HTP_MM_HMX_TILE_N_ELMS * sizeof(__fp16));
+        const uint32_t cut[] = { 0, 3, 8, n_tiles - 1, n_tiles };
+        for (int r = 0; r + 1 < (int) (sizeof(cut) / sizeof(cut[0])); r++) {
+            dequantize_tiled_weight_to_fp16_task_q8_0_packed(&st, cut[r], cut[r + 1]);
+        }
+        same = same && memcmp(out_a, out_p, (size_t) n_tiles * HTP_MM_HMX_TILE_N_ELMS * sizeof(__fp16)) == 0;
+    }
+    printf("lab: dq %u tiles: aligned %.1f cycles per tile, packed %.1f cycles per tile (%+.1f %%), f16 bytes %s\n",
+           n_tiles, (double) best_a / n_tiles, (double) best_p / n_tiles,
+           100.0 * ((double) best_p - (double) best_a) / (double) best_a, same ? "the same" : "DIFFERENT");
+    lab_report(TARGET, "dq_aligned", (double) best_a / n_tiles, "cycles/tile");
+    lab_report(TARGET, "dq_packed", (double) best_p / n_tiles, "cycles/tile");
+    g_fail += same ? 0 : 1;
+}
+#endif
+
 int main(int argc, char ** argv) {
     lab_init();
 
     const uint32_t nt = (uint32_t) lab_arg_long(argc, argv, "--threads", 6);
+    const uint32_t dq = (uint32_t) lab_arg_long(argc, argv, "--dq_tiles", 0);
+    if (dq > 0) {
+#ifdef HTP_MM_WSTREAM_RINGS
+        dq_bench(dq, 3);
+        printf("lab: check %s %s\n", TARGET, g_fail == 0 ? "PASS" : "FAIL");
+        return g_fail == 0 ? 0 : 1;
+#else
+        printf("lab: --dq_tiles needs the tree with the weight streams (HTP_MM_WSTREAM_RINGS)\n");
+        return 1;
+#endif
+    }
 
     g_ctx.vtcm_base     = lab_vtcm_base();
     g_ctx.vtcm_size     = (size_t) lab_arg_long(argc, argv, "--vtcm", 1 << 20);
