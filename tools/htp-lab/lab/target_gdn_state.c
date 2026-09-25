@@ -24,7 +24,9 @@
 #include <string.h>
 #include <math.h>
 
+// The chunked kernel calls gdn_step_token_f32 for the snapshot tokens at the end of a batch.
 #include "gdn-chunk-ops.c"
+#include "gated-delta-net-ops.c"
 
 #define TARGET "gdn_state"
 
