@@ -1,0 +1,354 @@
+hexagon: skip the zero terms of the forward substitution of version 2
+
+The cost
+
+Version 2 of the chunked gated delta net kernel sends each chunk with a zero coefficient in the forward
+substitution to a second solve with the arithmetic of version 1. That solve converts each product and
+each sum to IEEE f32 at once and does one row at a time. A strong decay flushes the coefficients far from
+the diagonal to zero, and a small key product times a moderate decay also flushes to zero. Thus the 4B
+shape with gates from -0.5 also sends chunks to that solve, and the kernel has two solves with different
+rounding.
+
+The change
+
+- gdn_c2_solve does not run a term with a zero coefficient. The probe of stage gdnk3 (2026-09-25, the
+  v79 NPU of the phone) shows the cause of the values near 2^105 that the qfloat solve gave for such
+  chunks:
+    - A qfloat product with a zero operand gives the qf32 bits 0x00000080 (+2^-22) or 0xffffff80
+      (-2^-22), for each other operand, zero included.
+    - A sum of 16 such products with mixed signs (the form of the solve with zero coefficients) gives
+      0x400000e9, which is about 2^106 in f32. The float64 value is 0.
+    - The same sums with coefficients of 0 or 0.5, and with 2^-60 in place of 0, agree with a float64
+      reference to 1 or 2 ulp.
+    - The products of normal operands are correct down to 2^-149. 2^-80 * 2^-80 gives a wrapped qf32
+      value, thus the multiply operands keep the flush below 2^-50 (gdn_c2_ftz).
+- The zeros of a row usually come first, because the decay decreases with the distance from the
+  diagonal. For each pair of rows, a vector max finds the last zero coefficient. The terms up to it go one
+  at a time with a test of each coefficient. The terms after it go in pairs with no test, as before.
+- Each chunk takes gdn_c2_solve. gdn_c2_solve_f32, the zero mask of phase solve and the macro
+  GDN_C2_SOLVE_F32_ALWAYS go.
+- The state goes through gdn_c2_ftz one time, in phase begin. gdn_c2_state_row flushed it at each update
+  when it read it, and it still flushes each state that it stores.
+
+The results
+
+The kernel lab (tools/htp-lab, target gdnk, the v79 timing model, 12 heads of 128, 512 tokens, 6 threads,
+--hmx 0), the cycles of the kernel functions on the threads, HEAD fa1530b against this patch:
+                        HEAD      this patch
+    gates from -0.5     4.94 M    4.73 M (-4.2 %)
+    gates from -20      5.76 M    5.71 M (-1.0 %)
+With gates from -0.5 the solve phase goes from 1.62 M to 1.52 M cycles, and the state update goes from
+0.91 M to 0.72 M. The simulator gives exact zeros for the qfloat products with a zero operand, thus the
+lab cannot show the defect of the phone. The functional runs of the patch before give the same NMSE with
+this patch (9 runs of 70 to 512 tokens, gates from -0.5 to -8, 1 to 5 snapshot slots, with and without
+the norm). A run with gates from -20 (165 tokens, 5 slots, the norm) gives 3.1e-07 for the output. The
+target gdnsolve (gates from -0.5, -8 and -20) gives a worst error of 3.8e-09 or less.
+
+On the phone (HTP0, Qwen3.5-4B Q8_0, stages gdnk3 and gdnk3p of 2026-09-25) A is HEAD fa1530b and B is
+this patch, with the same libraries apart from the Hexagon backend:
+- test-backend-ops passes the 82 cases of the gated delta net ops with the q/k norm inside and without it.
+- The KL divergence of the prefill path against the naive x86 base (4 chunks of 512) is 0.000617 +-
+  0.000045 for B and 0.000602 +- 0.000042 for A. The decode path gives 0.000534 +- 0.000077 for B.
+- The probe log of each phase (gates from -20, one and four chunks) has no value that is not finite. 1927
+  to 1945 of the 2016 coefficients of a chunk are zero.
+- test-backend-ops perf, the median of 2 rounds:
+      case                                    A          B
+      16 k heads, 32 v heads, 1024 tokens     3092 us    3083 us
+      32 heads, 1024 tokens, gates from -20   4116 us    4044 us
+- llama-bench, 5 rounds with A and B in turn, the rounds that the runner did not mark for a change of
+  the CPU caps (A 3, B 4): pp512 1159.5 t/s for A and 1164.4 t/s for B, pp1024 1111.5 t/s for A and
+  1123.9 t/s for B. The paired difference is -0.1 % for pp512 and +0.9 % for pp1024.
+Thus the speed does not change on the phone. The solve of version 1 was not the cause of the difference
+between the 2762 us of version 2 before the flushes (stage gdnk of 2026-09-24) and its time with them.
+
+Base: llama.cpp commit c6824a9 with the patches of patches/series above this one.
+
+Files:
+    ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c
+diff --git a/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c b/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c
+index dfbd0a9..f8f1358 100644
+--- a/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c
++++ b/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c
+@@ -1154,11 +1154,6 @@ static size_t gdn_ch_layout_row(struct gdn_ch_row * rw, uint8_t * base, uint32_t
+ #define GDN_C2_HMX_WAIT_HOOK() ((void) 0)
+ #endif
+ 
+-// A test program can set this to 1: each chunk then takes gdn_c2_solve_f32, also with no zero coefficient
+-#ifndef GDN_C2_SOLVE_F32_ALWAYS
+-#define GDN_C2_SOLVE_F32_ALWAYS 0
+-#endif
+-
+ // One sum of tile products. The tile of act at (r, k) is act + (r * a_r + k * a_k) tiles, and the tile
+ // of wt at (k, c) is wt + (k * w_k + c * w_c) tiles. tri limits k to k <= r.
+ struct gdn_c2_sum {
+@@ -1738,6 +1733,12 @@ static inline void gdn_c2_solve_row_out(float * restrict row, uint32_t i, HVX_Ve
+     hvx_vmem(row + 32) = t1;
+ }
+ 
++// The index of each word lane of a vector, for the lane of the last zero coefficient in gdn_c2_solve
++static const int32_t gdn_c2_lane_index[32] __attribute__((aligned(VLEN))) = {
++    0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,
++    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
++};
++
+ // The forward substitution T = (I + A')^-1 with A'[i][s] = beta_i * E[i][s] * (k_i . k_s) for s < i.
+ // a32 holds E * (K K^T) on entry, and beta comes in at the end of each row: row i of T is
+ // e_i - beta_i * sum_s a32[i][s] T[s]. Row s of T is zero past lane s, thus the terms s < 32 add to the
+@@ -1746,25 +1747,92 @@ static inline void gdn_c2_solve_row_out(float * restrict row, uint32_t i, HVX_Ve
+ // Two rows go together: each row s of T loads once for the terms of rows i and i + 1, and the four to
+ // eight sums are independent chains. Row i + 1 takes its term s = i after row i is done. The sums stay in
+ // qfloat until the end of a row. O(C^3 / 6).
++//
++// A term with a zero coefficient does not run. A qfloat product with a zero operand is not zero on the
++// v79 NPU of the phone (0.5 * 0 gives 2^-22, stage gdnk2 of 2026-09-25). The lanes above the diagonal
++// of T are zero, thus a zero coefficient multiplies zero by zero in those lanes. The qfloat sums of the
++// solve gave values near 2^105 on that NPU for each chunk with a zero coefficient. A strong decay makes
++// the coefficients far from the diagonal zero (gdn_c2_ftz), thus the zeros usually come first in a row.
++// The terms up to the last zero of the two rows go one at a time with a test of each coefficient, and the
++// terms after it go in pairs with no test.
+ static void gdn_c2_solve(float * restrict t32, const float * restrict a32, const float * restrict bet) {
+     // the coefficients of the two rows in work, on the stack for the scalar reads
+     float ai[GDN_CH_C] __attribute__((aligned(VLEN)));
+     float bi[GDN_CH_C] __attribute__((aligned(VLEN)));
+-    const HVX_Vector zero = Q6_V_vzero();
++    int32_t zl[32] __attribute__((aligned(VLEN)));
++    const HVX_Vector zero     = Q6_V_vzero();
++    const HVX_Vector abs_mask = Q6_V_vsplat_R(0x7FFFFFFF);
++    const HVX_Vector none     = Q6_V_vsplat_R(-1);
++    const HVX_Vector lane     = hvx_vmem(gdn_c2_lane_index);
+ 
+     for (uint32_t i = 0; i < GDN_CH_C; i += 2) {
+         const float * ra = a32 + (size_t) i * GDN_CH_C;
+-        hvx_vmem(ai)      = hvx_vmem(ra);
+-        hvx_vmem(ai + 32) = hvx_vmem(ra + 32);
+-        hvx_vmem(bi)      = hvx_vmem(ra + GDN_CH_C);
+-        hvx_vmem(bi + 32) = hvx_vmem(ra + GDN_CH_C + 32);
++        const HVX_Vector al = hvx_vmem(ra);
++        const HVX_Vector ah = hvx_vmem(ra + 32);
++        const HVX_Vector bl = hvx_vmem(ra + GDN_CH_C);
++        const HVX_Vector bh = hvx_vmem(ra + GDN_CH_C + 32);
++        hvx_vmem(ai)      = al;
++        hvx_vmem(ai + 32) = ah;
++        hvx_vmem(bi)      = bl;
++        hvx_vmem(bi + 32) = bh;
++
++        // z: the last s < i with a zero coefficient in one of the two rows, or -1. The lane index of each
++        // zero, and the largest one by five steps of a rotate and a max.
++        const uint32_t nlo = i < 32 ? i : 32;
++        const HVX_VectorPred blo = nlo >= 32 ? Q6_Q_vsetq2_R(128) : Q6_Q_vsetq_R(nlo * 4);
++        const HVX_VectorPred zlo = Q6_Q_or_QQ(Q6_Q_vcmp_eq_VwVw(Q6_V_vand_VV(al, abs_mask), zero),
++                                              Q6_Q_vcmp_eq_VwVw(Q6_V_vand_VV(bl, abs_mask), zero));
++        HVX_Vector m = Q6_V_vmux_QVV(Q6_Q_and_QQ(zlo, blo), lane, none);
++        if (i > 32) {
++            const HVX_VectorPred bhi = Q6_Q_vsetq_R((i - 32) * 4);
++            const HVX_VectorPred zhi = Q6_Q_or_QQ(Q6_Q_vcmp_eq_VwVw(Q6_V_vand_VV(ah, abs_mask), zero),
++                                                  Q6_Q_vcmp_eq_VwVw(Q6_V_vand_VV(bh, abs_mask), zero));
++            m = Q6_Vw_vmax_VwVw(m, Q6_V_vmux_QVV(Q6_Q_and_QQ(zhi, bhi), Q6_Vw_vadd_VwVw(lane, Q6_V_vsplat_R(32)), none));
++        }
++        for (uint32_t sh = 64; sh >= 4; sh /= 2) {
++            m = Q6_Vw_vmax_VwVw(m, Q6_V_vror_VR(m, sh));
++        }
++        hvx_vmem(zl) = m;
++        const uint32_t nz = (uint32_t) (zl[0] + 1);
+ 
+         HVX_Vector la0 = zero, la1 = zero, lb0 = zero, lb1 = zero;
+         HVX_Vector ha0 = zero, ha1 = zero, hb0 = zero, hb1 = zero;
+ 
+-        // the terms s < min(i, 32): the low vectors. i is even, thus so is the count.
+-        const uint32_t nlo = i < 32 ? i : 32;
+-        for (uint32_t s = 0; s < nlo; s += 2) {
++        // the terms s < nz, one at a time
++        for (uint32_t s = 0; s < nz; ++s) {
++            const float * r = t32 + (size_t) s * GDN_CH_C;
++            if (ai[s] != 0.0f) {
++                const HVX_Vector a = hvx_vec_splat_f32(ai[s]);
++                la0 = Q6_Vqf32_vadd_Vqf32Vqf32(la0, Q6_Vqf32_vmpy_VsfVsf(hvx_vmem(r), a));
++                if (s >= 32) {
++                    ha0 = Q6_Vqf32_vadd_Vqf32Vqf32(ha0, Q6_Vqf32_vmpy_VsfVsf(hvx_vmem(r + 32), a));
++                }
++            }
++            if (bi[s] != 0.0f) {
++                const HVX_Vector b = hvx_vec_splat_f32(bi[s]);
++                lb0 = Q6_Vqf32_vadd_Vqf32Vqf32(lb0, Q6_Vqf32_vmpy_VsfVsf(hvx_vmem(r), b));
++                if (s >= 32) {
++                    hb0 = Q6_Vqf32_vadd_Vqf32Vqf32(hb0, Q6_Vqf32_vmpy_VsfVsf(hvx_vmem(r + 32), b));
++                }
++            }
++        }
++        // An odd nz takes the term s = nz alone, thus the pairs start at an even s
++        uint32_t s0 = nz;
++        if ((s0 & 1) && s0 < i) {
++            const float *    r = t32 + (size_t) s0 * GDN_CH_C;
++            const HVX_Vector a = hvx_vec_splat_f32(ai[s0]);
++            const HVX_Vector b = hvx_vec_splat_f32(bi[s0]);
++            la1 = Q6_Vqf32_vadd_Vqf32Vqf32(la1, Q6_Vqf32_vmpy_VsfVsf(hvx_vmem(r), a));
++            lb1 = Q6_Vqf32_vadd_Vqf32Vqf32(lb1, Q6_Vqf32_vmpy_VsfVsf(hvx_vmem(r), b));
++            if (s0 >= 32) {
++                ha1 = Q6_Vqf32_vadd_Vqf32Vqf32(ha1, Q6_Vqf32_vmpy_VsfVsf(hvx_vmem(r + 32), a));
++                hb1 = Q6_Vqf32_vadd_Vqf32Vqf32(hb1, Q6_Vqf32_vmpy_VsfVsf(hvx_vmem(r + 32), b));
++            }
++            ++s0;
++        }
++
++        // the terms s0 <= s < min(i, 32): the low vectors. s0 and i are even, thus so is the count.
++        for (uint32_t s = s0; s < nlo; s += 2) {
+             const float *    r  = t32 + (size_t) s * GDN_CH_C;
+             const HVX_Vector r0 = hvx_vmem(r);
+             const HVX_Vector r1 = hvx_vmem(r + GDN_CH_C);
+@@ -1773,8 +1841,8 @@ static void gdn_c2_solve(float * restrict t32, const float * restrict a32, const
+             la1 = Q6_Vqf32_vadd_Vqf32Vqf32(la1, Q6_Vqf32_vmpy_VsfVsf(r1, hvx_vec_splat_f32(ai[s + 1])));
+             lb1 = Q6_Vqf32_vadd_Vqf32Vqf32(lb1, Q6_Vqf32_vmpy_VsfVsf(r1, hvx_vec_splat_f32(bi[s + 1])));
+         }
+-        // the terms 32 <= s < i: both vectors
+-        for (uint32_t s = 32; s < i; s += 2) {
++        // the terms max(s0, 32) <= s < i: both vectors
++        for (uint32_t s = s0 > 32 ? s0 : 32; s < i; s += 2) {
+             const float *    r   = t32 + (size_t) s * GDN_CH_C;
+             const HVX_Vector r0l = hvx_vmem(r);
+             const HVX_Vector r0h = hvx_vmem(r + 32);
+@@ -1799,59 +1867,18 @@ static void gdn_c2_solve(float * restrict t32, const float * restrict a32, const
+                              Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(ha0, ha1)), bet[i]);
+ 
+         // row i + 1 takes the term s = i
+-        const HVX_Vector c = hvx_vec_splat_f32(bi[i]);
+-        lb0 = Q6_Vqf32_vadd_Vqf32Vqf32(lb0, Q6_Vqf32_vmpy_VsfVsf(hvx_vmem(ti), c));
+-        if (i >= 32) {
+-            hb0 = Q6_Vqf32_vadd_Vqf32Vqf32(hb0, Q6_Vqf32_vmpy_VsfVsf(hvx_vmem(ti + 32), c));
++        if (bi[i] != 0.0f) {
++            const HVX_Vector c = hvx_vec_splat_f32(bi[i]);
++            lb0 = Q6_Vqf32_vadd_Vqf32Vqf32(lb0, Q6_Vqf32_vmpy_VsfVsf(hvx_vmem(ti), c));
++            if (i >= 32) {
++                hb0 = Q6_Vqf32_vadd_Vqf32Vqf32(hb0, Q6_Vqf32_vmpy_VsfVsf(hvx_vmem(ti + 32), c));
++            }
+         }
+         gdn_c2_solve_row_out(ti + GDN_CH_C, i + 1, Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(lb0, lb1)),
+                              Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(hb0, hb1)), bet[i + 1]);
+     }
+ }
+ 
+-// The forward substitution of gdn_c2_solve with the arithmetic of version 1: each product and each sum
+-// goes to IEEE f32 at once, row by row. A term with a zero coefficient does not run. Phase solve uses it
+-// when a coefficient of the chunk is zero: on the v79 NPU of the phone the qfloat sums of gdn_c2_solve
+-// gave values near 2^105 for such chunks (stage gdnk2, gates from -20, beta and A' finite and at most
+-// 1), where the kernel lab gives values below 10. The phone gives correct results for zero terms in this
+-// form (version 1). O(C^3 / 6) at most, less for each zero coefficient.
+-static void gdn_c2_solve_f32(float * restrict t32, const float * restrict a32, const float * restrict bet) {
+-    // the coefficients of the row in work, on the stack for the scalar reads
+-    float ai[GDN_CH_C] __attribute__((aligned(VLEN)));
+-    const HVX_Vector zero = Q6_V_vzero();
+-
+-    for (uint32_t i = 0; i < GDN_CH_C; ++i) {
+-        const float * ra = a32 + (size_t) i * GDN_CH_C;
+-        hvx_vmem(ai)      = hvx_vmem(ra);
+-        hvx_vmem(ai + 32) = hvx_vmem(ra + 32);
+-
+-        HVX_Vector lo = zero;
+-        HVX_Vector hi = zero;
+-        for (uint32_t s = 0; s < i; ++s) {
+-            if (ai[s] == 0.0f) {
+-                continue;
+-            }
+-            const HVX_Vector a = hvx_vec_splat_f32(ai[s]);
+-            const float *    r = t32 + (size_t) s * GDN_CH_C;
+-            lo = hvx_vec_add_f32_f32(lo, hvx_vec_mul_f32_f32(hvx_vmem(r), a));
+-            if (s >= 32) {
+-                hi = hvx_vec_add_f32_f32(hi, hvx_vec_mul_f32_f32(hvx_vmem(r + 32), a));
+-            }
+-        }
+-        gdn_c2_solve_row_out(t32 + (size_t) i * GDN_CH_C, i, lo, hi, bet[i]);
+-    }
+-}
+-
+-// True when a coefficient of the solve, a32[t][s] with s < t, is zero. The lanes of the tile vectors of
+-// phase solve: zmask gathers them, one bit for each lane that is zero and below the diagonal.
+-static inline HVX_Vector gdn_c2_zero_below(HVX_Vector zmask, HVX_Vector row, uint32_t n_below) {
+-    const HVX_Vector abs_mask = Q6_V_vsplat_R(0x7FFFFFFF);
+-    const HVX_VectorPred z    = Q6_Q_vcmp_eq_VwVw(Q6_V_vand_VV(row, abs_mask), Q6_V_vzero());
+-    // n_below is 0 to 32 lanes; vsetq2 of 128 bytes sets every lane, vsetq of 0 sets none
+-    const HVX_VectorPred below = n_below >= 32 ? Q6_Q_vsetq2_R(128) : Q6_Q_vsetq_R(n_below * 4);
+-    return Q6_V_vor_VV(zmask, Q6_V_vmux_QVV(Q6_Q_and_QQ(z, below), Q6_V_vsplat_R(1), Q6_V_vzero()));
+-}
+-
+ // ---- the phases of version 2
+ 
+ static inline void gdn_c2_range(const struct gdn_c2_ctx * c, unsigned int ith, uint32_t * begin, uint32_t * end) {
+@@ -1940,6 +1967,11 @@ static void gdn_c2_phase_begin(unsigned int nth, unsigned int ith, void * data)
+         dma_queue_push(dma, dma_make_ptr(rw->stg_q, rp.s_in), row, row, row, c->D);
+         dma_queue_pop(dma);
+         gdn_c2_transpose_f32(rw->s32, rw->stg_q, c->D, rw->scr);
++        // The state is a multiply operand of gdn_c2_state_row, thus it goes through gdn_c2_ftz. The input
++        // state goes here one time, and gdn_c2_state_row flushes each state that it stores. O(D^2).
++        for (size_t k = 0; k < (size_t) c->D * c->D; k += 32) {
++            hvx_vmem(rw->s32 + k) = gdn_c2_ftz(hvx_vmem(rw->s32 + k));
++        }
+     }
+     for (uint32_t i = begin; i < end; ++i) {
+         struct gdn_ch_row_ptrs rp;
+@@ -2004,8 +2036,8 @@ static void gdn_c2_state_row(struct gdn_c2_ctx * c, uint32_t i, bool update, boo
+     const HVX_Vector ve  = hvx_vec_splat_f32(eC);
+     const HVX_Vector one = hvx_vec_splat_f16(1.0);
+     const HVX_Vector zero = Q6_V_vzero();
+-    // A chunk decay of zero (gdn_c2_gates flushes it below 2^-50) takes no multiply: the qfloat sum of a
+-    // product by a zero factor is the case that gdn_c2_solve_f32 keeps out of the solve
++    // A chunk decay of zero (gdn_c2_gates flushes it below 2^-50) takes no multiply: a qfloat product
++    // with a zero operand is not zero (refer to gdn_c2_solve)
+     const bool decay = eC != 0.0f;
+ 
+     for (uint32_t r = 0; r < D; r += 2) {
+@@ -2019,10 +2051,10 @@ static void gdn_c2_state_row(struct gdn_c2_ctx * c, uint32_t i, bool update, boo
+                 const HVX_Vector upd = ((const HVX_Vector *) (rw->s_upd + (size_t) (it * n_kt + jt) * GDN_CH_TILE))[p];
+                 const HVX_VectorPair w = Q6_Wqf32_vmpy_VhfVhf(upd, one);
+                 if (decay) {
+-                    // The state is a multiply operand here and in the tail tokens, thus it goes through
+-                    // gdn_c2_ftz: the input state when it is read, the updated state when it is stored
+-                    q0 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(gdn_c2_ftz(hvx_vmem(p0 + jt * 32)), ve), Q6_V_lo_W(w));
+-                    q1 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(gdn_c2_ftz(hvx_vmem(p1 + jt * 32)), ve), Q6_V_hi_W(w));
++                    // The state is a multiply operand, thus each stored state goes through gdn_c2_ftz.
++                    // gdn_c2_phase_begin flushes the input state.
++                    q0 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(hvx_vmem(p0 + jt * 32), ve), Q6_V_lo_W(w));
++                    q1 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(hvx_vmem(p1 + jt * 32), ve), Q6_V_hi_W(w));
+                 } else {
+                     q0 = Q6_V_lo_W(w);
+                     q1 = Q6_V_hi_W(w);
+@@ -2068,10 +2100,8 @@ static void gdn_c2_phase_solve(unsigned int nth, unsigned int ith, void * data)
+         float *                    t32 = (float *) rw->out_ws;
+ 
+         // A' = A * E and P' = P * E. With the factored E the rows of E come in f32 from its factors, as
+-        // in the version above, and A' and P' round once. Else E comes from its f16 tiles. zmask gathers
+-        // the zero coefficients of the solve.
+-        const HVX_Vector one   = hvx_vec_splat_f16(1.0);
+-        HVX_Vector       zmask = Q6_V_vzero();
++        // in the version above, and A' and P' round once. Else E comes from its f16 tiles.
++        const HVX_Vector one = hvx_vec_splat_f16(1.0);
+         for (uint32_t tt = 0; tt < GDN_CH_CT; ++tt) {
+             for (uint32_t st = 0; st <= tt; ++st) {
+                 const size_t       ti = (size_t) (tt * GDN_CH_CT + st) * GDN_CH_TILE;
+@@ -2099,8 +2129,6 @@ static void gdn_c2_phase_solve(unsigned int nth, unsigned int ith, void * data)
+                     }
+                     hvx_vmem(r0)            = a0;
+                     hvx_vmem(r0 + GDN_CH_C) = a1;
+-                    zmask = gdn_c2_zero_below(zmask, a0, st < tt ? 32 : 2 * p);
+-                    zmask = gdn_c2_zero_below(zmask, a1, st < tt ? 32 : 2 * p + 1);
+                     if (st == tt) {
+                         pv = Q6_V_vmux_QVV(gdn_c2_diag_mask(p), pv, Q6_V_vzero());
+                     }
+@@ -2109,18 +2137,7 @@ static void gdn_c2_phase_solve(unsigned int nth, unsigned int ith, void * data)
+             }
+         }
+ 
+-        // A zero coefficient takes the solve with the arithmetic of version 1 (gdn_c2_solve_f32)
+-        uint32_t zw[32] __attribute__((aligned(VLEN)));
+-        hvx_vmem(zw) = zmask;
+-        bool has_zero = GDN_C2_SOLVE_F32_ALWAYS != 0;
+-        for (uint32_t k = 0; k < 32; ++k) {
+-            has_zero = has_zero || zw[k] != 0;
+-        }
+-        if (has_zero) {
+-            gdn_c2_solve_f32(t32, a32, sc->bet);
+-        } else {
+-            gdn_c2_solve(t32, a32, sc->bet);
+-        }
++        gdn_c2_solve(t32, a32, sc->bet);
+ 
+         // T' = T diag(beta e^gamma) into out_a, T'' = T diag(beta) into t2
+         for (uint32_t tt = 0; tt < GDN_CH_CT; ++tt) {
