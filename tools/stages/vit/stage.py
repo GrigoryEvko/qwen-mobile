@@ -130,6 +130,31 @@ V = {v.key: v for v in (
     Variant("oc", "test-backend-ops test -o CPY", tool="tbo", args="-o CPY", timing=False, embd=False),
     Variant("b", "llama-bench of the 4B Q8_0 text model, pp512 and tg32, 3 reps", tool="bench", timing=True,
             embd=False, limit=110),
+    # The bisect of the plans (GGML_HEXAGON_FUSE_VIT) and of the paths of HTP_OP_ROPE_QKV (GGML_HEXAGON_VIT_QKV_IO:
+    # 1 V by DMA, 2 K and V out by DMA, 4 a ring of 2 buffer sets; 7 is the kernel of the stage vit2)
+    Variant("f1", "768 tokens, the LayerNorm op only", "photo", 768, reps=3, env="GGML_HEXAGON_FUSE_VIT=1"),
+    Variant("f4", "768 tokens, the F16 activations only", "photo", 768, reps=3, env="GGML_HEXAGON_FUSE_VIT=4"),
+    Variant("q7", "768 tokens, ROPE_QKV with the paths of vit2 (io 7)", "photo", 768, reps=3,
+            env="GGML_HEXAGON_FUSE_VIT=2 GGML_HEXAGON_VIT_QKV_IO=7"),
+    Variant("q3", "768 tokens, ROPE_QKV io 3: 4 sets, V and K/V out by DMA", "photo", 768, reps=3,
+            env="GGML_HEXAGON_FUSE_VIT=2 GGML_HEXAGON_VIT_QKV_IO=3"),
+    Variant("q1", "768 tokens, ROPE_QKV io 1: 4 sets, V by DMA, K/V out by HVX stores", "photo", 768, reps=3,
+            env="GGML_HEXAGON_FUSE_VIT=2 GGML_HEXAGON_VIT_QKV_IO=1"),
+    Variant("q2", "768 tokens, ROPE_QKV io 2: 4 sets, V by HVX loads, K/V out by DMA", "photo", 768, reps=3,
+            env="GGML_HEXAGON_FUSE_VIT=2 GGML_HEXAGON_VIT_QKV_IO=2"),
+    Variant("q0", "768 tokens, ROPE_QKV io 0: 4 sets, V by HVX loads, K/V out by HVX stores", "photo", 768, reps=3,
+            env="GGML_HEXAGON_FUSE_VIT=2 GGML_HEXAGON_VIT_QKV_IO=0"),
+    Variant("c3", "768 tokens, the LayerNorm op and ROPE_QKV io 0", "photo", 768, reps=3,
+            env="GGML_HEXAGON_FUSE_VIT=3 GGML_HEXAGON_VIT_QKV_IO=0"),
+    Variant("c3s", "256 tokens, the LayerNorm op and ROPE_QKV io 0", "photo", 256, reps=3,
+            env="GGML_HEXAGON_FUSE_VIT=3 GGML_HEXAGON_VIT_QKV_IO=0"),
+    Variant("d7", "256 tokens, all plans with the vit2 paths, the statistics of each layer output", "photo", 256,
+            reps=1, env="GGML_HEXAGON_FUSE_VIT=7 GGML_HEXAGON_VIT_QKV_IO=7", args="--dump - --dump-re \"(layer_out|ffn_inp)-.*\"",
+            embd=False, timing=False),
+    Variant("ov7", "test-backend-ops test -o VIT_BLOCK, ROPE_QKV io 7", tool="tbo", args="-o VIT_BLOCK",
+            env="GGML_HEXAGON_FUSE_VIT=2 GGML_HEXAGON_VIT_QKV_IO=7", timing=False, embd=False),
+    Variant("ovc", "test-backend-ops test -o VIT_BLOCK, the LayerNorm op and ROPE_QKV io 0", tool="tbo",
+            args="-o VIT_BLOCK", env="GGML_HEXAGON_FUSE_VIT=3 GGML_HEXAGON_VIT_QKV_IO=0", timing=False, embd=False),
 )}
 
 
@@ -156,6 +181,13 @@ STAGES = {s.name: s for s in (
           runs_ab("ha", ["t768", "t256"], 2) + [("a", "x768", 1), ("a", "x256", 1)] +
           [("a", "p768", 1), ("a", "u768", 1)] + runs_ab("ha", ["b"], 2),
           tools_set="a", minutes=15),
+    Stage("vit3", "the bisect of the non-finite embeddings of candidate a: the three plans alone, the paths of "
+          "ROPE_QKV (DMA or HVX for V and for the F16 outputs, 2 or 4 buffer sets), the statistics of each layer, and "
+          "the op test with the QKV MUL_MAT before the fused op (candidate b)",
+          {"h": "phone-head", "b": "phone-b"},
+          [("b", "ov7", 1), ("b", "ovc", 1), ("b", "d7", 1), ("h", "t768", 1)] +
+          [("b", k, 1) for k in ("f1", "f4", "q7", "q3", "q1", "q2", "q0", "c3", "c3s")] + [("h", "t256", 1)],
+          minutes=8),
 )}
 
 
@@ -474,7 +506,25 @@ def runner_marks(stage: Stage) -> dict[str, list[str]]:
     return marks
 
 
-TBO_CASE_RE = re.compile(r"^\s+([A-Z_0-9]+)\((.*)\): (OK|FAIL|not supported)", re.M)
+# A case line: the op, its vars and the status, which the tool writes between two color codes
+TBO_CASE_RE = re.compile(r"^\s+([A-Z_0-9]+)\((.*)\): (?:\x1b\[[0-9;]*m)?(OK|FAIL|not supported)", re.M)
+DUMP_RE_LINE = re.compile(r"^DUMP (\S+) nonfinite=(\d+) absmax=(\S+) rms=(\S+) hash=(\w+)", re.M)
+
+
+def dump_table(stage: Stage, results: dict[str, Result]) -> list[str]:
+    """The statistics lines of the dump runs (vitprobe --dump -): each tensor in graph order, and the first tensor
+    with a value that is not finite."""
+    out = []
+    for s, vk, r in stage.runs:
+        res = results.get(run_name(s, vk, r))
+        if res is None or "--dump -" not in V[vk].args:
+            continue
+        rows = DUMP_RE_LINE.findall(res.out)
+        first = next((row[0] for row in rows if int(row[1]) > 0), None)
+        out.append(f"{run_name(s, vk, r)}: {len(rows)} tensors, the first with a value that is not finite: {first or 'none'}")
+        for name, bad, amax, rms, _h in rows:
+            out.append(f"    {name:18s} nonfinite {bad:>8s} absmax {amax:>12s} rms {rms:>10s}")
+    return out
 TBO_SUM_RE = re.compile(r"(\d+)/(\d+) tests passed")
 BENCH_RE = re.compile(r"\|\s*(pp\d+|tg\d+)\s*\|\s*([\d.]+) ± ([\d.]+)\s*\|")
 
@@ -564,6 +614,8 @@ def table(stage: Stage, include_all: bool) -> int:
         parts.append(tbo_table(stage, results))
     if any(V[vk].tool == "bench" for _, vk, _ in stage.runs):
         parts.append(bench_table(stage, results, include_all))
+    if any("--dump -" in V[vk].args for _, vk, _ in stage.runs):
+        parts.append(dump_table(stage, results))
     for s, vk, r in stage.runs:
         if V[vk].env == PROFILE_ENV:
             parts.append(profile_table(results, run_name(s, vk, r)))

@@ -26,7 +26,9 @@
 // EMBD line gives the shape, a hash of the bytes, and the count of values that are not finite.
 // --dump DIR writes each graph node whose name matches --dump-re (std::regex_match, for example "layer_out-.*")
 // to DIR/<name>.f32 as float32 during the last encode, and a line "<name> <type> ne0 ne1 ne2 ne3" to
-// DIR/index.txt. The callback splits the graph at each such node, thus a dump run is not a timing run.
+// DIR/index.txt. With --dump - the tool writes no file: it prints one line "DUMP <name> nonfinite=N absmax=A
+// rms=R hash=H" for each such node, in graph order. The callback splits the graph at each such node, thus a dump
+// run is not a timing run.
 // --log-ts gives each log line the time since the start, and STAMP lines around each encode.
 //
 // Time: the load of the projector plus reps times one encode. Memory: the projector, the compute buffers of the
@@ -276,6 +278,23 @@ bool dump_callback(ggml_tensor * t, bool ask, void * user_data) {
             f[i] = ggml_fp16_to_fp32(h[i]);
         }
     }
+    if (d.dir == "-") {
+        size_t bad    = 0;
+        double sumsq  = 0.0;
+        float  absmax = 0.0f;
+        for (float v : f) {
+            if (!std::isfinite(v)) {
+                bad++;
+                continue;
+            }
+            sumsq += (double) v * v;
+            absmax = std::max(absmax, std::fabs(v));
+        }
+        std::printf("DUMP %s nonfinite=%zu absmax=%.6g rms=%.6g hash=%016" PRIx64 "\n", t->name, bad, absmax,
+                    std::sqrt(sumsq / (double) std::max<int64_t>(n, 1)), fnv1a(f.data(), f.size() * sizeof(float)));
+        std::fflush(stdout);
+        return true;
+    }
     const std::string path = d.dir + "/" + t->name + ".f32";
     if (!write_file(path, f.data(), f.size() * sizeof(float))) {
         std::fprintf(stderr, "vitprobe: cannot write %s\n", path.c_str());
@@ -392,8 +411,8 @@ int run(const options & o) {
     if (!o.dump_dir.empty()) {
         dump.dir   = o.dump_dir;
         dump.re    = std::regex(o.dump_re);
-        dump.index = std::fopen((o.dump_dir + "/index.txt").c_str(), "w");
-        if (dump.index == nullptr) {
+        dump.index = o.dump_dir == "-" ? nullptr : std::fopen((o.dump_dir + "/index.txt").c_str(), "w");
+        if (dump.index == nullptr && o.dump_dir != "-") {
             std::fprintf(stderr, "vitprobe: cannot write %s/index.txt\n", o.dump_dir.c_str());
             return 1;
         }
