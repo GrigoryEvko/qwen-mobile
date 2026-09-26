@@ -35,9 +35,11 @@ The blocks, in the order of the stage:
     g   llama-bench tg32 at depth 0, -r 3: A M F, 3 rounds
 
 A run name is <block>-<round>-<variant>, for example kp-2-f. Each run writes <name>-gate.txt, <name>.out and
-<name>.log to the phone directory out/. The rate table uses a run when its gate passed, its exit code is 0, the CPU
-caps after the run are the caps before it, and the thermal status after it is 0. --all also uses the runs with
-changed caps or heat. The table only reads files. O(size of the logs) time.
+<name>.log to the phone directory out/. The rate table uses a run when its gate passed, its exit code is 0, each
+CPU cap before and after the run is at least gate.CAP_MIN_KHZ, and the thermal status after it is 0. A small step
+of a cap during a run (4320000 to 4089600 kHz on cpu7) is the usual state of this phone, thus it keeps the run in,
+and the list of the runs names it. --all also uses the runs with a lower cap or heat. The table names each run
+that it leaves out. The table only reads files. O(size of the logs) time.
 """
 
 import re
@@ -269,17 +271,25 @@ def table(root: Path, include_all: bool) -> int:
     print()
 
     rates: dict[tuple, dict[str, dict[int, float]]] = {}
+    left_out = []
     for b, rnd, v in runs():
         if b.tool != "llama-bench":
             continue
-        text, out, _ = logs.read_run(root, f"{b.key}-{rnd}-{v.key}")
-        c = gate.read(text)
-        if not c.ok or (c.flags and not include_all):
+        name = f"{b.key}-{rnd}-{v.key}"
+        text, out, _ = logs.read_run(root, name)
+        # A cap that collapsed or heat after the run keeps the run out. A small step of a cap during the run is
+        # the usual state of this phone, and the list of the runs above names it.
+        c = gate.read(text, cap_min=gate.CAP_MIN_KHZ)
+        if not c.ok:
+            left_out.append(f"{name} ({', '.join(c.faults)})")
+            continue
+        if c.removed and not include_all:
+            left_out.append(f"{name} ({', '.join(c.removed)})")
             continue
         for key, ts in parse.bench_values(out).items():
             rates.setdefault(key, {}).setdefault(v.key, {})[rnd] = ts
     print("llama-bench t/s: the median of the rounds, and the median change to A over the paired rounds [range]"
-          + ("" if include_all else " (--all also uses the runs with changed caps or heat)"))
+          + ("" if include_all else f" (--all also uses the runs with a cap below {gate.CAP_MIN_KHZ} kHz or heat)"))
     for key, per in sorted(rates.items()):
         cells = []
         for k in "amf":
@@ -294,6 +304,10 @@ def table(root: Path, include_all: bool) -> int:
                              f"[{100 * (min(ratios) - 1):+.2f}, {100 * (max(ratios) - 1):+.2f}], {len(ratios)} rounds)")
             cells.append(cell)
         print(f"  pp{key[0]} tg{key[1]} d{key[2]}: " + " | ".join(cells))
+    if not rates:
+        print("  no run qualified for the table")
+    if left_out:
+        print("  not in the table: " + "; ".join(left_out))
     return 0
 
 
