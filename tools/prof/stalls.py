@@ -28,9 +28,17 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 
-# The order of the eight counters in the `stalls` set of pmu.py.
-STALL_EVENTS = ["COMMITTED_PKT_ANY", "COMMITTED_INSTS", "DU_CACHE_MISS", "CU_BUSY",
-                "COPROC_BUSY", "IU_NO_PKT", "DU_BUSY_OTHER", "SYSTEM_BUSY"]
+# The six stall counters of the `stalls` set of pmu.py, in the order of that set. Counter 0 and
+# counter 1 of the set are the packet count and the instruction count, thus they are not here.
+# The name is the column of the table and the event is the counter of the set.
+STALL_COLUMNS: tuple[tuple[int, str, str], ...] = (
+    (2, "cache", "DU_CACHE_MISS_PVIEW_CYCLES,   a data-cache miss held the cluster"),
+    (3, "cu", "CU_BUSY_PVIEW_CYCLES,         a register interlock or a port conflict"),
+    (4, "coproc", "COPROC_BUSY_PVIEW_CYCLES,     the coprocessor was busy"),
+    (5, "ifetch", "IU_NO_PKT_PVIEW_CYCLES,       the issue queue was empty"),
+    (6, "dubusy", "DU_BUSY_OTHER_PVIEW_CYCLES,   the data unit was busy with other work"),
+    (7, "sys", "SYSTEM_BUSY_PVIEW_CYCLES,     DMA sync, a busy AXI bus, cache maintenance"),
+)
 
 # ggml-hex: HTP0 profile-op NAME|tensors|dims|types|strides|kernel|usec U cycles C start S mhz M pmu [a,b,...]
 LINE = re.compile(
@@ -125,25 +133,21 @@ def report(groups: dict[str, Agg], top: int) -> None:
     total = sum(g.usec for g in groups.values())
     rows = sorted(groups.items(), key=lambda kv: -kv[1].usec)[:top]
     width = min(48, max(len(k) for k, _ in rows))
+    rule = "-" * (width + 30 + 8 * len(STALL_COLUMNS))
 
-    print(f"{'operation':<{width}} {'ms':>9} {'%':>6} {'calls':>6} {'i/pkt':>6}"
-          f" {'cache':>7} {'cu':>7} {'coproc':>7} {'sys':>7} {'ifetch':>7}")
-    print("-" * (width + 68))
+    head = "".join(f" {name:>7}" for _, name, _ in STALL_COLUMNS)
+    print(f"{'operation':<{width}} {'ms':>9} {'%':>6} {'calls':>6} {'i/pkt':>6}{head}")
+    print(rule)
     for name, g in rows:
+        shares = "".join(f" {100 * g.share(i):6.1f}%" for i, _, _ in STALL_COLUMNS)
         print(f"{name[:width]:<{width}} {g.usec / 1000:9.1f} {100 * g.usec / total:6.1f}"
-              f" {g.calls:6d} {g.ipp:6.2f}"
-              f" {100 * g.share(2):6.1f}% {100 * g.share(3):6.1f}%"
-              f" {100 * g.share(4):6.1f}% {100 * g.share(7):6.1f}%"
-              f" {100 * g.share(5):6.1f}%")
-    print("-" * (width + 68))
+              f" {g.calls:6d} {g.ipp:6.2f}{shares}")
+    print(rule)
     print(f"{'total':<{width}} {total / 1000:9.1f}")
     print()
     print("i/pkt   instructions per packet, the VLIW slot fill, at most 4")
-    print("cache   DU_CACHE_MISS_PVIEW_CYCLES,  a data-cache miss held the cluster")
-    print("cu      CU_BUSY_PVIEW_CYCLES,        a register interlock or a port conflict")
-    print("coproc  COPROC_BUSY_PVIEW_CYCLES,    the coprocessor was busy")
-    print("sys     SYSTEM_BUSY_PVIEW_CYCLES,    DMA sync, a busy AXI bus, cache maintenance")
-    print("ifetch  IU_NO_PKT_PVIEW_CYCLES,      the issue queue was empty")
+    for _, name, event in STALL_COLUMNS:
+        print(f"{name:<7} {event}")
     print()
     print("A share above 100 % is not an error. The counters are not filtered to one")
     print("hardware thread, thus a threaded operation sums the cycles of every thread")

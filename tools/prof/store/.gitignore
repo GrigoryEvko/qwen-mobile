@@ -1,3 +1,8 @@
-# The raw profile logs are large build artifacts. The JSON records beside
-# them name every run and are small enough to track.
+# The output of tools/prof/run.py: one JSON record and one log for each pass of a run.
+#
+# Neither is tracked. The logs are large, and nothing in the repository reads a record: the
+# record names the device, the event set and the thermal status of one run, thus it is the
+# provenance of a number while that number is under discussion. A number that a decision
+# rests on goes into the project record, not into this directory.
 *.log
+*.json

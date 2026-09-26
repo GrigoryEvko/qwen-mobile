@@ -7,8 +7,8 @@ yields. This module computes both, thus a change can be ranked before anyone
 writes a kernel.
 
 The model is analytic and takes the hyperparameters of a model, because the GGUF
-files live on the phone and not in this repository. Pass ``--gguf`` to refine the
-weight bytes from a real file when one is available.
+files live on the phone and not in this repository. The shapes of the two models
+are in ``MODELS`` below, with the tensor that gives each one.
 
 Usage:
     tools/prof/bytes.py budget 4b
@@ -58,7 +58,6 @@ class Model:
         vocab: The number of rows of the output head
         n_head_kv: The number of key and value heads of a full-attention layer
         head_dim: The dimension of one attention head
-        tied_head: True when the head shares its weights with the embedding
     """
 
     name: str
@@ -73,7 +72,6 @@ class Model:
     d_state: int
     n_v_heads: int
     n_k_heads: int
-    tied_head: bool = True
 
     @property
     def n_gqa(self) -> int:

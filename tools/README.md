@@ -1,12 +1,17 @@
 # The profiling kit
 
-Four tools, each answering a different question. Start from the question.
+Each tool answers a different question. Start from the question.
 
 | Question | Tool | Needs the phone |
 |---|---|---|
 | Is this change worth writing at all? | `prof/bytes.py` | no |
 | Why is this kernel slow? | `htp-lab/run.sh` | no, it runs the simulator |
 | What did the phone actually do? | `prof/run.py` + `prof/pmu.py` | yes |
+| Where did the time of one forward pass go? | `prof/optable.py` | no, it reads a log |
+| Why could the cluster not commit? | `prof/stalls.py` | no, it reads a log |
+| How fast is one matmul shape? | `prof/gemm.py` | yes, it makes the run |
+| Where does a decode token wait? | `prof/hostprof.py`, `prof/stallprof.py` | no, they read a log |
+| What does flash attention cost per token? | `prof/faprof.py`, `prof/kvtable.py` | no, they read a log |
 | When did each thing run? | `trace/htp_trace.py`, `trace/perfetto/capture.sh` | yes |
 
 Decode on this phone is memory-bandwidth bound at 51 to 56 GB/s. Almost every
@@ -82,9 +87,51 @@ often attached at once, one over USB and one over TCP, and a bare `adb` command
 then fails with "more than one device/emulator". **Prefer the TCP transport,
 because the USB cable charges the phone.**
 
-Every run writes one JSON record under `prof/store/` that names the device, the
-event set, the environment and the thermal status at both ends, thus a number
-can always be attributed to a build.
+Every run writes one JSON record and one log per pass under `prof/store/` that
+name the device, the event set, the environment and the thermal status at both
+ends, thus a number can always be attributed to a build. The directory is not
+tracked. A number that a decision rests on goes into the project record.
+
+## The readers of one log
+
+The backend prints one `profile-op` line for each op and one `OPBATCH` line for
+each DSP batch under `GGML_HEXAGON_PROFILE`, and `llama-bench -v` shows them.
+Each tool below reads that log and needs no phone.
+
+```
+tools/prof/optable.py graphs LOG                    # the time of each forward pass
+tools/prof/optable.py ops LOG --graphs 4-11         # time, bytes, FLOPs and rates per op
+tools/prof/optable.py ops LOG --by tensor --top 20  # the same per weight tensor
+tools/prof/optable.py top LOG --graph 0             # the slowest ops of one pass
+tools/prof/optable.py batches LOG --graphs 4-11     # prologue, epilogue and gaps
+tools/prof/stalls.py LOG --top 15                   # why the cluster could not commit
+```
+
+`optable.py` is the one parser with a byte model and a FLOP model, and the stage
+reports import it. Read a rate against the roofline of 51 to 56 GB/s: a rate far
+above it means the byte count is wrong, not that the op is fast. `stalls.py` is
+the report half of the `stalls` event set, thus the log needs that set.
+
+Two more readers take the host timers of `patches/hexagon-host/0001` and `0002`,
+which `LLAMA_HOSTPROF=1` turns on:
+
+```
+tools/prof/hostprof.py LOG            # the median, the 90th percentile and the maximum of each phase
+tools/prof/stallprof.py LOG --last 40 # the host wait of a token against the DSP batches of that token
+```
+
+And two read the flash attention and the rotation of a quantized KV cache:
+
+```
+tools/prof/faprof.py LOG --last 40    # the op profile of each decode batch
+tools/prof/kvtable.py --root build/memory   # the table of the KV cache types
+```
+
+## prof/gemm.py — one matmul shape at a time
+
+`gemm.py gen` writes the phone command file of a matmul sweep and `gemm.py parse`
+reads its log, thus the cost of one shape comes out without a full model run. The
+stage reports of the bandwidth work and of the matvec work import its `case`.
 
 ## htp-lab/ — the kernel lab
 
@@ -130,5 +177,6 @@ and write the hostprof times as ATrace slices.
 1. `bytes.py` to decide whether the change can pay at all.
 2. `htp-lab` to see the packets, offline and with no phone.
 3. `run.py --set stalls` to find out what the phone really did.
-4. `run.py --set bandwidth` or `dma` once the stall set names the suspect.
-5. `trace/` when the question is about order and gaps rather than about one op.
+4. `optable.py` and `stalls.py` on that log, to name the op and the stall.
+5. `run.py --set bandwidth` or `dma` once the stall set names the suspect.
+6. `trace/` when the question is about order and gaps rather than about one op.
