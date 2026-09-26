@@ -2342,9 +2342,9 @@ extern "C" {
  */
 static void init_impl(JNIEnv * env, jstring jlibdir) {
     llama_log_set(log_to_logcat, nullptr);
-    // Op fusion is correct with the patch of the fused matvec add (patches/hexagon-fusion/0001)
+    // Op fusion is correct with the patch of the fused matvec add (patches/hexagon-mm/0001)
     // and gives the F16 file a faster prefill. The fused recurrent state step is verified: a
-    // one-token KL run is at the same floor as the unfused path (patches/hexagon-fusion/0002 to 0004).
+    // one-token KL run is at the same floor as the unfused path (patches/hexagon-gdn/0001 and 0002).
     setenv("GGML_HEXAGON_OPFUSION", "1", 0);
     setenv("GGML_HEXAGON_OPFUSION_STATE", "1", 0);
     const std::string libdir = jstring_to_std(env, jlibdir);
@@ -2557,13 +2557,13 @@ static jlong load_impl(JNIEnv * env, jstring jpath, jstring jmmproj,
         cp.n_rs_seq = (uint32_t) kSpecDraftMax;
     }
     // The NPU engine keeps K and V in Q8_0: the cache takes 53 % of the bytes of F16. The HMX flash
-    // attention reads the Q8_0 rows (patches/memory/0003), and the Hadamard rotation that llama.cpp
-    // applies to a quantized cache runs as a fast transform (patches/memory/0006). On the phone the
+    // attention reads the Q8_0 rows (patches/hexagon-fa/0002), and the Hadamard rotation that llama.cpp
+    // applies to a quantized cache runs as a fast transform (patches/hexagon-fwht/0001). On the phone the
     // attention of a 4B decode token is 0.2 ms slower than with F16 at depth 16, 0.3 ms faster at 4096
     // and 6.5 ms faster at 16384, and the KL against the naive oracle equals that of F16. The rotation
     // stays on (the preset).
     // flash_attn_type stays AUTO: a quantized V needs flash attention, and AUTO probes the device of each
-    // attention layer (patches/memory/0002). When a layer cannot run it, the Q8_0 context does not
+    // attention layer (patches/context/0014). When a layer cannot run it, the Q8_0 context does not
     // initialize, and the engine uses F16. ENABLED would run the op of such a layer on the CPU with no
     // message. The CPU and the GPU engines keep F16. The hybrid engine keeps F16 too: it copies these
     // parameters to its NPU prefill context and moves the state into its GPU decode context. The MTP draft
