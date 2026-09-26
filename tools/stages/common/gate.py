@@ -96,21 +96,6 @@ def read(gate: str, *, ok_codes: tuple[int, ...] = (0,), cap_min: int | None = N
     return Conditions(ok, rc, caps, battery, nsp, faults, marks, removed)
 
 
-def one_line(gate: str) -> str:
-    """The exit code, the caps before the run, and each mark of one run, in one line."""
-    c = read(gate)
-    return f"rc={c.rc if c.rc is not None else '?'} caps {c.caps}" + (" " + ", ".join(c.marks) if c.marks else "")
-
-
-def caps_counts(items: list[Conditions]) -> str:
-    """One line with the count of the runs of each pair of caps. Only a run that ran counts."""
-    counts: dict[str, int] = {}
-    for c in items:
-        if c.ok:
-            counts[c.caps] = counts.get(c.caps, 0) + 1
-    return "  caps cpu0/cpu7 kHz before the runs: " + ", ".join(f"{k} x{n}" for k, n in counts.items())
-
-
 def nsp_range(items: list[Conditions], when: int) -> str:
     """One line with the lowest, the highest and the median NPU zone temperature of the runs that ran, or
     an empty text when the phone gave no temperature. `when` is 0 for before the runs and 1 for after."""
