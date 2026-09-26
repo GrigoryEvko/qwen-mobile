@@ -226,10 +226,10 @@ index c281192..9d19fbe 100644
      opt_nhvx      = str_nhvx     ? strtoul(str_nhvx, NULL, 0)             : opt_nhvx;
 diff --git a/ggml/src/ggml-hexagon/htp-gdn-match.h b/ggml/src/ggml-hexagon/htp-gdn-match.h
 new file mode 100644
-index 0000000..4e118fd
+index 0000000..02c22f1
 --- /dev/null
 +++ b/ggml/src/ggml-hexagon/htp-gdn-match.h
-@@ -0,0 +1,445 @@
+@@ -0,0 +1,441 @@
 +// The graph match of the fused recurrent state step of a gated delta net layer (host side).
 +//
 +// At one token, a gated delta net layer (Qwen3.5, Qwen3-Next) reads its two recurrent states with
@@ -245,10 +245,6 @@ index 0000000..4e118fd
 +// other reader of the replaced tensors, and no other node that touches the cache inside the chain span.
 +// The state_zero SCALE of build_rs comes before the chain, thus it stays a separate op and runs first.
 +//
-+// The matcher sees only the nodes of the split that graph_compute gets. The fused state op does not
-+// write the state tail of the GATED_DELTA_NET output, thus the only permitted reader of that tail is
-+// the CPY into the cache in the same split. A reader in a later split gets bytes that no op wrote. The
-+// model graphs have no such reader: tests/fuzz/hexhost/run.sh graphs checks the paths of the app.
 +//
 +// This header depends on ggml only. A host program can run the same checks on a graph. Each check
 +// returns nullptr when the chain matches, or a short text for the first failed condition.
@@ -1263,7 +1259,7 @@ index 1d291e1..2045f6b 100644
              return op_unary(octx);
  
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index dc529a3..b6409ef 100644
+index 77b180f..27cf0f1 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -4661,6 +4661,157 @@ struct test_gated_delta_net : public test_case {
@@ -1424,7 +1420,7 @@ index dc529a3..b6409ef 100644
  // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
  struct test_gated_delta_net_cache_fusion : public test_case {
      const ggml_type type;
-@@ -10899,6 +11050,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10976,6 +11127,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));
