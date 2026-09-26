@@ -38,7 +38,8 @@ def build_calibration(tokenizer, n_seq: int, seq_len: int, seed: int, out: Path)
     """Token ids [n_seq, seq_len] from C4 English, saved to ``out``.
 
     A cached file gives its ids and reads no corpus. Without the cache the function streams the
-    corpus, and that path needs the package datasets, which the locked environment does not hold.
+    corpus, and that path needs the package datasets of the group corpus of pyproject.toml, which
+    the default install does not hold.
 
     Args:
         tokenizer: A tokenizer with a call that gives input_ids
@@ -62,9 +63,10 @@ def build_calibration(tokenizer, n_seq: int, seq_len: int, seed: int, out: Path)
     except ImportError as exc:
         raise SystemExit(
             f"{out} does not exist, thus this run must read the corpus, and that path needs the "
-            "package datasets, which the locked environment does not hold. Install it beside that "
-            "environment with: uv pip install datasets==4.5.0. The group \"corpus\" of "
-            "pyproject.toml records the version and the reason that uv.lock does not hold it.") from exc
+            "package datasets of the group corpus, which the default install does not hold. Run "
+            "the same command in a temporary environment that holds it: uv run --frozen --isolated "
+            "--no-dev --group corpus python -m quant.run quantize ARGUMENTS. The header of "
+            "pyproject.toml gives the reason for the separate environment.") from exc
 
     ds = load_dataset("allenai/c4", "en", split="train", streaming=True).shuffle(seed=seed, buffer_size=10_000)
     rows: list[torch.Tensor] = []

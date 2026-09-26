@@ -10,16 +10,22 @@
 # series applied (scripts/apply-patches.sh). sentencepiece and protobuf are
 # imports of convert_hf_to_gguf.py, which quant/run.py starts as a subprocess.
 #
-# The group "corpus" records the one package that reads a corpus from the
-# network. It is not a dependency of the pipeline, because the calibration file
+# The group "corpus" holds the one package that reads a corpus from the network.
+# It is not a dependency of the pipeline, because the calibration file
 # data/calib-128x2048.pt is the input of every measured run.
 #
-# uv.lock does not hold that group. A resolution with datasets moves fsspec from
-# 2026.7.0 to 2025.10.0, and fsspec is a dependency of the default set, thus a
-# relock would change the environment that produced the results in analysis/.
-# Install the package beside the locked environment instead:
+# Each release of datasets caps fsspec below 2026.7.0, the version of the
+# environment that produced the results in analysis/. Thus the group conflicts
+# with the group dev, and uv.lock resolves it in a fork of its own. The default
+# install keeps every pin of the environment of the results. The corpus fork
+# takes fsspec 2025.10.0. Run it in a temporary environment, because a sync of
+# the fork removes the group dev from the environment that it syncs:
 #
-#   uv pip install datasets==4.5.0
+#   uv run --frozen --isolated --no-dev --group corpus python -m quant.run quantize ...
+#
+# A command that changes this file must keep pyproject.toml and uv.lock in
+# agreement in one commit. A uv run or uv sync without --frozen relocks a lock
+# that disagrees, and it syncs the shared .venv to the new lock.
 
 [project]
 name = "qwen-mobile-quant"
@@ -50,6 +56,8 @@ corpus = [
 [tool.uv]
 # quant/ is not a distribution: the tests import it from the repository root.
 package = false
+# The group corpus resolves apart from the group dev. Refer to the header of this file.
+conflicts = [[{ group = "dev" }, { group = "corpus" }]]
 
 [tool.uv.sources]
 gguf = { path = "third_party/llama.cpp/gguf-py", editable = true }
