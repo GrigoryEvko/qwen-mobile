@@ -202,6 +202,15 @@ HEADER_TOP = '''// The activation family in int16 for the HVX. tools/htp-lab/gen
 
 #include "hvx-base.h"
 
+// Which path the op entry points take. 1 is the int16 evaluator of this file, 0 is the qfloat
+// chain that came before it. The int16 path is 2.2 to 2.8 times faster, and its error is the
+// f16 rounding of the input: NMSE 1.5e-10 to 2.5e-9, at most 3.1e-4 of absolute error, against
+// a baseline that was exact to f32. Set this to 0 to take the old path back.
+#ifndef HTP_ACT_I16_MODE
+#define HTP_ACT_I16_MODE 1
+#endif
+static int htp_act_i16_mode = HTP_ACT_I16_MODE;
+
 #define HVX_ACT_I16_DEGREE {degree}
 #define HVX_ACT_I16_SCALE  {scale}
 #define HVX_ACT_I16_EBASE  {e_base}
@@ -317,11 +326,42 @@ HVX_Vector hvx_act_f32_pair_to_f16(HVX_Vector a, HVX_Vector b) {
 #define HVX_ACT_I16_STREAMS 4
 #define HVX_ACT_I16_UNROLL  (2 * HVX_ACT_I16_STREAMS)
 
+// The pieces of h start at the octave 2^-12, thus a lane with |x| < 2^-12 gets h = 0 from the table,
+// and relu(x) - h gives x or 0. Above 2^-12 the int16 step of h (2^-16) is large against a small
+// silu(x): at |x| = 1e-3 the relative error is 1.4e-2. silu(x) = x/2 + x^2/4 - x^4/48 + ..., thus a
+// lane with |x| < 2^-4 takes x * (0.5 + x/4), whose relative error is below |x|^3/24 (1e-5).
+struct hvx_act_i16_small {
+    HVX_Vector abs_mask;  // 0x7fffffff in each word
+    HVX_Vector bits;      // the f32 bits of 2^-4
+    HVX_Vector half;      // 0.5f
+    HVX_Vector quarter;   // 0.25f
+};
+
+static inline __attribute__((always_inline))
+struct hvx_act_i16_small hvx_act_i16_small_init(void) {
+    struct hvx_act_i16_small c;
+    c.abs_mask = Q6_V_vsplat_R(0x7fffffff);
+    c.bits     = Q6_V_vsplat_R(0x3d800000);
+    c.half     = hvx_vec_splat_f32(0.5f);
+    c.quarter  = hvx_vec_splat_f32(0.25f);
+    return c;
+}
+
+// y for |x| >= 2^-4, x * (0.5 + x/4) for |x| < 2^-4. The signed word compare is correct, because
+// the two operands are not negative. A NaN has larger bits than 2^-4, thus it keeps y.
+static inline __attribute__((always_inline))
+HVX_Vector hvx_act_i16_silu_small(HVX_Vector y, HVX_Vector x, struct hvx_act_i16_small c) {
+    const HVX_VectorPred small = Q6_Q_vcmp_gt_VwVw(c.bits, Q6_V_vand_VV(x, c.abs_mask));
+    const HVX_Vector     q     = Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(x, c.quarter), c.half);
+    const HVX_Vector     xs    = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(x, Q6_Vsf_equals_Vqf32(q)));
+    return Q6_V_vmux_QVV(small, xs, y);
+}
+
 // silu(x) = relu(x) - h(|x|). The scale of the conversion is negative, thus the combine is one
 // add and the subtract costs nothing.
 static inline __attribute__((always_inline))
 void hvx_silu_i16_block(const HVX_Vector * restrict vsrc, HVX_Vector * restrict vdst, uint32_t i,
-                        HVX_Vector k_sf, HVX_Vector zero, const int ns) {
+                        HVX_Vector k_sf, HVX_Vector zero, struct hvx_act_i16_small c, const int ns) {
     HVX_Vector a[HVX_ACT_I16_STREAMS], h16[HVX_ACT_I16_STREAMS];
 
     for (int s = 0; s < ns; s++) {
@@ -333,9 +373,26 @@ void hvx_silu_i16_block(const HVX_Vector * restrict vsrc, HVX_Vector * restrict 
         // a negative f32 is a negative int32, thus the signed max is the relu
         const HVX_Vector r0 = Q6_Vw_vmax_VwVw(vsrc[i + 2 * s], zero);
         const HVX_Vector r1 = Q6_Vw_vmax_VwVw(vsrc[i + 2 * s + 1], zero);
-        vdst[i + 2 * s]     = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_V_lo_W(nh), r0));
-        vdst[i + 2 * s + 1] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_V_hi_W(nh), r1));
+        const HVX_Vector y0 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_V_lo_W(nh), r0));
+        const HVX_Vector y1 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_V_hi_W(nh), r1));
+        vdst[i + 2 * s]     = hvx_act_i16_silu_small(y0, vsrc[i + 2 * s], c);
+        vdst[i + 2 * s + 1] = hvx_act_i16_silu_small(y1, vsrc[i + 2 * s + 1], c);
     }
+}
+
+// The SiLU of one f32 vector. The second half of the stream repeats the first and the routine
+// drops its result. The tail of a row calls it two times: one time for the last whole vector and
+// one time for the partial vector after it.
+static inline __attribute__((always_inline))
+HVX_Vector hvx_silu_i16_one(const HVX_Vector * restrict vsrc, uint32_t i,
+                            HVX_Vector k_sf, HVX_Vector zero, struct hvx_act_i16_small c) {
+    HVX_Vector a = hvx_act_f32_pair_to_f16(vsrc[i], vsrc[i]);
+    HVX_Vector h16;
+    hvx_act_i16_eval(&a, &h16, hvx_act_i16_tab_h, 1, 0);
+    const HVX_VectorPair nh = hvx_act_i16_to_qf32(h16, k_sf);
+    const HVX_Vector     y  = Q6_Vsf_equals_Vqf32(
+        Q6_Vqf32_vadd_Vqf32Vsf(Q6_V_lo_W(nh), Q6_Vw_vmax_VwVw(vsrc[i], zero)));
+    return hvx_act_i16_silu_small(y, vsrc[i], c);
 }
 
 static inline void hvx_silu_i16_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src,
@@ -345,24 +402,28 @@ static inline void hvx_silu_i16_f32_aa(uint8_t * restrict dst, const uint8_t * r
 
     const HVX_Vector k_sf = hvx_vec_splat_f32(-1.0f / 65536.0f);
     const HVX_Vector zero = Q6_V_vzero();
+    const struct hvx_act_i16_small c = hvx_act_i16_small_init();
 
     const uint32_t nvec = n / 32;
+    const uint32_t nloe = n % 32;
     uint32_t i = 0;
 
     for (; i + HVX_ACT_I16_UNROLL <= nvec; i += HVX_ACT_I16_UNROLL) {
-        hvx_silu_i16_block(vsrc, vdst, i, k_sf, zero, HVX_ACT_I16_STREAMS);
+        hvx_silu_i16_block(vsrc, vdst, i, k_sf, zero, c, HVX_ACT_I16_STREAMS);
     }
     for (; i + 2 <= nvec; i += 2) {
-        hvx_silu_i16_block(vsrc, vdst, i, k_sf, zero, 1);
+        hvx_silu_i16_block(vsrc, vdst, i, k_sf, zero, c, 1);
     }
     if (i < nvec) {
-        // one vector left: the second half of the stream repeats the first and its result is dropped
-        HVX_Vector a = hvx_act_f32_pair_to_f16(vsrc[i], vsrc[i]);
-        HVX_Vector h16;
-        hvx_act_i16_eval(&a, &h16, hvx_act_i16_tab_h, 1, 0);
-        const HVX_VectorPair nh = hvx_act_i16_to_qf32(h16, k_sf);
-        vdst[i] = Q6_Vsf_equals_Vqf32(
-            Q6_Vqf32_vadd_Vqf32Vsf(Q6_V_lo_W(nh), Q6_Vw_vmax_VwVw(vsrc[i], zero)));
+        vdst[i] = hvx_silu_i16_one(vsrc, i, k_sf, zero, c);
+        i++;
+    }
+    // The last 1 to 31 elements. Qwen3.5 gives the gated delta net gates a row of 1 element,
+    // thus this branch is not a corner case. The routine reads the whole trailing vector, which
+    // the caller pads to 128 bytes, and the masked store writes the valid bytes only. The f32
+    // path of hvx-sigmoid.h and hvx-arith.h does the same.
+    if (nloe) {
+        hvx_vec_store_a(&vdst[i], nloe * sizeof(float), hvx_silu_i16_one(vsrc, i, k_sf, zero, c));
     }
 }
 
@@ -370,7 +431,7 @@ static inline void hvx_silu_i16_f32_aa(uint8_t * restrict dst, const uint8_t * r
 static inline __attribute__((always_inline))
 void hvx_swiglu_i16_block(const HVX_Vector * restrict vsrc0, const HVX_Vector * restrict vsrc1,
                           HVX_Vector * restrict vdst, uint32_t i,
-                          HVX_Vector k_sf, HVX_Vector zero, const int ns) {
+                          HVX_Vector k_sf, HVX_Vector zero, struct hvx_act_i16_small c, const int ns) {
     HVX_Vector a[HVX_ACT_I16_STREAMS], h16[HVX_ACT_I16_STREAMS];
 
     for (int s = 0; s < ns; s++) {
@@ -381,13 +442,21 @@ void hvx_swiglu_i16_block(const HVX_Vector * restrict vsrc0, const HVX_Vector * 
         const HVX_VectorPair nh = hvx_act_i16_to_qf32(h16[s], k_sf);
         const uint32_t j0 = i + 2 * s;
         const uint32_t j1 = j0 + 1;
-        const HVX_Vector s0 = Q6_Vsf_equals_Vqf32(
-            Q6_Vqf32_vadd_Vqf32Vsf(Q6_V_lo_W(nh), Q6_Vw_vmax_VwVw(vsrc0[j0], zero)));
-        const HVX_Vector s1 = Q6_Vsf_equals_Vqf32(
-            Q6_Vqf32_vadd_Vqf32Vsf(Q6_V_hi_W(nh), Q6_Vw_vmax_VwVw(vsrc0[j1], zero)));
+        const HVX_Vector s0 = hvx_act_i16_silu_small(Q6_Vsf_equals_Vqf32(
+            Q6_Vqf32_vadd_Vqf32Vsf(Q6_V_lo_W(nh), Q6_Vw_vmax_VwVw(vsrc0[j0], zero))), vsrc0[j0], c);
+        const HVX_Vector s1 = hvx_act_i16_silu_small(Q6_Vsf_equals_Vqf32(
+            Q6_Vqf32_vadd_Vqf32Vsf(Q6_V_hi_W(nh), Q6_Vw_vmax_VwVw(vsrc0[j1], zero))), vsrc0[j1], c);
         vdst[j0] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(s0, vsrc1[j0]));
         vdst[j1] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(s1, vsrc1[j1]));
     }
+}
+
+// The SwiGLU of one f32 vector. The tail of a row calls it two times, as the SiLU form does.
+static inline __attribute__((always_inline))
+HVX_Vector hvx_swiglu_i16_one(const HVX_Vector * restrict vsrc0, const HVX_Vector * restrict vsrc1,
+                              uint32_t i, HVX_Vector k_sf, HVX_Vector zero, struct hvx_act_i16_small c) {
+    const HVX_Vector sv = hvx_silu_i16_one(vsrc0, i, k_sf, zero, c);
+    return Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(sv, vsrc1[i]));
 }
 
 static inline void hvx_swiglu_i16_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src0,
@@ -398,24 +467,25 @@ static inline void hvx_swiglu_i16_f32_aa(uint8_t * restrict dst, const uint8_t *
 
     const HVX_Vector k_sf = hvx_vec_splat_f32(-1.0f / 65536.0f);
     const HVX_Vector zero = Q6_V_vzero();
+    const struct hvx_act_i16_small c = hvx_act_i16_small_init();
 
     const uint32_t nvec = n / 32;
+    const uint32_t nloe = n % 32;
     uint32_t i = 0;
 
     for (; i + HVX_ACT_I16_UNROLL <= nvec; i += HVX_ACT_I16_UNROLL) {
-        hvx_swiglu_i16_block(vsrc0, vsrc1, vdst, i, k_sf, zero, HVX_ACT_I16_STREAMS);
+        hvx_swiglu_i16_block(vsrc0, vsrc1, vdst, i, k_sf, zero, c, HVX_ACT_I16_STREAMS);
     }
     for (; i + 2 <= nvec; i += 2) {
-        hvx_swiglu_i16_block(vsrc0, vsrc1, vdst, i, k_sf, zero, 1);
+        hvx_swiglu_i16_block(vsrc0, vsrc1, vdst, i, k_sf, zero, c, 1);
     }
     if (i < nvec) {
-        HVX_Vector a = hvx_act_f32_pair_to_f16(vsrc0[i], vsrc0[i]);
-        HVX_Vector h16;
-        hvx_act_i16_eval(&a, &h16, hvx_act_i16_tab_h, 1, 0);
-        const HVX_VectorPair nh = hvx_act_i16_to_qf32(h16, k_sf);
-        const HVX_Vector sv = Q6_Vsf_equals_Vqf32(
-            Q6_Vqf32_vadd_Vqf32Vsf(Q6_V_lo_W(nh), Q6_Vw_vmax_VwVw(vsrc0[i], zero)));
-        vdst[i] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(sv, vsrc1[i]));
+        vdst[i] = hvx_swiglu_i16_one(vsrc0, vsrc1, i, k_sf, zero, c);
+        i++;
+    }
+    if (nloe) {
+        hvx_vec_store_a(&vdst[i], nloe * sizeof(float),
+                        hvx_swiglu_i16_one(vsrc0, vsrc1, i, k_sf, zero, c));
     }
 }
 
@@ -445,6 +515,17 @@ void hvx_sigmoid_i16_block(const HVX_Vector * restrict vsrc, HVX_Vector * restri
     }
 }
 
+// The sigmoid of one f32 vector. The tail of a row calls it two times, as the SiLU form does.
+static inline __attribute__((always_inline))
+HVX_Vector hvx_sigmoid_i16_one(const HVX_Vector * restrict vsrc, uint32_t i,
+                               HVX_Vector k_sf, HVX_Vector one) {
+    HVX_Vector a = hvx_act_f32_pair_to_f16(vsrc[i], vsrc[i]);
+    HVX_Vector g16;
+    hvx_act_i16_eval(&a, &g16, hvx_act_i16_tab_g, 1, 1);
+    const HVX_VectorPair g32 = hvx_act_i16_to_qf32(g16, k_sf);
+    return hvx_sigmoid_i16_combine(Q6_V_lo_W(g32), vsrc[i], one);
+}
+
 static inline void hvx_sigmoid_i16_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src,
                                           uint32_t n) {
     HVX_Vector * restrict vdst = (HVX_Vector *) dst;
@@ -454,6 +535,7 @@ static inline void hvx_sigmoid_i16_f32_aa(uint8_t * restrict dst, const uint8_t 
     const HVX_Vector one  = hvx_vec_splat_f32(1.0f);
 
     const uint32_t nvec = n / 32;
+    const uint32_t nloe = n % 32;
     uint32_t i = 0;
 
     for (; i + HVX_ACT_I16_UNROLL <= nvec; i += HVX_ACT_I16_UNROLL) {
@@ -463,11 +545,11 @@ static inline void hvx_sigmoid_i16_f32_aa(uint8_t * restrict dst, const uint8_t 
         hvx_sigmoid_i16_block(vsrc, vdst, i, k_sf, one, 1);
     }
     if (i < nvec) {
-        HVX_Vector a = hvx_act_f32_pair_to_f16(vsrc[i], vsrc[i]);
-        HVX_Vector g16;
-        hvx_act_i16_eval(&a, &g16, hvx_act_i16_tab_g, 1, 1);
-        const HVX_VectorPair g32 = hvx_act_i16_to_qf32(g16, k_sf);
-        vdst[i] = hvx_sigmoid_i16_combine(Q6_V_lo_W(g32), vsrc[i], one);
+        vdst[i] = hvx_sigmoid_i16_one(vsrc, i, k_sf, one);
+        i++;
+    }
+    if (nloe) {
+        hvx_vec_store_a(&vdst[i], nloe * sizeof(float), hvx_sigmoid_i16_one(vsrc, i, k_sf, one));
     }
 }
 

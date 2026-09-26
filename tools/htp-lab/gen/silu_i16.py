@@ -189,7 +189,7 @@ static inline __attribute__((always_inline)) void hvx_silu_h_i16(const HVX_Vecto
     const int np = (n + 1) / 2;
 
     for (int r = 0; r < n; r++) {{
-        u[r] = Q6_Vh_vmin_VhVh(Q6_Vhf_vabs_Vhf(a[r]), u_max);
+        u[r] = Q6_Vh_vmin_VhVh(hvx_vec_abs_f16(a[r]), u_max);
     }}
     // k = the octave number, 0 to 15. Below the table k is -1 to -3, its byte is 0xfd to 0xff, and
     // that byte does not match the page 0, thus each coefficient and h are 0.

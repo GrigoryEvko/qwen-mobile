@@ -478,6 +478,12 @@ run_target ${target} ${TAG:-run} $*"
 "
             ALL_COUNT=$((ALL_COUNT + 1))
         done < <(lab_target_names)
+        # The generators of gen/ must give the bytes of their headers in the kernel tree, else a run
+        # of a generator deletes a landed change of its header. The check runs on the host, because
+        # the generators need numpy.
+        GEN_RC=0
+        python3 "${LAB_DIR}/gen/check_tree.py" --htp "${LLAMA_DIR}/${HTP_REL}" || GEN_RC=1
+        ALL_RC=0
         in_container "${PROLOGUE}
 ${BUILD}
 ${RUNFN}
@@ -496,7 +502,12 @@ for t in \${ALL_FAILED}; do
     v=\$(cat \"\$d/verdict.txt\" 2> /dev/null || echo \"lab: verdict \$t FAIL: the target did not build\")
     echo \"lab: all fail \$t: \${v#*FAIL: }\"
 done
-exit 1"
+exit 1" || ALL_RC=1
+        if [ "${GEN_RC}" != 0 ]; then
+            echo "lab: all fail gen/check_tree.py: a generator does not give the bytes of its header in the tree"
+            ALL_RC=1
+        fi
+        exit "${ALL_RC}"
         ;;
     shell)
         # An interactive shell holds the container lock until it exits.

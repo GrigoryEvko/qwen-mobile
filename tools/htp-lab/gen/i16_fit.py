@@ -18,16 +18,9 @@ This module holds the parts that every generator of that family shares:
 
 The callers are tools/htp-lab/gen/act_i16.py, silu_i16.py and softplus_i16.py. Each one keeps its
 own functions, its own header text and its own check text. A change of this module changes the
-bytes of three shipped headers, thus verify a change as follows:
-
-    H=third_party/llama.cpp/ggml/src/ggml-hexagon/htp
-    python3 tools/htp-lab/gen/softplus_i16.py | diff - $H/hvx-softplus.h
-    python3 tools/htp-lab/gen/act_i16.py  | sha256sum
-    python3 tools/htp-lab/gen/silu_i16.py | sha256sum
-
-The hash of the output of act_i16.py and of silu_i16.py must not change. A diff of those two
-against the tree is not valid: landed patches added a feature flag, a small-magnitude path and one
-f16 absolute-value form to the two headers, and the generators do not hold those blocks.
+bytes of three shipped headers, thus verify a change with tools/htp-lab/gen/check_tree.py: it runs
+each generator and compares the output with the header of the kernel tree, byte for byte.
+"run.sh all" runs that check.
 """
 
 from __future__ import annotations
