@@ -12,7 +12,7 @@ The oracle:
 - libFuzzer itself stops a run that is longer than -timeout or larger than
   -rss_limit_mb, and it saves the input.
 
-    uv run python tests/fuzz/quant/atheris_qfz_reader.py -max_total_time=600 -timeout=10 \\
+    uv run --frozen python tests/fuzz/quant/atheris_qfz_reader.py -max_total_time=600 -timeout=10 \\
         -rss_limit_mb=3072 -artifact_prefix=build/fuzz/quant/atheris/ build/fuzz/quant/atheris/reader-corpus \\
         tests/fuzz/quant/seeds/reader tests/fuzz/quant/regress/reader
 

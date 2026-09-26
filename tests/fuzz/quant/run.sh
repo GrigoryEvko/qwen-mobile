@@ -17,6 +17,11 @@ LLAMA_DIR="${QFZ_LLAMA_DIR:-$ROOT/build/fuzz/quant/llama-src}"
 LLAMA_COPY=1
 [[ -n "${QFZ_LLAMA_DIR:-}" ]] && LLAMA_COPY=0
 export CUDA_VISIBLE_DEVICES=""
+# The Python targets run in the shared project environment (.venv) with the versions of uv.lock.
+# --frozen makes a disagreement of the dependency groups and the lock stop the run with an error.
+# Without it, uv writes a new lock and synchronizes .venv again, which changes the environment of
+# every other user of the repository and of each recorded result.
+UV_RUN=(uv run --frozen)
 # Two threads for torch and numpy in each target, thus --jobs N does not ask for N x 28 threads.
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}" MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
 
@@ -261,7 +266,7 @@ case "$mode" in
                 echo "run.sh: the build of $p $san is not possible, the native targets report it as skipped" >&2
             fi
             code=0
-            FUZZ_SANITIZER="$san" FUZZ_PROFILE="$p" uv run python "$HERE/qfz_run.py" "$mode" "$san" --profile "$p" \
+            FUZZ_SANITIZER="$san" FUZZ_PROFILE="$p" "${UV_RUN[@]}" python "$HERE/qfz_run.py" "$mode" "$san" --profile "$p" \
                 ${rest[@]+"${rest[@]}"} || code=$?
             # A finding (1) wins over a skipped target (3) in the exit status.
             if [[ $code -eq 1 || ( $code -ne 0 && $status -eq 0 ) ]]; then status=$code; fi
@@ -271,10 +276,10 @@ case "$mode" in
     phone-files)
         for p in "${PROFILES[@]}"; do build none "$p" || die "the build of $p none failed"; done
         build_native || die "the build of the native host reference failed"
-        exec uv run python "$HERE/qfz_phone.py" files
+        exec "${UV_RUN[@]}" python "$HERE/qfz_phone.py" files
         ;;
     phone-commands)
-        exec uv run python "$HERE/qfz_phone.py" commands
+        exec "${UV_RUN[@]}" python "$HERE/qfz_phone.py" commands
         ;;
     *)
         usage

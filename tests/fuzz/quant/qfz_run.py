@@ -1,6 +1,6 @@
 """The driver of run.sh: run the targets of one mode, one sanitizer and one profile, and write results.jsonl.
 
-    uv run python tests/fuzz/quant/qfz_run.py <test|fuzz> <none|asan|ubsan|tsan|msan> \\
+    uv run --frozen python tests/fuzz/quant/qfz_run.py <test|fuzz> <none|asan|ubsan|tsan|msan> \\
         --profile <debug|release> [--budget-seconds N] [--jobs N]
 
 run.sh builds the native code first and sets FUZZ_SANITIZER and

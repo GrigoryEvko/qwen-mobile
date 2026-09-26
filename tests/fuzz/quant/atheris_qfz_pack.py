@@ -11,7 +11,7 @@ possible. The oracle is the same as in test_qfz_grid.py:
 - A value that is not finite, or a block beyond the F16 scale range, gives
   ValueError, and no input in the range does (qfz_common.scale_domain).
 
-    uv run python tests/fuzz/quant/atheris_qfz_pack.py -max_total_time=600 -runs=200000 -timeout=20 \\
+    uv run --frozen python tests/fuzz/quant/atheris_qfz_pack.py -max_total_time=600 -runs=200000 -timeout=20 \\
         -rss_limit_mb=4096 -artifact_prefix=build/fuzz/quant/atheris/ build/fuzz/quant/atheris/pack-corpus \\
         tests/fuzz/quant/seeds/pack
 

@@ -1,9 +1,9 @@
 """The phone set of the quant fuzz area: fuzzed GGUF files that the packer writes, and the commands to run them.
 
-    uv run python tests/fuzz/quant/qfz_phone.py files      # build/fuzz/quant/phone: files, KL bases, host results
-    uv run python tests/fuzz/quant/qfz_phone.py commands   # print the adb commands of the phone runs
-    uv run python tests/fuzz/quant/qfz_phone.py seeds      # write the seed files of the atheris reader fuzzer
-    uv run python tests/fuzz/quant/qfz_phone.py compare <pulled-dir>   # the table of the pulled phone logs
+    uv run --frozen python tests/fuzz/quant/qfz_phone.py files      # build/fuzz/quant/phone: files, KL bases, host results
+    uv run --frozen python tests/fuzz/quant/qfz_phone.py commands   # print the adb commands of the phone runs
+    uv run --frozen python tests/fuzz/quant/qfz_phone.py seeds      # write the seed files of the atheris reader fuzzer
+    uv run --frozen python tests/fuzz/quant/qfz_phone.py compare <pulled-dir>   # the table of the pulled phone logs
 
 The set holds a tiny Qwen3.5 model (the geometry PHONE of qfz_toy: 3 GDN
 layers and 1 attention layer, the head sizes of the 2B and 4B) with random
@@ -243,7 +243,7 @@ def phone_commands() -> str:
         f"timeout -s KILL 100 adb -s {SERIAL} pull {REMOTE}/logs build/fuzz/quant/phone/pulled/",
         "",
         "# 4. The table of the results against the host and the oracle.",
-        "uv run python tests/fuzz/quant/qfz_phone.py compare build/fuzz/quant/phone/pulled/logs",
+        "uv run --frozen python tests/fuzz/quant/qfz_phone.py compare build/fuzz/quant/phone/pulled/logs",
     ]
     return "\n".join(lines) + "\n"
 

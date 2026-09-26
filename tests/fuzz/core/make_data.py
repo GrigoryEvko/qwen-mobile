@@ -11,7 +11,7 @@ The script writes two groups of files:
 
 Run it with the uv environment of the repository, from the repository root:
 
-    uv run python tests/fuzz/core/make_data.py --model weights/gguf/Qwen3.5-2B-Q8_0.gguf
+    uv run --frozen python tests/fuzz/core/make_data.py --model weights/gguf/Qwen3.5-2B-Q8_0.gguf
 
 The script reads the model file but does not change it. GGUFReader maps the
 file into memory and reads only the header pages.
