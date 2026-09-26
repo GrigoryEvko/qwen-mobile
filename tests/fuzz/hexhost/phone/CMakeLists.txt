@@ -6,8 +6,10 @@
 # FUZZ_PROFILE (the flags of the preset arm64-android-snapdragon of android/snapdragon/CMakeUserPresets.json):
 #   release  -march=armv8.7a+fp16+dotprod+i8mm -fvectorize -ffp-model=fast -fno-finite-math-only
 #            -flto -D_GNU_SOURCE -O3 -DNDEBUG -g (the flags of the shipped libraries)
-#   debug    the same -march and fp flags, -O1 -g -fno-omit-frame-pointer, no LTO, no NDEBUG
+#   debug    the same -march and fp flags, -O1 -g, no LTO, no NDEBUG, the libc++ asserts
 # FUZZ_SANITIZER: none, asan, hwasan or ubsan (one each). The NDK has no TSan and no MSan.
+# The flags of the profile and of the sanitizer come from tests/sanitizers/fuzz-common.cmake, which
+# reads them from the initial cache files of the host builds.
 #
 # The flags go to every target, thus the ggml libraries have the same instrumentation as the
 # driver. Only the target hexhost_phone and its dependencies build: the DSP libraries (the
@@ -20,6 +22,9 @@
 cmake_minimum_required(VERSION 3.20)
 project(hexhost_phone C CXX)
 
+# The shared flag functions of the areas (the tables of the sanitizers and of the profiles).
+include("${CMAKE_CURRENT_LIST_DIR}/../../../sanitizers/fuzz-common.cmake")
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -30,51 +35,39 @@ set(FUZZ_SANITIZER "none" CACHE STRING "none, asan, hwasan or ubsan")
 set(FUZZ_PROFILE "debug" CACHE STRING "debug or release")
 option(HEXHOST_PHONE_X86 "Build for the host with the CPU backend only (a check of the driver)" OFF)
 
-if (HEXHOST_PHONE_X86)
-    set(ARCH_FLAGS "")
-else()
-    set(ARCH_FLAGS -march=armv8.7a+fp16+dotprod+i8mm)
-endif()
-set(APP_FP_FLAGS -fvectorize -ffp-model=fast -fno-finite-math-only -D_GNU_SOURCE)
-
-if (FUZZ_PROFILE STREQUAL "release")
-    set(PROFILE_FLAGS ${ARCH_FLAGS} ${APP_FP_FLAGS} -flto -O3 -DNDEBUG -g)
-    set(PROFILE_LINK_FLAGS -flto)
-elseif (FUZZ_PROFILE STREQUAL "debug")
-    set(PROFILE_FLAGS ${ARCH_FLAGS} ${APP_FP_FLAGS} -O1 -g -fno-omit-frame-pointer)
-    set(PROFILE_LINK_FLAGS "")
-else()
-    message(FATAL_ERROR "hexhost_phone: FUZZ_PROFILE must be debug or release, it is ${FUZZ_PROFILE}")
-endif()
-
-if (FUZZ_SANITIZER STREQUAL "asan")
-    set(SAN_FLAGS -fsanitize=address -fno-optimize-sibling-calls)
-elseif (FUZZ_SANITIZER STREQUAL "hwasan")
-    if (HEXHOST_PHONE_X86)
-        message(FATAL_ERROR "hexhost_phone: hwasan is for arm64 only")
-    endif()
-    set(SAN_FLAGS -fsanitize=hwaddress)
-elseif (FUZZ_SANITIZER STREQUAL "ubsan")
-    # No check recovers, thus each UBSan report stops the run.
-    set(SAN_FLAGS -fsanitize=undefined -fno-sanitize-recover=undefined)
-    if (ANDROID)
-        # The shared UBSan runtime of the NDK has its own copy of the libc++abi type_info
-        # classes, and the executable has the copy of the static NDK libc++. The vptr check
-        # does a dynamic_cast to the copy of the runtime, which fails for the type_info
-        # objects of the executable, thus it gave a false report at the start
-        # ("dynamic-type-mismatch" in sstream). The static runtime uses the one copy of the
-        # executable, and it exports its handlers to the ggml libraries.
-        set(SAN_LINK_FLAGS -static-libsan)
-    endif()
-elseif (FUZZ_SANITIZER STREQUAL "none")
-    set(SAN_FLAGS "")
-else()
+if (NOT FUZZ_SANITIZER MATCHES "^(none|asan|hwasan|ubsan)$")
     message(FATAL_ERROR "hexhost_phone: FUZZ_SANITIZER must be none, asan, hwasan or ubsan, it is ${FUZZ_SANITIZER}")
 endif()
+if (HEXHOST_PHONE_X86 AND FUZZ_SANITIZER STREQUAL "hwasan")
+    message(FATAL_ERROR "hexhost_phone: hwasan is for arm64 only")
+endif()
 
-add_compile_options(${PROFILE_FLAGS} ${SAN_FLAGS})
-add_link_options(${PROFILE_LINK_FLAGS} ${SAN_FLAGS} ${SAN_LINK_FLAGS})
-message(STATUS "hexhost_phone: profile ${FUZZ_PROFILE}, sanitizer ${FUZZ_SANITIZER}: ${PROFILE_FLAGS} ${SAN_FLAGS}")
+# The build type of this project is None, thus the optimizer flags go into the compile options.
+# The optimizer flags and the profile flags both hold -g: one occurrence is enough.
+fuzz_profile_opt_flags("${FUZZ_PROFILE}" opt_flags)
+fuzz_profile_flags("${FUZZ_PROFILE}" prof_flags prof_link)
+fuzz_profile_cxx_flags("${FUZZ_PROFILE}" "${FUZZ_SANITIZER}" prof_cxx)
+fuzz_sanitizer_flags("${FUZZ_SANITIZER}" san_flags san_link san_cxx)
+separate_arguments(PROFILE_FLAGS UNIX_COMMAND "${opt_flags} ${prof_flags}")
+list(REMOVE_DUPLICATES PROFILE_FLAGS)
+if (NOT HEXHOST_PHONE_X86)
+    list(APPEND PROFILE_FLAGS -march=armv8.7a+fp16+dotprod+i8mm)
+endif()
+separate_arguments(PROFILE_LINK_FLAGS UNIX_COMMAND "${prof_link}")
+separate_arguments(SAN_FLAGS UNIX_COMMAND "${san_flags}")
+# The ubsan build links the UBSan runtime statically (fuzz_sanitizer_flags), and it exports its
+# handlers to the ggml libraries. This driver links no libFuzzer, thus the none build has no UBSan
+# runtime to link.
+if (FUZZ_SANITIZER STREQUAL "none")
+    set(san_link "")
+endif()
+separate_arguments(SAN_LINK_FLAGS UNIX_COMMAND "${san_link}")
+separate_arguments(CXX_ONLY_FLAGS UNIX_COMMAND "${san_cxx} ${prof_cxx}")
+
+add_compile_options(${PROFILE_FLAGS} ${SAN_FLAGS} "$<$<COMPILE_LANGUAGE:CXX>:${CXX_ONLY_FLAGS}>")
+add_link_options(${PROFILE_LINK_FLAGS} ${SAN_LINK_FLAGS})
+message(STATUS "hexhost_phone: profile ${FUZZ_PROFILE}, sanitizer ${FUZZ_SANITIZER}: ${PROFILE_FLAGS} ${SAN_FLAGS} "
+               "| C++ ${CXX_ONLY_FLAGS} | link ${PROFILE_LINK_FLAGS} ${SAN_LINK_FLAGS}")
 
 # ggml as the app builds it (the preset arm64-android-snapdragon), without OpenCL. The ubsan
 # build for the phone links ggml statically: the NDK links a shared library with --no-undefined,

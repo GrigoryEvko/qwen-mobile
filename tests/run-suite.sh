@@ -290,7 +290,7 @@ test_steps() {
             run_step test probe-host "$p" "$c" $((20 * 60)) "$SUITE_REPO_ROOT/build/fuzz/matrix-probe-$p-$c/results.jsonl" \
                 "$SUITE_REPO_ROOT/tests/suite/probe-host-test.sh" "$c" --profile "$p"
         else
-            skip_step test probe-host "$p" "$c" "podman and the Snapdragon image are necessary (or --no-container is set)"
+            skip_step test probe-host "$p" "$c" "podman and the Snapdragon image are necessary (or --no-container is set). tests/sanitizers/setup-lab-image.sh gets the image and its tag v0.7"
         fi
     fi
     if want_step lab && [[ "$c" == none ]]; then
@@ -298,7 +298,7 @@ test_steps() {
             run_step test lab "$p" "$c" $((60 * 60)) "$SUITE_REPO_ROOT/build/fuzz/matrix-lab-$p/results.jsonl" \
                 "$SUITE_REPO_ROOT/tests/suite/lab-checks.sh" --profile "$p"
         else
-            skip_step test lab "$p" "$c" "podman and the Hexagon SDK image are necessary (or --no-container is set)"
+            skip_step test lab "$p" "$c" "podman and the Hexagon SDK image are necessary (or --no-container is set). tests/sanitizers/setup-lab-image.sh gets the image and its tag v0.7"
         fi
     fi
     if want_step supp-repro && [[ "$c" == ubsan ]]; then
