@@ -4,16 +4,19 @@
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO=$(cd "$HERE/../../.." && pwd)
+# shellcheck source=../../sanitizers/fuzz-lib.sh
+source "$HERE/../../sanitizers/fuzz-lib.sh"
+
+REPO=$FUZZ_REPO
 AREA=hexhost
 ALL_TARGETS="kparams graph repack envparse dirty mmap"
-X86_CONFIGS="none asan ubsan tsan msan"
-PHONE_CONFIGS="none asan hwasan ubsan"
-ALL_PROFILES="debug release"
+X86_CONFIGS=$FUZZ_HOST_CONFIGS
+PHONE_CONFIGS=$FUZZ_PHONE_CONFIGS
+ALL_PROFILES=$FUZZ_PROFILES
 
-BUDGET=${BUDGET:-600}
-JOBS=${JOBS:-4}
-BUILD_JOBS=${BUILD_JOBS:-8}
+BUDGET=$FUZZ_BUDGET
+JOBS=$FUZZ_JOBS
+BUILD_JOBS=$FUZZ_BUILD_JOBS
 KNOWN=${FUZZ_KNOWN:-1}
 PROFILES=$ALL_PROFILES
 # The llama.cpp tree: HEXHOST_LLAMA_DIR, or a private copy of the patched tree of HEAD that each
@@ -28,18 +31,14 @@ BUILD_TAG=${HEXHOST_BUILD_TAG:-}
 # dspqueue_write (HEXHOST_EINTR of common/fake_dsp.h), as a signal to the thread of the host does on
 # the phone. The host must do such a call again. 0 gives no such code.
 TEST_EINTR=${HEXHOST_TEST_EINTR:-3}
-UBSAN_SUPP="$REPO/tests/sanitizers/ubsan.supp"
-PHONE=${PHONE:-192.168.14.130:5555}
+UBSAN_SUPP="$FUZZ_SHARED_DIR/ubsan.supp"
+PHONE=$FUZZ_PHONE_SERIAL
 PHONE_DIR=${PHONE_DIR:-/data/local/tmp/qwen/fuzz/hexhost}
 PHONE_SECONDS=${PHONE_SECONDS:-80}
 PHONE_RANDOM=${PHONE_RANDOM:-60}
 DSP_LIB=${DSP_LIB:-}
 SHIPPED_LIBS="$REPO/android/snapdragon/jniLibs/arm64-v8a"
 SHIPPED_HASHES="$REPO/build/hashes-native.txt"
-# The Android ASan runtime of compiler-rt 22 (tests/sanitizers/build-asan-android-runtime.sh). The
-# runtime of the NDK stops each new thread with SIGILL on the SM8750.
-ASAN_RT_DIR=${ASAN_RT_DIR:-$REPO/build/fuzz/asan-android-runtime}
-ASAN_RT=libclang_rt.asan-aarch64-android.so
 
 # The names of the checks (fake_dsp.cpp: violation) that detect a defect of the backend with no
 # fix in the patch series. In the fuzz mode the harness keeps these conditions off (HEXHOST_IGNORE),
@@ -134,7 +133,8 @@ Environment:
   HEXHOST_TEST_EINTR  N: the test and graphs modes give AEE_EINTERRUPTED to each Nth
                       dspqueue_read and each Nth dspqueue_write (default $TEST_EINTR, 0: none)
   FUZZ_MSAN_PREFIX    The MSan libc++ (default build/fuzz/msan-libcxx/install)
-  PHONE, PHONE_DIR    The phone serial ($PHONE) and the work directory on the phone ($PHONE_DIR)
+  FUZZ_PHONE_SERIAL   The phone serial ($PHONE)
+  PHONE_DIR           The work directory on the phone ($PHONE_DIR)
   PHONE_SECONDS       The driver time of each phone run (default $PHONE_SECONDS s, under the 100 s kill)
   PHONE_RANDOM        The random inputs of each phone run after the corpus (default $PHONE_RANDOM)
   DSP_LIB             The DSP library for the phone. By default, the release none build stages the
@@ -147,14 +147,9 @@ one JSON line for each target to results.jsonl.
 EOF
 }
 
-die() {
-    echo "run.sh: $*" >&2
-    exit 1
-}
-
 # The build directory of the profile $1 and the x86 config $2
 x86_dir() {
-    echo "$REPO/build/fuzz/$AREA-$1-$2${BUILD_TAG:+-$BUILD_TAG}"
+    fuzz_build_dir "$AREA" "$1" "$2" "$BUILD_TAG"
 }
 
 # Make or refresh the private copy of llama.cpp, one time for each run of this script, when
@@ -162,8 +157,7 @@ x86_dir() {
 # build does not change the tree of the build, and a change of the series goes into the next build.
 refresh_llama() {
     [[ $LLAMA_COPY == 1 && $LLAMA_FRESH == 0 ]] || return 0
-    "$REPO/tests/sanitizers/llama-copy.sh" "$LLAMA_DIR" > /dev/null \
-        || die "tests/sanitizers/llama-copy.sh could not make the copy $LLAMA_DIR"
+    fuzz_llama_copy "$LLAMA_DIR"
     LLAMA_FRESH=1
 }
 
@@ -173,31 +167,23 @@ build_x86() {
     refresh_llama
     dir=$(x86_dir "$prof" "$cfg")
     if [[ $cfg == ubsan && ! -f $UBSAN_SUPP ]]; then
-        die "the shared file $UBSAN_SUPP does not exist. The UBSan runtime of the ubsan runs reads it."
+        fuzz_die "the shared file $UBSAN_SUPP does not exist. The UBSan runtime of the ubsan runs reads it."
     fi
     mkdir -p "$dir"
     CC=clang CXX=clang++ cmake -S "$HERE" -B "$dir" -G Ninja -DCMAKE_BUILD_TYPE=None \
         -DFUZZ_PROFILE="$prof" -DFUZZ_SANITIZER="$cfg" -DHEXHOST_LLAMA_DIR="$LLAMA_DIR" \
         ${FUZZ_MSAN_PREFIX:+-DFUZZ_MSAN_PREFIX="$FUZZ_MSAN_PREFIX"} > "$dir/configure.log" 2>&1 \
-        || die "the configure of $dir failed. Read $dir/configure.log."
+        || fuzz_die "the configure of $dir failed. Read $dir/configure.log."
     nice -n 10 cmake --build "$dir" -j"$BUILD_JOBS" > "$dir/build.log" 2>&1 \
-        || die "the build of $dir failed. Read $dir/build.log."
+        || fuzz_die "the build of $dir failed. Read $dir/build.log."
 }
 
-# Print the environment of a run: the shared sanitizer options (tests/sanitizers/env.sh) and, for
-# the fuzz mode ($2 = 1), the checks of KNOWN_IDS in HEXHOST_IGNORE, or for the test mode
-# ($2 = 0), the interrupts of TEST_EINTR.
+# Print the environment of a run: the shared sanitizer options
+# (tests/sanitizers/fuzz-lib.sh) and, for the fuzz mode ($2 = 1), the checks of KNOWN_IDS in
+# HEXHOST_IGNORE, or for the test mode ($2 = 0), the interrupts of TEST_EINTR.
 run_env() {
-    local cfg=$1 fuzz=$2 v
-    (
-        # shellcheck source=../../sanitizers/env.sh
-        source "$REPO/tests/sanitizers/env.sh"
-        sanitizer_env "$cfg"
-        for v in ASAN_OPTIONS LSAN_OPTIONS UBSAN_OPTIONS TSAN_OPTIONS MSAN_OPTIONS; do
-            [[ -n ${!v:-} ]] && echo "$v=${!v}"
-        done
-        true
-    )
+    local cfg=$1 fuzz=$2
+    fuzz_sanitizer_assignments "$cfg"
     echo "GGML_NO_BACKTRACE=1"
     if [[ $fuzz == 1 && $KNOWN == 1 ]]; then
         echo "HEXHOST_IGNORE=$KNOWN_IDS"
@@ -205,19 +191,6 @@ run_env() {
     if [[ $fuzz == 0 ]]; then
         echo "HEXHOST_EINTR=$TEST_EINTR"
     fi
-}
-
-# Write one JSON line for a target to results.jsonl. The crash files are the remaining arguments.
-result_line() {
-    local dir=$1 target=$2 prof=$3 cfg=$4 mode=$5 seconds=$6 execs=$7 findings=$8
-    shift 8
-    local files
-    files=$(printf '%s\n' "$@" | jq -R . | jq -sc 'map(select(length > 0))')
-    jq -nc --arg area "$AREA" --arg target "$target" --arg profile "$prof" --arg sanitizer "$cfg" --arg mode "$mode" \
-        --argjson seconds "$seconds" --argjson executions "$execs" --argjson findings "$findings" \
-        --argjson crash_files "$files" \
-        '{area: $area, target: $target, profile: $profile, sanitizer: $sanitizer, mode: $mode, seconds: $seconds,
-          executions: $executions, findings: $findings, crash_files: $crash_files}' >> "$dir/results.jsonl"
 }
 
 # Fuzz one target for the budget. After a crash the target starts again with its corpus.
@@ -235,34 +208,21 @@ fuzz_one() {
     local -a envs
     mapfile -t envs < <(run_env "$cfg" 1)
     envs+=("FUZZ_ARTIFACT_DIR=$out/artifacts")
-    local start=$SECONDS left starts=0 rc
-    while :; do
-        left=$(( BUDGET - (SECONDS - start) ))
-        (( left > 5 && starts < 200 )) || break
-        starts=$(( starts + 1 ))
-        rc=0
-        # The outer kill stops a hang that libFuzzer cannot stop (a TSan report can deadlock in the
-        # death callback of libFuzzer). A kill is a finding: a hang record goes to the artifacts.
-        timeout -s KILL $(( left + 180 )) env "${envs[@]}" nice -n 10 "$dir/fuzz_$t" "$out/corpus" "$HERE/corpus/$t" \
-            -max_total_time="$left" -rss_limit_mb=4096 -malloc_limit_mb=4096 -timeout=60 -max_len=4096 \
-            -artifact_prefix="$out/artifacts/" -print_final_stats=1 >> "$log" 2>&1 || rc=$?
-        echo "run.sh: start $starts ended with code $rc after $(( SECONDS - start )) s" >> "$log"
-        if [[ $rc == 137 ]]; then
-            tail -n 40 "$log" > "$out/artifacts/hang-start-$starts.txt"
-        fi
-        [[ $rc == 0 ]] && break
-    done
-    # the executions: the sum of the last progress count of each start
-    local execs=0 prev=0 n
-    while read -r n; do
-        (( n < prev )) && execs=$(( execs + prev ))
-        prev=$n
-    done < <(rg -o --no-line-number '^#[0-9]+' "$log" | tr -d '#')
-    execs=$(( execs + prev ))
+    # One start of libFuzzer with the seconds of $1 that are left. The outer kill of rule L9 stops a
+    # hang that libFuzzer cannot stop (a TSan report can deadlock in the death callback).
+    hexhost_fuzz_start() {
+        timeout -s KILL $(( $1 + 180 )) env "${envs[@]}" nice -n 10 "$dir/fuzz_$t" "$out/corpus" "$HERE/corpus/$t" \
+            -max_total_time="$1" -rss_limit_mb=4096 -malloc_limit_mb=4096 -timeout=60 -max_len=4096 \
+            -artifact_prefix="$out/artifacts/" -print_final_stats=1 >> "$log" 2>&1
+    }
+    local start=$SECONDS execs
+    fuzz_rounds "$BUDGET" 200 "$log" "$out/artifacts" hexhost_fuzz_start
+    execs=$(fuzz_libfuzzer_executions "$log")
     local -a arts=()
-    mapfile -t arts < <(find "$out/artifacts" -type f -newer "$mark" | sort)
-    result_line "$dir" "$t" "$prof" "$cfg" fuzz "$(( SECONDS - start ))" "$execs" "${#arts[@]}" "${arts[@]}"
-    echo "$AREA-$prof-$cfg $t: $(( SECONDS - start )) s, $starts starts, $execs executions, corpus $(fd -t f . "$out/corpus" | wc -l), crash files ${#arts[@]}"
+    mapfile -t arts < <(fuzz_new_artifacts "$out/artifacts" "$mark")
+    fuzz_result_line "$dir/results.jsonl" "$AREA" "$t" "$prof" "$cfg" fuzz "$(( SECONDS - start ))" \
+        "$execs" "${#arts[@]}" "${arts[@]}"
+    echo "$AREA-$prof-$cfg $t: $(( SECONDS - start )) s, $FUZZ_STARTS starts, $execs executions, corpus $(fd -t f . "$out/corpus" | wc -l), crash files ${#arts[@]}"
 }
 
 # Run one target one time on each seed and each regression input, with no check kept off.
@@ -287,7 +247,8 @@ test_one() {
         echo "run.sh: $f gives the code $rc" >> "$log"
         [[ $rc != 0 ]] && failed+=("$f")
     done
-    result_line "$dir" "$t" "$prof" "$cfg" test "$(( SECONDS - start ))" "${#files[@]}" "${#failed[@]}" "${failed[@]}"
+    fuzz_result_line "$dir/results.jsonl" "$AREA" "$t" "$prof" "$cfg" test "$(( SECONDS - start ))" \
+        "${#files[@]}" "${#failed[@]}" "${failed[@]}"
     local names=""
     for f in "${failed[@]}"; do
         names+=" ${f#"$HERE"/}"
@@ -341,7 +302,8 @@ cancel_one() {
         failed=("$f")
         note=": ${f#"$HERE"/}: $verdict"
     fi
-    result_line "$dir" queue-cancel "$prof" "$cfg" test "$(( SECONDS - start ))" "$n" "${#failed[@]}" "${failed[@]}"
+    fuzz_result_line "$dir/results.jsonl" "$AREA" queue-cancel "$prof" "$cfg" test "$(( SECONDS - start ))" \
+        "$n" "${#failed[@]}" "${failed[@]}"
     echo "$AREA-$prof-$cfg queue-cancel: $n inputs, ${#failed[@]} findings$note"
 }
 
@@ -350,10 +312,10 @@ cancel_one() {
 run_mode() {
     local mode=$1 cfg=$2
     shift 2
-    [[ " $X86_CONFIGS " == *" $cfg "* ]] || die "the x86 config must be one of: $X86_CONFIGS"
+    fuzz_check_config "$cfg" host
     local targets="${*:-$ALL_TARGETS}" t prof dir summary bad=0
     for t in $targets; do
-        [[ " $ALL_TARGETS " == *" $t "* ]] || die "no target $t. The targets: $ALL_TARGETS"
+        [[ " $ALL_TARGETS " == *" $t "* ]] || fuzz_die "no target $t. The targets: $ALL_TARGETS"
     done
     for prof in $PROFILES; do
         build_x86 "$prof" "$cfg"
@@ -361,9 +323,7 @@ run_mode() {
         summary="$dir/$mode-summary.txt"
         : > "$summary"
         for t in $targets; do
-            while (( $(jobs -rp | wc -l) >= JOBS )); do
-                sleep 5
-            done
+            fuzz_wait_for_slot "$JOBS"
             if [[ $mode == fuzz ]]; then
                 fuzz_one "$prof" "$cfg" "$t" >> "$summary" &
             else
@@ -398,7 +358,7 @@ phone_build_one() {
     dir=$(phone_dir "$prof" "$cfg")
     rel=${dir#"$REPO"/}
     stage="$dir/stage"
-    [[ -z $DSP_LIB || -f $DSP_LIB ]] || die "the DSP library $DSP_LIB does not exist"
+    [[ -z $DSP_LIB || -f $DSP_LIB ]] || fuzz_die "the DSP library $DSP_LIB does not exist"
     refresh_llama
     # The DSP library: the shipped one for the release none run, else a build of the same tree
     local shipped=0 dsp_build=0
@@ -408,11 +368,9 @@ phone_build_one() {
         # The preset of the app, as scripts/build-native.sh uses it
         cp -f "$REPO/android/snapdragon/CMakeUserPresets.json" "$LLAMA_DIR/CMakeUserPresets.json"
     fi
-    if [[ $cfg == asan ]]; then
-        (cd "$ASAN_RT_DIR" 2> /dev/null && sha256sum -c --quiet "$ASAN_RT.sha256") \
-            || die "the ASan runtime $ASAN_RT_DIR/$ASAN_RT is missing or does not match its sha256. Run tests/sanitizers/build-asan-android-runtime.sh first."
-    fi
-    [[ $LLAMA_DIR == "$REPO"/* ]] || die "the llama.cpp tree $LLAMA_DIR is not inside the repository, thus the container cannot see it"
+    local asan_rt=""
+    [[ $cfg == asan ]] && asan_rt=$(fuzz_asan_runtime_path)
+    [[ $LLAMA_DIR == "$REPO"/* ]] || fuzz_die "the llama.cpp tree $LLAMA_DIR is not inside the repository, thus the container cannot see it"
     mkdir -p "$dir/include/fuzzer"
     # FuzzedDataProvider.h is one header; the copy of the host clang is the same file as the NDK copy
     cp -f "$(clang -print-resource-dir)/include/fuzzer/FuzzedDataProvider.h" "$dir/include/fuzzer/"
@@ -430,18 +388,14 @@ if [[ $dsp_build == 1 ]]; then
     cmake --build $rel/dsp -j$BUILD_JOBS --target htp-v79 > $rel/dsp.build.log 2>&1
 fi
 rm -rf $rel/runtime && mkdir -p $rel/runtime
-case $cfg in
-    hwasan) rt=libclang_rt.hwasan-aarch64-android.so ;;
-    # The ubsan build links its runtime statically (-static-libsan, refer to the vptr text in
-    # phone/CMakeLists.txt), thus the stage has no UBSan library.
-    *) rt= ;;
-esac
-if [[ -n \$rt ]]; then
+# The ASan runtime comes from the shared build below, not from the NDK. The ubsan build links its
+# runtime statically (-static-libsan, refer to the vptr text in phone/CMakeLists.txt).
+rt='$(fuzz_phone_runtime "$cfg")'
+if [[ -n \$rt && \$rt != '$FUZZ_ASAN_RT_NAME' ]]; then
     cp -f \$(find \$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt -name \$rt | head -n 1) $rel/runtime/
 fi
-" > "$dir.build.log" 2>&1 || die "the phone build failed. Read $dir.build.log."
-    # The ASan runtime comes from the shared build, not from the NDK
-    [[ $cfg == asan ]] && cp -f "$ASAN_RT_DIR/$ASAN_RT" "$dir/runtime/"
+" > "$dir.build.log" 2>&1 || fuzz_die "the phone build failed. Read $dir.build.log."
+    [[ -n $asan_rt ]] && cp -f "$asan_rt" "$dir/runtime/"
 
     rm -rf "$stage"
     mkdir -p "$stage/bin" "$stage/lib" "$stage/dsp" "$stage/in"
@@ -453,7 +407,7 @@ fi
         for lib in libggml.so libggml-base.so libggml-cpu.so libggml-hexagon.so libggml-opencl.so; do
             want=$(rg -F "  $lib" "$SHIPPED_HASHES" | cut -d' ' -f1)
             have=$(sha256sum "$SHIPPED_LIBS/$lib" | cut -d' ' -f1)
-            [[ -n $want && $want == "$have" ]] || die "$SHIPPED_LIBS/$lib does not match $SHIPPED_HASHES"
+            [[ -n $want && $want == "$have" ]] || fuzz_die "$SHIPPED_LIBS/$lib does not match $SHIPPED_HASHES"
             cp -f "$SHIPPED_LIBS/$lib" "$stage/lib/"
         done
     else
@@ -465,10 +419,10 @@ fi
         dsp="$SHIPPED_LIBS/libggml-htp-v79.so"
         want=$(rg -F "  libggml-htp-v79.so" "$SHIPPED_HASHES" | cut -d' ' -f1)
         have=$(sha256sum "$dsp" | cut -d' ' -f1)
-        [[ -n $want && $want == "$have" ]] || die "$dsp does not match $SHIPPED_HASHES"
+        [[ -n $want && $want == "$have" ]] || fuzz_die "$dsp does not match $SHIPPED_HASHES"
     elif [[ -z $dsp ]]; then
         dsp="$dir/dsp/ggml/src/ggml-hexagon/libggml-htp-v79.so"
-        [[ -f $dsp ]] || die "the DSP build made no $dsp. Read $dir/dsp.build.log."
+        [[ -f $dsp ]] || fuzz_die "the DSP build made no $dsp. Read $dir/dsp.build.log."
     fi
     cp -f "$dsp" "$stage/dsp/libggml-htp-v79.so"
     [[ -f $UBSAN_SUPP ]] && cp -f "$UBSAN_SUPP" "$stage/ubsan.supp"
@@ -490,7 +444,7 @@ fi
 
 phone_build() {
     local cfg=$1 prof
-    [[ " $PHONE_CONFIGS " == *" $cfg "* ]] || die "the phone config must be one of: $PHONE_CONFIGS"
+    fuzz_check_config "$cfg" phone
     # container_run and SNAPDRAGON_IMAGE. The file sets readonly variables, thus one source only.
     # shellcheck source=../../../scripts/lib.sh
     [[ -n ${SNAPDRAGON_IMAGE:-} ]] || source "$REPO/scripts/lib.sh"
@@ -499,25 +453,19 @@ phone_build() {
     done
 }
 
-# The sanitizer options of a phone run
-phone_san_env() {
-    local cfg=$1 d=$2
-    case $cfg in
-        asan) echo "ASAN_OPTIONS=halt_on_error=1:detect_leaks=0:abort_on_error=1" ;;
-        hwasan) echo "HWASAN_OPTIONS=halt_on_error=1:abort_on_error=1" ;;
-        ubsan) echo "UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:report_error_type=1:suppressions=$d/ubsan.supp" ;;
-        *) echo "" ;;
-    esac
-}
-
 phone_commands() {
-    local cfg=$1 prof stage d run name vars san tag
-    [[ " $PHONE_CONFIGS " == *" $cfg "* ]] || die "the phone config must be one of: $PHONE_CONFIGS"
+    local cfg=$1 prof stage d run name vars san supp tag thermal
+    fuzz_check_config "$cfg" phone
+    thermal=$(fuzz_phone_thermal_cmd)
     for prof in $PROFILES; do
         stage="$(phone_dir "$prof" "$cfg")/stage"
-        [[ -f "$stage/bin/hexhost_phone" ]] || die "run tests/fuzz/hexhost/run.sh phone-build $cfg --profile $prof first"
+        [[ -f "$stage/bin/hexhost_phone" ]] || fuzz_die "run tests/fuzz/hexhost/run.sh phone-build $cfg --profile $prof first"
         d="$PHONE_DIR/$prof-$cfg"
-        san=$(phone_san_env "$cfg" "$d")
+        # The stage holds the shared UBSan suppression file only. The other configurations get no
+        # suppression path: a sanitizer runtime stops when its suppression file does not exist.
+        supp=""
+        [[ $cfg == ubsan ]] && supp="$d/ubsan.supp"
+        san=$(fuzz_phone_options "$cfg" "$supp")
         echo "# ==== $prof $cfg: push the files ($(fd -t f . "$stage" | wc -l) files)"
         echo "adb -s $PHONE shell 'rm -rf $d && mkdir -p $d/out'"
         echo "adb -s $PHONE push ${stage#"$REPO"/}/. $d/"
@@ -532,9 +480,9 @@ phone_commands() {
             vars=${run#*:}
             tag="$prof-$cfg-$name"
             echo "# ---- $tag"
-            echo "adb -s $PHONE shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
+            echo "$thermal"
             echo "adb -s $PHONE shell 'cd $d && mkdir -p out/save-$name && timeout -s KILL 100 env LD_LIBRARY_PATH=$d/lib ADSP_LIBRARY_PATH=$d/dsp $san $vars ./bin/hexhost_phone --seconds $PHONE_SECONDS --random $PHONE_RANDOM --save out/save-$name in > out/$name.txt 2> out/$name.err; echo exit=\$? >> out/$name.txt'"
-            echo "adb -s $PHONE shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
+            echo "$thermal"
             echo "adb -s $PHONE shell 'pgrep -a hexhost_phone; tail -n 2 $d/out/$name.txt'"
             # The saved random inputs again with one op for each batch (the stale L2 line property)
             echo "adb -s $PHONE shell 'cd $d && if [ -z \"\$(ls out/save-$name)\" ]; then echo \"no saved input\" > out/$name-batch1.txt; else timeout -s KILL 100 env LD_LIBRARY_PATH=$d/lib ADSP_LIBRARY_PATH=$d/dsp $san $vars GGML_HEXAGON_OPBATCH=1 GGML_HEXAGON_OPQUEUE=1 ./bin/hexhost_phone --seconds $PHONE_SECONDS out/save-$name > out/$name-batch1.txt 2> out/$name-batch1.err; echo exit=\$? >> out/$name-batch1.txt; fi'"
@@ -562,9 +510,9 @@ graphs_check() {
     # Shared libraries, as the app ships them
     CC=clang CXX=clang++ cmake -S "$HERE/graphs" -B "$dir" -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_SHARED_LIBS=ON -DHEXHOST_LLAMA_DIR="$LLAMA_DIR" > "$dir/configure.log" 2>&1 \
-        || die "the configure of $dir failed. Read $dir/configure.log."
+        || fuzz_die "the configure of $dir failed. Read $dir/configure.log."
     nice -n 10 cmake --build "$dir" -j"$BUILD_JOBS" --target hexhost_graphs > "$dir/build.log" 2>&1 \
-        || die "the build of $dir failed. Read $dir/build.log."
+        || fuzz_die "the build of $dir failed. Read $dir/build.log."
     for m in 2B 4B; do
         model="$REPO/weights/gguf/Qwen3.5-$m-Q8_0.gguf"
         mmproj="$REPO/weights/gguf/Qwen3.5-$m-Q8_0.mmproj.gguf"
@@ -627,12 +575,12 @@ main() {
             --budget-seconds) BUDGET=$2; shift 2 ;;
             --jobs) JOBS=$2; shift 2 ;;
             --profile) PROFILES=$2; shift 2 ;;
-            -*) die "unknown option $1" ;;
+            -*) fuzz_die_code 2 "unknown option $1" ;;
             *) targets+=("$1"); shift ;;
         esac
     done
-    [[ $BUDGET =~ ^[0-9]+$ && $JOBS =~ ^[1-9][0-9]*$ ]] || die "--budget-seconds and --jobs take positive numbers"
-    [[ " $ALL_PROFILES " == *" $PROFILES "* || $PROFILES == "$ALL_PROFILES" ]] || die "--profile takes debug or release"
+    [[ $BUDGET =~ ^[0-9]+$ && $JOBS =~ ^[1-9][0-9]*$ ]] || fuzz_die "--budget-seconds and --jobs take positive numbers"
+    [[ " $ALL_PROFILES " == *" $PROFILES "* || $PROFILES == "$ALL_PROFILES" ]] || fuzz_die "--profile takes debug or release"
     case $mode in
         test)
             # The targets, then the model graphs (the same check for each config)

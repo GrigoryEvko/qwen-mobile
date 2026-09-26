@@ -2,11 +2,13 @@
 # The fuzz runner of the quant area (quant/ and the GGUF files that it writes).
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-HERE="$ROOT/tests/fuzz/quant"
-SANITIZERS=(none asan ubsan tsan msan)
-PROFILES=(debug release)
-FUZZ_MSAN_PREFIX="${FUZZ_MSAN_PREFIX:-$ROOT/build/fuzz/msan-libcxx/install}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../../sanitizers/fuzz-lib.sh
+source "$HERE/../../sanitizers/fuzz-lib.sh"
+
+ROOT="$FUZZ_REPO"
+read -r -a SANITIZERS <<< "$FUZZ_HOST_CONFIGS"
+read -r -a PROFILES <<< "$FUZZ_PROFILES"
 # The llama.cpp tree: QFZ_LLAMA_DIR, or a private copy of the patched tree of HEAD that
 # tests/sanitizers/llama-copy.sh makes or refreshes one time for each run of this script (refresh_llama).
 # The copy comes from the git objects of HEAD, thus an uncommitted edit in the submodule, or a landing
@@ -105,9 +107,9 @@ hidden.
 EOF
 }
 
+# Write a message to stderr and stop with the code 2: the run could not start.
 die() {
-    echo "run.sh: $*" >&2
-    exit 2
+    fuzz_die_code 2 "$*"
 }
 
 member() {
@@ -120,27 +122,12 @@ member() {
     return 1
 }
 
-# Give the compile flags of one sanitizer for C, C++ and the linker.
-sanitizer_flags() {
-    case "$1" in
-        none)  echo "" ;;
-        asan)  echo "-fsanitize=address -fno-omit-frame-pointer" ;;
-        ubsan) echo "-fsanitize=undefined -fno-sanitize-recover=undefined" ;;
-        tsan)  echo "-fsanitize=thread" ;;
-        msan)  echo "-fsanitize=memory -fsanitize-memory-track-origins=2 -fno-omit-frame-pointer" ;;
-    esac
-}
-
-FP_FLAGS="-fvectorize -ffp-model=fast -fno-finite-math-only -D_GNU_SOURCE"
-
 # Make or refresh the copy of llama.cpp (when QFZ_LLAMA_DIR is not set). Then give the Python targets its
 # gguf-py: qfz_common.LLAMA_DIR reads QFZ_LLAMA_DIR, and PYTHONPATH puts the gguf-py of the tree before the
-# editable install of the submodule. The lock keeps two runs of this script from writing the copy together.
+# editable install of the submodule.
 refresh_llama() {
     if [[ $LLAMA_COPY == 1 ]]; then
-        mkdir -p "$(dirname "$LLAMA_DIR")"
-        flock "$LLAMA_DIR.lock" "$ROOT/tests/sanitizers/llama-copy.sh" "$LLAMA_DIR" > /dev/null \
-            || die "tests/sanitizers/llama-copy.sh could not make the copy $LLAMA_DIR"
+        fuzz_llama_copy "$LLAMA_DIR"
     fi
     [[ -f "$LLAMA_DIR/gguf-py/gguf/__init__.py" ]] || die "$LLAMA_DIR is not a llama.cpp tree: it has no gguf-py"
     export QFZ_LLAMA_DIR="$LLAMA_DIR" PYTHONPATH="$LLAMA_DIR/gguf-py${PYTHONPATH:+:$PYTHONPATH}"
@@ -160,19 +147,25 @@ drop_other_tree() {
 build() {
     local san="$1" profile="$2"
     local out="$ROOT/build/fuzz/quant-$profile-$san"
-    local flags cxx_extra="" link_extra="" build_type opt_var opt_flags lto="" lto_link="" tools=()
-    flags="$(sanitizer_flags "$san")"
+    local flags cxx_extra link_extra prof_flags opt_flags prof_link cxx_asserts build_type opt_var tools=()
+    # The flags come from the shared files tests/sanitizers/profile-<profile>.cmake and
+    # tests/sanitizers/<san>.cmake: this area compiles one file of its own (qfz_gguf_check.c) with a
+    # direct compiler call, thus it reads the flags and does not give the files to cmake -C.
+    flags="$(fuzz_sanitizer_flags "$san")"
+    cxx_extra="$(fuzz_sanitizer_cxx_flags "$san")"
+    link_extra="$(fuzz_sanitizer_link_flags "$san")"
+    prof_flags="$(fuzz_profile_flags "$profile")"
+    opt_flags="$(fuzz_profile_opt_flags "$profile")"
+    prof_link="$(fuzz_profile_link_flags "$profile")"
+    cxx_asserts="$(fuzz_profile_cxx_flags "$profile" "$san")"
     if [[ "$san" == "msan" ]]; then
         [[ -d "$FUZZ_MSAN_PREFIX/lib" ]] || { echo "run.sh: the MSan libc++ is missing at $FUZZ_MSAN_PREFIX" >&2; return 3; }
-        cxx_extra="-stdlib=libc++ -nostdinc++ -isystem $FUZZ_MSAN_PREFIX/include/c++/v1"
-        link_extra="-stdlib=libc++ -L$FUZZ_MSAN_PREFIX/lib -Wl,-rpath,$FUZZ_MSAN_PREFIX/lib"
     fi
     if [[ "$profile" == "release" ]]; then
-        build_type=Release; opt_var=RELEASE; opt_flags="-O3 -DNDEBUG"
-        lto="-flto -g"; lto_link="-flto -fuse-ld=lld"
+        build_type=Release; opt_var=RELEASE
         tools=(-DCMAKE_AR=/usr/bin/llvm-ar -DCMAKE_RANLIB=/usr/bin/llvm-ranlib)
     else
-        build_type=Debug; opt_var=DEBUG; opt_flags="-O1 -g -fno-omit-frame-pointer"
+        build_type=Debug; opt_var=DEBUG
     fi
     # The CMake build directory is $out/build, the name that the rule LLAMA-COPY of check-rules.sh reads.
     local cm="$out/build"
@@ -181,9 +174,9 @@ build() {
     echo "run.sh: build $profile $san from $LLAMA_DIR into $out (logs in $out/logs)"
     cmake -S "$LLAMA_DIR" -B "$cm" -G Ninja \
         -DCMAKE_BUILD_TYPE="$build_type" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ "${tools[@]}" \
-        -DCMAKE_C_FLAGS="$FP_FLAGS $lto $flags" -DCMAKE_CXX_FLAGS="$FP_FLAGS $lto $flags $cxx_extra" \
+        -DCMAKE_C_FLAGS="$prof_flags $flags" -DCMAKE_CXX_FLAGS="$prof_flags $flags $cxx_extra $cxx_asserts" \
         -DCMAKE_C_FLAGS_"$opt_var"="$opt_flags" -DCMAKE_CXX_FLAGS_"$opt_var"="$opt_flags" \
-        -DCMAKE_EXE_LINKER_FLAGS="$lto_link $flags $link_extra" \
+        -DCMAKE_EXE_LINKER_FLAGS="$prof_link $link_extra" \
         -DGGML_NATIVE=ON -DGGML_OPENMP=OFF -DGGML_LLAMAFILE=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF \
         -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TESTS=OFF -DBUILD_SHARED_LIBS=OFF > "$out/logs/cmake.log" 2>&1 \
         || { echo "run.sh: the configure of $cm failed. Read $out/logs/cmake.log." >&2; return 1; }
@@ -191,10 +184,10 @@ build() {
         > "$out/logs/build.log" 2>&1 \
         || { echo "run.sh: the build of $cm failed. Read $out/logs/build.log." >&2; return 1; }
     # shellcheck disable=SC2086
-    clang -std=c11 $opt_flags $FP_FLAGS $lto $flags -I "$LLAMA_DIR/ggml/include" \
+    clang -std=c11 $opt_flags $prof_flags $flags -I "$LLAMA_DIR/ggml/include" \
         -c "$HERE/qfz_gguf_check.c" -o "$out/bin/qfz_gguf_check.o" || return 1
     # shellcheck disable=SC2086
-    clang++ $lto_link $flags $link_extra "$out/bin/qfz_gguf_check.o" "$cm/ggml/src/libggml-base.a" -lm -lpthread \
+    clang++ $prof_link $link_extra "$out/bin/qfz_gguf_check.o" "$cm/ggml/src/libggml-base.a" -lm -lpthread \
         -o "$out/bin/qfz-gguf-check" || return 1
     rm -f "$out/bin/qfz_gguf_check.o"
     echo "run.sh: built $cm/bin/llama-perplexity and $out/bin/qfz-gguf-check"
@@ -242,7 +235,7 @@ done
 if [[ ${#profiles[@]} -eq 0 ]]; then
     if [[ -n "${FUZZ_PROFILE:-}" ]]; then profiles=("$FUZZ_PROFILE"); else profiles=("${PROFILES[@]}"); fi
 fi
-for p in "${profiles[@]}"; do member "$p" "${PROFILES[@]}" || die "the profile $p is not one of: ${PROFILES[*]}"; done
+for p in "${profiles[@]}"; do fuzz_check_profile "$p"; done
 
 case "$mode" in
     build|test|fuzz|phone-files|phone-commands) refresh_llama ;;
@@ -261,7 +254,7 @@ case "$mode" in
         for p in "${profiles[@]}"; do build "$san" "$p"; done
         ;;
     test|fuzz)
-        member "$san" "${SANITIZERS[@]}" || die "$mode needs one sanitizer of: ${SANITIZERS[*]}"
+        fuzz_check_config "$san" host
         status=0
         for p in "${profiles[@]}"; do
             if ! build "$san" "$p"; then

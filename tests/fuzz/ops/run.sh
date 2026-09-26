@@ -10,16 +10,18 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 readonly HERE
 # shellcheck source=../../../scripts/lib.sh
 source "$HERE/../../../scripts/lib.sh"
+# shellcheck source=../../sanitizers/fuzz-lib.sh
+source "$HERE/../../sanitizers/fuzz-lib.sh"
 
 readonly AREA=ops
 readonly SNAP="$REPO_ROOT/build/fuzz/ops-src"
 readonly SRC="$SNAP/ggml"
 readonly MISC="$REPO_ROOT/build/fuzz/ops"          # the oracle, fixes, phone stage, temporary files
 readonly B_ORACLE_X86="$REPO_ROOT/build/oracle-x86"   # the naive llama.cpp build, read by other areas
-readonly SHARED_SAN="$REPO_ROOT/tests/sanitizers"
+readonly SHARED_SAN="$FUZZ_SHARED_DIR"
 readonly SHIPPED_LIBS="$REPO_ROOT/android/snapdragon/jniLibs/arm64-v8a"
 readonly SYMBOLIZER="$REPO_ROOT/build/fuzz/android-symbolizer/llvm-symbolizer"   # of LLVM 22.1.8
-readonly ASAN_RUNTIME="$REPO_ROOT/build/fuzz/asan-android-runtime/libclang_rt.asan-aarch64-android.so"   # of compiler-rt 22.1.8
+readonly ASAN_RUNTIME="$FUZZ_ASAN_RT_DIR/$FUZZ_ASAN_RT_NAME"   # of compiler-rt 22.1.8
 # FUZZ_OPS_SRC: a different ggml tree for the host builds, for example the private copy of a fix
 # (never the shared submodule). FUZZ_OPS_TAG: the suffix of the build directories of that tree.
 readonly HOST_SRC=${FUZZ_OPS_SRC:-$SRC}
@@ -32,15 +34,15 @@ fi
 # ggml code.
 readonly B_ORACLE="$MISC/oracle${TAG:+-$TAG}"
 readonly ALL_GROUPS="matmul gdn attn norm elem data"
-readonly HOST_CONFIGS="none asan ubsan tsan msan"
-readonly PHONE_CONFIGS_ALL="none asan hwasan ubsan"
-readonly ALL_PROFILES="debug release"
+readonly HOST_CONFIGS="$FUZZ_HOST_CONFIGS"
+readonly PHONE_CONFIGS_ALL="$FUZZ_PHONE_CONFIGS"
+readonly ALL_PROFILES="$FUZZ_PROFILES"
 
-BUDGET=${FUZZ_BUDGET:-600}
-JOBS=${FUZZ_JOBS:-4}
-BUILD_JOBS=${BUILD_JOBS:-8}
+BUDGET=$FUZZ_BUDGET
+JOBS=$FUZZ_JOBS
+BUILD_JOBS=$FUZZ_BUILD_JOBS
 RSS_MB=${RSS_MB:-4096}
-PHONE=${PHONE:-192.168.14.130:5555}
+PHONE=$FUZZ_PHONE_SERIAL
 PHONE_DIR=${PHONE_DIR:-/data/local/tmp/qwen/fuzz/ops}
 PHONE_BUILDS=${PHONE_BUILDS:-}
 DSP_LIB=${DSP_LIB:-}
@@ -171,15 +173,10 @@ EOF
 # script). Then record the date and hashes. A lock keeps two runs of this script from one copy at
 # the same time.
 take_snapshot() {
-    mkdir -p "$SNAP"
-    (
-        flock 8
-        "$REPO_ROOT/tests/sanitizers/llama-copy.sh" --ggml "$SNAP" > /dev/null \
-            || die "tests/sanitizers/llama-copy.sh --ggml $SNAP failed"
-        date > "$SNAP/SNAPSHOT-DATE"
-        sha256sum "$SRC/src/ggml-hexagon/ggml-hexagon.cpp" "$SRC/src/ggml-hexagon/htp/htp-ops.h" \
-            "$SRC/src/ggml-hexagon/htp-opnode.h" > "$SNAP/SNAPSHOT-HASHES"
-    ) 8> "$SNAP.lock"
+    fuzz_llama_copy "$SNAP" --ggml
+    date > "$SNAP/SNAPSHOT-DATE"
+    sha256sum "$SRC/src/ggml-hexagon/ggml-hexagon.cpp" "$SRC/src/ggml-hexagon/htp/htp-ops.h" \
+        "$SRC/src/ggml-hexagon/htp-opnode.h" > "$SNAP/SNAPSHOT-HASHES"
     echo "fuzz-ops: the snapshot in $SNAP is the tree of HEAD"
 }
 
@@ -193,12 +190,12 @@ need_snapshot() {
 
 # Stop when the argument is not a host configuration.
 check_host_config() {
-    [[ " $HOST_CONFIGS " == *" $1 "* ]] || die "the configuration '$1' is not one of: $HOST_CONFIGS"
+    fuzz_check_config "$1" host
 }
 
 # Stop when the argument is not a profile.
 check_profile() {
-    [[ " $ALL_PROFILES " == *" $1 "* ]] || die "the profile '$1' is not one of: $ALL_PROFILES"
+    fuzz_check_profile "$1"
 }
 
 # Build the oracle with gcc, like build/oracle-x86. It is the reference of every profile and every
@@ -308,12 +305,8 @@ group_kinds_of() {
 json_line() {
     local profile=$1 config=$2 target=$3 mode=$4 seconds=$5 executions=$6 findings=$7
     shift 7
-    jq -cn --arg area "$AREA" --arg target "$target" --arg sanitizer "$config" --arg profile "$profile" \
-        --arg mode "$mode" --argjson seconds "$seconds" --argjson executions "$executions" \
-        --argjson findings "$findings" \
-        '{area: $area, target: $target, sanitizer: $sanitizer, profile: $profile, mode: $mode, seconds: $seconds,
-          executions: $executions, findings: $findings, crash_files: $ARGS.positional}' --args "$@" \
-        >> "$(host_dir "$profile" "$config")/results.jsonl"
+    fuzz_result_line "$(host_dir "$profile" "$config")/results.jsonl" "$AREA" "$target" "$profile" \
+        "$config" "$mode" "$seconds" "$executions" "$findings" "$@"
 }
 
 # The test suite of one group: each seed and each regression input of its kinds, once. Print the
@@ -413,38 +406,37 @@ fuzz_group() {
     local marker="$w/.start"
     : > "$marker"
     echo "fuzz-ops: fuzz $profile-$config $g for $budget s, log $log"
-    local t0 end round=0 left r0 last="" summary_line
+    local t0 last=""
     t0=$(date +%s)
-    end=$((t0 + budget))
-    while left=$((end - $(date +%s))); [[ $left -gt 5 && $round -lt 100 ]]; do
-        echo "fuzz-ops: round $round, $left s left" >> "$log"
-        r0=$(date +%s)
-        # The outer timeout stops a process that hangs (for example the TSan report path under
-        # libFuzzer can deadlock). libFuzzer stops by itself within -timeout after -max_total_time,
-        # thus a kill by the outer timeout is a hang, and the hang is a finding.
-        local rc=0
+    # One start of libFuzzer with the seconds of $1 that are left. The outer timeout of rule L9 stops
+    # a process that hangs (for example the TSan report path under libFuzzer can deadlock).
+    # libFuzzer stops by itself within -timeout after -max_total_time, thus a kill by the outer
+    # timeout is a hang, and the hang is a finding.
+    ops_fuzz_start() {
         with_san "$config" env FUZZ_OPS_ORACLE="$B_ORACLE/ops_oracle" FUZZ_OPS_GROUP="$g" FUZZ_OPS_FINDINGS="$f" \
             FUZZ_ARTIFACT_DIR="$w/artifacts" \
-            timeout -s KILL $((left + 180)) nice -n 10 "$dir/fuzz_ops" -max_total_time="$left" -rss_limit_mb="$RSS_MB" \
+            timeout -s KILL $(( $1 + 180 )) nice -n 10 "$dir/fuzz_ops" -max_total_time="$1" -rss_limit_mb="$RSS_MB" \
             -max_len=512 -timeout=120 -artifact_prefix="$w/artifacts/" -print_final_stats=1 \
-            "$w/corpus" "$HERE/corpus/$g" >> "$log" 2>&1 || rc=$?
+            "$w/corpus" "$HERE/corpus/$g" >> "$log" 2>&1
+    }
+    # A report that ends two short starts in a row stops the rest of every start too: the defect
+    # blocks this group, thus the run stops and reports it.
+    ops_round_hook() {
+        local n=$1 hook_log=$2 rc=$3 secs=$4 summary_line
         if [[ $rc -eq 137 ]]; then
-            {
-                echo "hang: the outer timeout stopped round $round of $profile-$config $g after $(($(date +%s) - r0)) s"
-                tail -n 40 "$log"
-            } > "$w/artifacts/hang-round-$round.txt"
-            echo "fuzz-ops: HANG in round $round of $profile-$config $g (refer to $w/artifacts/hang-round-$round.txt)" | tee -a "$log"
+            echo "fuzz-ops: HANG in the start $n of $profile-$config $g (refer to $w/artifacts/hang-start-$n.txt)" \
+                | tee -a "$hook_log"
         fi
-        round=$((round + 1))
-        # A report that ends two short rounds in a row stops the rest of every round too: the
-        # defect blocks this group, thus the run stops and reports it.
-        summary_line=$(rg '^SUMMARY: ' "$log" | tail -n 1 || true)
-        if [[ -n $summary_line && $summary_line == "$last" && $(($(date +%s) - r0)) -lt 20 ]]; then
-            echo "fuzz-ops: the same report stops each round, the run of $g stops: $summary_line" | tee -a "$log"
-            break
+        summary_line=$(rg '^SUMMARY: ' "$hook_log" | tail -n 1 || true)
+        if [[ -n $summary_line && $summary_line == "$last" && $secs -lt 20 ]]; then
+            echo "fuzz-ops: the same report stops each start, the run of $g stops: $summary_line" | tee -a "$hook_log"
+            return 1
         fi
         last=$summary_line
-    done
+        return 0
+    }
+    FUZZ_ROUND_HOOK=ops_round_hook fuzz_rounds "$budget" 100 "$log" "$w/artifacts" ops_fuzz_start
+    local round=$FUZZ_STARTS
     # executions: the sum of the K rows; findings: the crash files of this run and the numeric
     # findings above the loose bound for inputs without special values
     local execs=0 x numeric
@@ -564,14 +556,13 @@ phone_build() {
         p=${b%%-*}
         c=${b#*-}
         check_profile "$p"
-        [[ " $PHONE_CONFIGS_ALL " == *" $c "* ]] || die "the phone configuration '$c' is not one of: $PHONE_CONFIGS_ALL"
+        fuzz_check_config "$c" phone
         local rt="" prebuilt=""
         # the runtime library of the sanitizer; the ubsan build links its runtime statically
         # (-static-libsan, refer to the vptr text in CMakeLists.txt). The asan builds use the runtime
         # of compiler-rt 22.1.8 in the stage directory asan-rt, not the runtime of the NDK.
-        case $c in
-            hwasan) rt=libclang_rt.hwasan-aarch64-android.so ;;
-        esac
+        rt=$(fuzz_phone_runtime "$c")
+        [[ $rt == "$FUZZ_ASAN_RT_NAME" ]] && rt=""
         if [[ $b == release-none ]]; then
             # the release none run uses the shipped libraries themselves
             check_shipped
@@ -659,12 +650,12 @@ phone_adsp() {
 phone_run_cmd() {
     local build=$1 tag=$2 backends=$3 suffix=$4 fusion=$5 adsp=$6 count=$7 halt=$8 trace=${9:-}
     local d=$PHONE_DIR
-    echo "adb -s $PHONE shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
+    fuzz_phone_thermal_cmd
     local penv=""
     [[ -n ${FUZZ_OPS_CMD_PACK:-} && ${FUZZ_OPS_CMD_PACK} != cases.pack ]] && penv="env FUZZ_OPS_PACK=$FUZZ_OPS_CMD_PACK "
     echo "adb -s $PHONE shell 'timeout -s KILL 100 ${penv}sh $d/phone_run.sh $build $tag $backends $suffix $fusion $adsp $PHONE_SECONDS $count $halt $trace'"
-    echo "adb -s $PHONE shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
-    echo "adb -s $PHONE shell 'pgrep -a ops_replay; tail -n 4 $d/out/log-$build-$tag.txt'"
+    fuzz_phone_thermal_cmd
+    echo "adb -s $PHONE shell 'pgrep -a -f \"[o]ps_replay\"; tail -n 4 $d/out/log-$build-$tag.txt'"
 }
 
 phone_commands() {
@@ -729,10 +720,10 @@ phone_commands() {
             tag="diag-$variant"
             for n in $(seq 1 "$parts"); do
                 echo "# $variant, part $n"
-                echo "adb -s $PHONE shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
+                fuzz_phone_thermal_cmd
                 echo "adb -s $PHONE shell 'timeout -s KILL 100 env FUZZ_OPS_PACK=diag.pack FUZZ_OPS_EXTRA=\"$extra\" FUZZ_OPS_ENV=\"$xenv\" sh $d/phone_run.sh $DIAG_BUILD $tag HTP0 -$variant $fusion $adsp $PHONE_SECONDS all 1'"
-                echo "adb -s $PHONE shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
-                echo "adb -s $PHONE shell 'pgrep -a ops_replay; tail -n 2 $d/out/log-$DIAG_BUILD-$tag.txt'"
+                fuzz_phone_thermal_cmd
+                echo "adb -s $PHONE shell 'pgrep -a -f \"[o]ps_replay\"; tail -n 2 $d/out/log-$DIAG_BUILD-$tag.txt'"
             done
         done
         echo
@@ -1026,7 +1017,7 @@ phone_check_commands() {
         done
     done
     echo "$status"
-    echo "adb -s $PHONE shell 'pgrep -a llama; pgrep -a ops_replay'"
+    echo "adb -s $PHONE shell 'pgrep -a -f \"[l]lama-bench|[o]ps_replay\"'"
     echo "# 3. Pull, then: build/fuzz/ops/oracle/ops_oracle same PULLED/res-check-$TAG-before-libcheck.bin PULLED/res-check-$TAG-after-libcheck.bin"
     echo "mkdir -p $stage/pulled-check-$TAG"
     echo "adb -s $PHONE pull $d/out $stage/pulled-check-$TAG/"
@@ -1041,6 +1032,7 @@ build_asan_runtime() {
     fi
     "$SHARED_SAN/build-asan-android-runtime.sh" --verify-only > /dev/null \
         || die "the ASan runtime $ASAN_RUNTIME does not pass its checks"
+    fuzz_asan_runtime_path > /dev/null
 }
 
 main() {

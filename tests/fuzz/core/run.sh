@@ -10,8 +10,9 @@
 #
 # The configurations (one sanitizer for each build and each run, never two):
 # none, asan, ubsan, tsan, msan on the host, and none, asan, hwasan, ubsan on the
-# phone. TSan runs on the x86 host only: the TSan runtime of NDK r29 stops on the
-# SM8750 (a CHECK failure in tsan_rtl.cpp). MSan is not available on Android.
+# phone (the lists of tests/sanitizers/fuzz-lib.sh). TSan runs on the x86 host
+# only: the TSan runtime of NDK r29 stops on the SM8750 (a CHECK failure in
+# tsan_rtl.cpp). MSan is not available on Android.
 # The profiles: debug and release (the flags of the shipped build). Without
 # --profile, a mode runs the two profiles, debug first. The build directory is
 # build/fuzz/core-<profile>-<config> (build/fuzz/core-android-<profile>-<config>
@@ -68,7 +69,7 @@
 #                       build/fuzz/core-android-<profile>-<config>-<tag> for the
 #                       phone. The phone directory of phone-commands gets it too.
 #                       It is necessary with FUZZ_LLAMA_DIR.
-#   ADB_SERIAL          The phone of phone-commands (default 192.168.14.130:5555).
+#   FUZZ_PHONE_SERIAL   The phone of phone-commands (default 192.168.14.130:5555).
 #
 # Each fuzz run uses nice 10, -rss_limit_mb=4096 and -timeout=30 (a test run
 # -timeout=60). fuzz_npu_decode gets -timeout=120 in a sanitizer build, because
@@ -84,16 +85,19 @@
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO=$(cd "$HERE/../../.." && pwd)
-SHARED="$REPO/tests/sanitizers"
+# shellcheck source=../../sanitizers/fuzz-lib.sh
+source "$HERE/../../sanitizers/fuzz-lib.sh"
+
+AREA=core
+REPO=$FUZZ_REPO
+SHARED=$FUZZ_SHARED_DIR
 DATA="$REPO/build/fuzz/core/data"
-BUDGET=${FUZZ_BUDGET:-600}
-JOBS=${FUZZ_JOBS:-4}
-BUILD_JOBS=${FUZZ_BUILD_JOBS:-8}
+BUDGET=$FUZZ_BUDGET
+JOBS=$FUZZ_JOBS
+BUILD_JOBS=$FUZZ_BUILD_JOBS
 KNOWN=${FUZZ_KNOWN:-1}
 LLAMA_DIR=${FUZZ_LLAMA_DIR:-}
 TREE_TAG=${FUZZ_TREE_TAG:-}
-ADB_SERIAL=${ADB_SERIAL:-192.168.14.130:5555}
 PHONE_BASE=/data/local/tmp/qwen/fuzz/core
 SHIPPED_MARCH="-march=armv8.7a+fp16+dotprod+i8mm"
 
@@ -110,26 +114,11 @@ declare -A SWITCH=(
 declare -A EXPECT=(
 )
 
-# Print the header comment of this file (from line 2 to the first empty line) as the usage text, then
-# stop with the status $1 (2 when it is not given: a wrong command line).
+# Print the header comment of this file as the usage text, then stop with the status $1 (2 when it
+# is not given: a wrong command line).
 usage() {
-    local line first=1 status=${1:-2}
-    while IFS= read -r line; do
-        if [[ $first == 1 ]]; then
-            first=0
-            continue
-        fi
-        [[ -z $line ]] && break
-        line=${line#\#}
-        echo "${line# }"
-    done < "${BASH_SOURCE[0]}"
-    exit "$status"
-}
-
-# Write a message to stderr and stop with the code 1.
-die() {
-    echo "run.sh: $*" >&2
-    exit 1
+    fuzz_usage_text "${BASH_SOURCE[0]}"
+    exit "${1:-2}"
 }
 
 # The switches of all known findings, as NAME=1 words. $1, if given, is a switch to leave out.
@@ -138,20 +127,6 @@ known_env() {
     for v in $(printf '%s\n' "${SWITCH[@]}" | sort -u); do
         [[ $v == "${1:-}" ]] || printf '%s=1 ' "$v"
     done
-}
-
-# Check the name of a configuration. $1 is the name, $2 is "host" or "phone".
-check_san() {
-    case "$2:$1" in
-        host:none|host:asan|host:ubsan|host:tsan|host:msan) ;;
-        phone:none|phone:asan|phone:hwasan|phone:ubsan|phone:tsan) ;;
-        *) die "the configuration '$1' is not known for the $2. Host: none asan ubsan tsan msan. Phone: none asan hwasan ubsan tsan." ;;
-    esac
-}
-
-# Check the name of a profile.
-check_profile() {
-    [[ $1 == debug || $1 == release ]] || die "the profile '$1' is not known. Use debug or release."
 }
 
 # The -max_len of each target: the largest seed and some room.
@@ -187,12 +162,14 @@ signature() {
 
 # The build directory of the profile $1 and the configuration $2 (with the suffix of a private tree).
 tree_dir() {
-    echo "$REPO/build/fuzz/core-$1-$2${TREE_TAG:+-$TREE_TAG}"
+    fuzz_build_dir "$AREA" "$1" "$2" "$TREE_TAG"
 }
 
 # The phone build directory of the profile $1 and the configuration $2, relative to the repository.
 phone_rel() {
-    echo "build/fuzz/core-android-$1-$2${TREE_TAG:+-$TREE_TAG}"
+    local dir
+    dir=$(fuzz_android_build_dir "$AREA" "$1" "$2" "$TREE_TAG")
+    echo "${dir#"$REPO"/}"
 }
 
 # Configure and build the host tree of the profile $1 and the configuration $2 with the targets $3.
@@ -201,30 +178,17 @@ build_tree() {
     local dir
     dir=$(tree_dir "$profile" "$san")
     [[ -f "$SHARED/profile-$profile.cmake" && -f "$SHARED/$san.cmake" ]] \
-        || die "the shared files $SHARED/profile-$profile.cmake and $SHARED/$san.cmake are necessary"
+        || fuzz_die "the shared files $SHARED/profile-$profile.cmake and $SHARED/$san.cmake are necessary"
     local -a src=()
     [[ -n $LLAMA_DIR ]] && src=(-DFUZZ_LLAMA_DIR="$LLAMA_DIR")
     cmake -G Ninja -S "$HERE" -B "$dir" "${src[@]}" \
         -DFUZZ_TARGETS="${targets// /;}" \
         -DCMAKE_AR="$(command -v llvm-ar)" -DCMAKE_RANLIB="$(command -v llvm-ranlib)" \
         -C "$SHARED/profile-$profile.cmake" -C "$SHARED/$san.cmake" > "$dir.configure.log" 2>&1 \
-        || die "the configure of $dir failed. Read $dir.configure.log."
+        || fuzz_die "the configure of $dir failed. Read $dir.configure.log."
     # shellcheck disable=SC2086
     nice -n 10 cmake --build "$dir" -j"$BUILD_JOBS" --target $targets > "$dir.build.log" 2>&1 \
-        || die "the build of $dir failed. Read $dir.build.log."
-}
-
-# Write one JSON line for a target to results.jsonl. The crash files are the remaining arguments.
-result_line() {
-    local dir=$1 target=$2 san=$3 profile=$4 mode=$5 seconds=$6 execs=$7 findings=$8
-    shift 8
-    local files
-    files=$(printf '%s\n' "$@" | jq -R . | jq -sc 'map(select(length > 0))')
-    jq -nc --arg area core --arg target "$target" --arg sanitizer "$san" --arg profile "$profile" --arg mode "$mode" \
-        --argjson seconds "$seconds" --argjson executions "$execs" --argjson findings "$findings" \
-        --argjson crash_files "$files" \
-        '{area: $area, target: $target, sanitizer: $sanitizer, profile: $profile, mode: $mode, seconds: $seconds,
-          executions: $executions, findings: $findings, crash_files: $crash_files}' >> "$dir/results.jsonl"
+        || fuzz_die "the build of $dir failed. Read $dir.build.log."
 }
 
 # Fuzz one target for the budget. $1 is the profile, $2 the configuration, $3 the target.
@@ -240,43 +204,27 @@ fuzz_one() {
     # run, thus it is not a finding of this run.
     local mark="$out/.fuzz-start"
     touch "$mark"
-    # shellcheck source=../../sanitizers/env.sh
-    source "$SHARED/env.sh"
-    sanitizer_env "$san"
+    fuzz_sanitizer_env "$san"
     local -a known=()
     [[ "$KNOWN" == 1 ]] && read -r -a known <<< "$(known_env)"
-    local start=$SECONDS left starts=0 rc
-    while :; do
-        left=$(( BUDGET - (SECONDS - start) ))
-        (( left > 5 && starts < 200 )) || break
-        starts=$(( starts + 1 ))
-        rc=0
+    # One start of libFuzzer with the seconds of $1 that are left. The outer kill of rule L9 gives
+    # 120 s more than that time: a sanitizer report can hang in the death callback of libFuzzer.
+    core_fuzz_start() {
         env "${known[@]}" GGML_NO_BACKTRACE=1 FUZZ_DATA_DIR="$DATA" FUZZ_ARTIFACT_DIR="$out/artifacts" \
-            timeout -s KILL $(( left + 120 )) nice -n 10 "$dir/$fz" "$out/corpus" "$HERE/seeds/$fz" \
-                -max_total_time="$left" -rss_limit_mb=4096 -timeout="$(unit_timeout fuzz "$fz" "$san")" \
+            timeout -s KILL $(( $1 + 120 )) nice -n 10 "$dir/$fz" "$out/corpus" "$HERE/seeds/$fz" \
+                -max_total_time="$1" -rss_limit_mb=4096 -timeout="$(unit_timeout fuzz "$fz" "$san")" \
                 -max_len="$(max_len "$fz")" -artifact_prefix="$out/artifacts/" -print_final_stats=1 \
-                >> "$log" 2>&1 || rc=$?
-        echo "run.sh: start $starts ended with code $rc after $(( SECONDS - start )) s" >> "$log"
-        [[ $rc == 0 ]] && break
-    done
-    # the executions: the sum of the last progress count of each start
-    local execs=0 prev=0 n
-    while read -r n; do
-        if (( n < prev )); then
-            execs=$(( execs + prev ))
-        fi
-        prev=$n
-    # only the progress lines of libFuzzer ("#N<tab>NEW ..."): a target can write a line that starts
-    # with # and digits (a rendered template), and bash arithmetic overflows on such a number
-    done < <(grep -oE '^#[0-9]{1,15}[[:space:]]+(INITED|NEW|REDUCE|pulse|DONE|RELOAD)' "$log" | grep -oE '^#[0-9]+' | tr -d '#')
-    execs=$(( execs + prev ))
-    local cov
-    cov=$(grep -oE 'cov: [0-9]+ ft: [0-9]+' "$log" | tail -n 1 || true)
-    # a slow unit (an input that took more than 10 s, not a crash) is not a finding
+                >> "$log" 2>&1
+    }
+    local start=$SECONDS execs cov
+    fuzz_rounds "$BUDGET" 200 "$log" "$out/artifacts" core_fuzz_start
+    execs=$(fuzz_libfuzzer_executions "$log")
+    cov=$(rg -o -e 'cov: [0-9]+ ft: [0-9]+' "$log" | tail -n 1 || true)
     local -a arts=()
-    mapfile -t arts < <(find "$out/artifacts" -type f -newer "$mark" ! -name 'slow-unit-*' | sort)
-    result_line "$dir" "$fz" "$san" "$profile" fuzz "$(( SECONDS - start ))" "$execs" "${#arts[@]}" "${arts[@]}"
-    echo "core-$profile-$san${TREE_TAG:+-$TREE_TAG} $fz: $(( SECONDS - start )) s, $starts starts, $execs executions, $cov, corpus $(find "$out/corpus" -type f | wc -l), crash files ${#arts[@]}"
+    mapfile -t arts < <(fuzz_new_artifacts "$out/artifacts" "$mark")
+    fuzz_result_line "$dir/results.jsonl" "$AREA" "$fz" "$profile" "$san" fuzz "$(( SECONDS - start ))" \
+        "$execs" "${#arts[@]}" "${arts[@]}"
+    echo "$AREA-$profile-$san${TREE_TAG:+-$TREE_TAG} $fz: $(( SECONDS - start )) s, $FUZZ_STARTS starts, $execs executions, $cov, corpus $(find "$out/corpus" -type f | wc -l), crash files ${#arts[@]}"
 }
 
 # Test one target. The seeds run with all the switches on: a failure is a finding with no switch.
@@ -293,9 +241,7 @@ test_one() {
     mkdir -p "$out"
     local log="$out/test-log.txt"
     : > "$log"
-    # shellcheck source=../../sanitizers/env.sh
-    source "$SHARED/env.sh"
-    sanitizer_env "$san"
+    fuzz_sanitizer_env "$san"
     local start=$SECONDS findings=0 execs=0 rc f name finding sw expect sig tmp art tmo
     local -a failed=() all=() others=()
     local notes=""
@@ -338,7 +284,7 @@ test_one() {
             fi
             continue
         fi
-        [[ -n $expect ]] || die "the finding $finding of $name has a switch but no expected report in run.sh"
+        [[ -n $expect ]] || fuzz_die "the finding $finding of $name has a switch but no expected report in run.sh"
         # A: all the switches on, less the switch of this finding. The input must show its finding,
         # or pass when this configuration cannot show it.
         read -r -a others <<< "$(known_env "$sw")"
@@ -381,7 +327,8 @@ test_one() {
         fi
     done
     rm -rf "$tmp" "$art"
-    result_line "$dir" "$fz" "$san" "$profile" test "$(( SECONDS - start ))" "$execs" "$findings" "${failed[@]}"
+    fuzz_result_line "$dir/results.jsonl" "$AREA" "$fz" "$profile" "$san" test "$(( SECONDS - start ))" \
+        "$execs" "$findings" "${failed[@]}"
     echo "core-$profile-$san${TREE_TAG:+-$TREE_TAG} $fz: $execs runs, $findings findings |$notes"
 }
 
@@ -395,7 +342,7 @@ run_mode() {
         targets=$ALL_TARGETS
         [[ $san == tsan ]] && targets=$TSAN_TARGETS
     fi
-    [[ -f "$DATA/tiny-qwen35-f32.gguf" && -f "$DATA/qwen35-vocab.gguf" ]] || die "no data in $DATA. Run 'tests/fuzz/core/run.sh data' first."
+    [[ -f "$DATA/tiny-qwen35-f32.gguf" && -f "$DATA/qwen35-vocab.gguf" ]] || fuzz_die "no data in $DATA. Run 'tests/fuzz/core/run.sh data' first."
     build_tree "$profile" "$san" "$targets"
     local dir
     dir=$(tree_dir "$profile" "$san")
@@ -403,9 +350,7 @@ run_mode() {
     : > "$summary"
     local fz
     for fz in $targets; do
-        while (( $(jobs -rp | wc -l) >= JOBS )); do
-            sleep 5
-        done
+        fuzz_wait_for_slot "$JOBS"
         if [[ $mode == fuzz ]]; then
             fuzz_one "$profile" "$san" "$fz" >> "$summary" &
         else
@@ -432,25 +377,13 @@ make_data() {
     ls -l "$DATA"
 }
 
-# The runtime library that a phone build needs next to its executables. The ubsan and none builds
-# link the UBSan runtime statically (-static-libsan, refer to the vptr text in CMakeLists.txt), thus
-# they need none.
-phone_runtime() {
-    case $1 in
-        asan)       echo libclang_rt.asan-aarch64-android.so ;;
-        hwasan)     echo libclang_rt.hwasan-aarch64-android.so ;;
-        tsan)       echo libclang_rt.tsan-aarch64-android.so ;;
-        *)          echo "" ;;
-    esac
-}
-
 # Build the device targets for arm64 Android with the profile $1 and the configuration $2 in the
 # Snapdragon container. The release profile has the shipped flags: the -march of the preset here,
 # the rest from CMakeLists.txt.
 phone_build() {
     local profile=$1 san=$2
-    check_profile "$profile"
-    check_san "$san" phone
+    fuzz_check_profile "$profile"
+    fuzz_check_config "$san" phone
     # shellcheck source=../../../scripts/lib.sh
     source "$REPO/scripts/lib.sh"
     local src_rel="build/fuzz/core-android-src${TREE_TAG:+-$TREE_TAG}"
@@ -465,10 +398,10 @@ phone_build() {
     if [[ -n $LLAMA_DIR ]]; then
         rsync -rlc --delete --exclude .git --exclude '/build*/' "$LLAMA_DIR/" "$copy/llama.cpp/"
     else
-        "$REPO/tests/sanitizers/llama-copy.sh" "$copy/llama.cpp" > /dev/null
+        fuzz_llama_copy "$copy/llama.cpp"
     fi
     local runtime
-    runtime=$(phone_runtime "$san")
+    runtime=$(fuzz_phone_runtime "$san")
     container_run "$SNAPDRAGON_IMAGE" bash -euo pipefail -c "
         cmake -S tests/fuzz/core -B $rel/build -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE=\$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake \
@@ -489,16 +422,13 @@ phone_build() {
         if [[ -n '$runtime' ]]; then
             install -m 0644 \$(ls \$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/*/lib/linux/$runtime) $rel/out/
         fi
-    " || die "the phone build $rel failed. Read $REPO/$rel/configure.log and $REPO/$rel/build.log."
+    " || fuzz_die "the phone build $rel failed. Read $REPO/$rel/configure.log and $REPO/$rel/build.log."
     if [[ $san == asan ]]; then
         # The ASan runtime of NDK r29 traps in each new thread on the phone: bionic resets the PAC key
         # through prctl, and the prctl interceptor then fails its own AUTIASP. The runtime of
-        # compiler-rt 22.1.8 (tests/sanitizers/build-asan-android-runtime.sh) has the upstream
-        # correction of the interceptor, thus it replaces the runtime of the NDK.
-        local rt22="$REPO/build/fuzz/ops/phone/asan-rt22/libclang_rt.asan-aarch64-android.so"
-        [[ -f $rt22 ]] || die "the ASan runtime $rt22 of compiler-rt 22.1.8 is missing (tests/sanitizers/build-asan-android-runtime.sh builds it)"
-        [[ $(sha256sum "$rt22" | cut -c1-8) == 546f2a86 ]] || die "the ASan runtime $rt22 does not have the hash 546f2a86"
-        install -m 0644 "$rt22" "$REPO/$rel/out/"
+        # compiler-rt 22.1.8 has the upstream correction of the interceptor, thus it replaces the
+        # runtime of the NDK.
+        install -m 0644 "$(fuzz_asan_runtime_path)" "$REPO/$rel/out/"
     fi
     mkdir -p "$REPO/$rel/out/seeds"
     local fz
@@ -523,29 +453,25 @@ phone_build() {
 # P6 (return codes, finite logits, rollback answers, log errors) still stop the run.
 phone_commands() {
     local profile=$1 san=$2
-    check_profile "$profile"
-    check_san "$san" phone
-    local a="adb -s $ADB_SERIAL"
+    fuzz_check_profile "$profile"
+    fuzz_check_config "$san" phone
+    local a="adb -s $FUZZ_PHONE_SERIAL"
     local rel
     rel=$(phone_rel "$profile" "$san")
     local out="$REPO/$rel/out"
     local logs="$REPO/$rel/phone-logs"
     local pd="$PHONE_BASE/$profile-$san${TREE_TAG:+-$TREE_TAG}"
-    local runtime
-    runtime=$(phone_runtime "$san")
-    # the options of the one sanitizer of this build, as tests/sanitizers/env.sh gives them on the host
-    local sopt="FUZZ_NO_SANITIZER=1"
-    case $san in
-        asan)   sopt="ASAN_OPTIONS=halt_on_error=1:allocator_may_return_null=1:detect_leaks=0:suppressions=$pd/asan.supp" ;;
-        hwasan) sopt="HWASAN_OPTIONS=halt_on_error=1:allocator_may_return_null=1" ;;
-        ubsan)  sopt="UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:report_error_type=1:suppressions=$pd/ubsan.supp" ;;
-        tsan)   sopt="TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1:suppressions=$pd/tsan.supp" ;;
-    esac
+    local runtime sopt
+    runtime=$(fuzz_phone_runtime "$san")
+    # the options of the one sanitizer of this build, as tests/sanitizers/fuzz-lib.sh gives them
+    sopt=$(fuzz_phone_options "$san" "$pd/$san.supp")
+    [[ -n $sopt ]] || sopt="FUZZ_NO_SANITIZER=1"
     local env="cd $pd && LD_LIBRARY_PATH=$pd ADSP_LIBRARY_PATH=$pd GGML_NO_BACKTRACE=1 FUZZ_DATA_DIR=$PHONE_BASE/data FUZZ_ARTIFACT_DIR=$pd/art $sopt"
     # each adb command has a hard limit: a short command 30 s, a push, a pull or a run 100 s
     local q="timeout -s KILL 30 $a"
-    local thermal="$q shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
-    local check="$q shell 'pgrep -a fuzz_; dumpsys thermalservice | grep \"Thermal Status\"'"
+    local thermal check
+    thermal=$(fuzz_phone_thermal_cmd)
+    check=$(fuzz_phone_check_cmd '[f]uzz_')
     local push_files="$out/fuzz_npu_decode $out/fuzz_recurrent $out/libggml-htp-v79.so $out/$san.supp"
     [[ -n $runtime ]] && push_files+=" $out/$runtime"
     # Step 3: the 2B model on HTP0 against the CPU. Release none runs 8 inputs. A release build with a
@@ -613,16 +539,16 @@ case $mode in
     test|fuzz|phone-build|phone-commands)
         san=${1:-}
         shift || true
-        [[ -z $LLAMA_DIR || -n $TREE_TAG ]] || die "FUZZ_LLAMA_DIR needs FUZZ_TREE_TAG (the suffix of the build directory)"
-        [[ -z $LLAMA_DIR || -f $LLAMA_DIR/include/llama.h ]] || die "FUZZ_LLAMA_DIR=$LLAMA_DIR holds no include/llama.h"
+        [[ -z $LLAMA_DIR || -n $TREE_TAG ]] || fuzz_die "FUZZ_LLAMA_DIR needs FUZZ_TREE_TAG (the suffix of the build directory)"
+        [[ -z $LLAMA_DIR || -f $LLAMA_DIR/include/llama.h ]] || fuzz_die "FUZZ_LLAMA_DIR=$LLAMA_DIR holds no include/llama.h"
         profiles="debug release"
         targets=()
         while (( $# > 0 )); do
             case $1 in
-                --profile)        profiles=${2:?--profile needs debug or release}; check_profile "$profiles"; shift 2 ;;
+                --profile)        profiles=${2:?--profile needs debug or release}; fuzz_check_profile "$profiles"; shift 2 ;;
                 --budget-seconds) BUDGET=${2:?--budget-seconds needs a number}; shift 2 ;;
                 --jobs)           JOBS=${2:?--jobs needs a number}; shift 2 ;;
-                -*)               die "the option $1 is not known" ;;
+                -*)               fuzz_die "the option $1 is not known" ;;
                 *)                targets+=("$1"); shift ;;
             esac
         done
@@ -630,7 +556,7 @@ case $mode in
         for profile in $profiles; do
             case $mode in
                 test|fuzz)
-                    check_san "$san" host
+                    fuzz_check_config "$san" host
                     run_mode "$mode" "$profile" "$san" "${targets[@]}" || status=1
                     ;;
                 phone-build)    phone_build "$profile" "$san" ;;

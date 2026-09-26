@@ -70,18 +70,22 @@
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO=$(cd "$HERE/../../.." && pwd)
+# shellcheck source=../../sanitizers/fuzz-lib.sh
+source "$HERE/../../sanitizers/fuzz-lib.sh"
+
+AREA=app
+REPO=$FUZZ_REPO
 OUT="$REPO/build/fuzz/app"
 SNAP="$OUT/llama-snap"
 MODELS="$OUT/models"
-BUILD_JOBS=${FUZZ_BUILD_JOBS:-8}
+BUILD_JOBS=$FUZZ_BUILD_JOBS
 PROFILE=debug
 # The libFuzzer processes of one target in the fuzz mode (--workers).
 WORKERS=1
 
 # The build directory of the sanitizer $1 in the current profile.
 bdir() {
-    echo "$REPO/build/fuzz/app-$PROFILE-$1"
+    fuzz_build_dir "$AREA" "$PROFILE" "$1"
 }
 TARGETS="fuzz_jni_api fuzz_jni_threads fuzz_jni_threads_free fuzz_caches fuzz_spec_policy"
 SCENARIOS="image-shape image-twice jni-pending spec-disable spec-parity spec-image snapshot-damage image-damage sampler-nan stop-free priority render-live live-turns spec-limit image-stage"
@@ -92,34 +96,20 @@ export FUZZ_APP_WORK="$OUT/work"
 # Print the usage text (the comment block at the top of this file) and stop with the code $1
 # (the default is 2). --help prints it to stdout and stops with 0.
 usage() {
-    local line first=1 code=${1:-2}
-    while IFS= read -r line; do
-        if ((first)); then
-            first=0
-            continue
-        fi
-        [[ -z "$line" ]] && break
-        line=${line#\#}
-        if ((code == 0)); then
-            echo "${line# }"
-        else
-            echo "${line# }" >&2
-        fi
-    done < "${BASH_SOURCE[0]}"
+    local code=${1:-2}
+    if ((code == 0)); then
+        fuzz_usage_text "${BASH_SOURCE[0]}"
+    else
+        fuzz_usage_text "${BASH_SOURCE[0]}" >&2
+    fi
     exit "$code"
-}
-
-# Write a message to stderr and stop with the code 1.
-die() {
-    echo "run.sh: $*" >&2
-    exit 1
 }
 
 # Make or refresh the private llama.cpp tree $SNAP with the shared helper: the commit
 # that HEAD pins with the patch series of HEAD. A file with new contents gets the
 # time of the copy, thus ninja compiles only its objects again. About 10 s.
 snapshot() {
-    "$REPO/tests/sanitizers/llama-copy.sh" "$SNAP" || die "the copy of the patched llama.cpp tree into $SNAP failed"
+    fuzz_llama_copy "$SNAP"
 }
 
 # Write the tiny models, one time.
@@ -133,30 +123,7 @@ models() {
 }
 
 # The one suppression file of UBSan for all fuzz areas. This area has no file of its own.
-UBSAN_SUPP="$REPO/tests/sanitizers/ubsan.supp"
-
-# Set the runtime options of the sanitizer $1: the shared ones of all fuzz areas
-# (tests/sanitizers/env.sh) when they exist, else the same values here.
-runtime_options() {
-    case $1 in
-        none | asan | ubsan | tsan | msan) ;;
-        *) die "unknown sanitizer '$1': none, asan, ubsan, tsan or msan" ;;
-    esac
-    if [[ -f "$REPO/tests/sanitizers/env.sh" ]]; then
-        # shellcheck source=/dev/null
-        source "$REPO/tests/sanitizers/env.sh"
-        sanitizer_env "$1"
-        return
-    fi
-    unset ASAN_OPTIONS LSAN_OPTIONS UBSAN_OPTIONS TSAN_OPTIONS MSAN_OPTIONS
-    local common="halt_on_error=1:allocator_may_return_null=1"
-    case $1 in
-        asan) export ASAN_OPTIONS="$common:detect_leaks=1:detect_stack_use_after_return=1" ;;
-        ubsan) export UBSAN_OPTIONS="$common:print_stacktrace=1${UBSAN_SUPP:+:suppressions=$UBSAN_SUPP}" ;;
-        tsan) export TSAN_OPTIONS="$common:second_deadlock_stack=1" ;;
-        msan) export MSAN_OPTIONS="$common" ;;
-    esac
-}
+UBSAN_SUPP="$FUZZ_SHARED_DIR/ubsan.supp"
 
 # Print the directory of the jni.h of the host build, or nothing when CMakeLists.txt finds
 # one itself (an NDK on the host). A host without an NDK takes the jni.h of the NDK of the
@@ -177,7 +144,7 @@ host_jni_include() {
         container_run "$SNAPDRAGON_IMAGE" bash -c \
             'cat "$ANDROID_NDK_ROOT"/toolchains/llvm/prebuilt/*/sysroot/usr/include/jni.h' \
             > "$OUT/jni-include/jni.h.tmp" && [[ -s "$OUT/jni-include/jni.h.tmp" ]] \
-            || die "no jni.h: no NDK on the host, and the Snapdragon container did not give one"
+            || fuzz_die "no jni.h: no NDK on the host, and the Snapdragon container did not give one"
         mv "$OUT/jni-include/jni.h.tmp" "$OUT/jni-include/jni.h"
     fi
     echo "$OUT/jni-include"
@@ -209,13 +176,13 @@ build_host() {
     cmake -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DFUZZ_SANITIZER="$san" -DFUZZ_PROFILE="$PROFILE" \
         "${init[@]}" -S "$HERE" -B "$dir" -G Ninja \
         -DLLAMA_CPP_DIR="$SNAP" -DFUZZ_APP_MODEL_DIR="$MODELS" -DFUZZ_JNI_INCLUDE="$jni" > "$dir/logs/configure.log" 2>&1 \
-        || die "the configuration of $dir failed, see $dir/logs/configure.log"
+        || fuzz_die "the configuration of $dir failed, see $dir/logs/configure.log"
     if ((${#init[@]} > 0)); then
         echo "$sums" > "$dir/.initial-cache"
     fi
     nice -n 10 cmake --build "$dir" -j"$BUILD_JOBS" \
         --target fuzz_jni_api fuzz_jni_threads fuzz_caches fuzz_spec_policy app_fuzz_driver > "$dir/logs/build.log" 2>&1 \
-        || die "the build of $dir failed, see $dir/logs/build.log"
+        || fuzz_die "the build of $dir failed, see $dir/logs/build.log"
 }
 
 # The binary of a target: fuzz_jni_threads_free is fuzz_jni_threads with frees from the second thread.
@@ -269,16 +236,12 @@ max_len_of() {
 }
 
 # Append one result line: target, sanitizer, mode, seconds, executions, then the crash files.
+# The number of crash files is the number of findings.
 result() {
     local target=$1 san=$2 mode=$3 seconds=$4 executions=$5
     shift 5
-    local files
-    files=$(printf '%s\n' "$@" | jq -R . | jq -sc 'map(select(length > 0))')
-    jq -nc --arg profile "$PROFILE" --arg target "$target" --arg san "$san" --arg mode "$mode" \
-        --argjson seconds "$seconds" --argjson executions "$executions" --argjson files "$files" \
-        '{area: "app", profile: $profile, target: $target, sanitizer: $san, mode: $mode, seconds: $seconds,
-          executions: $executions, findings: ($files | length), crash_files: $files}' \
-        >> "$(bdir "$san")/results.jsonl"
+    fuzz_result_line "$(bdir "$san")/results.jsonl" "$AREA" "$target" "$PROFILE" "$san" "$mode" \
+        "$seconds" "$executions" "$#" "$@"
 }
 
 # Mutate one target for the budget with WORKERS processes on one corpus: $1 the target,
@@ -404,7 +367,7 @@ test_scenarios() {
 
 mode_test() {
     local san=$1 target status=0
-    runtime_options "$san"
+    fuzz_sanitizer_env "$san"
     build_host "$san"
     for target in $TARGETS; do
         test_one "$target" "$san" || status=1
@@ -415,7 +378,7 @@ mode_test() {
 
 mode_fuzz() {
     local san=$1 budget=$2 jobs=$3 target results lines=0 found
-    runtime_options "$san"
+    fuzz_sanitizer_env "$san"
     build_host "$san"
     results="$(bdir "$san")/results.jsonl"
     [[ -f "$results" ]] && lines=$(wc -l < "$results")
@@ -469,25 +432,13 @@ exit ${status:-0}
 # the PAC key through prctl, and the prctl interceptor then fails its own AUTIASP.
 # Each Android ASan run uses the runtime of compiler-rt 22.1.8 that
 # tests/sanitizers/build-asan-android-runtime.sh builds, first in LD_LIBRARY_PATH.
-ASAN_RT22="$REPO/build/fuzz/asan-android-runtime/libclang_rt.asan-aarch64-android.so"
+ASAN_RT22="$FUZZ_ASAN_RT_DIR/$FUZZ_ASAN_RT_NAME"
 
-# Stop when that ASan runtime is missing, or when its sha256 is not the one of its build.
-check_asan_rt22() {
-    [[ -f "$ASAN_RT22" && -f "$ASAN_RT22.sha256" ]] \
-        || die "no $ASAN_RT22: run tests/sanitizers/build-asan-android-runtime.sh"
-    [[ $(sha256sum "$ASAN_RT22" | cut -d' ' -f1) == "$(cut -d' ' -f1 "$ASAN_RT22.sha256")" ]] \
-        || die "$ASAN_RT22 does not have the sha256 of $ASAN_RT22.sha256"
-}
-
-# The runtime library of the sanitizer $1 on the phone, or nothing.
+# The runtime library of the sanitizer $1 on the phone, or nothing. The ubsan and none builds link
+# the UBSan runtime statically (-static-libsan, refer to the vptr text in CMakeLists.txt).
 android_runtime() {
-    case $1 in
-        asan) echo libclang_rt.asan-aarch64-android.so ;;
-        hwasan) echo libclang_rt.hwasan-aarch64-android.so ;;
-        # The ubsan build links its runtime statically (-static-libsan, refer to the vptr text in CMakeLists.txt).
-        ubsan | none) ;;
-        *) die "unknown phone sanitizer '$1': none, asan, hwasan or ubsan (MSan does not exist on Android)" ;;
-    esac
+    fuzz_check_config "$1" phone
+    fuzz_phone_runtime "$1"
 }
 
 phone_build() {
@@ -498,14 +449,14 @@ phone_build() {
     snapshot
     models
     local dsp="$REPO/build/native/llama/ggml/src/ggml-hexagon/libggml-htp-v79.so"
-    [[ -f "$dsp" ]] || die "no DSP library at $dsp: the main build makes it"
+    [[ -f "$dsp" ]] || fuzz_die "no DSP library at $dsp: the main build makes it"
     local rel_snap=${SNAP#"$REPO"/} runtime name="$PROFILE-$san" prebuilt=""
     local jnilibs="$REPO/android/snapdragon/jniLibs/arm64-v8a"
     runtime=$(android_runtime "$san")
     if [[ $PROFILE == release && $san == none ]]; then
         # The release none run links the shipped libraries: they must be the ones of the last native build.
         diff -q "$REPO/build/hashes-native.txt" <(sha256_table "$jnilibs"/*.so) > /dev/null \
-            || die "$jnilibs does not match build/hashes-native.txt: the shipped libraries are not the last build"
+            || fuzz_die "$jnilibs does not match build/hashes-native.txt: the shipped libraries are not the last build"
         prebuilt=/workspace/android/snapdragon/jniLibs/arm64-v8a
     fi
     mkdir -p "$OUT/logs"
@@ -525,7 +476,7 @@ nice -n 10 cmake --build build/fuzz/app-android-$PROFILE-$SAN -j"$JOBS" \
 if [ -n "$RUNTIME" ] && [ "$SAN" != asan ]; then
     cp -f "$(find "$ANDROID_NDK_ROOT" -name "$RUNTIME" | head -1)" build/fuzz/app-android-$PROFILE-$SAN/
 fi
-' > "$OUT/logs/phone-build-$name.log" 2>&1 || die "the phone build failed, see $OUT/logs/phone-build-$name.log"
+' > "$OUT/logs/phone-build-$name.log" 2>&1 || fuzz_die "the phone build failed, see $OUT/logs/phone-build-$name.log"
     local stage="$OUT/phone-$name" b="$REPO/build/fuzz/app-android-$name"
     rm -rf "$stage"
     mkdir -p "$stage/bin" "$stage/lib" "$stage/models"
@@ -533,9 +484,8 @@ fi
     cp "$dsp" "$stage/lib/"
     if [[ $san == asan ]]; then
         # That runtime goes in its own directory, which is first in LD_LIBRARY_PATH.
-        check_asan_rt22
         mkdir -p "$stage/asan-rt"
-        cp "$ASAN_RT22" "$stage/asan-rt/"
+        cp "$(fuzz_asan_runtime_path)" "$stage/asan-rt/"
     elif [[ -n "$runtime" ]]; then
         cp "$b/$runtime" "$stage/lib/"
     fi
@@ -543,7 +493,7 @@ fi
         cp "$jnilibs"/*.so "$stage/lib/"
     fi
     cp "$MODELS"/tiny-qwen35-*.gguf "$stage/models/"
-    [[ -f "$UBSAN_SUPP" ]] || die "no $UBSAN_SUPP: the shared sanitizer files are missing"
+    [[ -f "$UBSAN_SUPP" ]] || fuzz_die "no $UBSAN_SUPP: the shared sanitizer files are missing"
     cp "$UBSAN_SUPP" "$stage/ubsan.supp"
     echo "run.sh: the phone files are in $stage ($(du -sh "$stage" | cut -f1))"
 }
@@ -557,12 +507,12 @@ phone_apk() {
     source "$REPO/scripts/lib.sh"
     local jnilibs="$REPO/android/snapdragon/jniLibs/arm64-v8a" out="$OUT/phone-apk" lib name
     diff -q "$REPO/build/hashes-native.txt" <(sha256_table "$jnilibs"/*.so) > /dev/null \
-        || die "$jnilibs does not match build/hashes-native.txt: the shipped libraries are not the last build"
+        || fuzz_die "$jnilibs does not match build/hashes-native.txt: the shipped libraries are not the last build"
     # The library links the llama.cpp libraries of build/native/llama: they must be the shipped ones.
     for lib in "$REPO"/build/native/llama/bin/lib*.so; do
         name=${lib##*/}
         if [[ -f "$jnilibs/$name" ]] && ! cmp -s "$lib" "$jnilibs/$name"; then
-            die "build/native/llama/bin/$name is not the shipped $name: build the native libraries first"
+            fuzz_die "build/native/llama/bin/$name is not the shipped $name: build the native libraries first"
         fi
     done
     rm -rf "$out"
@@ -577,7 +527,7 @@ cmake -S android/snapdragon -B build/fuzz/app/phone-apk/jni -G Ninja \
     -DLLAMA_CPP_DIR=/workspace/third_party/llama.cpp -DLLAMA_BUILD_DIR=/workspace/build/native/llama \
     -DCMAKE_C_FLAGS="$flags" -DCMAKE_CXX_FLAGS="$flags"
 nice -n 10 cmake --build build/fuzz/app/phone-apk/jni -j"$JOBS"
-' > "$out/logs/jni.log" 2>&1 || die "the build of libqwenmobile.so failed, see $out/logs/jni.log"
+' > "$out/logs/jni.log" 2>&1 || fuzz_die "the build of libqwenmobile.so failed, see $out/logs/jni.log"
     (
         cd "$REPO"
         while IFS= read -r -d '' file; do
@@ -606,7 +556,7 @@ nice -n 10 cmake --build build/fuzz/app/phone-apk/jni -j"$JOBS"
     -PversionCode="$VERSION_CODE" :app:testDebugUnitTest :app:assembleRelease
 cp app/build/outputs/apk/release/app-release.apk /workspace/build/fuzz/app/phone-apk/
 cp -r app/build/test-results/testDebugUnitTest /workspace/build/fuzz/app/phone-apk/test-results
-' > "$out/logs/apk.log" 2>&1 || die "the APK build or a unit test failed, see $out/logs/apk.log"
+' > "$out/logs/apk.log" 2>&1 || fuzz_die "the APK build or a unit test failed, see $out/logs/apk.log"
     rm -rf "$out/src"
     sha256_table "$out/app-release.apk" "$out/jni/libqwenmobile.so" | tee "$out/hashes.txt"
     echo "run.sh: the APK is $out/app-release.apk; android/scripts/install.sh $out/app-release.apk installs it"
@@ -615,30 +565,26 @@ cp -r app/build/test-results/testDebugUnitTest /workspace/build/fuzz/app/phone-a
 phone_commands() {
     local san=$1
     android_runtime "$san" > /dev/null
-    local s="$OUT/phone-$PROFILE-$san" d="/data/local/tmp/qwen/fuzz/app/$PROFILE-$san" a="adb -s 192.168.14.130:5555"
-    local rt libs="$d/lib" push="$s/bin $s/lib $s/models $s/ubsan.supp"
-    case $san in
-        asan)
-            rt="ASAN_OPTIONS=halt_on_error=1:allocator_may_return_null=1:detect_leaks=0"
-            libs="$d/asan-rt:$d/lib"
-            push="$s/asan-rt $push"
-            ;;
-        hwasan) rt="HWASAN_OPTIONS=halt_on_error=1:allocator_may_return_null=1" ;;
-        ubsan) rt="UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:suppressions=$d/ubsan.supp" ;;
-        none) rt="" ;;
-    esac
+    local s="$OUT/phone-$PROFILE-$san" d="/data/local/tmp/qwen/fuzz/app/$PROFILE-$san" a="adb -s $FUZZ_PHONE_SERIAL"
+    local rt libs="$d/lib" push="$s/bin $s/lib $s/models $s/ubsan.supp" supp=""
+    [[ $san == ubsan ]] && supp="$d/ubsan.supp"
+    rt=$(fuzz_phone_options "$san" "$supp")
+    if [[ $san == asan ]]; then
+        libs="$d/asan-rt:$d/lib"
+        push="$s/asan-rt $push"
+    fi
     local envs="LD_LIBRARY_PATH=$libs ADSP_LIBRARY_PATH=$d/lib FUZZ_APP_LIBDIR=$d/lib FUZZ_APP_MODEL_DIR=$d/models FUZZ_APP_WORK=$d/work FUZZ_ARTIFACT_DIR=$d/logs $rt"
     local real="FUZZ_APP_REAL_MODEL=/data/local/tmp/qwen/models/Qwen3.5-2B-Q8_0.gguf FUZZ_APP_REAL_ONLY=1 FUZZ_APP_MAX_OPS=8 FUZZ_APP_MAX_GEN=16 FUZZ_APP_ORACLE=0"
-    local thermal="$a shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
+    local thermal check
+    thermal=$(fuzz_phone_thermal_cmd)
+    check=$(fuzz_phone_check_cmd '[f]uzz_|[a]pp_fuzz_driver')
     # One run: the thermal status before and after it, and the processes that stay.
-    # The phone shell must get the pattern in quotes, else it reads the | as a pipe. The
-    # brackets prevent a match of the pattern with the command line of that shell.
     one() {
         echo "# $1"
         echo "$thermal"
         echo "$a shell \"$2; echo rc=\\\$?\""
         echo "$thermal"
-        echo "$a shell \"pgrep -a -f '[f]uzz_|[a]pp_fuzz_driver'\""
+        echo "$check"
     }
     echo "# The phone build of $PROFILE-$san: $s (run \"tests/fuzz/app/run.sh phone-build $san --profile $PROFILE\" first)."
     # The logs and the work files of an earlier batch go first, thus a crash file of that batch is not in the pull.
@@ -692,13 +638,13 @@ parse_options() {
         case $1 in
             --profile)
                 PROFILES=${2:?"--profile needs a value: debug or release"}
-                [[ $PROFILES == debug || $PROFILES == release ]] || die "--profile must be debug or release, not '$PROFILES'"
+                [[ $PROFILES == debug || $PROFILES == release ]] || fuzz_die "--profile must be debug or release, not '$PROFILES'"
                 shift 2
                 ;;
             --budget-seconds) BUDGET=${2:?"--budget-seconds needs a value"}; shift 2 ;;
             --jobs) JOBS=${2:?"--jobs needs a value"}; shift 2 ;;
             --workers) WORKERS=${2:?"--workers needs a value"}; shift 2 ;;
-            *) die "unknown option '$1'" ;;
+            *) fuzz_die_code 2 "unknown option '$1'" ;;
         esac
     done
 }
