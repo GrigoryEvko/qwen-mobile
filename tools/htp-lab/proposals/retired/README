@@ -1,13 +1,19 @@
 These proposals do not apply to the kernel directory, thus the lab does not pick them up.
-0001-hvx-multirow-dot.patch      landed in the patch series as the multi-row dot kernel.
+Each landed proposal names the patch of patches/series that holds its code, by the directory and the
+name of the patch. A number alone goes stale when the series takes new numbers.
+0001-hvx-multirow-dot.patch      landed as hexagon-mm/0002-hexagon-htp-multirow-decode-step.
 0002-hvx-gdn-conv-tap-planes.patch  is stale against gdn-conv-ops.c. Its tap-plane layout of the conv state is not in the series.
-0010-gdn-state-packed.patch      landed as hexagon-kernels/0002. The tree holds it: a reverse apply succeeds.
-0020-act-packed.patch            landed in a changed form as hexagon-kernels/0003, 0010 and 0003b.
-0040-gdn-conv-step-planes.patch  landed as hexagon-kernels/0005. The tree holds it: a reverse apply succeeds.
-0050-binary-fused.patch          landed in a changed form as hexagon-kernels/0006.
-0060-reduce-packed.patch         landed in a changed form as hexagon-kernels/0007.
-0070-flash-attn-packed.patch     landed as hexagon-kernels/0008. The tree holds it: a reverse apply succeeds.
-0080-move-packed.patch           landed in a changed form as hexagon-kernels/0009.
+0010-gdn-state-packed.patch      landed as hexagon-gdn/0007-hexagon-htp-gdn-chunk-rank1-decay-and-transpose.
+                                 The tree holds it: a reverse apply succeeds.
+0020-act-packed.patch            landed in a changed form as hexagon-kernels/0002-hexagon-htp-activation-int16-tables
+                                 (with the stores of the tail of a row) and hexagon-kernels/0007-hexagon-htp-wire-activation-tables.
+0040-gdn-conv-step-planes.patch  landed as hexagon-gdn/0008-hexagon-htp-gdn-conv-step-four-chains.
+                                 The tree holds it: a reverse apply succeeds.
+0050-binary-fused.patch          landed in a changed form as hexagon-kernels/0004-hexagon-htp-arith-fused-chains.
+0060-reduce-packed.patch         landed in a changed form as hexagon-kernels/0005-hexagon-htp-softmax-and-norm-packed.
+0070-flash-attn-packed.patch     landed as hexagon-fa/0001-hexagon-htp-flash-attn-code-size.
+                                 The tree holds it: a reverse apply succeeds.
+0080-move-packed.patch           landed in a changed form as hexagon-kernels/0006-hexagon-htp-cpy-transpose-tiles.
 
 The online softmax. The lab target smx asked whether a single-pass softmax pays on the v79, against
 the three passes of 0060: the maximum, then the exponential with its sum into a pad, then the
