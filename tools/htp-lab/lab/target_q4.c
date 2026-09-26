@@ -8,9 +8,9 @@
 // For n activation rows the matmul op (MATMUL_2D_REPACKED_IMPL in matmul-ops.c) calls the 32x2
 // kernel for each pair of rows and the 32x1 kernel for the last row, over the same weight tile in
 // VTCM. The program repeats that sequence for n = 1 to 4 and reports the cycles per 32x32 weight
-// tile. With the proposal (LAB_PROPOSED) the program also measures the 32x3 and 32x4 kernels with
-// vector-loaded activations ("after") and the 32x1c to 32x4c kernels with the compact activation
-// in scalar registers ("compact").
+// tile. When hvx-mm-kernels-tiled.h defines HTP_MM_HAVE_MULTIROW, the program also measures the
+// 32x3 and 32x4 kernels with vector-loaded activations ("after") and the 32x1c to 32x4c kernels
+// with the compact activation in scalar registers ("compact").
 //
 // Arguments: --k 2048 --rows 4 --ct 4 --iters 5
 #pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
@@ -365,7 +365,7 @@ int main(int argc, char ** argv) {
     }
 
 #ifdef HTP_MM_HAVE_MULTIROW
-    // the proposal, step 2: the compact Q8 activation in DDR, 4 quants per scalar register
+    // the compact Q8 activation in DDR, 4 quants per scalar register
     uint8_t * act_c[MAX_ROWS];
     int32_t * act_b[MAX_ROWS];  // the sum of each k-tile
     for (uint32_t r = 0; r < n_rows; r++) {

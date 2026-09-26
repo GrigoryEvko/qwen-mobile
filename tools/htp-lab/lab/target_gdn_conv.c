@@ -6,9 +6,7 @@
 // simulator memory), as on the phone.
 //
 // The program builds the taps of every channel in one canonical array, and then writes them into
-// the slot in the layout that the kernel expects: three floats per channel for the kernel of the
-// checkout, three planes of n_ch floats for the kernel of the proposal (LAB_PROPOSED). The output
-// y does not depend on the layout, thus the base run and the proposal run must give the same y.
+// the slot in the layout that the kernel expects: three floats for each channel.
 //
 // Arguments: --n_ch 6144 --threads 1 --iters 20
 // lab-run: mode=functional
@@ -23,7 +21,7 @@
 #define TARGET "gdn_conv"
 #define D_CONV 4
 
-// The slot holds the three taps of a channel one after the other, in both programs.
+// The slot holds the three taps of a channel one after the other.
 //
 // A plane layout (tap t of every channel in one row) would remove almost every permute of this
 // kernel, but the slot is the recurrent state cache of llama.cpp: the graph of
@@ -31,13 +29,9 @@
 // the Hexagon matcher refuses reads it with the generic ops, and
 // llama_memory_recurrent::state_write_data writes those bytes into the state file that the app
 // stores. Thus a plane layout needs the host, the CPU reference and the state file to change
-// together, and at one token the conversion at the two ends costs the permutes again. The
-// proposal keeps the layout and changes the schedule instead.
-#ifdef LAB_PROPOSED
-#define LAYOUT "interleaved (proposal)"
-#else
+// together, and at one token the conversion at the two ends costs the permutes again. The kernel
+// keeps the layout and runs four chains in flight instead.
 #define LAYOUT "interleaved"
-#endif
 
 static inline size_t slot_off(uint32_t c, uint32_t t, uint32_t n_ch) {
     (void) n_ch;

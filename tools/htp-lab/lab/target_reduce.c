@@ -102,11 +102,7 @@ int main(int argc, char ** argv) {
     const float    range = (float) lab_arg_long(argc, argv, "--range", 4);
 
     lab_init();
-#ifdef LAB_PROPOSED
-    printf("lab: %s build = proposed\n", TARGET);
-#else
     printf("lab: %s build = checkout\n", TARGET);
-#endif
 
     const float eps = 1e-6f;
 

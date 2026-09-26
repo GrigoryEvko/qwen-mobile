@@ -18,11 +18,8 @@
 #include <string.h>
 #include <math.h>
 
-// hvx-sqrt.h comes first because hvx-arith.h of the checkout calls HVX_OP_MUL, which only
-// hvx-sqrt.h defines. The backend builds only because another header pulls it in first.
-// The proposal removes that dependency, and this include keeps the baseline buildable.
-#include "hvx-sqrt.h"
 #include "hvx-arith.h"
+#include "hvx-copy.h"  // hvx_copy_f32_aa, the one-read pass of the cost of a pass
 
 #define TARGET "binary"
 #define VEC_F32 32              // f32 elements in one HVX vector
@@ -188,8 +185,7 @@ int main(int argc, char ** argv) {
                                   (const uint8_t *) d_c, n));
     row("ddr", &c_fuse, cyc, n, nmse(d_y, ref, n));
 
-#ifdef LAB_PROPOSED
-    // 3. The fused chains that the proposal adds.
+    // 3. The fused chains of hvx-arith.h.
     static const struct bin_case c_madd2 = { "mul+add 2 passes", "t = a * b, then y = t + c", 4, 2 };
     static const struct bin_case c_madd  = { "mul_add fused",    "y = a * b + c in one pass",  3, 1 };
 
@@ -235,7 +231,6 @@ int main(int argc, char ** argv) {
     }));
     ref_mul_add(d_a, d_b, d_c, ref, n);
     row("ddr", &c_madd2, cyc, n, nmse(d_y, ref, n));
-#endif
 
 #undef TIME
 

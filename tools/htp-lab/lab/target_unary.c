@@ -5,8 +5,8 @@
 // 536 ms of DSP op time of a 512-token prefill of the 4B Q8_0, at 2.24 instructions per packet
 // with CU_BUSY at 70.9 %, which is the signature of scalar float work.
 //
-// The program times that scalar loop and, with the proposal applied (LAB_PROPOSED), the two
-// vector paths of hvx-softplus.h against it. Each path is checked against a float64 reference.
+// The program times that scalar loop and the two vector paths of hvx-softplus.h against it, and
+// it compares each path with a float64 reference.
 // The report gives the cycles for each vector of 32 f32 elements, thus the paths compare
 // directly whatever the row length.
 //
@@ -15,9 +15,9 @@
 // block for the rest. The compiler inlines the four-vector routine one time for each block, and
 // it can give the two copies different code. An element count that is a multiple of 128 runs
 // the first block only. The model calls the op with ne0 = ssm_dt_rank, which is 16 for the 2B
-// and 32 for the 4B, thus the device runs the tail block and no other block. On 2026-09-20 a
-// seed of the wrong type in the Horner accumulator gave -1.43e36 in the tail block and the
-// correct result in the main block, and a measurement at 1024 elements saw nothing.
+// and 32 for the 4B, thus the device runs the tail block and no other block. A seed of the wrong
+// type in the Horner accumulator gives -1.43e36 in the tail block and the correct result in the
+// main block, and a measurement at 1024 elements does not see it.
 //
 // The sweep also makes sure that no path writes an element after the row. The tail block writes
 // a part of a vector, thus a wrong mask corrupts the next row.
@@ -37,9 +37,7 @@
 
 #include "hvx-utils.h"
 
-#ifdef LAB_PROPOSED
 #include "hvx-softplus.h"
-#endif
 
 #define TARGET "unary"
 
@@ -116,7 +114,6 @@ static void measure(const char * name, lab_row_fn fn,
            sr > 0.0 ? se / sr : 0.0, worst_abs, at_abs, worst_rel, at_rel, worst_rel_tail);
 }
 
-#ifdef LAB_PROPOSED
 static void softplus_vec_f32(const float * restrict src, float * restrict dst, uint32_t n) {
     hvx_softplus_f32_aa((uint8_t *) dst, (const uint8_t *) src, n);
 }
@@ -124,7 +121,6 @@ static void softplus_vec_f32(const float * restrict src, float * restrict dst, u
 static void softplus_vec_i16(const float * restrict src, float * restrict dst, uint32_t n) {
     hvx_softplus_i16_f32_aa((uint8_t *) dst, (const uint8_t *) src, n);
 }
-#endif
 
 // The result of one path at one element count
 struct sweep_result {
@@ -205,7 +201,6 @@ static uint32_t sweep(const float * src, float * dst) {
         const struct sweep_result s = sweep_one(softplus_scalar, src, dst, n,
                                                 LAB_F32_ABS_TOL, LAB_F32_REL_TOL);
         uint32_t bad = s.bad + s.overwrite;
-#ifdef LAB_PROPOSED
         const struct sweep_result v = sweep_one(softplus_vec_f32, src, dst, n,
                                                 LAB_F32_ABS_TOL, LAB_F32_REL_TOL);
         const struct sweep_result q = sweep_one(softplus_vec_i16, src, dst, n,
@@ -217,11 +212,6 @@ static uint32_t sweep(const float * src, float * dst) {
                (unsigned) s.bad, (unsigned) v.bad, (unsigned) q.bad,
                (unsigned) s.overwrite, (unsigned) v.overwrite, (unsigned) q.overwrite,
                bad ? "FAIL" : "ok");
-#else
-        printf("lab: %s sweep n = %4u  scalar %9.2e  bad %u  after the row %u  %s\n",
-               TARGET, n, s.max_abs, (unsigned) s.bad, (unsigned) s.overwrite,
-               bad ? "FAIL" : "ok");
-#endif
         if (bad) {
             fail++;
         }
@@ -258,10 +248,8 @@ int main(int argc, char ** argv) {
 
     printf("lab: %s n = %u rows = %u range = %.1f\n", TARGET, n, rows, (double) range);
     measure("scalar", softplus_scalar, src, dst, ref, n, rows, iters);
-#ifdef LAB_PROPOSED
     measure("vector_f32", softplus_vec_f32, src, dst, ref, n, rows, iters);
     measure("vector_i16", softplus_vec_i16, src, dst, ref, n, rows, iters);
-#endif
 
     // The sweep of the element count. The buffers are separate, because the sweep writes guard
     // elements after each row.

@@ -1,18 +1,17 @@
 // Target 8: the activation family of the backend, SIGMOID, SILU and SWIGLU.
 //
 // On the phone these three are the largest part of the elementwise family of a 512-token prefill
-// of the 4B (the family is 114 ms of 536 ms of DSP op time, measured 2026-09-20). The op reads
-// and writes a VTCM scratch pad that the DMA fills from the DDR, thus this target puts its
-// buffers in the VTCM and measures the kernel alone, without the DMA and the work queue.
+// of the 4B (the family is 114 ms of 536 ms of DSP op time). The op reads and writes a VTCM
+// scratch pad that the DMA fills from the DDR, thus this target puts its buffers in the VTCM and
+// measures the kernel alone, without the DMA and the work queue.
 //
-// The program calls the same helpers as the op:
-//   SIGMOID  hvx_sigmoid_f32_aa(dst, src, n)
-//   SILU     hvx_sigmoid_f32_aa(dst, src, n) then a multiply pass over the row
-//   SWIGLU   hvx_sigmoid_f32_aa(dst, src0, n) then hvx_mul_mul_f32_aa(dst, src0, dst, src1, n)
-// Thus each kernel walks the row twice, which the proposal changes to one pass.
-//
-// Under LAB_PROPOSED the target also measures the fused paths of the proposal and reports the
-// error of each against the same reference.
+// The program calls the helpers of the op in their two forms:
+//   f32 (".base")   SIGMOID  hvx_sigmoid_f32_aa(dst, src, n)
+//                   SILU     hvx_sigmoid_f32_aa(dst, src, n) then a multiply pass over the row
+//                   SWIGLU   hvx_sigmoid_f32_aa(dst, src0, n) then hvx_mul_mul_f32_aa(dst, src0, dst, src1, n)
+//   int16 (".i16")  hvx_sigmoid_i16_f32_aa, hvx_silu_i16_f32_aa and hvx_swiglu_i16_f32_aa of
+//                   hvx-act-i16.h, one pass over the row each
+// Each case reports its error against the same float64 reference.
 //
 // One invocation measures one kernel, because the register allocation of the compiler depends on
 // the whole program: with six kernels in one program the baseline sigmoid measured 155 cycles for
@@ -32,9 +31,7 @@
 #include "hvx-sigmoid.h"
 #include "hvx-arith.h"
 
-#ifdef LAB_PROPOSED
 #include "hvx-act-i16.h"
-#endif
 
 #define TARGET "act"
 #define VEC_F32 32
@@ -94,7 +91,6 @@ LAB_KERNEL void base_copy(uint8_t * dst, const uint8_t * src, uint32_t n) {
     hvx_copy_f32_aa(dst, src, n);
 }
 
-#ifdef LAB_PROPOSED
 LAB_KERNEL void i16_sigmoid(uint8_t * dst, const uint8_t * src, uint32_t n) {
     hvx_sigmoid_i16_f32_aa(dst, src, n);
 }
@@ -106,7 +102,6 @@ LAB_KERNEL void i16_silu(uint8_t * dst, const uint8_t * src, uint32_t n) {
 LAB_KERNEL void i16_swiglu(uint8_t * dst, const uint8_t * src0, const uint8_t * src1, uint32_t n) {
     hvx_swiglu_i16_f32_aa(dst, src0, src1, n);
 }
-#endif
 
 int main(int argc, char ** argv) {
     const uint32_t nc      = (uint32_t) lab_arg_long(argc, argv, "--nc", 9216);
@@ -172,14 +167,12 @@ int main(int argc, char ** argv) {
     RUN_CASE("swiglu.base", ref_swiglu(x0, x1, ref, nc),
              base_swiglu((uint8_t *) dst, (const uint8_t *) src0, (const uint8_t *) src1, nc));
 
-#ifdef LAB_PROPOSED
     RUN_CASE("sigmoid.i16", ref_sigmoid(x0, ref, nc),
              i16_sigmoid((uint8_t *) dst, (const uint8_t *) src0, nc));
     RUN_CASE("silu.i16", ref_silu(x0, ref, nc),
              i16_silu((uint8_t *) dst, (const uint8_t *) src0, nc));
     RUN_CASE("swiglu.i16", ref_swiglu(x0, x1, ref, nc),
              i16_swiglu((uint8_t *) dst, (const uint8_t *) src0, (const uint8_t *) src1, nc));
-#endif
 
     // A plain copy of the row gives the memory floor of a one-pass kernel on this pad.
     if (!only || !strcmp(only, "copy.floor")) {

@@ -6,7 +6,7 @@
 // simulator memory) and the plane buffers are in the VTCM, as on the phone.
 //
 // On the phone this op is the largest single op of a 512-token prefill of the 4B (27 % of the DSP
-// time at 1.27 instructions per packet, measured 2026-09-20), thus it has its own target.
+// time at 1.27 instructions per packet), thus it has its own target.
 //
 // The program runs three phases. Each phase reports its own errors, and each one can fail the run.
 //   random   Uniform inputs in [-range, range]. This phase gives the cycle numbers.
@@ -16,18 +16,18 @@
 //   silu     Every one of the 65536 f16 values through hvx_silu_h_i16, with a check of the range
 //            of h. This phase holds the routine to its own contract, 0 <= h <= 0.2785.
 //
-// Why the two phases after the random one: the packed path of 2026-09-20 gave -Inf for a conv
+// Why the two phases after the random one: a sign error of the int16 SiLU gives -Inf for a conv
 // accumulator in [14.4922, 15.7266], and a uniform input of [-4, 4] reaches that band with a
-// probability near zero. The random phase measured NMSE 2.9e-07 and reported no failure, thus the
-// build shipped and the phone answered with one token again and again. A mean square error hides
-// a rare value that is not finite when the rare value does not occur.
+// probability near zero. The random phase then gives NMSE 2.9e-07 and no failure, and the model
+// on the phone answers with one token again and again. A mean square error hides a rare value
+// that is not finite when the rare value does not occur.
 //
-// Arguments: --n_ch 8192 --tokens 16 --threads 1 --iters 3 --range 4 --f16 0
+// Arguments: --n_ch 8192 --tokens 16 --threads 1 --iters 3 --range 4 --f16 <mode>
 //            --phase all|random|octaves|silu
-// --f16 selects the precision mode of the proposal (0 f32, 1 f16 SiLU, 2 f16 taps with a 32-bit
+// --f16 sets gdn_conv_f16_mode of the kernel (0 f32, 1 f16 SiLU, 2 f16 taps with a 32-bit
 // accumulator, 3 f16 taps with an f16 accumulator, 4 the packed path: f16 taps, a 16-bit qfloat
-// accumulator, the int16 SiLU, 3 token rows in each iteration). The kernel of the checkout has
-// mode 0 only.
+// accumulator, the int16 SiLU, 3 token rows in each iteration). The option needs the build flag
+// EXTRA_CFLAGS=-DLAB_F16_MODE_OPTION=1. Without it the program runs the mode of the library.
 // lab-run: mode=functional
 #include "lab.h"
 
@@ -270,10 +270,13 @@ int main(int argc, char ** argv) {
 
     lab_init();
 
-#ifdef LAB_PROPOSED
-    gdn_conv_f16_mode = (int) lab_arg_long(argc, argv, "--f16", 0);
-    printf("lab: %s f16_mode = %d\n", TARGET, gdn_conv_f16_mode);
+#ifdef LAB_F16_MODE_OPTION
+    // A write of gdn_conv_f16_mode makes the mode a value of the run. The compiler then keeps each
+    // path of the kernel, and the cycles grow by approximately 0.8 %. The library never writes the
+    // mode, thus a build without this flag measures the code of the library.
+    gdn_conv_f16_mode = (int) lab_arg_long(argc, argv, "--f16", gdn_conv_f16_mode);
 #endif
+    printf("lab: %s f16_mode = %d\n", TARGET, gdn_conv_f16_mode);
 
     const size_t n_xy = (size_t) n_tokens * n_ch;
 

@@ -1,8 +1,7 @@
 // Target 6: the accuracy of the f16 math helpers of the HTP kernels against libm.
 //
 // An f16 kernel is only as good as hvx_vec_exp2_f16, hvx_vec_inverse_f16 and
-// hvx_vec_fast_sigmoid_f16. No model of ours runs them today, because every activation is f32,
-// thus nothing has measured them. This target sweeps an input range and reports the worst relative
+// hvx_vec_fast_sigmoid_f16. This target sweeps an input range and reports the worst relative
 // error of each helper, and the worst points. Run it with MODE=functional, the timing is not the point.
 //
 // Arguments: --lo -12 --hi 12
@@ -13,11 +12,7 @@
 #include <string.h>
 #include <math.h>
 
-#ifdef LAB_PROPOSED
-#include "gdn-conv-ops.c"   // the proposal: gdn_conv_silu_t_f16 and gdn_conv_silu2_f16
-#else
-#include "hvx-utils.h"
-#endif
+#include "gdn-conv-ops.c"   // gdn_conv_silu_t_f16 and gdn_conv_silu2_f16, and hvx-utils.h
 
 #define TARGET "f16math"
 #define N      (64 * 128)
@@ -64,11 +59,10 @@ static void sweep(const char * name, vec_fn fn, double (*ref)(double), double lo
            (double) lab_hf_to_f32(out_h[wi]));
 }
 
-#ifdef LAB_PROPOSED
 static HVX_Vector fn_silu_t(HVX_Vector v) { return gdn_conv_silu_t_f16(v); }
 static double ref_silu_t(double x) { const double e = exp(-fabs(x)); return e / (1.0 + e); }
 
-// the conversions and the f32 SiLU of the proposal, on f32 inputs
+// the conversions and the f32 SiLU of gdn-conv-ops.c, on f32 inputs
 static float in_f[N] __attribute__((aligned(128)));
 static float out_f[N] __attribute__((aligned(128)));
 static void sweep_f32(double lo, double hi) {
@@ -153,9 +147,7 @@ static void sweep_f32(double lo, double hi) {
     printf("lab: %s silu2_f16 [%g, %g]: rms rel err %.3g worst %.3g at x = %g (ref %g got %g)\n", TARGET, lo, hi,
            sqrt(s2 / N), w_s, (double) in_f[wi], (double) in_f[wi] / (1.0 + exp(-(double) in_f[wi])), (double) out_f[wi]);
 }
-#endif
 
-#ifdef LAB_PROPOSED
 // The full map of vlut16 in the 128-byte mode, measured and not assumed. The table holds
 // 1000 + its halfword index, thus an output names the halfword that it read.
 //   1. The position map: one matching byte at the position p, all other bytes do not match.
@@ -247,7 +239,6 @@ static void sweep_silu_i16(int n, double lo, double hi) {
     printf("lab: %s silu_h_i16 n=%d [%g, %g]: rms abs err %.3g worst %.3g at x = %g (ref %g got %g)\n", TARGET, n, lo, hi,
            sqrt(s2 / (double) cnt), worst, wx, wr, wg);
 }
-#endif
 
 int main(int argc, char ** argv) {
     const double lo = (double) lab_arg_long(argc, argv, "--lo", -12);
@@ -259,7 +250,6 @@ int main(int argc, char ** argv) {
     sweep("inverse", fn_inverse, ref_inverse, 0.01,  100.0);
     sweep("sigmoid", fn_sigmoid, ref_sigmoid, lo,    hi);
     sweep("sigmoid", fn_sigmoid, ref_sigmoid, -2.0,  2.0);
-#ifdef LAB_PROPOSED
     probe_vlut16();
     sweep_silu_i16(1, -18.0, 18.0);
     sweep_silu_i16(2, -18.0, 18.0);
@@ -269,6 +259,5 @@ int main(int argc, char ** argv) {
     sweep("silu_t",  fn_silu_t,  ref_silu_t,  -2.0,  2.0);
     sweep_f32(-8.0, 8.0);
     sweep_f32(-2.0, 2.0);
-#endif
     return 0;
 }
