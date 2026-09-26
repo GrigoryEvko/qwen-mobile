@@ -55,6 +55,13 @@ endif()
 if (NOT LAB_EXTRA_C_FLAGS STREQUAL "")
     list(APPEND LAB_C_FLAGS "SHELL:${LAB_EXTRA_C_FLAGS}")
 endif()
+# The runtime prints the profile and the limits of the build in the limits block of each run, thus
+# a reader of a result knows whether the build had -flto and live asserts. Refer to lab_limit.
+if (LAB_PROFILE STREQUAL "")
+    list(APPEND LAB_C_FLAGS -DLAB_PROFILE_NAME="lab")
+else()
+    list(APPEND LAB_C_FLAGS -DLAB_PROFILE_NAME="${LAB_PROFILE}" -DLAB_LTO=1)
+endif()
 message(STATUS "lab profile '${LAB_PROFILE}': ${LAB_C_FLAGS}")
 
 function(lab_add_target name source htp_include)
