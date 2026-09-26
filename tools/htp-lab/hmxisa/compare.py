@@ -1068,7 +1068,7 @@ def report_oracle(runs: list[Run], names: list[str]) -> dict[str, dict[str, tupl
             s = err_stats(hmx, orc)
             parts.append(f"{r.label}: {fmt_err(s)}, = f16(oracle) {100 * float((out == ideal_bits).mean()):5.1f}%")
             if n.startswith("f16w"):
-                ranking[r.label].setdefault("F16 weights: HMX f16 deep (today)", []).append(s)
+                ranking[r.label].setdefault("F16 weights: HMX f16 deep (the backend)", []).append(s)
         print(f"  {n:18s} " + " | ".join(parts))
         if n.startswith("f16w"):
             ideal = f16_to_float(orc.astype(np.float16).view(np.uint16))
@@ -1094,7 +1094,7 @@ def report_oracle(runs: list[Run], names: list[str]) -> dict[str, dict[str, tupl
             ca, cb, cc = r.cases.get(f"q8a_k{k}"), r.cases.get(f"q8b_k{k}"), r.cases.get(f"q8c_k{k}")
             res = {}
             if ca is not None:
-                res["A f16 deep (today)"] = f16_to_float(ca.out[-1]).astype(np.float32)
+                res["A f16 deep (the backend)"] = f16_to_float(ca.out[-1]).astype(np.float32)
             if cb is not None:
                 colsum = np.stack([src.qw[32 * t:32 * t + 32].astype(np.int64).sum(axis=0) for t in range(n_kt)])
                 sumi = np.stack([planes_to_i32(cb, t) - 128 * colsum[t][None, :] for t in range(n_kt)])
@@ -1119,13 +1119,13 @@ def report_oracle(runs: list[Run], names: list[str]) -> dict[str, dict[str, tupl
 
 # HMX instructions and accumulator reads for one 64 x 32 output block and K = 1024, from the loops
 # of the census (the kernel loops for path A). The cycle numbers are the v79 silicon measurement of
-# 2026-09-20 (tools/hmx-bench): 34.7 pcycles per f16 tile issue, 33.8 per int8 64x32x32 issue, and
+# tools/hmx-bench: 34.7 pcycles per f16 tile issue, 33.8 per int8 64x32x32 issue, and
 # about 711 pcycles for one int32 read (four u8 plane stores) of a 64x32 tile. The simulator times
 # no HMX instruction.
 PATH_COST = {
-    "F16 weights: HMX f16 deep (today)": "K=1024: 6 HMX instructions, 64 f16 tile MACs, 2 f16 reads; v79 ~0.6k pcycles"
+    "F16 weights: HMX f16 deep (the backend)": "K=1024: 6 HMX instructions, 64 f16 tile MACs, 2 f16 reads; v79 ~0.6k pcycles"
                                          " at the kernel rate (9 per tile)",
-    "Q8_0: A f16 deep (today)": "K=1024: 6 HMX instructions, 64 f16 tile MACs, 2 f16 reads; plus the HVX dequantization"
+    "Q8_0: A f16 deep (the backend)": "K=1024: 6 HMX instructions, 64 f16 tile MACs, 2 f16 reads; plus the HVX dequantization"
                                 " of the weights to f16",
     "Q8_0: C f16 per block": "K=1024: 192 HMX instructions, 64 f16 tile MACs, 64 f16 reads (not measured);"
                              " HVX f16->f32 and a scale-add of 2048 values per 32 k",

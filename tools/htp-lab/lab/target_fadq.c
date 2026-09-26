@@ -20,7 +20,7 @@
 // with a negative or a zero scale, which no Q8_0 quantizer writes.
 //
 // Arguments: --rows 256 --iters 5 --exhaustive 0 --convert-only 0
-// Results of 2026-09-23 (v79, PROFILE=release): 656 against 66 cycles for each row of 256 values
+// Measured on v79 with PROFILE=release: 656 against 66 cycles for each row of 256 values
 // (--convert-only 1 --rows 64); 0 different tile values for 1, 63 and 64 rows; the exhaustive
 // check gives 31999 differences, all signed zeros.
 #pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"

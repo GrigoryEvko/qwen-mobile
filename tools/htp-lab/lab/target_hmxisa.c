@@ -1113,7 +1113,7 @@ static void cases_int(void) {
 // reference. compare.py checks them against its own quantization.
 //
 // The HMX paths on this data:
-//   q8a  today's prefill path: f16(x) x f16(q_w * d_w), one deep f16 accumulation
+//   q8a  the prefill path of the backend: f16(x) x f16(q_w * d_w), one deep f16 accumulation
 //   q8c  the integer quants as f16 values (exact), one f16 sum for each 32-k block (M_BLOCK)
 //   q8b  the integer quants on the int path: u8 activation q_x + 128, s8 weight q_w, one int32 read
 //        for each 32-k block (M_I8_BLOCK); the host subtracts 128 * sum(q_w) for each block

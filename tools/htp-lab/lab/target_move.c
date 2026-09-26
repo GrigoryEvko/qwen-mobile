@@ -40,10 +40,10 @@ static void transpose_gather(HVX_Vector * restrict dst, const HVX_Vector * restr
     }
 }
 
-// A shuffle butterfly was tried here and rejected. A 32 x 32 f32 transpose needs all 32 vectors
-// live at once, which is the whole register file, thus every one of the 5 stages spills to
-// memory: measured 1356 cycles against 150 for the gather, and the result was wrong as well.
-// The gather unit is the right tool for a transpose on this part.
+// This file holds no shuffle butterfly. A 32 x 32 f32 transpose needs all 32 vectors live at
+// once, which is the whole register file, thus each of the 5 stages spills to memory: a butterfly
+// measured 1356 cycles against 150 for the gather. The gather unit is the correct tool for a
+// transpose on this part.
 
 // The transpose of the cpy reshape path: one element for each iteration, with the index update
 // that cpy-ops.c does. O(n^2) elements, no vector unit at all.
@@ -74,7 +74,7 @@ static void transpose_tile_gather(float * restrict dst, uint32_t dst_stride,
     }
 }
 
-// The same tile the way cpy-ops.c does it today when the rows are not contiguous: one element
+// The same tile the way the scalar path of cpy-ops.c does it when the rows are not contiguous: one element
 // for each iteration of the loop.
 static void transpose_tile_scalar(float * restrict dst, uint32_t dst_stride,
                                   const float * restrict src, uint32_t src_stride) {

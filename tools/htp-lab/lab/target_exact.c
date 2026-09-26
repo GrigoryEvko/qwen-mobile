@@ -4,8 +4,8 @@
 // Hexagon version. It runs each routine and writes the inputs and the outputs to files in the run
 // directory, and tools/htp-lab/exact/check.py compares them with an exact reference on the host.
 // It also prints one FNV-1a checksum per routine, thus the four versions compare from the stdout.
-// With --timing 1 it measures the cycles per vector of each routine and of the qf sequence that the
-// kernels use today, over data in the L2.
+// With --timing 1 it measures the cycles per vector of each routine and of the qf sequence of the
+// kernels, over data in the L2.
 //
 // Arguments: --vectors 8192 --timing 0
 // lab-run: mode=functional
@@ -146,7 +146,7 @@ static void run_bin(bin_fn fn, const uint32_t * a, const uint32_t * b, uint32_t 
     }
 }
 
-// The qf sequences of the kernels of today, for the timing comparison only.
+// The qf sequences of the kernels, for the timing comparison only.
 static HVX_Vector qf_mul(HVX_Vector a, HVX_Vector b) {
     return Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(a, b));
 }
