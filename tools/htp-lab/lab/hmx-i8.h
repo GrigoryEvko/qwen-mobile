@@ -1,11 +1,10 @@
 // The int8 HMX inline asm macros that tools/htp-lab/lab/target_hmxisa.c uses. This header is part of the
 // lab, not of the backend.
 //
-// Where the macros come from. The patch hexagon-hmx-i8/0001 of patches/series put them into
-// htp/hmx-utils.h, and no kernel of the backend used them. Each form comes from a probe of
-// hexagon-llvm-mc at -mcpu=hexagonv79 -mattr=+hvxv79,+hvx-length128b,+hmx, and each one also occurs in the
-// Qualcomm HexKL micro library for the same core. Do not change a suffix or the order of two suffixes
-// without a new probe: ":deep:cm" assembles and ":cm:deep" does not.
+// Where the macros come from. Each form comes from a probe of hexagon-llvm-mc at -mcpu=hexagonv79
+// -mattr=+hvxv79,+hvx-length128b,+hmx, and each one also occurs in the Qualcomm HexKL micro library for the
+// same core. Do not change a suffix or the order of two suffixes without a new probe: ":deep:cm" assembles
+// and ":cm:deep" does not.
 //
 // Why the backend does not hold them. The int8 path is a no-go by measurement. The engine does 2.05 times
 // the multiply-accumulates of the f16 path for each issue, but the accumulator cannot hold a scale, thus the
@@ -14,8 +13,8 @@
 // the prefill at most. The f16 GEMMs stay. The census of this target keeps the int path because it records
 // what the silicon does.
 //
-// Include this header AFTER hmx-utils.h. It removes a definition of the same name that a kernel tree
-// holds and gives its own, thus the target compiles the same text whether the tree holds the macros or not.
+// Include this header after hmx-utils.h. It removes a definition of the same name, if a kernel tree holds
+// one, and gives its own. Thus the target compiles the same text with each kernel tree.
 //
 // The facts that the macros depend on:
 //   - The activation is unsigned and the weight is signed. No other pair of int types assembles for v79.
