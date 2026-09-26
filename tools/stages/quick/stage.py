@@ -31,6 +31,7 @@ A run name is <block>-<round>-<variant>, for example t-2-c. Each run writes <nam
 import re
 import statistics
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -89,7 +90,7 @@ VARIANTS = {v.key: v for v in (
     Variant("v", "lib-new", "GGML_HEXAGON_VMEM=0", "new, measured VA limit"),
     Variant("p", "lib-new", "GGML_HEXAGON_OPPOLL=1", "new, the host polls the queue"),
 )}
-BLOCKS = [
+BLOCKS = (
     Block("k", "test-backend-ops", f"-o {UNARY_OPS} -b HTP0", "ab", 1, 100, device.GATE_TOOL_KB, "",
           "test-backend-ops of the pointwise unary ops on HTP0 against the CPU"),
     Block("h", "memprobe", "--hash -p 1024 -n 16", "abc", 1, 90, device.GATE_4B_KB, "",
@@ -104,18 +105,54 @@ BLOCKS = [
           "host times (LLAMA_HOSTPROF), a prompt of 64 tokens and 24 decode tokens"),
     Block("v", "llama-bench", "-p 0 -n 8 -r 1", "v", 1, 60, device.GATE_4B_KB, "",
           "llama-bench tg8 with the VA limit that the backend measures"),
-]
+)
 
 
-def runs() -> list[tuple[Block, int, Variant]]:
-    """The runs in the order of the stage: each block, round by round, odd rounds in the order of the block
-    and even rounds in the reverse order. O(runs)."""
-    out = []
-    for b in BLOCKS:
-        for rnd in range(1, b.rounds + 1):
-            order = b.variants if rnd % 2 else b.variants[::-1]
-            out.extend((b, rnd, VARIANTS[k]) for k in order)
-    return out
+@dataclass(frozen=True)
+class Stage:
+    """The values of one stage of this form: quick, and unary-rows, which uses the code of quick with its own
+    values. paths gives the directories, bins, libs and new_libs give the files of bin/, lib-base/ and lib-new/
+    of the laptop stage, and run_lines gives the lines of one run."""
+    paths: device.StagePaths
+    bins: tuple[str, ...]
+    libs: tuple[str, ...]
+    new_libs: tuple[str, ...]
+    variants: dict[str, Variant]
+    blocks: tuple[Block, ...]
+    header: str
+    run_lines: Callable[[Block, int, Variant], list[str]]
+
+    def runs(self) -> list[tuple[Block, int, Variant]]:
+        """The runs in the order of the stage: each block, round by round, odd rounds in the order of the block
+        and even rounds in the reverse order. O(runs)."""
+        out: list[tuple[Block, int, Variant]] = []
+        for b in self.blocks:
+            for rnd in range(1, b.rounds + 1):
+                order = b.variants if rnd % 2 else b.variants[::-1]
+                out.extend((b, rnd, self.variants[k]) for k in order)
+        return out
+
+    def setup_lines(self) -> list[str]:
+        """The lines that copy the stage to the phone and check its files."""
+        local = self.paths.local
+        files = {
+            "bin": [f"{local}/phone/bin/{f}" for f in self.bins],
+            "lib-base": [f"{local}/phone/lib-base/{f}" for f in self.libs],
+            "lib-new": [f"{local}/phone/lib-new/{f}" for f in self.new_libs],
+        }
+        # No "models/Qwen3.5" in the model line: the runner gates each line with that text as a model run.
+        return commands.setup_lines(
+            self.paths, files,
+            model_check=f"{ADB} shell 'ls -l {device.MODEL_DIR} | grep -E \"Qwen3.5-4B-Q8_0.gguf\"'")
+
+    def write_commands(self, path: Path) -> int:
+        """Write the command file and return its line count."""
+        lines = commands.header_lines(self.header) + self.setup_lines()
+        lines += ["#", f"# ==== Qwen3.5-4B-Q8_0: {len(self.runs())} runs ===="]
+        for b, rnd, v in self.runs():
+            lines += self.run_lines(b, rnd, v)
+        lines += commands.output_lines(self.paths)
+        return commands.write_commands(path, lines)
 
 
 def run_lines(b: Block, rnd: int, v: Variant) -> list[str]:
@@ -183,27 +220,7 @@ HEADER = """\
 """
 
 
-def setup_lines() -> list[str]:
-    """The lines that copy the stage to the phone and check its files."""
-    files = {
-        "bin": [f"{LAPTOP_STAGE}/phone/bin/{f}" for f in BINS],
-        "lib-base": [f"{LAPTOP_STAGE}/phone/lib-base/{f}" for f in LIBS],
-        "lib-new": [f"{LAPTOP_STAGE}/phone/lib-new/{f}" for f in NEW_LIBS],
-    }
-    # No "models/Qwen3.5" in the model line: the runner gates each line with that text as a model run.
-    return commands.setup_lines(
-        PATHS, files,
-        model_check=f"{ADB} shell 'ls -l {device.MODEL_DIR} | grep -E \"Qwen3.5-4B-Q8_0.gguf\"'")
-
-
-def write_commands(path: Path) -> int:
-    """Write the command file and return its line count."""
-    lines = commands.header_lines(HEADER) + setup_lines()
-    lines += ["#", f"# ==== Qwen3.5-4B-Q8_0: {len(runs())} runs ===="]
-    for b, rnd, v in runs():
-        lines += run_lines(b, rnd, v)
-    lines += commands.output_lines(PATHS)
-    return commands.write_commands(path, lines)
+QUICK = Stage(PATHS, BINS, LIBS, NEW_LIBS, VARIANTS, BLOCKS, HEADER, run_lines)
 
 
 # ---- The results ----
@@ -230,7 +247,7 @@ def table(root: Path) -> int:
     """Print the results of each block."""
     if not root.is_dir():
         return cli.missing_root(root)
-    for b, rnd, v in runs():
+    for b, rnd, v in QUICK.runs():
         text, _, _ = logs.read_run(root, f"{b.key}-{rnd}-{v.key}")
         print(f"{b.key}-{rnd}-{v.key}: {conditions(text) if text else 'no gate file'}")
     print()
@@ -252,7 +269,7 @@ def table(root: Path) -> int:
     print()
 
     tests: dict[tuple, dict[str, dict[int, float]]] = {}
-    for b, rnd, v in runs():
+    for b, rnd, v in QUICK.runs():
         if b.key not in ("p", "t"):
             continue
         for key, ts in parse.bench_values(logs.read_text(root / f"{b.key}-{rnd}-{v.key}.out")).items():
@@ -293,7 +310,7 @@ def table(root: Path) -> int:
 
 def main() -> int:
     """Run the subcommand of the command line."""
-    return cli.run(STAGE_DIR, __doc__, write=write_commands, count=lambda: len(runs()), table=table,
+    return cli.run(STAGE_DIR, __doc__, write=QUICK.write_commands, count=lambda: len(QUICK.runs()), table=table,
                    all_flag=False, table_help="print the results from the pulled logs")
 
 

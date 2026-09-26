@@ -18,7 +18,6 @@ The variants, each in the app configuration of the stage quick:
     c  GGML_HEXAGON_UNARY_FLAT=8: only SCALE (the clear of a recurrent state)
 """
 
-import importlib.util
 import re
 import struct
 import sys
@@ -26,23 +25,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from common import cli, commands, device, logs  # noqa: E402
+from quick import stage as q  # noqa: E402
 
-_spec = importlib.util.spec_from_file_location("quick_stage", Path(__file__).resolve().parents[1] / "quick" / "stage.py")
-q = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(q)
-
-# The stage quick writes the lines that copy the files, thus its module takes the directories of this stage
-q.PATHS = device.stage_paths("unary-rows", __file__)
-q.PHONE, q.LAPTOP_STAGE, q.BOX, q.STAGE_DIR = q.PATHS
-STAGE_DIR = q.STAGE_DIR
-q.BINS = ("gate.sh", "memprobe", "test-backend-ops", "unarycheck")
-q.LIBS = ("libggml-base.so", "libggml-cpu.so", "libggml-hexagon.so", "libggml-htp-v79.so", "libggml-opencl.so",
-          "libggml.so", "libllama-common.so", "libllama.so", "libmtmd.so")
+PATHS = device.stage_paths("unary-rows", __file__)
+PHONE, LAPTOP_STAGE, BOX, STAGE_DIR = PATHS
+BINS = ("gate.sh", "memprobe", "test-backend-ops", "unarycheck")
+LIBS = ("libggml-base.so", "libggml-cpu.so", "libggml-hexagon.so", "libggml-htp-v79.so", "libggml-opencl.so",
+        "libggml.so", "libllama-common.so", "libllama.so", "libmtmd.so")
 # build.sh keeps in lib-new only the libraries that differ from lib-base. The shell of the runner expands the glob on
 # the laptop, and the checksum check on the phone finds a library that the push did not move.
-q.NEW_LIBS = ("*.so",)
+NEW_LIBS = ("*.so",)
 
-q.VARIANTS = {v.key: v for v in (
+VARIANTS = {v.key: v for v in (
     q.Variant("a", "lib-base", "", "HEAD"),
     q.Variant("z", "lib-new", "GGML_HEXAGON_UNARY_FLAT=0", "new, no op gets new rows"),
     q.Variant("b", "lib-new", "", "new, each kind of pointwise op gets new rows"),
@@ -50,43 +44,41 @@ q.VARIANTS = {v.key: v for v in (
     q.Variant("p", "lib-new", "GGML_HEXAGON_UNARY_FLAT=4", "new, only SOFTPLUS gets new rows"),
     q.Variant("c", "lib-new", "GGML_HEXAGON_UNARY_FLAT=8", "new, only SCALE gets new rows"),
 )}
-q.BLOCKS = [
+BLOCKS = (
     q.Block("h", "memprobe", "--hash -p 1024 -n 16", "azbspc", 1, 90, device.GATE_4B_KB, "",
             "memprobe --hash, a prompt of 1024 tokens and 16 decode tokens: the logits hashes"),
     q.Block("u", "unarycheck", "--cpu", "azb", 1, 60, device.GATE_TOOL_KB, "",
             "unarycheck --cpu: the ops of the model shapes on HTP0 against the CPU of the phone"),
     q.Block("k", "test-backend-ops", "-o SIGMOID,SOFTPLUS,SCALE -b HTP0", "azb", 1, 100, device.GATE_TOOL_KB, "",
             "test-backend-ops of SIGMOID, SOFTPLUS and SCALE on HTP0 against the CPU"),
-]
+)
 CHECK_CASES = ("sigmoid_beta_t1024", "sigmoid_beta_t1", "softplus_gate_t1024", "softplus_gate_t1")
 
 
 def run_lines(b: q.Block, rnd: int, v: q.Variant) -> list[str]:
     """The lines of one run: a title, the thermal line, the run and the pgrep line."""
     name = f"{b.key}-{rnd}-{v.key}"
-    stem = f"{q.PHONE}/out/{name}"
+    stem = f"{PHONE}/out/{name}"
     # lib-new holds only the libraries that differ (the Hexagon backend)
     host = v.lib if v.lib == "lib-base" else f"{v.lib}:lib-base"
     # The row change does not change the DSP code, thus each run loads the DSP library of lib-base
-    env = " ".join(x for x in (device.lib_env(q.PHONE, host, "lib-base"), q.APP_ENV, v.env, b.env) if x)
+    env = " ".join(x for x in (device.lib_env(PHONE, host, "lib-base"), q.APP_ENV, v.env, b.env) if x)
     pre = ""
     if b.tool == "memprobe":
-        tool = f"{q.PHONE}/bin/memprobe -m {q.MODEL} {q.PROBE_ARGS} {b.args}"
+        tool = f"{PHONE}/bin/memprobe -m {q.MODEL} {q.PROBE_ARGS} {b.args}"
         title = f"# REAL-MODEL Qwen3.5-4B-Q8_0: {name}, {b.text}, {v.key.upper()}: {v.text}"
     elif b.tool == "unarycheck":
         pre = f"mkdir -p {stem}-dump && "
-        tool = f"{q.PHONE}/bin/unarycheck {b.args} --dump {stem}-dump"
+        tool = f"{PHONE}/bin/unarycheck {b.args} --dump {stem}-dump"
         title = f"# KERNEL: {name}, {b.text}, {v.key.upper()}: {v.text}"
     else:
-        tool = f"{q.PHONE}/bin/{b.tool} {b.args}"
+        tool = f"{PHONE}/bin/{b.tool} {b.args}"
         title = f"# KERNEL: {name}, {b.text}, {v.key.upper()}: {v.text}"
-    cmd = commands.gated_run(stem, b.gate_kb, b.limit, env, tool, stage=q.PHONE, pre=pre)
+    cmd = commands.gated_run(stem, b.gate_kb, b.limit, env, tool, stage=PHONE, pre=pre)
     return commands.run_lines(title, cmd, q.PGREP)
 
 
-q.run_lines = run_lines
-
-q.HEADER = """\
+HEADER = """\
 # Phone stage "unary-rows": which op of the row change of the pointwise unary ops moves the logits of the 4B Q8_0,
 # and which rows give the correct values on the NPU. The app configuration: Q8_0 K and V with the FWHT rotation,
 # GGML_HEXAGON_OPFUSION=1, OPFUSION_STATE=1.
@@ -121,6 +113,9 @@ q.HEADER = """\
 # the box: python3 build/unary-rows/stage.py table
 """
 
+# The stage quick writes the command file from these values
+STAGE = q.Stage(PATHS, BINS, LIBS, NEW_LIBS, VARIANTS, BLOCKS, HEADER, run_lines)
+
 CHECK_RE = re.compile(r"^unarycheck case=(\S+) flat=\S+ hash=([0-9a-f]{16}) nonfinite=(\d+)(.*?) us=", re.M)
 
 
@@ -142,7 +137,7 @@ def table(root: Path) -> int:
     """Print the results of each block."""
     if not root.is_dir():
         return cli.missing_root(root)
-    for b, rnd, v in q.runs():
+    for b, rnd, v in STAGE.runs():
         text, _, _ = logs.read_run(root, f"{b.key}-{rnd}-{v.key}")
         print(f"{b.key}-{rnd}-{v.key}: {q.conditions(text) if text else 'no gate file'}")
     print()
@@ -189,7 +184,7 @@ def table(root: Path) -> int:
 
 def main() -> int:
     """Run the subcommand of the command line."""
-    return cli.run(STAGE_DIR, __doc__, write=q.write_commands, count=lambda: len(q.runs()), table=table,
+    return cli.run(STAGE_DIR, __doc__, write=STAGE.write_commands, count=lambda: len(STAGE.runs()), table=table,
                    all_flag=False, table_help="print the results from the pulled logs")
 
 
