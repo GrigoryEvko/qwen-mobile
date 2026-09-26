@@ -12,7 +12,8 @@
 #   SUFFIX      a tag suffix of the results, "-" for none. The results always get "-BUILD".
 #   FUSION      the value of GGML_HEXAGON_OPFUSION and GGML_HEXAGON_OPFUSION_STATE (0 or 1)
 #   ADSP_DIR    the ADSP_LIBRARY_PATH with libggml-htp-v79.so. The script prints the SHA-256 of each
-#               DSP library in it before the first case.
+#               DSP library in it before the first case, and it stops a run with an HTP backend when
+#               the directory holds no DSP library.
 #   SECONDS     the run time before the deadline. Keep it 15 s below the outer timeout.
 #   COUNT       "all", or the number of cases from the start of the pack (a probe)
 #   UBSAN_HALT  1 stops at the first UBSan report without a suppression, 0 prints every report
@@ -28,7 +29,8 @@
 #
 # ops_replay continues after a crash: a new process records the case that stopped the last one.
 # The loop starts a new process until ops_replay stops with 0 (all runs done) or 3 (the deadline).
-# The exit code 4 is an environment failure (no ASan runtime, or the thread self-test failed).
+# The exit code 4 is an environment failure (no ASan runtime, the thread self-test failed, or no
+# DSP library for an HTP backend).
 
 # FUZZ_OPS_PHONE_DIR replaces the work directory for a test of this script on the host.
 d=${FUZZ_OPS_PHONE_DIR:-/data/local/tmp/qwen/fuzz/ops}
@@ -65,7 +67,17 @@ for lib in "$adsp"/libggml-htp-v*.so; do
     echo "$line" >> "out/log-$build-$tag.txt"
     ndsp=$((ndsp + 1))
 done
-[ $ndsp -gt 0 ] || echo "build=$build tag=$tag dsp: no libggml-htp-v*.so in $adsp"
+if [ $ndsp -eq 0 ]; then
+    # With no DSP library, HTP0 cannot start, and a run of its backends would give no result of the
+    # NPU. A run on the CPU only needs no DSP library.
+    case $backends in
+        *HTP*)
+            echo "build=$build tag=$tag ENVIRONMENT FAILURE: no libggml-htp-v*.so in $adsp (ADSP_DIR), no case ran"
+            exit 4
+            ;;
+    esac
+    echo "build=$build tag=$tag dsp: no libggml-htp-v*.so in $adsp"
+fi
 
 # the options of the one sanitizer of the build. With the symbolizer, the report frames have
 # function names, and the function-level entries of ubsan.supp can match them.

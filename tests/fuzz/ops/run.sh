@@ -46,7 +46,7 @@ PHONE=$FUZZ_PHONE_SERIAL
 PHONE_DIR=${PHONE_DIR:-/data/local/tmp/qwen/fuzz/ops}
 PHONE_BUILDS=${PHONE_BUILDS:-}
 DSP_LIB=${DSP_LIB:-}
-ADSP_DIR=${ADSP_DIR:-/data/local/tmp/qwen/q8ref/lib}
+ADSP_DIR=${ADSP_DIR:-}
 PACK_N=${PACK_N:-20}
 PACK_CORPUS=${PACK_CORPUS:-40}
 PHONE_SECONDS=${PHONE_SECONDS:-85}
@@ -122,6 +122,8 @@ Other modes:
                            only; a "git clone --shared" of the submodule gives (3).
   phone-check-commands     With FUZZ_OPS_TAG: print the phone check of a fix before it lands:
                            the op pack and llama-bench, the shipped libraries against libs-TAG.
+  phone-selftest           Test the staging of the DSP library on scratch stages (no container, no
+                           phone). The test mode runs it as the target phone-stage.
   bounds                   Print the bound rule of each kind.
   help                     Print this text.
   Aliases: cpu-asan = fuzz asan, cpu-tsan = fuzz tsan, regress = test asan.
@@ -149,13 +151,17 @@ Environment (defaults in parentheses):
   PHONE          the adb serial (192.168.14.130:5555)
   PHONE_DIR      the work directory on the phone (/data/local/tmp/qwen/fuzz/ops)
   PHONE_BUILDS   the builds of phone-commands full, for example "release-none debug-asan"
-  DSP_LIB        a DSP library to push as libggml-htp-v79.so for the builds other than release-none;
-                 empty uses ADSP_DIR as it is. release-none always uses the shipped DSP library
+  DSP_LIB        a DSP library that phone-build stages as libggml-htp-v79.so for the builds other than
+                 release-none (they have the host code of the snapshot). FUZZ_OPS_BUILD_DSP=1 stages
+                 the library of the debug-none build of the snapshot. Without the two, phone-build
+                 keeps the library that an earlier run staged, and it stops when the stage holds such
+                 a build and no library. release-none always uses the shipped DSP library
                  (android/snapdragon/jniLibs/arm64-v8a, hash-checked against build/hashes-native.txt),
                  which phone-build copies to its stage directory. phone_run.sh prints the SHA-256 of
-                 each DSP library of a run.
-  ADSP_DIR       the ADSP_LIBRARY_PATH on the phone of the builds other than release-none without
-                 DSP_LIB (/data/local/tmp/qwen/q8ref/lib)
+                 each DSP library of a run, and it stops an HTP0 run with no DSP library.
+  ADSP_DIR       a directory on the phone that holds the DSP library of the builds other than
+                 release-none, in place of a staged library (empty: phone-build and phone-commands
+                 stop when the stage has no library)
   PACK_N         the random cases of each kind in the phone pack (20)
   PACK_CORPUS    the most inputs from each CPU corpus in the phone pack (40). The pack takes the
                  corpora of the fuzz suites of the none builds (debug and release) only
@@ -377,6 +383,17 @@ run_test() {
     json_line "$profile" "$config" f16_check test $((t1 - t0)) 1 "$fbad"
     echo "fuzz-ops: test $profile-$config f16_check: 1 check, $fbad findings"
     total_bad=$((total_bad + fbad))
+    # The staging of the DSP library for the phone (phone_selftest): 5 cases on scratch stages.
+    local pbad=0
+    t0=$(date +%s)
+    if ! phone_selftest > "$dir/test/phone-stage.log" 2>&1; then
+        pbad=1
+        echo "fuzz-ops: test $profile-$config phone-stage: FINDING (log $dir/test/phone-stage.log)" >&2
+    fi
+    t1=$(date +%s)
+    json_line "$profile" "$config" phone-stage test $((t1 - t0)) 5 "$pbad"
+    echo "fuzz-ops: test $profile-$config phone-stage: 5 cases, $pbad findings"
+    total_bad=$((total_bad + pbad))
     for g in $ALL_GROUPS; do
         local t0 t1 res n bad failed
         failed="$(host_dir "$profile" "$config")/test/$g.failed"
@@ -620,37 +637,125 @@ fi
     cp -f "$SYMBOLIZER" "$stage/llvm-symbolizer"
     rm -f "$stage/ubsan.supp"
     [[ -f "$SHARED_SAN/ubsan.supp" ]] && cp -f "$SHARED_SAN/ubsan.supp" "$stage/"
-    # FUZZ_OPS_BUILD_DSP=1: the v79 DSP library of the snapshot (it pairs with the host code of the
-    # snapshot in the builds other than release-none, which has the shipped host libraries)
-    if [[ ${FUZZ_OPS_BUILD_DSP:-0} == 1 && -z $DSP_LIB ]]; then
-        DSP_LIB=$(find "$REPO_ROOT/build/fuzz/ops-debug-none/android" -name libggml-htp-v79.so | head -n 1)
-        [[ -f $DSP_LIB ]] || die "no libggml-htp-v79.so in build/fuzz/ops-debug-none/android"
-    fi
-    rm -f "$stage/libggml-htp-v79.so"
-    if [[ -n $DSP_LIB ]]; then
-        [[ -f $DSP_LIB ]] || die "DSP_LIB=$DSP_LIB is not a file"
-        cp -f "$DSP_LIB" "$stage/libggml-htp-v79.so"
-    fi
+    stage_dsp_library "$stage"
     (cd "$stage" && find . -type f ! -name SHA256SUMS | sort | xargs sha256sum > SHA256SUMS)
     cat "$stage/SHA256SUMS"
 }
 
-# Print the ADSP_LIBRARY_PATH on the phone for one build. release-none links the shipped host
-# libraries, thus it takes the shipped DSP library in its stage directory (phone-build copies it
-# there after the check against build/hashes-native.txt). The other builds have the host code of
-# the snapshot: they take the staged DSP library of the snapshot (DSP_LIB or FUZZ_OPS_BUILD_DSP=1),
-# or ADSP_DIR when the stage has none.
+# The message of a stage with builds of the snapshot and no DSP library for them.
+readonly NO_DSP_HELP="give DSP_LIB=<the libggml-htp-v79.so of the snapshot>, or FUZZ_OPS_BUILD_DSP=1 (the \
+library of the debug-none build of the snapshot), or ADSP_DIR=<a directory on the phone that holds it>"
+
+# Stage the DSP library of the builds with the host code of the snapshot (each build other than
+# release-none) in the stage directory $1: DSP_LIB, or with FUZZ_OPS_BUILD_DSP=1 the library of the
+# debug-none build of the snapshot. Without the two, keep the library that an earlier run staged:
+# this run did not build one. A stage with such a build, with no library and with no ADSP_DIR stops
+# the run, because its phone commands would name a directory with no library.
+stage_dsp_library() {
+    local stage=$1 lib=$DSP_LIB b
+    if [[ -z $lib && ${FUZZ_OPS_BUILD_DSP:-0} == 1 ]]; then
+        lib=$(find "$REPO_ROOT/build/fuzz/ops-debug-none/android" -name libggml-htp-v79.so | head -n 1)
+        [[ -f $lib ]] || die "FUZZ_OPS_BUILD_DSP=1: no libggml-htp-v79.so in build/fuzz/ops-debug-none/android"
+    fi
+    if [[ -n $lib ]]; then
+        [[ -f $lib ]] || die "DSP_LIB=$lib is not a file"
+        cp -f "$lib" "$stage/libggml-htp-v79.so"
+        echo "fuzz-ops: the stage holds the DSP library $lib ($(sha256sum "$lib" | cut -c1-16))"
+        return 0
+    fi
+    if [[ -f $stage/libggml-htp-v79.so ]]; then
+        echo "fuzz-ops: the stage keeps its DSP library ($(sha256sum "$stage/libggml-htp-v79.so" | cut -c1-16))"
+        return 0
+    fi
+    for b in "$stage"/{debug,release}-{none,asan,hwasan,ubsan}; do
+        [[ $b != */release-none && -f $b/ops_replay && -z $ADSP_DIR ]] \
+            && die "the stage holds the build $(basename "$b") of the snapshot and no DSP library for it: $NO_DSP_HELP"
+    done
+    return 0
+}
+
+# Print the ADSP_LIBRARY_PATH on the phone for one build, and stop when the stage has no DSP library
+# for it. release-none links the shipped host libraries, thus it takes the shipped DSP library in its
+# stage directory (phone-build copies it there after the check against build/hashes-native.txt). The
+# other builds have the host code of the snapshot: they take the staged DSP library, which the phone
+# commands push to $PHONE_DIR/dsp, or ADSP_DIR when the operator names a directory on the phone.
+# Arguments: the build, and the stage directory (the preset value is the stage of phone-build).
 phone_adsp() {
-    local b=$1 stage="$MISC/phone"
+    local b=$1 stage=${2:-$MISC/phone}
     if [[ $b == release-none ]]; then
         [[ -f $stage/release-none/dsp/libggml-htp-v79.so ]] \
             || die "no shipped DSP library in $stage/release-none/dsp: run phone-build release-none"
         echo "$PHONE_DIR/release-none/dsp"
     elif [[ -f $stage/libggml-htp-v79.so ]]; then
         echo "$PHONE_DIR/dsp"
-    else
+    elif [[ -n $ADSP_DIR ]]; then
         echo "$ADSP_DIR"
+    else
+        die "the build $b needs the DSP library of the snapshot, and the stage $stage has none: $NO_DSP_HELP"
     fi
+}
+
+# The self-test of the staging of the DSP library, on scratch stages (no container, no phone). The
+# test mode runs it as the target phone-stage. The cases:
+#   keep        no DSP_LIB: the stage keeps its library, with the same bytes
+#   dsp-lib     DSP_LIB: the stage holds that library
+#   stop        a build of the snapshot and no library: phone-build and phone-commands stop, and
+#               the message names DSP_LIB and FUZZ_OPS_BUILD_DSP
+#   shipped     only release-none: no library is necessary
+#   adsp-dir    ADSP_DIR names the directory on the phone
+# Output: one line for each case. Return status: 0 if each case passes, 1 if not.
+phone_selftest() {
+    local s failed=0 name
+    s=$(mktemp -d)
+    # shellcheck disable=SC2064
+    trap "rm -rf '$s'" RETURN
+    # Three scratch stages: a has a build of the snapshot and a staged library, b has only
+    # release-none with its shipped library, c has a build of the snapshot and no library.
+    mkdir -p "$s/a/debug-asan" "$s/b/release-none/dsp" "$s/c/debug-none"
+    : > "$s/a/debug-asan/ops_replay"
+    : > "$s/b/release-none/ops_replay"
+    : > "$s/b/release-none/dsp/libggml-htp-v79.so"
+    : > "$s/c/debug-none/ops_replay"
+    echo "the staged library" > "$s/a/libggml-htp-v79.so"
+    echo "a library of DSP_LIB" > "$s/new.so"
+
+    case_keep() {
+        ( DSP_LIB="" FUZZ_OPS_BUILD_DSP=0 ADSP_DIR=""; stage_dsp_library "$s/a" ) > /dev/null 2>&1 \
+            && [[ $(cat "$s/a/libggml-htp-v79.so") == "the staged library" ]] \
+            && [[ $(ADSP_DIR="" phone_adsp debug-asan "$s/a") == "$PHONE_DIR/dsp" ]]
+    }
+    case_dsp_lib() {
+        ( DSP_LIB="$s/new.so" FUZZ_OPS_BUILD_DSP=0; stage_dsp_library "$s/c" ) > /dev/null 2>&1 \
+            && [[ $(cat "$s/c/libggml-htp-v79.so" 2> /dev/null) == "a library of DSP_LIB" ]] \
+            && rm -f "$s/c/libggml-htp-v79.so"
+    }
+    case_stop() {
+        local build commands
+        if build=$( ( DSP_LIB="" FUZZ_OPS_BUILD_DSP=0 ADSP_DIR=""; stage_dsp_library "$s/c" ) 2>&1); then
+            return 1
+        fi
+        if commands=$( ( ADSP_DIR=""; phone_adsp debug-none "$s/c" ) 2>&1); then
+            return 1
+        fi
+        [[ $build == *DSP_LIB*FUZZ_OPS_BUILD_DSP* && $commands == *DSP_LIB*FUZZ_OPS_BUILD_DSP* ]]
+    }
+    case_shipped() {
+        ( DSP_LIB="" FUZZ_OPS_BUILD_DSP=0 ADSP_DIR=""; stage_dsp_library "$s/b" ) > /dev/null 2>&1 \
+            && [[ $(phone_adsp release-none "$s/b") == "$PHONE_DIR/release-none/dsp" ]]
+    }
+    case_adsp_dir() {
+        ( ADSP_DIR=/data/local/tmp/qwen/dsp-lib; stage_dsp_library "$s/c" ) > /dev/null 2>&1 \
+            && [[ $(ADSP_DIR=/data/local/tmp/qwen/dsp-lib phone_adsp debug-none "$s/c") == /data/local/tmp/qwen/dsp-lib ]]
+    }
+    for name in keep dsp_lib stop shipped adsp_dir; do
+        if "case_$name"; then
+            echo "fuzz-ops: phone-stage pass ${name//_/-}"
+        else
+            echo "fuzz-ops: phone-stage FAIL ${name//_/-}"
+            failed=1
+        fi
+    done
+    return $failed
 }
 
 # Print one phone run: the thermal status, the run inside timeout, the thermal status again, and
@@ -1062,6 +1167,7 @@ main() {
         oracle-x86)     build_oracle_x86 ;;
         phone-libs)     phone_libs ;;
         phone-check-commands) phone_check_commands ;;
+        phone-selftest) phone_selftest ;;
         bounds)         build_oracle; "$B_ORACLE/ops_oracle" bounds ;;
         help | -h | --help) usage ;;
         *)              usage; die "unknown mode: $mode" ;;
