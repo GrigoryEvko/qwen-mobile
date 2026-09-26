@@ -30,7 +30,6 @@ on without the keyguard. --all also uses the other runs. The table only reads fi
 from __future__ import annotations
 
 import argparse
-import gzip
 import hashlib
 import math
 import re
@@ -42,35 +41,38 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common import cli, commands, device, gate, logs  # noqa: E402
+
 # The script lives in tools/stages/sweep, and build/sweep/stage.py is a link to it. The stage files
 # (phone/, phone-commands.txt, phone-out/) are in build/sweep of the repository in each case.
 REPO = Path(__file__).resolve().parents[3]
-HERE = REPO / "build/sweep"
 
 # ---- The stage paths and the phone lines ----
 
-ADB = "adb -s 192.168.14.130:5555"
-PHONE = "/data/local/tmp/qwen/sweep"
-LAPTOP_STAGE = "build/sweep"
-BOX = "grigory@10.10.20.200:airi/qwen-mobile/build/sweep"
+ADB = device.ADB
+PATHS = device.stage_paths("sweep", __file__)
+PHONE, LAPTOP_STAGE, BOX, STAGE_DIR = PATHS
 # The ls of this file makes the laptop runner treat a line as a model run: it waits for the unlocked
 # phone, stops the Qwen app, wakes the screen, checks MemAvailable against MIN_2B_MB (6000 MB) and
 # prints the caps and the screen state. No run of this stage loads the file.
-MARKER = "ls /data/local/tmp/qwen/models/Qwen3.5-2B-Q8_0.gguf > /dev/null"
-GATE_KB = 2097152
-LIB_ENV = f"LD_LIBRARY_PATH={PHONE}/lib ADSP_LIBRARY_PATH={PHONE}/lib"
-THERMAL = f"{ADB} shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
-PGREP = f"{ADB} shell 'pgrep -x test-backend-op; pgrep -x run_main_on_he; echo pgrep-done'"
-NSP = ('$(for z in /sys/class/thermal/thermal_zone*; do case "$(cat $z/type 2>/dev/null)" in (nsp*) '
-       'cat $z/temp 2>/dev/null;; esac; done | sort -n | tail -n 1)')
+MARKER = f"ls {device.MODEL_DIR}/{device.MODEL_2B} > /dev/null"
+GATE_KB = device.GATE_TOOL_KB
+LIB_ENV = device.lib_env(PHONE)
+THERMAL = device.THERMAL
+TOOLS = ("test-backend-op", "run_main_on_hex")
+PGREP = device.pgrep(*TOOLS)
+# The screen state and the keyguard state. The shared before line and after line do not record them, thus
+# this stage keeps its own two lines: with the screen off the SoC goes into its standby mode, and the times
+# of such a run are not comparable.
 SCREEN = ('screen=$(dumpsys power | grep -o "mWakefulness=[A-Za-z]*" | head -n 1 | cut -d= -f2)'
           ' keyguard=$(dumpsys window | grep -m1 -o "isKeyguardShowing=[a-z]*" | cut -d= -f2)')
-BEFORE = f'echo "before: nsp={NSP} {SCREEN}"'
+BEFORE = f'echo "before: nsp={device.NSP} {SCREEN}"'
 AFTER = ('echo "after: thermal=$(dumpsys thermalservice | grep "Thermal Status" | head -n 1 | tr -dc 0-9)'
          ' cap0=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)'
          ' cap7=$(cat /sys/devices/system/cpu/cpu7/cpufreq/scaling_max_freq)'
          ' battery=$(dumpsys battery | grep "^  level:" | tr -dc 0-9)'
-         f' temp=$(dumpsys battery | grep "temperature:" | tr -dc 0-9) nsp={NSP} {SCREEN}"')
+         f' temp=$(dumpsys battery | grep "temperature:" | tr -dc 0-9) nsp={device.NSP} {SCREEN}"')
 
 # The libraries of build/bench-kv/phone/lib that test-backend-ops loads (the APK set of HEAD e8a3a07
 # plus the switch GGML_HEXAGON_FWHT), and the binary of build/perf-tbo from the same tree and flags.
@@ -647,73 +649,63 @@ HEADER = """\
 
 
 def setup_lines() -> list[str]:
-    """The lines that copy the stage to the phone and check its files."""
-    return [
-        f"mkdir -p {LAPTOP_STAGE} && rsync -a --delete {BOX}/phone/ {LAPTOP_STAGE}/phone/",
-        f"(cd {LAPTOP_STAGE}/phone && sha256sum -c SHA256SUMS)",
-        f"{ADB} shell 'rm -rf {PHONE} && mkdir -p {PHONE}/bin {PHONE}/lib {PHONE}/hmx {PHONE}/tests {PHONE}/out'",
-        f"{ADB} push {LAPTOP_STAGE}/phone/bin/test-backend-ops {LAPTOP_STAGE}/phone/bin/gate.sh {PHONE}/bin/",
-        f"{ADB} push " + " ".join(f"{LAPTOP_STAGE}/phone/lib/{x}" for x in LIBS) + f" {PHONE}/lib/",
-        f"{ADB} push " + " ".join(f"{LAPTOP_STAGE}/phone/hmx/{x}" for x in HMX_FILES) + f" {PHONE}/hmx/",
-        f"{ADB} push " + " ".join(f"{LAPTOP_STAGE}/phone/tests/{r.key}.txt" for r in runs() if r.cases) + f" {PHONE}/tests/",
-        f"{ADB} push {LAPTOP_STAGE}/phone/SHA256SUMS {PHONE}/",
-        f"{ADB} shell 'cd {PHONE} && sha256sum -c SHA256SUMS | grep -c OK && chmod 755 {PHONE}/bin/* {PHONE}/hmx/*'",
+    """The lines that copy the stage to the phone and check its files. The chmod also makes the DSP programs
+    of hmx/ executable, and the last line checks for uniq, which a verbose run needs."""
+    pushes = {
+        "bin": [f"{LAPTOP_STAGE}/phone/bin/test-backend-ops", f"{LAPTOP_STAGE}/phone/bin/gate.sh"],
+        "lib": [f"{LAPTOP_STAGE}/phone/lib/{x}" for x in LIBS],
+        "hmx": [f"{LAPTOP_STAGE}/phone/hmx/{x}" for x in HMX_FILES],
+        "tests": [f"{LAPTOP_STAGE}/phone/tests/{r.key}.txt" for r in runs() if r.cases],
+    }
+    return commands.setup_lines(PATHS, pushes, chmod=("bin", "hmx"), extra=[
         f"{ADB} shell 'echo gzip: $(command -v gzip) uniq: $(command -v uniq) timeout: $(command -v timeout)'",
-    ]
+    ])
 
 
 def run_lines(r: Run) -> list[str]:
     """The lines of one run: a title, the thermal line, the run and the pgrep line."""
     stem = f"{PHONE}/out/{r.key}"
-    gate = (f"{MARKER}; sh {PHONE}/bin/gate.sh {GATE_KB} > {stem}-gate.txt && {BEFORE} >> {stem}-gate.txt && ")
-    tail = f"echo \"rc=$?\" >> {stem}-gate.txt; {AFTER} >> {stem}-gate.txt; cat {stem}-gate.txt"
+    head = commands.gate_head(stem, GATE_KB, PHONE, prefix=f"{MARKER}; ", before=BEFORE)
+    clean = ""
     # Each tool part is one group: a gate that fails skips all of it, and $? after it is the exit code of
     # the tool (or of the gate).
     if r.program:
-        tool = (f"{{ cd {PHONE}/hmx && timeout -s KILL {limit_s(r)} env ADSP_LIBRARY_PATH={PHONE}/hmx "
-                f"./run_main_on_hexagon 3 {r.program} --out {stem}.txt > {stem}.out 2> {stem}.log; }}; ")
-        tail = (f"echo \"rc=$?\" >> {stem}-gate.txt; logcat -d -s adsprpc -t 4000 | grep -E \"i8read:|sustain:\" > "
-                f"{stem}-logcat.txt; {AFTER} >> {stem}-gate.txt; cat {stem}-gate.txt")
+        cmd = commands.timeout_cmd(limit_s(r), f"ADSP_LIBRARY_PATH={PHONE}/hmx",
+                                   f"./run_main_on_hexagon 3 {r.program} --out {stem}.txt")
+        tool = f"{{ cd {PHONE}/hmx && {commands.redirect(stem, cmd)}; }}; "
+        # The lines of a DSP program also go to the log of the DSP daemon: they are the fallback when the
+        # result file of the program is empty.
+        clean = f"logcat -d -s adsprpc -t 4000 | grep -E \"i8read:|sustain:\" > {stem}-logcat.txt; "
     else:
         env = " ".join(x for x in (LIB_ENV, r.env,
                                    "GGML_HEXAGON_VERBOSE=1" if r.verbose else "",
                                    f"GGML_HEXAGON_PROFILE=3 GGML_HEXAGON_OPTRACE={r.trace}" if r.trace else "",
                                    "GGML_HEXAGON_PROFILE=1" if r.profile else "") if x)
-        cmd = (f"timeout -s KILL {limit_s(r)} env {env} {PHONE}/bin/test-backend-ops perf -b HTP0 "
-               f"--test-file {PHONE}/tests/{r.key}.txt")
+        cmd = commands.timeout_cmd(limit_s(r), env, f"{PHONE}/bin/test-backend-ops perf -b HTP0 "
+                                                   f"--test-file {PHONE}/tests/{r.key}.txt")
         if r.verbose:
             # The verbose map prints one line for each packed copy of a node: uniq keeps one of each.
             tool = f"{{ set -o pipefail; {cmd} 2>&1 | uniq > {stem}.out; }}; "
         elif r.profile or r.trace:
-            # One profile line for each op copy: gzip (when the phone has it) keeps the file small. The
-            # parser reads a gzip file and a plain file alike.
-            tool = (f"{{ Z=cat; command -v gzip > /dev/null && Z=\"gzip -1\"; set -o pipefail; "
-                    f"{cmd} 2>&1 > {stem}.out | $Z > {stem}.log.z; }}; ")
+            tool = commands.gzip_group(stem, cmd)
         else:
-            tool = f"{{ {cmd} > {stem}.out 2> {stem}.log; }}; "
+            tool = f"{{ {commands.redirect(stem, cmd)}; }}; "
+    tail = commands.gate_tail(stem, clean=clean, after=AFTER)
     what = f"{len(r.cases)} cases, " if r.cases else ""
-    return ["#", f"# SWEEP {r.key}: {r.text} ({what}estimate {est_run_s(r):.0f} s, limit {limit_s(r)} s)",
-            THERMAL, f"{ADB} shell '{gate}{tool}{tail}'", PGREP]
+    title = f"# SWEEP {r.key}: {r.text} ({what}estimate {est_run_s(r):.0f} s, limit {limit_s(r)} s)"
+    return commands.run_lines(title, f"{head}{tool}{tail}", PGREP)
 
 
 def output_lines() -> list[str]:
-    """The lines that pull the outputs, copy them to the box and remove the phone directory."""
-    return [
-        "#", "# ---- The outputs ----", "#", THERMAL,
-        f"{ADB} shell 'pgrep -x test-backend-op; ls {PHONE}/out | wc -l; du -sh {PHONE}/out'",
-        f"rm -rf {LAPTOP_STAGE}/phone-out",
-        f"{ADB} pull {PHONE}/out {LAPTOP_STAGE}/phone-out",
-        f"rsync -a --delete {LAPTOP_STAGE}/phone-out/ {BOX}/phone-out/",
-        f"test \"$(ls {LAPTOP_STAGE}/phone-out | wc -l)\" -eq "
-        f"\"$({ADB} shell 'ls {PHONE}/out | wc -l' | tr -d '\\r')\" "
-        f"&& {ADB} shell 'rm -rf {PHONE}' && echo removed {PHONE}",
-    ]
+    """The lines that pull the outputs, copy them to the box and remove the phone directory. The pull line
+    names test-backend-ops only, which is the tool of each run that has a test file."""
+    return commands.output_lines(PATHS, tools=TOOLS[:1])
 
 
 def write_files() -> int:
     """Write phone/ and phone-commands.txt. A case name must be unique in its run."""
     ops = ggml_ops()
-    phone = HERE / "phone"
+    phone = STAGE_DIR / "phone"
     for sub in ("bin", "lib", "tests"):
         (phone / sub).mkdir(parents=True, exist_ok=True)
     shutil.copy2(REPO / "build/perf-tbo/phone/bin/test-backend-ops", phone / "bin")
@@ -742,14 +734,14 @@ def write_files() -> int:
         raise FileNotFoundError(f"{hmx} has no {missing}: run tools/stages/sweep/build.sh")
     tool = sum(est_run_s(r) for r in all_runs)
     head = HEADER.format(tool_min=tool / 60, n_runs=len(all_runs), total_min=(tool + 15 * len(all_runs)) / 60)
-    lines = head.rstrip("\n").split("\n") + setup_lines()
+    lines = commands.header_lines(head) + setup_lines()
     for r in all_runs:
         lines += run_lines(r)
     lines += output_lines()
-    (HERE / "phone-commands.txt").write_text("\n".join(lines) + "\n")
+    n = commands.write_commands(STAGE_DIR / "phone-commands.txt", lines)
     for r in all_runs:
         print(f"  {r.key:8s} {len(r.cases):3d} cases  estimate {est_run_s(r):5.1f} s  limit {limit_s(r):3d} s")
-    print(f"phone-commands.txt: {len(lines)} lines, {len(all_runs)} runs, tool time about {tool / 60:.1f} min")
+    print(f"phone-commands.txt: {n} lines, {len(all_runs)} runs, tool time about {tool / 60:.1f} min")
     return 0
 
 
@@ -774,7 +766,8 @@ def print_plan() -> int:
 
 # ---- The outputs ----
 
-GATE_RE = re.compile(r"gate: screen=(\S+) thermal=(\d*) cap0=(\d*) cap7=(\d*) battery=(\d*)% temp=(\d*)")
+# The before line and the after line of this stage also hold the screen state and the keyguard state, thus
+# the two patterns capture more groups than the shared ones.
 BEFORE_RE = re.compile(r"before: nsp=(\d*) screen=(\S*) keyguard=(\S*)")
 AFTER_RE = re.compile(r"after: thermal=(\d*) cap0=(\d*) cap7=(\d*) battery=(\d*) temp=(\d*) nsp=(\d*) "
                       r"screen=(\S*) keyguard=(\S*)")
@@ -808,30 +801,14 @@ class RunOut:
 
 def read_run(root: Path, r: Run) -> RunOut:
     """Read the gate file, the stdout and the stderr of one run. O(size of the files)."""
-    gate_p = root / f"{r.key}-gate.txt"
-    gate = gate_p.read_text(errors="replace") if gate_p.exists() else ""
-    before, bnsp, after = GATE_RE.search(gate), BEFORE_RE.search(gate), AFTER_RE.search(gate)
-    rc = re.search(r"^rc=(\d+)", gate, re.M)
-    flags: list[str] = []
-    ok = "gate: OK" in gate and rc is not None and rc.group(1) == "0"
-    if not gate:
-        flags.append("no gate file")
-    elif "gate: OK" not in gate:
-        flags.append("the gate stopped the run")
-    elif not ok:
-        flags.append(f"exit code {rc.group(1) if rc else '?'}")
-    caps = f"{before.group(3)}/{before.group(4)}" if before else "?"
-    if before and after and (before.group(3), before.group(4)) != (after.group(2), after.group(3)):
-        flags.append(f"caps {caps} -> {after.group(2)}/{after.group(3)}")
-    if after and after.group(1) not in ("", "0"):
-        flags.append(f"thermal {after.group(1)} after the run")
-    for label, m, si, ki in (("before", bnsp, 2, 3), ("after", after, 7, 8)):
+    text, out, log = logs.read_run(root, r.key)
+    cond = gate.read(text)
+    flags = cond.flags
+    before, after = BEFORE_RE.search(text), AFTER_RE.search(text)
+    for label, m, si, ki in (("before", before, 2, 3), ("after", after, 7, 8)):
         if m and (m.group(si) != "Awake" or m.group(ki) != "false"):
             flags.append(f"screen {m.group(si)} keyguard {m.group(ki)} {label} the run")
-    res = RunOut(r, ok, flags, caps)
-    out_p = root / f"{r.key}.out"
-    res.out = out_p.read_text(errors="replace") if out_p.exists() else ""
-    res.log = read_log(root, r.key)
+    res = RunOut(r, cond.ok, flags, cond.caps, out=out, log=log)
     if r.program:
         read_program(root, r, res)
         return res
@@ -845,28 +822,15 @@ def read_run(root: Path, r: Run) -> RunOut:
         if t:
             res.us[m.group(1)] = float(t.group(2))
     missing = [c.name for c in r.cases if c.name not in res.us and c.name not in res.unsupported]
-    if ok and missing:
+    if cond.ok and missing:
         flags.append(f"{len(missing)} cases without a result, the first {missing[0]}")
     if res.unsupported:
         flags.append(f"not supported: {', '.join(res.unsupported)}")
     if r.profile or r.trace:
         res.series = op_series(res.log, r.cases)
-        if ok and not res.series:
+        if cond.ok and not res.series:
             flags.append("no profile-op line of a case")
     return res
-
-
-def read_log(root: Path, key: str) -> str:
-    """The stderr of one run: <key>.log, or <key>.log.z (gzip, or plain when the phone had no gzip)."""
-    plain, packed = root / f"{key}.log", root / f"{key}.log.z"
-    if plain.exists():
-        return plain.read_text(errors="replace")
-    if packed.exists():
-        data = packed.read_bytes()
-        if data[:2] == b"\x1f\x8b":
-            data = gzip.decompress(data)
-        return data.decode(errors="replace")
-    return ""
 
 
 SUSTAIN_RE = re.compile(r"sustain: series i=\d+ t_us=(\d+) passes=(\d+) us=(\d+) pcycles=(\d+)")
@@ -995,11 +959,11 @@ def i8_tables(outs: dict[str, RunOut], clock: float, include_all: bool) -> tuple
                 lines.append(f"    {variant:7s} " + " ".join(f"{row.get(k, float('nan')):7.1f}" for k in cols))
         lines.append("    TFLOPS  " + " ".join(f"{TILE_MAC_FLOP * k * clock * 1e6 / f16[k] / 1e12:7.2f}" if k >= I8_KMIN
                                          else f"{'-':>7s}" for k in cols))
-        lines.append(f"    pcyc/MAC" + " ".join(f"{f16[k] / k:7.2f}" if k >= I8_KMIN else f"{'-':>7s}" for k in cols))
+        lines.append("    pcyc/MAC" + " ".join(f"{f16[k] / k:7.2f}" if k >= I8_KMIN else f"{'-':>7s}" for k in cols))
         if engine is None:
             engine = Engine(a, b, clock, f16)
     if engine is not None:
-        lines.append(f"  the f16 rate of the fit at the 4B reductions (computed; the fit holds from 48 k-tiles): "
+        lines.append("  the f16 rate of the fit at the 4B reductions (computed; the fit holds from 48 k-tiles): "
                      + ", ".join(f"K {k}: {engine.tflops(k // 32):.2f} TFLOPS" for k in (2560, 4096, 9216)))
         lines.append("  The short i8read pass reads low: 7.06 pcycles per tile-MAC at 80 k-tiles against 8.07 in the 800 ms "
                      "run of hmx_sustain and 8.05 to 8.08 in the kernel (section 6). 7.06 x 8 / 7 = 8.07: the syncht at "
@@ -1468,8 +1432,7 @@ def conditions(outs: dict[str, RunOut]) -> list[str]:
 def table(root: Path, include_all: bool) -> int:
     """Print the tables."""
     if not root.is_dir():
-        print(f"stage.py: {root} is not a directory. Pull the outputs of the stage first.", file=sys.stderr)
-        return 1
+        return cli.missing_root(root)
     outs = {r.key: read_run(root, r) for r in runs() if (root / f"{r.key}-gate.txt").exists()}
     clock, how = clock_mhz(outs)
     parts = [conditions(outs), [f"  the DSP clock: {clock:.1f} MHz ({how})"]]
@@ -1499,7 +1462,7 @@ def main() -> int:
     sub.add_parser("files", help="write phone/ and phone-commands.txt")
     sub.add_parser("plan", help="print the host kernel choice of each case")
     t = sub.add_parser("table", help="print the tables from the pulled outputs")
-    t.add_argument("--root", type=Path, default=HERE / "phone-out")
+    t.add_argument("--root", type=Path, default=STAGE_DIR / "phone-out")
     t.add_argument("--all", action="store_true", help="also use the runs with flags")
     a = ap.parse_args()
     if a.cmd == "files":

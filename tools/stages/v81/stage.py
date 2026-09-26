@@ -27,25 +27,19 @@ files. O(size of the logs) time.
 
 import argparse
 import json
-import os
 import re
 import statistics
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-LAPTOP_STAGE = "build/v81"
-BOX = "grigory@10.10.20.200:airi/qwen-mobile/build/v81"
-STAGE_DIR = Path(os.path.relpath(Path(__file__).resolve().parents[3] / LAPTOP_STAGE))
-NSP = ('$(for z in /sys/class/thermal/thermal_zone*; do case "$(cat $z/type 2>/dev/null)" in (nsp*) '
-       'cat $z/temp 2>/dev/null;; esac; done | sort -n | tail -n 1)')
-BEFORE = f'echo "before: nsp={NSP}"'
-AFTER = ('echo "after: thermal=$(dumpsys thermalservice | grep "Thermal Status" | head -n 1 | tr -dc 0-9)'
-         ' cap0=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)'
-         ' cap7=$(cat /sys/devices/system/cpu/cpu7/cpufreq/scaling_max_freq)'
-         ' battery=$(dumpsys battery | grep "^  level:" | tr -dc 0-9)'
-         f' temp=$(dumpsys battery | grep "temperature:" | tr -dc 0-9) nsp={NSP}"')
-TOOLS = ("llama-bench", "llama-perplexity", "test-backend-ops", "canarytime", "isaprobe")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common import commands, device, gate, logs  # noqa: E402
+
+PATHS = device.stage_paths("v81", __file__)
+LAPTOP_STAGE, BOX, STAGE_DIR = PATHS.local, PATHS.box, PATHS.dir
+# The kernel keeps 15 characters of a process name, and pgrep -x matches that name
+TOOLS = ("llama-bench", "llama-perplexit", "test-backend-op", "canarytime", "isaprobe")
 
 
 @dataclass(frozen=True)
@@ -61,11 +55,22 @@ class Target:
     out_dir: str    # the directory of the pulled outputs in build/v81
     commands: str   # the command file in build/v81
 
+    @property
+    def thermal(self) -> str:
+        """The line that prints the thermal status. device.THERMAL gives this line for the phone of the
+        project, and the kit target has its own adb command."""
+        return f"{self.adb} shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
 
-PHONE = Target(adb="adb -s 192.168.14.130:5555", phone="/data/local/tmp/qwen/v81",
-               model="/data/local/tmp/qwen/models/Qwen3.5-4B-Q8_0.gguf", eval_dir="/data/local/tmp/qwen/eval",
-               base="naive-4B-q8.kld", gate_env="", stage="phone", out_dir="phone-out",
-               commands="phone-commands.txt")
+    @property
+    def pgrep(self) -> str:
+        """The line that prints the process id of each tool of the stage that still runs. device.pgrep gives
+        this line for the phone of the project, and the kit target has its own adb command."""
+        return f"{self.adb} shell '" + "; ".join(f"pgrep -x {x}" for x in TOOLS) + "; echo pgrep-done'"
+
+
+PHONE = Target(adb=device.ADB, phone=PATHS.phone, model=f"{device.MODEL_DIR}/{device.MODEL_4B}",
+               eval_dir=device.EVAL_DIR, base="naive-4B-q8.kld", gate_env="", stage="phone",
+               out_dir="phone-out", commands="phone-commands.txt")
 MINI = Target(adb=PHONE.adb, phone=PHONE.phone, model=PHONE.model, eval_dir=PHONE.eval_dir, base=PHONE.base,
               gate_env="", stage="phone", out_dir="mini-out", commands="mini-commands.txt")
 KIT = Target(adb="adb", phone="/data/local/tmp/qwen/v81kit", model="/data/local/tmp/qwen/v81kit/models/Qwen3.5-4B-Q8_0.gguf",
@@ -89,22 +94,22 @@ class Run:
 
 
 def lib_env(t: Target, dsp: str = "lib") -> str:
-    """The environment of the app (init_impl in llama_jni.cpp) and the stage libraries."""
-    return (f"LD_LIBRARY_PATH={t.phone}/lib ADSP_LIBRARY_PATH={t.phone}/{dsp} "
-            "GGML_HEXAGON_OPFUSION=1 GGML_HEXAGON_OPFUSION_STATE=1")
+    """The environment of the app (init_impl in llama_jni.cpp) and the stage libraries. The host loads the
+    libraries of lib, and the DSP loads those of `dsp`, thus device.lib_env does not give this text."""
+    return f"LD_LIBRARY_PATH={t.phone}/lib ADSP_LIBRARY_PATH={t.phone}/{dsp} {device.APP_ENV}"
 
 
-def mini_runs() -> list:
+def mini_runs() -> list[Run]:
     """The runs of the set mini: two canary runs and the MUL_MAT op tests."""
-    out = [Run(f"can-{i}-c1", "canarytime", "--rounds 3", "GGML_HEXAGON_CANARY=1", 60, 2097152,
+    out = [Run(f"can-{i}-c1", "canarytime", "--rounds 3", "GGML_HEXAGON_CANARY=1", 60, device.GATE_TOOL_KB,
                "canarytime, GGML_HEXAGON_CANARY=1: the canary result, the register and open times, 3 work graphs")
            for i in (1, 2)]
-    out.append(Run("tbo-mm", "test-backend-ops", "test -b HTP0 -o MUL_MAT", "", 110, 2097152,
+    out.append(Run("tbo-mm", "test-backend-ops", "test -b HTP0 -o MUL_MAT", "", 110, device.GATE_TOOL_KB,
                    "test-backend-ops MUL_MAT on HTP0 against the CPU (the Q8_0 GEMV, the HMX GEMM)"))
     return out
 
 
-def runs(t: Target, kit: bool) -> list:
+def runs(t: Target, kit: bool) -> list[Run]:
     """The runs of a run set, in their order."""
     if t is MINI:
         return mini_runs()
@@ -114,9 +119,10 @@ def runs(t: Target, kit: bool) -> list:
     out = []
     # The canary: its load time in alternated rounds, then the path with no device
     for i, c in enumerate(("0", "1", "1", "0", "0", "1")):
-        out.append(Run(f"can-{i + 1}-c{c}", "canarytime", "--rounds 3", f"GGML_HEXAGON_CANARY={c}", 60, 2097152,
+        out.append(Run(f"can-{i + 1}-c{c}", "canarytime", "--rounds 3", f"GGML_HEXAGON_CANARY={c}", 60,
+                       device.GATE_TOOL_KB,
                        f"canarytime, GGML_HEXAGON_CANARY={c}: the register and open times, 3 work graphs"))
-    out.append(Run("can-fail", "canarytime", "--rounds 0", "GGML_HEXAGON_CANARY=2", 60, 2097152,
+    out.append(Run("can-fail", "canarytime", "--rounds 0", "GGML_HEXAGON_CANARY=2", 60, device.GATE_TOOL_KB,
                    "canarytime, GGML_HEXAGON_CANARY=2: the backend must register no device (exit 3)"))
     ops = (("tbo-mm", "MUL_MAT", "MUL_MAT (the Q8_0 GEMV and the HMX GEMM, the f16 HMX path)"),
            ("tbo-gdn", "GATED_DELTA_NET,SSM_CONV", "GATED_DELTA_NET and SSM_CONV (the state step, the chunked GDN, "
@@ -126,45 +132,44 @@ def runs(t: Target, kit: bool) -> list:
             "RMS_NORM, SOFT_MAX, ROPE, SWIGLU, SILU, SIGMOID, SOFTPLUS, GELU (vision), ADD, MUL and SCALE"),
            ("tbo-fa", "FLASH_ATTN_EXT", "FLASH_ATTN_EXT (the cases with sinks fail at the tolerance edge on v79 too)"))
     for name, o, text in ops:
-        out.append(Run(name, "test-backend-ops", f"test -b HTP0 -o {o}", "", 110, 2097152,
+        out.append(Run(name, "test-backend-ops", f"test -b HTP0 -o {o}", "", 110, device.GATE_TOOL_KB,
                        f"test-backend-ops {text} on HTP0 against the CPU"))
-    out.append(Run("klp", "llama-perplexity", f"{kl} -b 512", "", 90, 8388608,
+    out.append(Run("klp", "llama-perplexity", f"{kl} -b 512", "", 90, device.GATE_4B_KB,
                    f"llama-perplexity KL against {t.base}, 1 chunk of 512, -b 512 (the HMX prefill path)"))
-    out.append(Run("kld", "llama-perplexity", f"{kl} -b 1 -ub 1", "", 108, 8388608,
+    out.append(Run("kld", "llama-perplexity", f"{kl} -b 1 -ub 1", "", 108, device.GATE_4B_KB,
                    f"llama-perplexity KL against {t.base}, 1 chunk of 512, -b 1 (the HVX decode path)"))
     if kit:
-        out.append(Run("bench", "llama-bench", f"{bench} -p 512 -n 32 -r 3", "", 100, 8388608,
+        out.append(Run("bench", "llama-bench", f"{bench} -p 512 -n 32 -r 3", "", 100, device.GATE_4B_KB,
                        "llama-bench pp512 and tg32 at the depth 0, -r 3"))
         return out
     # The A/B timing of the DSP libraries: new (lib) against HEAD (dsp-base), 3 rounds, the order alternated
     for rnd in range(1, 4):
         order = ("new", "base") if rnd % 2 else ("base", "new")
         for v in order:
-            out.append(Run(f"p-{rnd}-{v}", "llama-bench", f"{bench} -p 512 -n 0 -r 3", "", 100, 8388608,
+            out.append(Run(f"p-{rnd}-{v}", "llama-bench", f"{bench} -p 512 -n 0 -r 3", "", 100, device.GATE_4B_KB,
                            "llama-bench pp512 at the depth 0, -r 3", "lib" if v == "new" else "dsp-base"))
         for v in order[::-1]:
-            out.append(Run(f"t-{rnd}-{v}", "llama-bench", f"{bench} -p 0 -n 32 -d 0,4096 -r 3", "", 100, 8388608,
-                           "llama-bench tg32 at the depths 0 and 4096, -r 3", "lib" if v == "new" else "dsp-base"))
+            out.append(Run(f"t-{rnd}-{v}", "llama-bench", f"{bench} -p 0 -n 32 -d 0,4096 -r 3", "", 100,
+                           device.GATE_4B_KB, "llama-bench tg32 at the depths 0 and 4096, -r 3",
+                           "lib" if v == "new" else "dsp-base"))
     return out
 
 
-def run_lines(t: Target, r: Run) -> list:
+def run_lines(t: Target, r: Run) -> list[str]:
     """The lines of one run: a title, the thermal line, the run and the pgrep line."""
-    stem = f"{t.phone}/out/{r.name}"
     env = " ".join(x for x in (lib_env(t, r.dsp), r.env) if x)
-    gate = f"{t.gate_env} sh {t.phone}/bin/gate.sh {r.gate_kb}".strip()
-    cmd = (f"{gate} > {stem}-gate.txt && {BEFORE} >> {stem}-gate.txt && "
-           f"timeout -s KILL {r.limit} env {env} {t.phone}/bin/{r.tool} {r.args} "
-           f"> {stem}.out 2> {stem}.log; echo \"rc=$?\" >> {stem}-gate.txt; {AFTER} >> {stem}-gate.txt; "
-           f"cat {stem}-gate.txt")
+    cmd = commands.gated_run(f"{t.phone}/out/{r.name}", r.gate_kb, r.limit, env,
+                             f"{t.phone}/bin/{r.tool} {r.args}", stage=t.phone,
+                             prefix=f"{t.gate_env} " if t.gate_env else "")
     title = "REAL-MODEL Qwen3.5-4B-Q8_0" if r.tool in ("llama-bench", "llama-perplexity") else "OP-TEST"
-    thermal = f"{t.adb} shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
-    pgrep = f"{t.adb} shell '" + "; ".join(f"pgrep -x {x}" for x in TOOLS) + "; echo pgrep-done'"
-    return ["#", f"# {title}: {r.name}, {r.text}", thermal, f"{t.adb} shell '{cmd}'", pgrep]
+    return commands.run_lines(f"# {title}: {r.name}, {r.text}", cmd, t.pgrep, adb=t.adb, thermal=t.thermal)
 
 
-def setup_lines(t: Target, kit: bool) -> list:
-    """The lines that copy the stage files to the phone and check them."""
+def setup_lines(t: Target, kit: bool) -> list[str]:
+    """The lines that copy the stage files to the phone and check them.
+
+    Each run set has its own groups of files, its own order and its own check line. Thus
+    commands.setup_lines does not give the same text."""
     local = f"{LAPTOP_STAGE}/{t.stage}"
     lines = [
         f"mkdir -p {LAPTOP_STAGE} && rsync -a --delete {BOX}/{t.stage}/ {local}/",
@@ -202,7 +207,7 @@ def setup_lines(t: Target, kit: bool) -> list:
     return lines
 
 
-def kit_probe_lines(t: Target) -> list:
+def kit_probe_lines(t: Target) -> list[str]:
     """The ISA probe on the v81 phone: the chip facts, then the census of each HVX op with the ARM CPU oracle."""
     env = f"ADSP_LIBRARY_PATH={t.phone}/isaprobe/v81 LD_LIBRARY_PATH={t.phone}/isaprobe/v81"
     return [
@@ -219,8 +224,11 @@ def kit_probe_lines(t: Target) -> list:
     ]
 
 
-def output_lines(t: Target, kit: bool, n_runs: int) -> list:
-    """The lines that pull the outputs, copy them to the box and remove the phone directory."""
+def output_lines(t: Target, kit: bool, n_runs: int) -> list[str]:
+    """The lines that pull the outputs, copy them to the box and remove the phone directory.
+
+    This block has no thermal line, and its file count test counts 3 files for each run. Thus
+    commands.output_lines does not give the same text."""
     lines = [
         "#",
         "# ---- The outputs ----",
@@ -325,38 +333,43 @@ def write_commands(set_name: str, path: Path) -> None:
                          runs="\n".join(f"#   {k}: {v}" for k, v in decisions.items()),
                          charger="a charger permitted (ALLOW_CHARGER=1)" if kit else "no charger",
                          minutes=20 if kit else (2 if mini else 18), n_runs=len(rs))
-    lines = text.rstrip("\n").split("\n") + ["#", "# ---- Setup ----"] + setup_lines(t, kit)
+    lines = commands.header_lines(text) + ["#", "# ---- Setup ----"] + setup_lines(t, kit)
     if kit:
         lines += kit_probe_lines(t)
     lines += ["#", "# ---- The runs ----"]
     for r in rs:
         lines += run_lines(t, r)
     lines += output_lines(t, kit, len(rs))
-    path.write_text("\n".join(lines) + "\n")
-    print(f"{path}: {len(lines)} lines, {len(rs)} runs")
+    n = commands.write_commands(path, lines)
+    print(f"{path}: {n} lines, {len(rs)} runs")
 
 
-def read(path: Path) -> str:
-    """The text of a file, or an empty text."""
-    try:
-        return path.read_text(errors="replace")
-    except OSError:
-        return ""
+def bench_rows(path: Path) -> list[tuple[str, float, float]]:
+    """The (key, t/s, stddev) of each result line of a llama-bench jsonl output."""
+    rows = []
+    for ln in logs.read_text(path).splitlines():
+        try:
+            j = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        key = f"pp{j.get('n_prompt')}" if j.get("n_gen", 0) == 0 else f"tg{j.get('n_gen')}"
+        rows.append((f"{key}@d{j.get('n_depth', 0)}", j.get("avg_ts", 0.0), j.get("stddev_ts", 0.0)))
+    return rows
 
 
 def table(root: Path) -> None:
     """Print the results of the pulled outputs."""
     print(f"# {root}")
-    load = {"0": [], "1": []}
-    for gate in sorted(root.glob("can-*-gate.txt")):
-        name = gate.name[:-len("-gate.txt")]
-        out = read(root / f"{name}.out")
-        log = read(root / f"{name}.log")
-        rc = re.search(r"rc=(\d+)", read(gate))
+    load: dict[str, list[float]] = {"0": [], "1": []}
+    for gate_file in sorted(root.glob("can-*-gate.txt")):
+        name = gate_file.name[:-len("-gate.txt")]
+        out = logs.read_text(root / f"{name}.out")
+        log = logs.read_text(root / f"{name}.log")
+        rc = gate.read(logs.read_text(gate_file)).rc
         m = re.search(r"load: ([0-9.]+) ms", out)
         canary = [ln for ln in log.splitlines() if "canary" in ln]
         works = re.findall(r"work \d+: .* (pass|FAIL)", out)
-        print(f"{name}: rc {rc.group(1) if rc else '?'}, load {m.group(1) if m else '-'} ms, work {works}")
+        print(f"{name}: rc {rc if rc is not None else '?'}, load {m.group(1) if m else '-'} ms, work {works}")
         for ln in canary:
             print(f"    {ln.strip()[:400]}")
         c = re.search(r"-c(\d)$", name)
@@ -367,38 +380,27 @@ def table(root: Path) -> None:
         print(f"canary load cost: median load {statistics.median(load['1']):.1f} ms (1) against "
               f"{statistics.median(load['0']):.1f} ms (0), difference {d:.1f} ms (limit 50 ms)")
     for out in sorted(root.glob("tbo-*.out")):
-        txt = read(out)
+        txt = logs.read_text(out)
         m = re.findall(r"(\d+)/(\d+) tests passed", txt)
         fails = [ln.strip() for ln in txt.splitlines() if "FAIL" in ln][:6]
         print(f"{out.stem}: {m[-1][0] + '/' + m[-1][1] if m else 'no summary'} passed; " + "; ".join(fails)[:600])
     for name in ("klp", "kld"):
-        txt = read(root / f"{name}.out") + read(root / f"{name}.log")
+        txt = logs.read_text(root / f"{name}.out") + logs.read_text(root / f"{name}.log")
         vals = {}
         for key, rx in (("mean", r"Mean\s+KLD:\s+([0-9.eE+-]+)"), ("max", r"Maximum KLD:\s+([0-9.eE+-]+)"),
                         ("top1", r"Same top p:\s+([0-9.]+)")):
             m = re.search(rx, txt)
             vals[key] = m.group(1) if m else "-"
         print(f"{name}: KL mean {vals['mean']}, max {vals['max']}, same top 1 {vals['top1']} %")
-    def bench_rows(path: Path) -> list:
-        """The (key, t/s, stddev) of each result line of a llama-bench jsonl output."""
-        rows = []
-        for ln in read(path).splitlines():
-            try:
-                j = json.loads(ln)
-            except json.JSONDecodeError:
-                continue
-            key = f"pp{j.get('n_prompt')}" if j.get("n_gen", 0) == 0 else f"tg{j.get('n_gen')}"
-            rows.append((f"{key}@d{j.get('n_depth', 0)}", j.get("avg_ts", 0.0), j.get("stddev_ts", 0.0)))
-        return rows
-
     for key, ts, sd in bench_rows(root / "bench.out"):
         print(f"bench: {key}: {ts:.2f} +- {sd:.2f} t/s")
     # The A/B timing: a run counts when its gate passed, its exit code is 0 and the thermal status after it is 0
-    ab = {}
+    ab: dict[str, dict[str, dict[str, float]]] = {}
     for out in sorted(root.glob("[pt]-*-*.out")):
         name = out.stem
-        gate = read(root / f"{name}-gate.txt")
-        ok = "gate: OK" in gate and re.search(r"rc=0\b", gate) and re.search(r"after: thermal=0\b", gate)
+        text = logs.read_text(root / f"{name}-gate.txt")
+        after = gate.AFTER_RE.search(text)
+        ok = gate.read(text).ok and after is not None and after.group(1) == "0"
         m = re.match(r"([pt])-(\d+)-(new|base)$", name)
         if not m or not ok:
             print(f"{name}: not counted (gate, exit code or thermal status)")
@@ -413,12 +415,12 @@ def table(root: Path) -> None:
             print(f"A/B {key}: new {statistics.median(news):.2f} t/s, base {statistics.median(bases):.2f} t/s, "
                   f"median ratio of the rounds {statistics.median(ratios) if ratios else float('nan'):.4f} "
                   f"({len(ratios)} rounds)")
-    probe = read(root / "probe-info" / "stdout.txt")
+    probe = logs.read_text(root / "probe-info" / "stdout.txt")
     if probe:
         print("probe info:\n" + "\n".join("    " + ln for ln in probe.splitlines()[:40]))
 
 
-def main(argv: list) -> int:
+def main(argv: list[str]) -> int:
     """Parse the arguments and run the command."""
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)

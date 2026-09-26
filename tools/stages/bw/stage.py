@@ -37,6 +37,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common import cli, commands, device, gate, logs, parse, tables  # noqa: E402
 
 
 def find_repo() -> Path:
@@ -52,17 +54,16 @@ def find_repo() -> Path:
 
 
 REPO = find_repo()
-HERE = REPO / "build" / "bw"
+# find_repo also finds the root of a laptop copy of build/bw/stage.py, which the resolution of the link does
+# not, thus the stage directory comes from REPO and not from the resolved path of this file.
+PATHS = device.stage_paths("bw", __file__)._replace(dir=REPO / "build" / "bw")
+PHONE, LAPTOP_STAGE, BOX, HERE = PATHS
 
-ADB = "adb -s 192.168.14.130:5555"
-PHONE = "/data/local/tmp/qwen/bw"
-MODEL_DIR = "/data/local/tmp/qwen/models"
-MODEL = "Qwen3.5-4B-Q8_0.gguf"
-LAPTOP_STAGE = "build/bw"
-BOX = "grigory@10.10.20.200:airi/qwen-mobile/build/bw"
+ADB = device.ADB
+MODEL_DIR = device.MODEL_DIR
+MODEL = device.MODEL_4B
 # The environment of the app (init_impl in llama_jni.cpp) and the stage libraries.
-LIB_ENV = (f"LD_LIBRARY_PATH={PHONE}/lib ADSP_LIBRARY_PATH={PHONE}/lib "
-           "GGML_HEXAGON_OPFUSION=1 GGML_HEXAGON_OPFUSION_STATE=1")
+LIB_ENV = f"{device.lib_env(PHONE)} {device.APP_ENV}"
 DDRBW_ENV = f"ADSP_LIBRARY_PATH={PHONE}/lib"
 LIBS = ("libddrbw_skel.so", "libggml-base.so", "libggml-cpu.so", "libggml-hexagon.so", "libggml-htp-v79.so",
         "libggml-opencl.so", "libggml.so", "libllama-bench-impl.so", "libllama-common.so", "libllama.so",
@@ -70,18 +71,8 @@ LIBS = ("libddrbw_skel.so", "libggml-base.so", "libggml-cpu.so", "libggml-hexago
 BINS = ("ddrbw", "gate.sh", "llama-bench", "memprobe", "test-backend-ops")
 TEST_FILES = ("chain-q8_0.txt", "gemv-f16.txt", "gemv-q4_0.txt", "gemv-q8_0.txt", "head-f16.txt", "head-q4_0.txt",
               "head-q8_0.txt", "kern-f16.txt", "kern-q4_0.txt", "kern-q8_0.txt")
-THERMAL = f"{ADB} shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
-PGREP = (f"{ADB} shell 'pgrep -x llama-bench; pgrep -x memprobe; pgrep -x ddrbw; pgrep -x test-backend-op; "
-         "echo pgrep-done'")
-# The highest temperature of the NPU thermal zones (type nsp*) in millidegrees.
-NSP = ('$(for z in /sys/class/thermal/thermal_zone*; do case "$(cat $z/type 2>/dev/null)" in (nsp*) '
-       'cat $z/temp 2>/dev/null;; esac; done | sort -n | tail -n 1)')
-BEFORE = f'echo "before: nsp={NSP}"'
-AFTER = ('echo "after: thermal=$(dumpsys thermalservice | grep "Thermal Status" | head -n 1 | tr -dc 0-9)'
-         ' cap0=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)'
-         ' cap7=$(cat /sys/devices/system/cpu/cpu7/cpufreq/scaling_max_freq)'
-         ' battery=$(dumpsys battery | grep "^  level:" | tr -dc 0-9)'
-         f' temp=$(dumpsys battery | grep "temperature:" | tr -dc 0-9) nsp={NSP}"')
+TOOLS = ("llama-bench", "memprobe", "ddrbw", "test-backend-op")
+PGREP = device.pgrep(*TOOLS)
 # The CPU sets of ddrbw cpu. Cores 0 to 5 are the six cores of the first cluster, cores 6 and 7 the
 # two cores of the second cluster (the higher clock).
 CPU_SETS = "7/0/6,7/0,1/0-3/4-7/0,1,6,7/0-5/0-7"
@@ -105,9 +96,11 @@ class Run:
     text: str
 
 
-GATE_SMALL = 2097152
+GATE_SMALL = device.GATE_TOOL_KB
+# test-backend-ops holds the weights, the activations and the CPU reference of the head, thus its gate asks
+# for 5 GiB.
 GATE_BIG = 5242880
-GATE_MODEL = 8388608
+GATE_MODEL = device.GATE_4B_KB
 
 # The 4B shapes (k, m, label) of one decode token: bytes.py budget 4b and the op profile of bench-kv.
 SHAPES_4B = (
@@ -201,8 +194,6 @@ def run_lines(run: Run) -> list[str]:
     the text models/Qwen3.5 (a test of the model file), thus the runner applies to it the unlock wait,
     the screen wake, the memory gate and the CAPS line of a model run."""
     stem = f"{PHONE}/out/{run.name}"
-    gate = f"{stem}-gate.txt"
-    env = f"env {run.env} " if run.env else ""
     pre = ""
     post = ""
     if run.freq_hz:
@@ -211,10 +202,9 @@ def run_lines(run: Run) -> list[str]:
         post = "kill $fp 2>/dev/null; wait $fp 2>/dev/null; "
     # The brace group keeps the background sampler ("&") out of the && list of the gate: without it,
     # "gate && ... && sampler &" would put the gate itself in the background.
-    cmd = (f"test -r {MODEL_DIR}/{MODEL} && sh {PHONE}/bin/gate.sh {run.gate_kb} > {gate} && {BEFORE} >> {gate} && "
-           f"{{ {pre}timeout -s KILL {run.limit} {env}{PHONE}/bin/{run.tool} {run.args} > {stem}.out 2> {stem}.log; "
-           f"echo \"rc=$?\" >> {gate}; {post}}}; {AFTER} >> {gate}; cat {gate}")
-    return ["#", f"# {run.name}: {run.text} (limit {run.limit} s)", THERMAL, f"{ADB} shell '{cmd}'", PGREP]
+    cmd = commands.gated_run(stem, run.gate_kb, run.limit, run.env, f"{PHONE}/bin/{run.tool} {run.args}",
+                             stage=PHONE, model=MODEL, pre=f"{{ {pre}", clean=f"{post}}}; ")
+    return commands.run_lines(f"# {run.name}: {run.text} (limit {run.limit} s)", cmd, PGREP)
 
 
 HEADER = """\
@@ -250,56 +240,27 @@ HEADER = """\
 
 def setup_lines() -> list[str]:
     """The lines that copy the stage to the phone and check its files."""
-    bins = " ".join(f"{LAPTOP_STAGE}/phone/bin/{b}" for b in BINS)
-    libs = " ".join(f"{LAPTOP_STAGE}/phone/lib/{lib}" for lib in LIBS)
-    tests = " ".join(f"{LAPTOP_STAGE}/phone/tests/{name}" for name in TEST_FILES)
-    return [
-        f"mkdir -p {LAPTOP_STAGE} && rsync -a --delete {BOX}/phone/ {LAPTOP_STAGE}/phone/",
-        f"(cd {LAPTOP_STAGE}/phone && sha256sum -c SHA256SUMS)",
-        # No model path in this line: the runner gates each line with that text as a model run.
-        f"{ADB} shell 'ls -l {MODEL_DIR} | grep -E \"{MODEL}\"'",
-        f"{ADB} shell 'rm -rf {PHONE} && mkdir -p {PHONE}/bin {PHONE}/lib {PHONE}/tests {PHONE}/out'",
-        f"{ADB} push {bins} {PHONE}/bin/",
-        f"{ADB} push {libs} {PHONE}/lib/",
-        f"{ADB} push {tests} {PHONE}/tests/",
-        f"{ADB} push {LAPTOP_STAGE}/phone/SHA256SUMS {PHONE}/",
-        f"{ADB} shell 'cd {PHONE} && sha256sum -c SHA256SUMS | grep -c OK && chmod 755 {PHONE}/bin/*'",
-    ]
-
-
-def output_lines() -> list[str]:
-    """The lines that pull the outputs, copy them to the box and remove the phone directory. The phone
-    directory goes only when the pull has each of its files."""
-    return [
-        "#",
-        "# ---- The outputs ----",
-        "#",
-        THERMAL,
-        f"{ADB} shell 'pgrep -x ddrbw; pgrep -x test-backend-op; ls {PHONE}/out | wc -l; du -sh {PHONE}/out'",
-        f"rm -rf {LAPTOP_STAGE}/phone-out",
-        f"{ADB} pull {PHONE}/out {LAPTOP_STAGE}/phone-out",
-        f"rsync -a --delete {LAPTOP_STAGE}/phone-out/ {BOX}/phone-out/",
-        f"test \"$(ls {LAPTOP_STAGE}/phone-out | wc -l)\" -eq "
-        f"\"$({ADB} shell 'ls {PHONE}/out | wc -l' | tr -d '\\r')\" "
-        f"&& {ADB} shell 'rm -rf {PHONE}' && echo removed {PHONE}",
-    ]
+    files = {
+        "bin": [f"{LAPTOP_STAGE}/phone/bin/{b}" for b in BINS],
+        "lib": [f"{LAPTOP_STAGE}/phone/lib/{lib}" for lib in LIBS],
+        "tests": [f"{LAPTOP_STAGE}/phone/tests/{name}" for name in TEST_FILES],
+    }
+    # No model path in this line: the runner gates each line with that text as a model run.
+    return commands.setup_lines(PATHS, files,
+                                model_check=f"{ADB} shell 'ls -l {MODEL_DIR} | grep -E \"{MODEL}\"'")
 
 
 def write_commands(path: Path) -> int:
     """Write the command file and return its line count."""
-    lines = HEADER.rstrip("\n").split("\n") + setup_lines()
+    lines = commands.header_lines(HEADER) + setup_lines()
     for run in runs():
         lines += run_lines(run)
-    lines += output_lines()
-    path.write_text("\n".join(lines) + "\n")
-    return len(lines)
+    lines += commands.output_lines(PATHS, tools=TOOLS)
+    return commands.write_commands(path, lines)
 
 
 # ---- The table ----
 
-GATE_RE = re.compile(r"gate: screen=(\S+) thermal=(\d*) cap0=(\d*) cap7=(\d*) battery=(\d*)% temp=(\d*)")
-BEFORE_RE = re.compile(r"before: nsp=(\d*)")
-AFTER_RE = re.compile(r"after: thermal=(\d*) cap0=(\d*) cap7=(\d*) battery=(\d*) temp=(\d*)(?: nsp=(\d*))?")
 KV_RE = re.compile(r"(\w+)=(\S+)")
 
 
@@ -321,34 +282,12 @@ class Result:
 
 
 def read_result(root: Path, run: Run) -> Result:
-    """Read the files of one run. O(size of the files)."""
-    def text(suffix: str) -> str:
-        p = root / f"{run.name}{suffix}"
-        return p.read_text(errors="replace") if p.exists() else ""
-
-    gate = text("-gate.txt")
-    before, after = GATE_RE.search(gate), AFTER_RE.search(gate)
-    m = re.search(r"^rc=(\d+)", gate, re.M)
-    rc = int(m.group(1)) if m else None
-    flags = []
-    ok = "gate: OK" in gate and rc in (0, 4)
-    if not gate:
-        flags.append("no gate file")
-    elif "gate: OK" not in gate:
-        flags.append("gate stopped the run")
-    elif rc != 0:
-        flags.append(f"exit code {rc}")
-    caps = f"{before.group(3)}/{before.group(4)}" if before else "?"
-    if before and after and (before.group(3), before.group(4)) != (after.group(2), after.group(3)):
-        flags.append(f"caps {caps} -> {after.group(2)}/{after.group(3)}")
-    if after and after.group(1) not in ("", "0"):
-        flags.append(f"thermal {after.group(1)} after the run")
-    battery = f"{before.group(5)}% {int(before.group(6)) / 10:.1f} C" if before and before.group(6) else "?"
-    nb = BEFORE_RE.search(gate)
-    nsp = (int(nb.group(1)) / 1000 if nb and nb.group(1) else None,
-           int(after.group(6)) / 1000 if after and after.group(6) else None)
-    return Result(run, ok, rc, flags, caps, battery, nsp, text(".out"), text(".log"), text("-freq.txt"),
-                  text("-now.txt"))
+    """Read the files of one run. The exit code 4 is a checksum error of ddrbw, and the tables show such a
+    run. O(size of the files)."""
+    gate_text, out, log, freq, now = logs.read_run(root, run.name,
+                                                  ("-gate.txt", ".out", ".log", "-freq.txt", "-now.txt"))
+    c = gate.read(gate_text, ok_codes=(0, 4))
+    return Result(run, c.ok, c.rc, c.flags, c.caps, c.battery, c.nsp, out, log, freq, now)
 
 
 def ddrbw_lines(text: str, kind: str) -> list[dict[str, str]]:
@@ -359,16 +298,6 @@ def ddrbw_lines(text: str, kind: str) -> list[dict[str, str]]:
         if line.startswith(prefix):
             out.append(dict(KV_RE.findall(line[len(prefix):])))
     return out
-
-
-def med(vals: list[float]) -> float | None:
-    """The median, or None for no value."""
-    return statistics.median(vals) if vals else None
-
-
-def fmt(x: float | None, nd: int = 2) -> str:
-    """A number with nd decimals, or "-"."""
-    return "-" if x is None else f"{x:.{nd}f}"
 
 
 def conditions(results: list[Result]) -> list[str]:
@@ -459,10 +388,10 @@ MARK_NOTE = ("* = a value of the cell comes from a run whose CPU caps changed or
              "after the run (the conditions list names the runs)")
 
 
-def use(r: Result, block: str, strict: bool) -> bool:
-    """True when the run belongs to the block and goes into the tables. A run with a flag goes in unless
-    strict is True."""
-    return r.run.block == block and r.ok and not (strict and r.flags)
+def use(r: Result, block: str, include_all: bool) -> bool:
+    """True when the run belongs to the block and goes into the tables. A run with a flag goes in only when
+    include_all is True (the command line has no --strict)."""
+    return r.run.block == block and r.ok and (include_all or not r.flags)
 
 
 def mark(flagged: bool) -> str:
@@ -473,7 +402,7 @@ def mark(flagged: bool) -> str:
 VOTE_ORDER = ("backend", "max", "none", "ddrperf", "busperf", "expv", "ceng", "bw")
 
 
-def nsp_tables(results: list[Result], strict: bool) -> tuple[list[str], dict[str, float]]:
+def nsp_tables(results: list[Result], include_all: bool) -> tuple[list[str], dict[str, float]]:
     """The NSP read table: GB/s per configuration and vote set. Returns the lines and the ceilings.
     O(lines)."""
     by = defaultdict(list)
@@ -484,7 +413,7 @@ def nsp_tables(results: list[Result], strict: bool) -> tuple[list[str], dict[str
     facts = []
     flagged = set()
     for r in results:
-        if not use(r, "nsp", strict):
+        if not use(r, "nsp", include_all):
             continue
         for d in ddrbw_lines(r.out, "votes"):
             facts.append((r.run.name, "votes", d))
@@ -516,7 +445,8 @@ def nsp_tables(results: list[Result], strict: bool) -> tuple[list[str], dict[str
             if not vals and not f:
                 cells.append(f"| {'':24s}")
                 continue
-            c = f"{fmt(med(vals))} [{fmt(min(vals) if vals else None, 1)}-{fmt(max(vals) if vals else None, 1)}] n{len(vals)}"
+            c = (f"{tables.fmt(tables.med(vals), 2)} [{tables.fmt(min(vals) if vals else None, 1)}-"
+                 f"{tables.fmt(max(vals) if vals else None, 1)}] n{len(vals)}")
             c += f" F{f}" if f else ""
             c += mark((cfg, v) in flagged)
             cells.append(f"| {c:24s}")
@@ -527,11 +457,11 @@ def nsp_tables(results: list[Result], strict: bool) -> tuple[list[str], dict[str
                            ("hvx", lambda c: c.startswith("hvx")),
                            ("gemv", lambda c: c.startswith("gemv")),
                            ("any", lambda c: not c.startswith("ws-") or c == "ws-full")):
-            vals = [med(by[(c, v)]) for c in cfg_order if pred(c) and by.get((c, v))]
+            vals = [tables.med(by[(c, v)]) for c in cfg_order if pred(c) and by.get((c, v))]
             if vals:
                 ceil[f"{kind}-{v}"] = max(vals)
     out.append("  ceilings (the best median of a group): " +
-               ", ".join(f"{k} {fmt(x)}" for k, x in sorted(ceil.items())))
+               ", ".join(f"{k} {tables.fmt(x, 2)}" for k, x in sorted(ceil.items())))
     out.append("  the working-set rows (ws-*) show whether a re-read of a small region comes from a cache (the "
                "rate above the ws-full row)")
     if flagged:
@@ -564,7 +494,7 @@ def nsp_tables(results: list[Result], strict: bool) -> tuple[list[str], dict[str
     return out, ceil
 
 
-def cpu_table(results: list[Result], strict: bool) -> list[str]:
+def cpu_table(results: list[Result], include_all: bool) -> list[str]:
     """The CPU read table. O(lines)."""
     by = defaultdict(list)
     tmin = defaultdict(list)
@@ -574,7 +504,7 @@ def cpu_table(results: list[Result], strict: bool) -> list[str]:
     order: list[str] = []
     flagged = set()
     for r in results:
-        if not use(r, "cpu", strict):
+        if not use(r, "cpu", include_all):
             continue
         for d in ddrbw_lines(r.out, "cpu"):
             s = d["set"]
@@ -593,8 +523,9 @@ def cpu_table(results: list[Result], strict: bool) -> list[str]:
            f"  {'cores':14s} {'GB/s':>7s} {'low':>7s} {'high':>7s} {'n':>3s} {'thread min':>11s} {'thread max':>11s} pinned"]
     for s in order:
         v = by.get(s, [])
-        out.append(f"  {s:14s} {fmt(med(v)):>7s} {fmt(min(v) if v else None):>7s} {fmt(max(v) if v else None):>7s} "
-                   f"{len(v):3d} {fmt(med(tmin[s])):>11s} {fmt(med(tmax[s])):>11s} "
+        out.append(f"  {s:14s} {tables.fmt(tables.med(v), 2):>7s} {tables.fmt(min(v) if v else None, 2):>7s} "
+                   f"{tables.fmt(max(v) if v else None, 2):>7s} "
+                   f"{len(v):3d} {tables.fmt(tables.med(tmin[s]), 2):>11s} {tables.fmt(tables.med(tmax[s]), 2):>11s} "
                    f"{sum(pinned[s])}/{len(pinned[s])}" + (f" checksum FAIL x{fails[s]}" if fails.get(s) else "")
                    + (" " + mark(True) if s in flagged else ""))
     if flagged:
@@ -602,14 +533,14 @@ def cpu_table(results: list[Result], strict: bool) -> list[str]:
     return out
 
 
-def both_table(results: list[Result], strict: bool) -> list[str]:
+def both_table(results: list[Result], include_all: bool) -> list[str]:
     """The table of the NSP and the CPU at the same time. O(lines)."""
     by = defaultdict(lambda: defaultdict(list))
     order = []
     bad = defaultdict(int)
     flagged = set()
     for r in results:
-        if not use(r, "both", strict):
+        if not use(r, "both", include_all):
             continue
         for d in ddrbw_lines(r.out, "both"):
             key = (d["votes"], d["cfg"], d["set"])
@@ -627,12 +558,13 @@ def both_table(results: list[Result], strict: bool) -> list[str]:
            f"  {'votes':8s} {'NSP':8s} {'CPU':8s} {'nsp alone':>10s} {'cpu alone':>10s} {'nsp both':>9s} "
            f"{'cpu both':>9s} {'sum both':>9s} {'gain':>6s}"]
     for key in order:
-        m = {k: med(v) for k, v in by[key].items()}
+        m = {k: tables.med(v) for k, v in by[key].items()}
         gain = m["sum_both"] / m["nsp_alone"] if m.get("sum_both") and m.get("nsp_alone") else None
-        out.append(f"  {key[0]:8s} {key[1]:8s} {key[2]:8s} {fmt(m.get('nsp_alone')):>10s} {fmt(m.get('cpu_alone')):>10s} "
-                   f"{fmt(m.get('nsp_both')):>9s} {fmt(m.get('cpu_both')):>9s} {fmt(m.get('sum_both')):>9s} "
-                   f"{fmt(gain):>6s}" + (f"  (rejected {bad[key]}: checksum, clock or window)" if bad.get(key) else "")
-                   + (" " + mark(True) if key in flagged else ""))
+        note = f"  (rejected {bad[key]}: checksum, clock or window)" if bad.get(key) else ""
+        out.append(f"  {key[0]:8s} {key[1]:8s} {key[2]:8s} {tables.fmt(m.get('nsp_alone'), 2):>10s} "
+                   f"{tables.fmt(m.get('cpu_alone'), 2):>10s} {tables.fmt(m.get('nsp_both'), 2):>9s} "
+                   f"{tables.fmt(m.get('cpu_both'), 2):>9s} {tables.fmt(m.get('sum_both'), 2):>9s} "
+                   f"{tables.fmt(gain, 2):>6s}" + note + (" " + mark(True) if key in flagged else ""))
     if flagged:
         out.append("  " + MARK_NOTE)
     return out
@@ -670,20 +602,20 @@ def rtt_table(results: list[Result]) -> list[str]:
 
 CASE_RE = re.compile(r"MUL_MAT\(type=\w+,ne=\[(?P<m>\d+),(?P<n>\d+),\d+,\d+\].*?sources=(?P<t>\w+)\[(?P<k>\d+),")
 PERF_RE = re.compile(r"(?P<runs>\d+) runs -\s*(?P<us>[\d.]+) us/run")
+# The stage reads the fields after the op name of a profile line, thus it keeps its own pattern.
 PROF_RE = re.compile(r"profile-op (?P<op>[A-Z_0-9+]+)\|(?P<rest>.*?)\|usec (?P<usec>\d+) cycles")
 BPE = {"q8_0": 34 / 32, "q4_0": 18 / 32, "f16": 2.0, "f32": 4.0}
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
-def perf_rows(results: list[Result], strict: bool) -> tuple[dict[tuple, list[float]], set]:
+def perf_rows(results: list[Result], include_all: bool) -> tuple[dict[tuple, list[float]], set]:
     """us/run of each case (type, k, m, n) over the perf runs, and the cases with a value from a flagged
     run. O(lines)."""
     rows = defaultdict(list)
     flagged = set()
     for r in results:
-        if not use(r, "perf", strict):
+        if not use(r, "perf", include_all):
             continue
-        for line in ANSI_RE.sub("", r.out).splitlines():
+        for line in logs.ANSI_RE.sub("", r.out).splitlines():
             c, p = CASE_RE.search(line), PERF_RE.search(line)
             if c and p:
                 key = (c["t"], int(c["k"]), int(c["m"]), int(c["n"]))
@@ -701,7 +633,7 @@ def kern_rows(results: list[Result]) -> dict[tuple, dict[str, str]]:
     for r in results:
         if r.run.block != "kern" or not r.ok:
             continue
-        for line in ANSI_RE.sub("", r.out).splitlines():
+        for line in logs.ANSI_RE.sub("", r.out).splitlines():
             c = CASE_RE.search(line)
             if c:
                 key = (c["t"], int(c["k"]), int(c["m"]), int(c["n"]))
@@ -730,24 +662,24 @@ def kern_rows(results: list[Result]) -> dict[tuple, dict[str, str]]:
     return info
 
 
-def gemv_tables(results: list[Result], ceil: dict[str, float], strict: bool) -> list[str]:
+def gemv_tables(results: list[Result], ceil: dict[str, float], include_all: bool) -> list[str]:
     """The GEMV table (weight GB/s against the NSP ceiling), the kernel table and the chain. O(cases)."""
-    rows, flagged = perf_rows(results, strict)
+    rows, flagged = perf_rows(results, include_all)
     kern = kern_rows(results)
     ref = ceil.get("any-backend") or ceil.get("dma-backend")
     labels = {(k, m): lab for k, m, lab in SHAPES_4B + (HEAD_4B,)}
     out = [f"GEMV rate (test-backend-ops perf): weight bytes / us/run, decimal GB/s; % of the NSP ceiling "
-           f"{fmt(ref)} GB/s (ddrbw, votes backend); kernel and single-op DSP us from the test run",
+           f"{tables.fmt(ref, 2)} GB/s (ddrbw, votes backend); kernel and single-op DSP us from the test run",
            f"  {'type':5s} {'k':>6s} {'m':>7s} {'n':>2s} {'us/run':>10s} {'GB/s':>7s} {'% ceil':>7s} {'n runs':>6s} "
            f"{'kernel':22s} {'1-op us':>8s} {'test':>6s}  shape"]
     for key in sorted(rows, key=lambda k: (k[0], k[1], -k[2], k[3])):
         t, k, m, n = key
-        us = med(rows[key])
+        us = tables.med(rows[key])
         wb = k * m * BPE.get(t, 0)
         gbs = wb / us / 1e3 if us else None
         kr = kern.get(key, {})
-        out.append(f"  {t:5s} {k:6d} {m:7d} {n:2d} {fmt(us, 1):>10s} {fmt(gbs):>7s} "
-                   f"{fmt(100 * gbs / ref if gbs and ref else None, 0):>7s} {len(rows[key]):6d} "
+        out.append(f"  {t:5s} {k:6d} {m:7d} {n:2d} {tables.fmt(us, 1):>10s} {tables.fmt(gbs, 2):>7s} "
+                   f"{tables.fmt(100 * gbs / ref if gbs and ref else None, 0):>7s} {len(rows[key]):6d} "
                    f"{kr.get('kernel', '-'):22s} {kr.get('usec', '-'):>8s} {kr.get('test', '-'):>6s}  "
                    f"{labels.get((k, m), '')}" + ("" if us else " not supported or no result") +
                    (" " + mark(True) if key in flagged else ""))
@@ -763,16 +695,17 @@ def gemv_tables(results: list[Result], ceil: dict[str, float], strict: bool) -> 
             f"  {'k':>6s} {'m':>6s} {'N':>4s} {'t(m/N) us':>10s} {'N x t':>10s} {'t(m) us':>9s} {'extra us/op':>12s}"]
     fit_x, fit_y = [], []
     for k, m in CHAIN:
-        big = med(rows.get(("q8_0", k, m, 1), []))
+        big = tables.med(rows.get(("q8_0", k, m, 1), []))
         for n in CHAIN_N[1:]:
-            small = med(rows.get(("q8_0", k, m // n, 1), []))
+            small = tables.med(rows.get(("q8_0", k, m // n, 1), []))
             extra = (n * small - big) / (n - 1) if small and big else None
-            out.append(f"  {k:6d} {m:6d} {n:4d} {fmt(small, 1):>10s} {fmt(n * small if small else None, 1):>10s} "
-                       f"{fmt(big, 1):>9s} {fmt(extra, 2):>12s}")
+            out.append(f"  {k:6d} {m:6d} {n:4d} {tables.fmt(small, 1):>10s} "
+                       f"{tables.fmt(n * small if small else None, 1):>10s} "
+                       f"{tables.fmt(big, 1):>9s} {tables.fmt(extra, 2):>12s}")
     for (t, k, m, n), v in rows.items():
         if t == "q8_0" and n == 1 and v:
             fit_x.append(k * m * BPE[t])
-            fit_y.append(med(v))
+            fit_y.append(tables.med(v))
     if len(fit_x) >= 3:
         mx, my = statistics.fmean(fit_x), statistics.fmean(fit_y)
         sxx = sum((x - mx) ** 2 for x in fit_x)
@@ -785,9 +718,7 @@ def gemv_tables(results: list[Result], ceil: dict[str, float], strict: bool) -> 
 
 # ---- the decode runs
 
-GRAPH_START = "-> attn_norm-0|"
 TS_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)\.(\d+) \w ")
-OPLINE_RE = re.compile(r"profile-op (?P<op>[A-Z_0-9+]+)\|(?P<rest>.*?)\|usec (?P<usec>\d+) cycles")
 
 
 def dec_tables(results: list[Result]) -> list[str]:
@@ -816,12 +747,12 @@ def dec_tables(results: list[Result]) -> list[str]:
         graphs: list[list[tuple[str, int, float]]] = []
         cur = None
         for line in r.log.splitlines():
-            m = OPLINE_RE.search(line)
+            m = PROF_RE.search(line)
             if not m or m["op"] == "OPBATCH":
                 continue
             ts = TS_RE.match(line)
             t_us = ((int(ts[1]) * 60 + int(ts[2])) * 1000000 + int(ts[3]) * 1000 + int(ts[4])) if ts else -1
-            if cur is None or GRAPH_START in line:
+            if cur is None or parse.GRAPH_START in line:
                 cur = []
                 graphs.append(cur)
             f = m["rest"].split("|")
@@ -891,16 +822,15 @@ def freq_table(results: list[Result]) -> list[str]:
     return out
 
 
-def table(root: Path, strict: bool) -> int:
+def table(root: Path, include_all: bool) -> int:
     """Print the tables."""
     if not root.is_dir():
-        print(f"stage.py: {root} is not a directory. Pull the outputs of the stage first.", file=sys.stderr)
-        return 1
+        return cli.missing_root(root)
     results = [read_result(root, run) for run in runs() if (root / f"{run.name}-gate.txt").exists()]
     parts = [conditions(results)]
-    nsp_lines, ceil = nsp_tables(results, strict)
-    parts += [nsp_lines, cpu_table(results, strict), both_table(results, strict), rtt_table(results),
-              gemv_tables(results, ceil, strict), freq_table(results), dec_tables(results)]
+    nsp_lines, ceil = nsp_tables(results, include_all)
+    parts += [nsp_lines, cpu_table(results, include_all), both_table(results, include_all), rtt_table(results),
+              gemv_tables(results, ceil, include_all), freq_table(results), dec_tables(results)]
     for p in parts:
         print("\n".join(p))
         print()
@@ -933,7 +863,8 @@ def main() -> int:
         n = write_commands(a.out)
         print(f"{a.out}: {n} lines, {len(runs())} runs")
         return 0
-    return table(a.root, a.strict)
+    # --strict is the opposite of the --all flag of the other stages.
+    return table(a.root, not a.strict)
 
 
 if __name__ == "__main__":

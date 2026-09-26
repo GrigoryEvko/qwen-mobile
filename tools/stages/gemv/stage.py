@@ -41,13 +41,15 @@ the timing tables drop it. The tables only read files. O(size of the files) time
 """
 
 import argparse
-import json
 import re
 import statistics
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common import cli, commands, device, gate, logs, parse, tables  # noqa: E402
 
 
 def find_repo() -> Path:
@@ -63,10 +65,9 @@ def find_repo() -> Path:
 
 REPO = find_repo()
 
-ADB = "adb -s 192.168.14.130:5555"
-MODEL_DIR = "/data/local/tmp/qwen/models"
-MODEL = "Qwen3.5-4B-Q8_0.gguf"
-BOX_REPO = "grigory@10.10.20.200:airi/qwen-mobile"
+ADB = device.ADB
+MODEL_DIR = device.MODEL_DIR
+MODEL = device.MODEL_4B
 DSP_LIBS = ("libggml-htp-v73.so", "libggml-htp-v75.so", "libggml-htp-v79.so")
 
 
@@ -87,9 +88,10 @@ class Layout:
         return REPO / self.stage
 
     @property
-    def box(self) -> str:
-        """The stage directory on the box, for rsync."""
-        return f"{BOX_REPO}/{self.stage}"
+    def paths(self) -> device.StagePaths:
+        """The directories of the stage for the shared lines of a command file. The phone directory of the check
+        stage is not the name of its stage directory, thus this property replaces it."""
+        return device.stage_paths(Path(self.stage).name, __file__)._replace(phone=self.phone)
 
 
 FULL = Layout("/data/local/tmp/qwen/gemv", "build/gemv", ("gate.sh", "gemvcheck", "llama-bench", "test-backend-ops"),
@@ -103,28 +105,21 @@ CHECK = Layout("/data/local/tmp/qwen/gemvchk", "build/gemv-check", ("gate.sh", "
 HERE = FULL.here
 
 
-def lib_env(lay: Layout) -> str:
-    """The environment of the app (init_impl in llama_jni.cpp). ADSP_LIBRARY_PATH comes from the variant."""
-    return f"LD_LIBRARY_PATH={lay.phone}/lib GGML_HEXAGON_OPFUSION=1 GGML_HEXAGON_OPFUSION_STATE=1"
+def host_lib_env(lay: Layout) -> str:
+    """The host library path of the stage and the environment of the app (init_impl in llama_jni.cpp).
+    ADSP_LIBRARY_PATH comes from the variant."""
+    return f"LD_LIBRARY_PATH={lay.phone}/lib {device.APP_ENV}"
 
 
 # The flags of the variant b of bench-kv (the app): flash attention on HTP0, a Q8_0 K and V cache.
 BENCH_ARGS = f"-m {MODEL_DIR}/{MODEL} -dev HTP0 -ngl 99 -t 4 -fa on -b 1024 -ub 1024 -o jsonl -ctk q8_0 -ctv q8_0"
-THERMAL = f"{ADB} shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
-PGREP = (f"{ADB} shell 'pgrep -x llama-bench; pgrep -x gemvcheck; pgrep -x test-backend-op; echo pgrep-done'")
-# The highest temperature of the NPU thermal zones (type nsp*) in millidegrees.
-NSP = ('$(for z in /sys/class/thermal/thermal_zone*; do case "$(cat $z/type 2>/dev/null)" in (nsp*) '
-       'cat $z/temp 2>/dev/null;; esac; done | sort -n | tail -n 1)')
-BEFORE = f'echo "before: nsp={NSP}"'
-AFTER = ('echo "after: thermal=$(dumpsys thermalservice | grep "Thermal Status" | head -n 1 | tr -dc 0-9)'
-         ' cap0=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)'
-         ' cap7=$(cat /sys/devices/system/cpu/cpu7/cpufreq/scaling_max_freq)'
-         ' battery=$(dumpsys battery | grep "^  level:" | tr -dc 0-9)'
-         f' temp=$(dumpsys battery | grep "temperature:" | tr -dc 0-9) nsp={NSP}"')
+TOOLS = ("llama-bench", "gemvcheck", "test-backend-op")
+PGREP = device.pgrep(*TOOLS)
 
-GATE_SMALL = 2097152
+GATE_SMALL = device.GATE_TOOL_KB
+# gemvcheck holds the weights, the activations and the CPU reference of the largest case, thus its gate asks for 4 GiB.
 GATE_CHECK = 4194304
-GATE_MODEL = 8388608
+GATE_MODEL = device.GATE_4B_KB
 
 # The 4B shapes (k, m, label) of one decode token, and the output head
 SHAPES_4B = (
@@ -249,13 +244,9 @@ def run_lines(run: Run, lay: Layout) -> list[str]:
     the screen wake, the memory gate and the CAPS line of a model run."""
     p = lay.phone
     stem = f"{p}/out/{run.name}"
-    gate = f"{stem}-gate.txt"
-    env = " ".join(x for x in (lib_env(lay), f"ADSP_LIBRARY_PATH={p}/dsp/{run.variant}", run.env) if x)
-    cmd = (f"test -r {MODEL_DIR}/{MODEL} && sh {p}/bin/gate.sh {run.gate_kb} > {gate} && {BEFORE} >> {gate} && "
-           f"timeout -s KILL {run.limit} env {env} {p}/bin/{run.tool} {run.args} > {stem}.out 2> {stem}.log; "
-           f"echo \"rc=$?\" >> {gate}; {AFTER} >> {gate}; cat {gate}")
-    return ["#", f"# {run.name}: {run.text}, DSP {run.variant} (limit {run.limit} s)", THERMAL, f"{ADB} shell '{cmd}'",
-            PGREP]
+    env = " ".join(x for x in (host_lib_env(lay), f"ADSP_LIBRARY_PATH={p}/dsp/{run.variant}", run.env) if x)
+    cmd = commands.gated_run(stem, run.gate_kb, run.limit, env, f"{p}/bin/{run.tool} {run.args}", stage=p, model=MODEL)
+    return commands.run_lines(f"# {run.name}: {run.text}, DSP {run.variant} (limit {run.limit} s)", cmd, PGREP)
 
 
 HEADER = """\
@@ -319,74 +310,40 @@ CHECK_HEADER = """\
 
 
 def setup_lines(lay: Layout) -> list[str]:
-    """The lines that copy the stage to the phone and check its files."""
-    local, p = lay.stage, lay.phone
-    bins = " ".join(f"{local}/phone/bin/{b}" for b in lay.bins)
-    libs = " ".join(f"{local}/phone/lib/{lib}" for lib in lay.libs)
-    tests = " ".join(f"{local}/phone/tests/{name}" for name in lay.tests)
-    lines = [
-        f"mkdir -p {local} && rsync -a --delete {lay.box}/phone/ {local}/phone/",
-        f"(cd {local}/phone && sha256sum -c SHA256SUMS)",
-        # No model path in this line: the runner gates each line with that text as a model run.
-        f"{ADB} shell 'ls -l {MODEL_DIR} | grep -E \"{MODEL}\"'",
-        f"{ADB} shell 'rm -rf {p} && mkdir -p {p}/bin {p}/lib {p}/dsp/new {p}/dsp/base "
-        + (f"{p}/tests " if lay.tests else "") + f"{p}/out'",
-        f"{ADB} push {bins} {p}/bin/",
-        f"{ADB} push {libs} {p}/lib/",
-    ]
+    """The lines that copy the stage to the phone and check its files. The two DSP library directories go to the
+    phone as they are, thus a run selects its library with ADSP_LIBRARY_PATH."""
+    local = lay.stage
+    pushes = {
+        "bin": [f"{local}/phone/bin/{b}" for b in lay.bins],
+        "lib": [f"{local}/phone/lib/{lib}" for lib in lay.libs],
+    }
     for v in ("new", "base"):
-        dsp = " ".join(f"{local}/phone/dsp/{v}/{lib}" for lib in DSP_LIBS)
-        lines.append(f"{ADB} push {dsp} {p}/dsp/{v}/")
+        pushes[f"dsp/{v}"] = [f"{local}/phone/dsp/{v}/{lib}" for lib in DSP_LIBS]
     if lay.tests:
-        lines.append(f"{ADB} push {tests} {p}/tests/")
-    lines += [
-        f"{ADB} push {local}/phone/SHA256SUMS {p}/",
-        f"{ADB} shell 'cd {p} && sha256sum -c SHA256SUMS | grep -c OK && chmod 755 {p}/bin/*'",
-    ]
-    return lines
-
-
-def output_lines(lay: Layout) -> list[str]:
-    """The lines that pull the outputs, copy them to the box and remove the phone directory. The phone directory
-    goes only when the pull has each of its files."""
-    local, p = lay.stage, lay.phone
-    return [
-        "#",
-        "# ---- The outputs ----",
-        "#",
-        THERMAL,
-        f"{ADB} shell 'pgrep -x llama-bench; pgrep -x gemvcheck; ls {p}/out | wc -l; du -sh {p}/out'",
-        f"rm -rf {local}/phone-out",
-        f"{ADB} pull {p}/out {local}/phone-out",
-        f"rsync -a --delete {local}/phone-out/ {lay.box}/phone-out/",
-        f"test \"$(ls {local}/phone-out | wc -l)\" -eq "
-        f"\"$({ADB} shell 'ls {p}/out | wc -l' | tr -d '\\r')\" "
-        f"&& {ADB} shell 'rm -rf {p}' && echo removed {p}",
-    ]
+        pushes["tests"] = [f"{local}/phone/tests/{name}" for name in lay.tests]
+    # No model path in this line: the runner gates each line with that text as a model run.
+    return commands.setup_lines(lay.paths, pushes,
+                                model_check=f"{ADB} shell 'ls -l {MODEL_DIR} | grep -E \"{MODEL}\"'")
 
 
 def write_commands(path: Path, lay: Layout) -> int:
     """Write the command file of the stage and return its line count."""
     header = CHECK_HEADER if lay == CHECK else HEADER
-    lines = header.rstrip("\n").split("\n") + setup_lines(lay)
+    lines = commands.header_lines(header) + setup_lines(lay)
     for run in runs(lay):
         lines += run_lines(run, lay)
-    lines += output_lines(lay)
-    path.write_text("\n".join(lines) + "\n")
-    return len(lines)
+    lines += commands.output_lines(lay.paths, tools=TOOLS)
+    return commands.write_commands(path, lines)
 
 
 # ---- The tables ----
 
-GATE_RE = re.compile(r"gate: screen=(\S+) thermal=(\d*) cap0=(\d*) cap7=(\d*) battery=(\d*)% temp=(\d*)")
-AFTER_RE = re.compile(r"after: thermal=(\d*) cap0=(\d*) cap7=(\d*) battery=(\d*) temp=(\d*)(?: nsp=(\d*))?")
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 CHECK_RE = re.compile(r"^gemvcheck: check (\S+) out (\d+) hash (0x[0-9a-f]+) nmse (\S+)(.*)$", re.M)
 GPERF_RE = re.compile(r"^gemvcheck: perf (\S+) reps (\d+) us ([\d.]+) min ([\d.]+) max ([\d.]+) gbps ([\d.]+)", re.M)
 TBO_CASE_RE = re.compile(r"MUL_MAT\(type=\w+,ne=\[(?P<m>\d+),(?P<n>\d+),\d+,\d+\].*?sources=(?P<t>\w+)\[(?P<k>\d+),")
 PERF_RE = re.compile(r"(?P<runs>\d+) runs -\s*(?P<us>[\d.]+) us/run")
+# The stage reads the fields after the op name of a profile line, thus it keeps its own pattern.
 PROF_RE = re.compile(r"profile-op (?P<op>[A-Z_0-9+]+)\|(?P<rest>.*?)\|usec (?P<usec>\d+) cycles")
-GRAPH_START = "-> attn_norm-0|"
 
 
 @dataclass
@@ -404,43 +361,9 @@ class Result:
 
 def read_result(root: Path, run: Run) -> Result:
     """Read the files of one run. O(size of the files)."""
-    def text(suffix: str) -> str:
-        p = root / f"{run.name}{suffix}"
-        return ANSI_RE.sub("", p.read_text(errors="replace")) if p.exists() else ""
-
-    gate = text("-gate.txt")
-    before, after = GATE_RE.search(gate), AFTER_RE.search(gate)
-    m = re.search(r"^rc=(\d+)", gate, re.M)
-    rc = int(m.group(1)) if m else None
-    flags = []
-    ok = "gate: OK" in gate and rc == 0
-    if not gate:
-        flags.append("no gate file")
-    elif "gate: OK" not in gate:
-        flags.append("gate stopped the run")
-    elif rc != 0:
-        flags.append(f"exit code {rc}")
-    caps = f"{before.group(3)}/{before.group(4)}" if before else "?"
-    if before and after and (before.group(3), before.group(4)) != (after.group(2), after.group(3)):
-        flags.append(f"caps {caps} -> {after.group(2)}/{after.group(3)}")
-    if after and after.group(1) not in ("", "0"):
-        flags.append(f"thermal {after.group(1)} after the run")
-    return Result(run, ok, rc, flags, caps, text(".out"), text(".log"))
-
-
-def med(vals: list[float]) -> float | None:
-    """The median, or None for no value."""
-    return statistics.median(vals) if vals else None
-
-
-def fmt(x: float | None, nd: int = 2) -> str:
-    """A number with nd decimals, or "-"."""
-    return "-" if x is None else f"{x:.{nd}f}"
-
-
-def pct(new: float | None, base: float | None) -> str:
-    """The change of new against base in percent, or "-"."""
-    return "-" if not new or not base else f"{100 * (new / base - 1):+.1f}%"
+    gate_text, out, log = logs.read_run(root, run.name, strip_ansi=True)
+    c = gate.read(gate_text)
+    return Result(run, c.ok, c.rc, c.flags, c.caps, out, log)
 
 
 def conditions(results: dict[str, Result], lay: Layout) -> list[str]:
@@ -482,7 +405,7 @@ def check_table(results: dict[str, Result]) -> list[str]:
         fails = [k for k, v in hn.items() if v[2]] + [k for k, v in hb.items() if v[2]]
         all_equal = all_equal and not diff and not missing and bool(hn) and base.ok and new.ok
         out.append(f"  {arch}: {same} of {len(hn)} outputs have the same bits, {len(diff)} differ, {len(missing)} are in "
-                   f"one run only; worst nmse base {fmt(worst_b, 8)} new {fmt(worst_n, 8)}; exit codes "
+                   f"one run only; worst nmse base {tables.fmt(worst_b, 8)} new {tables.fmt(worst_n, 8)}; exit codes "
                    f"{base.rc}/{new.rc}" + (f"; FAIL or NONFINITE: {fails[:4]}" if fails else ""))
         for k in diff[:8]:
             out.append(f"    differs: {k[0]} out {k[1]} base {hb[k][0]} new {hn[k][0]}")
@@ -541,7 +464,8 @@ def perf_tables(results: dict[str, Result], include_all: bool) -> list[str]:
     labels = {(k, m): lab for k, m, lab in SHAPES_4B + (HEAD_4B,)}
     for key in sorted(set(rates["base"]) | set(rates["new"]), key=lambda x: (x[0], -x[1], x[2])):
         b, n = rates["base"].get(key), rates["new"].get(key)
-        out.append(f"  {key[0]:6d} {key[1]:7d} {key[2]:2d} {fmt(b):>10s} {fmt(n):>10s} {pct(n, b):>8s}  "
+        out.append(f"  {key[0]:6d} {key[1]:7d} {key[2]:2d} {tables.fmt(b, 2):>10s} {tables.fmt(n, 2):>10s} "
+                   f"{tables.change(n, b):>8s}  "
                    f"{labels.get((key[0], key[1]), '')}")
     return out + [""] + gperf_table(results, include_all)
 
@@ -560,27 +484,15 @@ def gperf_table(results: dict[str, Result], include_all: bool) -> list[str]:
             g[v][m.group(1)] = (float(m.group(6)), float(m.group(3)))
     for case in sorted(set(g["base"]) | set(g["new"])):
         b, n = g["base"].get(case), g["new"].get(case)
-        out.append(f"  {case:32s} {fmt(b[0] if b else None):>10s} {fmt(n[0] if n else None):>10s} "
-                   f"{pct(n[0] if n else None, b[0] if b else None):>8s} {fmt(b[1] if b else None, 1):>10s} "
-                   f"{fmt(n[1] if n else None, 1):>10s}")
+        out.append(f"  {case:32s} {tables.fmt(b[0] if b else None, 2):>10s} "
+                   f"{tables.fmt(n[0] if n else None, 2):>10s} "
+                   f"{tables.change(n[0] if n else None, b[0] if b else None):>8s} "
+                   f"{tables.fmt(b[1] if b else None, 1):>10s} {tables.fmt(n[1] if n else None, 1):>10s}")
     return out
 
 
 BENCH_ROWS = (("pp512 d0", "t", (512, 0, 0)), ("tg32 d0", "t", (0, 32, 0)), ("tg32 d4096", "m", (0, 32, 4096)),
               ("tg32 d16384", "l", (0, 32, 16384)))
-
-
-def bench_values(r: Result) -> dict[tuple[int, int, int], float]:
-    """The t/s of each llama-bench test of one run: (n_prompt, n_gen, n_depth) -> the median of its samples."""
-    vals = {}
-    for line in r.out.splitlines():
-        if line.startswith("{"):
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            vals[(rec["n_prompt"], rec["n_gen"], rec["n_depth"])] = statistics.median(rec["samples_ts"])
-    return vals
 
 
 def bench_table(results: dict[str, Result], include_all: bool) -> list[str]:
@@ -595,14 +507,14 @@ def bench_table(results: dict[str, Result], include_all: bool) -> list[str]:
             for v in ("base", "new"):
                 r = results.get(f"bench-{rnd}-{key}-{v}")
                 if r and r.ok and (include_all or not r.flags):
-                    val = bench_values(r).get(test)
+                    val = parse.bench_values(r.out).get(test)
                     if val is not None:
                         per[v][rnd] = val
         cells = []
         for v in ("base", "new"):
             vals = list(per[v].values())
-            cells.append(f"{fmt(med(vals))} [{fmt(min(vals) if vals else None)}-{fmt(max(vals) if vals else None)}] "
-                         f"n{len(vals)}")
+            cells.append(f"{tables.fmt(tables.med(vals), 2)} [{tables.fmt(min(vals) if vals else None, 2)}-"
+                         f"{tables.fmt(max(vals) if vals else None, 2)}] n{len(vals)}")
         ratios = [per["new"][k] / per["base"][k] for k in per["new"] if k in per["base"]]
         change = f"{100 * (statistics.median(ratios) - 1):+.1f}%" if ratios else "-"
         out.append(f"  {text:14s} {cells[0]:>24s} {cells[1]:>24s} {change:>8s}")
@@ -645,7 +557,7 @@ def prof_table(results: dict[str, Result]) -> list[str]:
             m = PROF_RE.search(line)
             if not m or m["op"] == "OPBATCH":
                 continue
-            if cur is None or GRAPH_START in line:
+            if cur is None or parse.GRAPH_START in line:
                 cur = []
                 graphs.append(cur)
             cur.append((m["op"], m["rest"], int(m["usec"])))
@@ -669,8 +581,9 @@ def prof_table(results: dict[str, Result]) -> list[str]:
             out.append(f"  {v}: no decode graph in the log")
             continue
         gbs = [b / u / 1e3 for b, u in zip(mm_bytes, mm_us) if u]
-        out.append(f"  {v}: {len(dec)} decode graphs, op time {fmt(med(tok_us) / 1e3)} ms, Q8_0 weight MUL_MATs "
-                   f"{fmt(med(mm_us) / 1e3)} ms at {fmt(med(gbs))} GB/s ({fmt(med(mm_bytes) / 1e9, 3)} GB); kernels "
+        out.append(f"  {v}: {len(dec)} decode graphs, op time {tables.fmt(tables.med(tok_us) / 1e3, 2)} ms, "
+                   f"Q8_0 weight MUL_MATs {tables.fmt(tables.med(mm_us) / 1e3, 2)} ms at "
+                   f"{tables.fmt(tables.med(gbs), 2)} GB/s ({tables.fmt(tables.med(mm_bytes) / 1e9, 3)} GB); kernels "
                    + ", ".join(f"{k} x{n}" for k, n in sorted(kern.items())))
     return out
 
@@ -678,8 +591,7 @@ def prof_table(results: dict[str, Result]) -> list[str]:
 def table(root: Path, include_all: bool, lay: Layout) -> int:
     """Print the tables of the stage. The check stage has only the conditions and the bit check."""
     if not root.is_dir():
-        print(f"stage.py: {root} is not a directory. Pull the outputs of the stage first.", file=sys.stderr)
-        return 1
+        return cli.missing_root(root)
     results = {run.name: read_result(root, run) for run in runs(lay) if (root / f"{run.name}-gate.txt").exists()}
     parts = [conditions(results, lay), check_table(results)]
     if lay == CHECK:

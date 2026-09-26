@@ -65,9 +65,7 @@ This file is tools/stages/fak/stage.py, and build/fak/stage.py is a link to it.
 from __future__ import annotations
 
 import argparse
-import gzip
 import hashlib
-import json
 import math
 import re
 import statistics
@@ -78,30 +76,29 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common import cli, commands, device, gate, logs, parse, tables  # noqa: E402
 
 # ---- The stage paths and the phone lines ----
 
 # The paths of one stage: use_stage sets them from the stage name.
 STAGE = "fak"
-HERE = REPO / "build/fak"
-PHONE = "/data/local/tmp/qwen/fak"
-LAPTOP_STAGE = "build/fak"
-BOX = "grigory@10.10.20.200:airi/qwen-mobile/build/fak"
+PATHS = device.stage_paths(STAGE, __file__)
+PHONE, LAPTOP_STAGE, BOX, HERE = PATHS
 LIB_ENV = ""
 
-ADB = "adb -s 192.168.14.130:5555"
-MODEL = "/data/local/tmp/qwen/models/Qwen3.5-4B-Q8_0.gguf"
-MODEL_KB = 8388608
+ADB = device.ADB
+MODEL = f"{device.MODEL_DIR}/{device.MODEL_4B}"
+MODEL_KB = device.GATE_4B_KB
 # The ls of a model file makes the laptop runner treat a line as a model run: it waits for the unlocked
 # phone, stops the Qwen app and wakes the screen. The op runs load no model.
-MARKER = "ls /data/local/tmp/qwen/models/Qwen3.5-2B-Q8_0.gguf > /dev/null"
-OPS_KB = 2097152
+MARKER = f"ls {device.MODEL_DIR}/{device.MODEL_2B} > /dev/null"
+OPS_KB = device.GATE_TOOL_KB
 # The KL bases: the naive x86 oracle (oracle-kl-floor), the text, and the 16k base with f32
 # activations (the prefill rows run with f16 activations on HTP0).
-KLD_BASE = "/data/local/tmp/qwen/eval/naive-4B-q8.kld"
-WIKI = "/data/local/tmp/qwen/eval/wiki.test.raw"
-KVKL_DIR = "/data/local/tmp/qwen/memory/b/bases"
+KLD_BASE = f"{device.EVAL_DIR}/naive-4B-q8.kld"
+WIKI = f"{device.EVAL_DIR}/wiki.test.raw"
+KVKL_DIR = f"{device.PHONE_ROOT}/memory/b/bases"
 KVKL_16K = f"{KVKL_DIR}/naive-4B-deqf32-c16384-s32-t64.kvb"
 KVKL_TEXT = f"{KVKL_DIR}/wiki.test.raw"
 # The context of the app (load_impl in llama_jni.cpp): n_batch = n_ubatch = 1024, 4 threads, flash
@@ -113,17 +110,9 @@ STAGE_FILES = ("bin/gate.sh", "bin/llama-bench", "bin/llama-perplexity", "bin/te
                "lib/libllama-perplexity-impl.so", "lib/libllama-common.so", "lib/libllama.so", "lib/libmtmd.so")
 # The test files of test-backend-ops (phone/tests/<name>.txt, written by write_files)
 TEST_FILES = ("fa4b", "fa4s", "fa4l", "vit", "faperf")
-THERMAL = f"{ADB} shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
-PGREP = (f"{ADB} shell 'pgrep -x llama-bench; pgrep -x llama-perplexi; pgrep -x test-backend-op; pgrep -x kvkl; "
-         "echo pgrep-done'")
-NSP = ('$(for z in /sys/class/thermal/thermal_zone*; do case "$(cat $z/type 2>/dev/null)" in (nsp*) '
-       'cat $z/temp 2>/dev/null;; esac; done | sort -n | tail -n 1)')
-BEFORE = f'echo "before: nsp={NSP}"'
-AFTER = ('echo "after: thermal=$(dumpsys thermalservice | grep "Thermal Status" | head -n 1 | tr -dc 0-9)'
-         ' cap0=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)'
-         ' cap7=$(cat /sys/devices/system/cpu/cpu7/cpufreq/scaling_max_freq)'
-         ' battery=$(dumpsys battery | grep "^  level:" | tr -dc 0-9)'
-         f' temp=$(dumpsys battery | grep "temperature:" | tr -dc 0-9) nsp={NSP}"')
+# The kernel keeps 15 characters of a process name, thus a longer tool name goes in cut to 15.
+TOOLS = ("llama-bench", "llama-perplexit", "test-backend-op", "kvkl")
+PGREP = device.pgrep(*TOOLS)
 
 
 @dataclass(frozen=True)
@@ -322,16 +311,14 @@ def use_stage(name: str) -> None:
     Raises:
         KeyError: If the name is not in STAGES
     """
-    global STAGE, HERE, PHONE, LAPTOP_STAGE, BOX, LIB_ENV, BLOCKS, GROUPS, EST_S, TABLE_KEYS, LOGCAT, VARIANTS, PRESET
+    global STAGE, PATHS, HERE, PHONE, LAPTOP_STAGE, BOX, LIB_ENV, BLOCKS, GROUPS, EST_S, TABLE_KEYS, LOGCAT, \
+        VARIANTS, PRESET
     sdef = STAGES[name]
     STAGE = name
-    HERE = REPO / "build" / name
-    PHONE = f"/data/local/tmp/qwen/{name}"
-    LAPTOP_STAGE = f"build/{name}"
-    BOX = f"grigory@10.10.20.200:airi/qwen-mobile/build/{name}"
+    PATHS = device.stage_paths(name, __file__)
+    PHONE, LAPTOP_STAGE, BOX, HERE = PATHS
     # The environment of the app (init_impl in llama_jni.cpp) and the stage libraries.
-    LIB_ENV = (f"LD_LIBRARY_PATH={PHONE}/lib ADSP_LIBRARY_PATH={PHONE}/lib "
-               "GGML_HEXAGON_OPFUSION=1 GGML_HEXAGON_OPFUSION_STATE=1")
+    LIB_ENV = f"{device.lib_env(PHONE)} {device.APP_ENV}"
     BLOCKS, GROUPS, EST_S = sdef.blocks, sdef.groups, sdef.est_s
     TABLE_KEYS, LOGCAT = sdef.table_keys, sdef.logcat
     VARIANTS, PRESET = sdef.variants, sdef.preset
@@ -505,22 +492,14 @@ STAGE_NOTES = {
 
 def setup_lines() -> list[str]:
     """The lines that copy the stage to the phone and check its files and the KL bases."""
-    bins = " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in STAGE_FILES if f.startswith("bin/"))
-    libs = " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in STAGE_FILES if f.startswith("lib/"))
-    return [
-        f"mkdir -p {LAPTOP_STAGE} && rsync -a --delete {BOX}/phone/ {LAPTOP_STAGE}/phone/",
-        f"(cd {LAPTOP_STAGE}/phone && sha256sum -c SHA256SUMS)",
-        # No "models/Qwen3.5" in this line: the runner gates each line with that text as a model run.
-        f"{ADB} shell 'ls -l {KLD_BASE} {WIKI} {KVKL_16K} {KVKL_TEXT} "
-        f"$(dirname {MODEL})/ | grep -c -E \"kvb|kld|raw|4B-Q8_0\"'",
-        f"{ADB} shell 'rm -rf {PHONE} && mkdir -p {PHONE}/bin {PHONE}/lib {PHONE}/tests {PHONE}/out'",
-        f"{ADB} push {bins} {PHONE}/bin/",
-        f"{ADB} push {libs} {PHONE}/lib/",
-        f"{ADB} push " + " ".join(f"{LAPTOP_STAGE}/phone/tests/{name}.txt" for name in TEST_FILES) + f" {PHONE}/tests/",
-        f"{ADB} push {LAPTOP_STAGE}/phone/SHA256SUMS {PHONE}/",
-        f"{ADB} shell 'cd {PHONE} && sha256sum -c SHA256SUMS | grep -c OK && chmod 755 {PHONE}/bin/*'",
-        f"{ADB} shell 'echo gzip: $(command -v gzip) timeout: $(command -v timeout)'",
-    ]
+    files = {d: [f"{LAPTOP_STAGE}/phone/{f}" for f in STAGE_FILES if f.startswith(f"{d}/")] for d in ("bin", "lib")}
+    files["tests"] = [f"{LAPTOP_STAGE}/phone/tests/{name}.txt" for name in TEST_FILES]
+    # No "models/Qwen3.5" in the model line: the runner gates each line with that text as a model run.
+    return commands.setup_lines(
+        PATHS, files,
+        model_check=f"{ADB} shell 'ls -l {KLD_BASE} {WIKI} {KVKL_16K} {KVKL_TEXT} "
+                    f"$(dirname {MODEL})/ | grep -c -E \"kvb|kld|raw|4B-Q8_0\"'",
+        extra=[f"{ADB} shell 'echo gzip: $(command -v gzip) timeout: $(command -v timeout)'"])
 
 
 def run_lines(run: Run) -> list[str]:
@@ -543,38 +522,23 @@ def run_lines(run: Run) -> list[str]:
     else:
         cmd = f"{PHONE}/bin/llama-bench -m {MODEL} {BENCH_ARGS} -ctk {b.kv} -ctv {b.kv} {b.args}"
         prefix = ""
+    timed = commands.timeout_cmd(b.limit, env, cmd)
     if b.profile:
         # One profile line for each op: gzip (when the phone has it) keeps the file small. The parser reads
         # a gzip file and a plain file alike.
-        tool = (f"{{ Z=cat; command -v gzip > /dev/null && Z=\"gzip -1\"; set -o pipefail; "
-                f"timeout -s KILL {b.limit} env {env} {cmd} 2>&1 > {stem}.out | $Z > {stem}.log.z; }}; ")
+        tool = commands.gzip_group(stem, timed)
     else:
-        tool = f"{{ timeout -s KILL {b.limit} env {env} {cmd} > {stem}.out 2> {stem}.log; }}; "
+        # The group holds the exit code of the tool, thus the logcat line after it does not change the code.
+        tool = "{ " + commands.redirect(stem, timed) + "; }; "
     # The logcat lines of the DSP session and of FastRPC during the run, for a stage with LOGCAT.
     lc_clear = "logcat -c; " if LOGCAT else ""
     lc_save = (f"logcat -d 2>/dev/null | grep -iE \"adsprpc|fastrpc|cdsp|htp|hexagon|qurt|dspqueue\" | tail -n 80 "
                f"> {stem}.lc; ") if LOGCAT else ""
-    shell = (f"{prefix}sh {PHONE}/bin/gate.sh {b.gate_kb} > {stem}-gate.txt && {BEFORE} >> {stem}-gate.txt && "
-             f"{lc_clear}{tool}echo \"rc=$?\" >> {stem}-gate.txt; {lc_save}{AFTER} >> {stem}-gate.txt; "
-             f"cat {stem}-gate.txt")
+    shell = (commands.gate_head(stem, b.gate_kb, PHONE, prefix=prefix) + lc_clear + tool
+             + commands.gate_tail(stem, clean=lc_save))
     title = "REAL-MODEL Qwen3.5-4B-Q8_0" if b.gate_kb == MODEL_KB else "OPS"
-    return ["#", f"# {title}: {run.name}, {b.text}, {v.key.upper()}: GGML_HEXAGON_FA_OPT={v.opt} ({v.text})",
-            THERMAL, f"{ADB} shell '{shell}'", PGREP]
-
-
-def output_lines() -> list[str]:
-    """The lines that pull the outputs, copy them to the box and remove the phone directory. The phone
-    directory goes only when the pull has each of its files."""
-    return [
-        "#", "# ---- The outputs ----", "#", THERMAL,
-        f"{ADB} shell 'pgrep -x llama-bench; pgrep -x kvkl; ls {PHONE}/out | wc -l; du -sh {PHONE}/out'",
-        f"rm -rf {LAPTOP_STAGE}/phone-out",
-        f"{ADB} pull {PHONE}/out {LAPTOP_STAGE}/phone-out",
-        f"rsync -a --delete {LAPTOP_STAGE}/phone-out/ {BOX}/phone-out/",
-        f"test \"$(ls {LAPTOP_STAGE}/phone-out | wc -l)\" -eq "
-        f"\"$({ADB} shell 'ls {PHONE}/out | wc -l' | tr -d '\\r')\" "
-        f"&& {ADB} shell 'rm -rf {PHONE}' && echo removed {PHONE}",
-    ]
+    return commands.run_lines(
+        f"# {title}: {run.name}, {b.text}, {v.key.upper()}: GGML_HEXAGON_FA_OPT={v.opt} ({v.text})", shell, PGREP)
 
 
 NEEDED_RE = re.compile(r"\(NEEDED\)\s+Shared library: \[([^\]]+)\]")
@@ -634,19 +598,18 @@ def write_files() -> int:
     variant_text = "\n".join(f"#   {v.key.upper()} {v.opt:2d}  {v.text}" for v in VARIANTS.values())
     head = HEADER.format(stage=STAGE, note=STAGE_NOTES[STAGE], lc_note=lc_note, n_runs=len(runs), run_text=run_text,
                          variant_text=variant_text, tool_min=tool / 60, total_min=(tool + 10 * len(runs)) / 60)
-    out = head.rstrip("\n").split("\n") + setup_lines()
+    out = commands.header_lines(head) + setup_lines()
     for run in runs:
         out += run_lines(run)
-    out += output_lines()
-    (HERE / "phone-commands.txt").write_text("\n".join(out) + "\n")
-    print(f"phone-commands.txt: {len(out)} lines, {len(runs)} runs, tool time about {tool / 60:.1f} min")
+    out += commands.output_lines(PATHS, tools=TOOLS)
+    n = commands.write_commands(HERE / "phone-commands.txt", out)
+    print(f"phone-commands.txt: {n} lines, {len(runs)} runs, tool time about {tool / 60:.1f} min")
     return 0
 
 
 # ---- The table ----
 
-GATE_RE = re.compile(r"gate: screen=(\S+) thermal=(\d*) cap0=(\d*) cap7=(\d*) battery=(\d*)% temp=(\d*)")
-AFTER_RE = re.compile(r"after: thermal=(\d*) cap0=(\d*) cap7=(\d*) battery=(\d*) temp=(\d*)(?: nsp=(\d*))?")
+# The KL lines of llama-perplexity, with the exponent form that a value at the floor takes
 KL_RE = re.compile(r"^Mean\s+KLD:\s+([\d.eE+-]+)\s+±\s+([\d.eE+-]+)", re.M)
 TOP_RE = re.compile(r"^Same top p:\s+([\d.]+)", re.M)
 KLMAX_RE = re.compile(r"^Maximum KLD:\s+([\d.eE+-]+)", re.M)
@@ -654,7 +617,6 @@ TEST_RE = re.compile(r"^\s*(\d+)/(\d+) tests passed", re.M)
 # A case line of test-backend-ops test, after the color codes go: "OP(params): OK" or, for a failed case,
 # "[OP] ERR = 0.0017 > 0.0005   OP(params): FAIL".
 CASE_RE = re.compile(r"^(?:\[\w+\] ERR = ([\d.eE+-]+) > [\d.eE+-]+\s+)?\s*FLASH_ATTN_EXT\((.*)\): (OK|FAIL)", re.M)
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 PROF_RE = re.compile(r"profile-op ([A-Z0-9_+]+)\|.*\|usec (\d+) cycles")
 
 
@@ -670,50 +632,12 @@ class Result:
     log: str
     lc: str = ""  # the DSP lines of logcat (<run>.lc), empty without LOGCAT
 
-    def bench(self) -> dict[tuple[int, int, int], float]:
-        """The llama-bench rates: (n_prompt, n_gen, n_depth) -> the median of the samples in t/s."""
-        rates = {}
-        for line in self.out.splitlines():
-            if line.startswith("{"):
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                rates[(rec["n_prompt"], rec["n_gen"], rec["n_depth"])] = statistics.median(rec["samples_ts"])
-        return rates
-
-
-def read_text(path: Path) -> str:
-    """A text file, or a gzip file of the phone (gzip -1), or an empty string."""
-    for p in (path, path.with_name(path.name + ".z")):
-        if p.exists():
-            data = p.read_bytes()
-            if data[:2] == b"\x1f\x8b":
-                data = gzip.decompress(data)
-            return data.decode(errors="replace")
-    return ""
-
 
 def read_result(root: Path, run: Run) -> Result:
-    """Read the gate file, the stdout and the stderr of one run. O(size of the files)."""
-    gate = read_text(root / f"{run.name}-gate.txt")
-    before, after = GATE_RE.search(gate), AFTER_RE.search(gate)
-    rc = re.search(r"^rc=(\d+)", gate, re.M)
-    flags = []
-    ok = "gate: OK" in gate and rc is not None and rc.group(1) == "0"
-    if not gate:
-        flags.append("no gate file")
-    elif "gate: OK" not in gate:
-        flags.append("gate stopped the run")
-    elif not ok:
-        flags.append(f"exit code {rc.group(1) if rc else '?'}")
-    caps = f"{before.group(3)}/{before.group(4)}" if before else "?"
-    if before and after and (before.group(3), before.group(4)) != (after.group(2), after.group(3)):
-        flags.append(f"caps {caps} -> {after.group(2)}/{after.group(3)}")
-    if after and after.group(1) not in ("", "0"):
-        flags.append(f"thermal {after.group(1)} after the run")
-    return Result(run, ok, flags, caps, read_text(root / f"{run.name}.out"), read_text(root / f"{run.name}.log"),
-                  read_text(root / f"{run.name}.lc"))
+    """Read the gate file, the stdout, the stderr and the logcat lines of one run. O(size of the files)."""
+    text, out, log, lc = logs.read_run(root, run.name, ("-gate.txt", ".out", ".log", ".lc"))
+    c = gate.read(text)
+    return Result(run, c.ok, c.flags, c.caps, out, log, lc)
 
 
 def usable(res: Result | None, include_all: bool) -> bool:
@@ -732,7 +656,7 @@ def op_table(results: dict[str, Result]) -> list[str]:
             if res is None:
                 out.append(f"  {key}-1-{v}: no output")
                 continue
-            text = ANSI_RE.sub("", res.out + res.log)
+            text = logs.ANSI_RE.sub("", res.out + res.log)
             passed = TEST_RE.findall(text)
             fails = {c: err or "?" for err, c, st in CASE_RE.findall(text) if st == "FAIL"}
             fails_of[v] = fails
@@ -768,7 +692,7 @@ def perf_table(results: dict[str, Result]) -> list[str]:
             if res is None or not res.ok:
                 out.append(f"  {key}-1-{v}: no usable run" + (f"; flags: {', '.join(res.flags)}" if res else ""))
                 continue
-            for name, _, val in PERF_RE.findall(ANSI_RE.sub("", res.out)):
+            for name, _, val in PERF_RE.findall(logs.ANSI_RE.sub("", res.out)):
                 us.setdefault(name, {})[v] = float(val)
         for name, per in us.items():
             base = per.get("a")
@@ -813,11 +737,6 @@ ROWS = (
 )
 
 
-def num(x: float) -> str:
-    """A rate with 2 decimals below 100 and 1 decimal from 100."""
-    return f"{x:.2f}" if x < 100 else f"{x:.1f}"
-
-
 def rate_table(results: dict[str, Result], include_all: bool) -> list[str]:
     """The t/s table: per row and variant the median of the rounds, the paired difference to A, the lowest
     and the highest round and the count of rounds. O(runs)."""
@@ -831,7 +750,7 @@ def rate_table(results: dict[str, Result], include_all: bool) -> list[str]:
             for k in block.variants:
                 res = results.get(f"{key}-{rnd}-{k}")
                 if usable(res, include_all):
-                    val = res.bench().get(bkey)
+                    val = parse.bench_values(res.out).get(bkey)
                     if val is not None:
                         per[k][rnd] = val
         cells = []
@@ -840,11 +759,11 @@ def rate_table(results: dict[str, Result], include_all: bool) -> list[str]:
             if not vals:
                 cells.append(f"{'-':32s}")
                 continue
-            cell = num(statistics.median(vals.values()))
+            cell = tables.rate(statistics.median(vals.values()))
             if k != "a" and "a" in per:
                 ratios = [vals[r] / per["a"][r] for r in vals if r in per["a"]]
                 cell += f" {100 * (statistics.median(ratios) - 1):+.1f}%" if ratios else " ?"
-            cell += f" [{num(min(vals.values()))}-{num(max(vals.values()))}] n{len(vals)}"
+            cell += f" [{tables.rate(min(vals.values()))}-{tables.rate(max(vals.values()))}] n{len(vals)}"
             cells.append(f"{cell:32s}")
         out.append(f"  {text:24s}| " + " | ".join(cells))
     # The release rule: the Q8_0 decode of E against the F16 decode of E, per round.
@@ -856,7 +775,8 @@ def rate_table(results: dict[str, Result], include_all: bool) -> list[str]:
             q = results.get(f"{qkey}-{rnd}-e")
             f = results.get(f"f-{rnd}-e")
             if usable(q, include_all) and usable(f, include_all):
-                qv, fv = q.bench().get((0, 32, depth)), f.bench().get((0, 32, depth))
+                qv = parse.bench_values(q.out).get((0, 32, depth))
+                fv = parse.bench_values(f.out).get((0, 32, depth))
                 if qv and fv:
                     ratios.append(qv / fv)
         if ratios:
@@ -945,8 +865,7 @@ def checks(results: dict[str, Result]) -> list[str]:
 def table(root: Path, include_all: bool) -> int:
     """Print the tables."""
     if not root.is_dir():
-        print(f"stage.py: {root} is not a directory. Pull the outputs of the stage first.", file=sys.stderr)
-        return 1
+        return cli.missing_root(root)
     results = {r.name: read_result(root, r) for r in all_runs() if (root / f"{r.name}-gate.txt").exists()}
     for part in (checks(results), op_table(results), perf_table(results), kl_table(results),
                  rate_table(results, include_all), prof_table(results)):

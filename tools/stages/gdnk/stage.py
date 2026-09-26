@@ -71,7 +71,8 @@ STAGE_FILES = ("bin/gate.sh", "bin/llama-bench", "bin/llama-perplexity", "bin/te
                "lib/libggml-base.so", "lib/libggml-cpu.so", "lib/libggml-hexagon.so", "lib/libggml-htp-v79.so",
                "lib/libggml-opencl.so", "lib/libggml.so", "lib/libllama-bench-impl.so", "lib/libllama-common.so",
                "lib/libllama-perplexity-impl.so", "lib/libllama.so", "lib/libmtmd.so")
-TOOLS = ("llama-bench", "llama-perplexit", "test-backend-o")
+# The kernel keeps 15 characters of a process name, and pgrep -x matches that name
+TOOLS = ("llama-bench", "llama-perplexit", "test-backend-op")
 PGREP = device.pgrep(*TOOLS)
 
 

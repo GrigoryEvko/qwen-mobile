@@ -30,7 +30,6 @@ O(size of the files).
 
 import argparse
 import math
-import os
 import re
 import statistics
 import subprocess
@@ -41,42 +40,37 @@ from pathlib import Path
 
 import numpy as np
 
-ADB = "adb -s 192.168.14.130:5555"
-PHONE = "/data/local/tmp/qwen/vit"
-MODEL_DIR = "/data/local/tmp/qwen/models"
-MODEL = "Qwen3.5-4B-Q8_0.gguf"
-MMPROJ = "Qwen3.5-4B-Q8_0.mmproj.gguf"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common import cli, commands, device, gate, logs, tables  # noqa: E402
+
+ADB = device.ADB
+PATHS = device.stage_paths("vit", __file__)
+PHONE, LAPTOP_STAGE, BOX, STAGE_ROOT = PATHS
+MODEL_DIR = device.MODEL_DIR
+MODEL = device.MODEL_4B
+MMPROJ = device.MMPROJ_4B
 # The photo of the user: the saved copy on the box (a new chat of the app deletes the photos of the chat, thus a
 # stage never takes the photo from the app)
-PHOTO_COPY = "build/imgturn/photo.jpg"
-PHOTO_SHA1 = "a2200d1a726ec0a8576b4a18dc2ef1aa4e4c797d"
+PHOTO_LOCAL = device.PHOTO_LOCAL
+PHOTO_SHA1 = device.PHOTO_SHA1
 OLD_IMAGE = "/sdcard/qwen/user.jpg"
+# The MemAvailable (KiB) of an encoder run: 3 GiB, because the run loads the projector and the vocabulary of the 4B
+# and not the layers of the text model.
 GATE_KB = 3145728
-BOX = "grigory@10.10.20.200:airi/qwen-mobile/build"
 REPO = Path(__file__).resolve().parents[3]
-STAGE_ROOT = Path(os.path.relpath(REPO / "build/vit"))
-BASE_ENV = "GGML_HEXAGON_OPFUSION=1 GGML_HEXAGON_OPFUSION_STATE=1"
+APP_ENV = device.APP_ENV
 PROFILE_ENV = "GGML_HEXAGON_PROFILE=1 LLAMA_HOSTPROF=1"
 # The phase events of each DSP thread (profile level 3). The preset trace size (256 events for each op of the
 # largest batch, 327680 for each thread) holds the events of one encode.
 TRACE_ENV = "GGML_HEXAGON_PROFILE=3 LLAMA_HOSTPROF=1"
-THERMAL = f"{ADB} shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
-# The kernel keeps 15 characters of a process name: test-backend-ops is test-backend-op
-PGREP = f"{ADB} shell 'pgrep -x vitprobe; pgrep -x llama-bench; pgrep -x test-backend-op; echo pgrep-done'"
-NSP = ('$(for z in /sys/class/thermal/thermal_zone*; do case "$(cat $z/type 2>/dev/null)" in (nsp*) '
-       'cat $z/temp 2>/dev/null;; esac; done | sort -n | tail -n 1)')
-BEFORE = f'echo "before: nsp={NSP}"'
-AFTER = ('echo "after: thermal=$(dumpsys thermalservice | grep "Thermal Status" | head -n 1 | tr -dc 0-9)'
-         ' cap0=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)'
-         ' cap7=$(cat /sys/devices/system/cpu/cpu7/cpufreq/scaling_max_freq)'
-         ' battery=$(dumpsys battery | grep "^  level:" | tr -dc 0-9)'
-         f' temp=$(dumpsys battery | grep "temperature:" | tr -dc 0-9) nsp={NSP}"')
-CAP_MIN_KHZ = 3000000
+THERMAL = device.THERMAL
+TOOLS = ("vitprobe", "llama-bench", "test-backend-op")
+PGREP = device.pgrep(*TOOLS)
 # The tensors of the dump runs: the output of layers 0, 1, 5, 11, 17 and 23, and the stages of layer 0.
 DUMP_RE = "(layer_out-(0|1|5|11|17|23)|ln1-0|QKcur_rope-0|kqv_out-0|attn_out-0|ffn_inp-0|ffn_out-0)"
 # The llama-bench runs of the text model: the flags of the app (4 threads, the Q8_0 cache, flash attention)
 BENCH_ARGS = "-dev HTP0 -ngl 99 -t 4 -ctk q8_0 -ctv q8_0 -fa 1 -p 512 -n 32 -r 3"
-BENCH_GATE_KB = 8388608
+BENCH_GATE_KB = device.GATE_4B_KB
 # The switch of the plans of the vision encoder (htp-vit-fusion.h). The HEAD libraries ignore it.
 VIT_OFF = "GGML_HEXAGON_FUSE_VIT=0"
 
@@ -292,7 +286,7 @@ def run_lines(stage: Stage, set_key: str, vk: str, rnd: int) -> list[str]:
     sdir = f"{PHONE}/{stage.sets[set_key]}"
     libs = f"{sdir}/lib"
     gate_kb = GATE_KB
-    pre = ""
+    prefix = ""
     if v.tool == "vit":
         args = (f"-m {MODEL_DIR}/{MODEL} --mmproj $P --image {image_path(v.image)} --image-tokens {v.tokens} "
                 f"--dev {v.dev} --reps {v.reps} --rgb-out {stem}.rgb")
@@ -300,7 +294,7 @@ def run_lines(stage: Stage, set_key: str, vk: str, rnd: int) -> list[str]:
             args += f" --embd-out {stem}.f32"
         if v.dump:
             args += f" --dump {stem}-dump --dump-re \"{DUMP_RE}\""
-            pre = f"mkdir -p {stem}-dump && "
+            prefix = f"mkdir -p {stem}-dump && "
         if v.args:
             args += f" {v.args}"
         tool = f"{sdir}/bin/vitprobe {args}"
@@ -312,14 +306,13 @@ def run_lines(stage: Stage, set_key: str, vk: str, rnd: int) -> list[str]:
         libs = f"{sdir}/lib:{tdir}/lib"
         gate_kb = BENCH_GATE_KB
         tool = f"{tdir}/bin/llama-bench -m {MODEL_DIR}/{MODEL} {BENCH_ARGS}"
-    env = " ".join(x for x in (f"LD_LIBRARY_PATH={libs} ADSP_LIBRARY_PATH={sdir}/lib", BASE_ENV, v.env) if x)
-    cmd = (f"{pre}sh {sdir}/bin/gate.sh {gate_kb} > {stem}-gate.txt && {BEFORE} >> {stem}-gate.txt && "
-           f"P={MODEL_DIR}/{MMPROJ}; [ -f $P ] || P=/sdcard/qwen/models/{MMPROJ}; echo \"mmproj: $P\" >> {stem}-gate.txt; "
-           f"timeout -s KILL {v.limit} env {env} {tool} "
-           f"> {stem}.out 2> {stem}.log; echo \"rc=$?\" >> {stem}-gate.txt; {AFTER} >> {stem}-gate.txt; "
-           f"cat {stem}-gate.txt; tail -n 12 {stem}.out")
-    return ["#", f"# REAL-MODEL {MODEL.removesuffix('.gguf')}: {name}, set {stage.sets[set_key]}, {v.text}",
-            THERMAL, f"{ADB} shell '{cmd}'", PGREP]
+    env = " ".join(x for x in (f"LD_LIBRARY_PATH={libs} ADSP_LIBRARY_PATH={sdir}/lib", APP_ENV, v.env) if x)
+    # The projector is in the model directory of the stages, or in the model directory of the app
+    find_mmproj = (f"P={MODEL_DIR}/{MMPROJ}; [ -f $P ] || P=/sdcard/qwen/models/{MMPROJ}; "
+                   f"echo \"mmproj: $P\" >> {stem}-gate.txt; ")
+    cmd = commands.gated_run(stem, gate_kb, v.limit, env, tool, stage=sdir, prefix=prefix, pre=find_mmproj)
+    return commands.run_lines(f"# REAL-MODEL {MODEL.removesuffix('.gguf')}: {name}, set {stage.sets[set_key]}, "
+                              f"{v.text}", f"{cmd}; tail -n 12 {stem}.out", PGREP)
 
 
 def header(stage: Stage) -> list[str]:
@@ -332,11 +325,11 @@ def header(stage: Stage) -> list[str]:
         "The tool: build/vit/<set>/bin/vitprobe (tools/vit/vitprobe.cpp) with the libraries of its set. It loads the",
         "vocabulary of the 4B and the projector Qwen3.5-4B-Q8_0.mmproj.gguf on the device of the run, with the",
         "parameters of the app (no warmup, flash attention AUTO, 4 threads, the fusion switches of the app), and",
-        f"encodes the image. The photo of the user is the saved copy {PHOTO_COPY} (sha1 {PHOTO_SHA1[:8]}...), which",
+        f"encodes the image. The photo of the user is the saved copy {PHOTO_LOCAL} (sha1 {PHOTO_SHA1[:8]}...), which",
         f"adb push copies; the older test photo is {OLD_IMAGE}. The tool resizes the image to the target size with",
         "an exact integer filter and writes the RGB bytes, thus the box encodes the same bytes with the x86 oracle.",
         "",
-        "The sets: " + ", ".join(f"{k} = build/vit/{d}" for k, d in stage.sets.items()) + ".",
+        "The sets: " + ", ".join(f"{k} = {LAPTOP_STAGE}/{d}" for k, d in stage.sets.items()) + ".",
         f"The runs, {len(stage.runs)}: " + ", ".join(f"{vk} x{n} ({V[vk].text})" for vk, n in runs.items()) + ".",
         "Each run: the thermal line, then bin/gate.sh (the Qwen app stopped, the screen on, thermal 0, no charger,",
         f"MemAvailable {GATE_KB // 1048576} GB, the caps), the tool under timeout -s KILL (at most 110 s), the exit",
@@ -361,19 +354,20 @@ def setup_lines(stage: Stage) -> list[str]:
     the user comes from the saved copy on the box, never from the app."""
     out = []
     for d in stage.sets.values():
-        local = f"build/vit/{d}"
-        out += [f"mkdir -p {local} && rsync -a --delete {BOX}/vit/{d}/ {local}/",
+        local = f"{LAPTOP_STAGE}/{d}"
+        out += [f"mkdir -p {local} && rsync -a --delete {BOX}/{d}/ {local}/",
                 f"(cd {local} && sha256sum -c SHA256SUMS)"]
-    out += [f"mkdir -p {Path(PHOTO_COPY).parent} && rsync -a {BOX}/{Path(PHOTO_COPY).relative_to('build')} {PHOTO_COPY}",
-            f"echo '{PHOTO_SHA1}  {PHOTO_COPY}' | sha1sum -c"]
+    out += [f"mkdir -p {Path(PHOTO_LOCAL).parent} && rsync -a "
+            f"{device.BOX_BUILD}/{Path(PHOTO_LOCAL).relative_to('build')} {PHOTO_LOCAL}",
+            f"echo '{PHOTO_SHA1}  {PHOTO_LOCAL}' | sha1sum -c"]
     # No "models/Qwen3.5" in these lines: the runner gates each line with that text as a model run.
     out += [f"{ADB} shell 'ls -l {MODEL_DIR} /sdcard/qwen/models | grep -E \"Qwen3.5-4B-Q8_0(.mmproj)?.gguf\"'",
             f"{ADB} shell 'rm -rf {PHONE} && mkdir -p {PHONE}/in {PHONE}/out'",
-            f"{ADB} push {PHOTO_COPY} {image_path('photo')}",
+            f"{ADB} push {PHOTO_LOCAL} {image_path('photo')}",
             f"{ADB} shell 'cp {OLD_IMAGE} {image_path('user')} && ls -l {PHONE}/in && sha1sum {PHONE}/in/*'"]
     # Each file of the bin/ and lib/ directories of a set (the SHA256SUMS of the set names them all)
     for d in stage.sets.values():
-        local = f"build/vit/{d}"
+        local = f"{LAPTOP_STAGE}/{d}"
         out += [f"{ADB} shell 'mkdir -p {PHONE}/{d}/bin {PHONE}/{d}/lib'",
                 f"{ADB} push {local}/bin/. {PHONE}/{d}/bin/",
                 f"{ADB} push {local}/lib/. {PHONE}/{d}/lib/",
@@ -384,17 +378,18 @@ def setup_lines(stage: Stage) -> list[str]:
 
 def output_lines(stage: Stage) -> list[str]:
     """The lines that pull the outputs, copy them to the box and remove the phone directory. The phone directory goes
-    only when the pull has each of its files."""
-    local = f"build/vit/{stage.name}/phone-out"
+    only when the pull has each of its files. A dump run writes a directory of tensors, thus the count of the files
+    comes from find and not from ls."""
+    local = f"{LAPTOP_STAGE}/{stage.name}/phone-out"
     return [
         "#",
         "# ---- The outputs ----",
         "#",
         THERMAL,
-        f"{ADB} shell 'pgrep -x vitprobe; ls {PHONE}/out | wc -l; du -sh {PHONE}/out'",
-        f"rm -rf {local} && mkdir -p build/vit/{stage.name}",
+        f"{ADB} shell '" + "".join(f"pgrep -x {t}; " for t in TOOLS) + f"ls {PHONE}/out | wc -l; du -sh {PHONE}/out'",
+        f"rm -rf {local} && mkdir -p {LAPTOP_STAGE}/{stage.name}",
         f"{ADB} pull {PHONE}/out {local}",
-        f"rsync -a --delete {local}/ {BOX}/vit/{stage.name}/phone-out/",
+        f"rsync -a --delete {local}/ {BOX}/{stage.name}/phone-out/",
         f"test \"$(find {local} -type f | wc -l)\" -eq \"$({ADB} shell 'find {PHONE}/out -type f | wc -l' | tr -d '\\r')\" "
         f"&& {ADB} shell 'rm -rf {PHONE}' && echo removed {PHONE}",
     ]
@@ -407,15 +402,11 @@ def write_commands(stage: Stage, path: Path) -> int:
     for s, vk, r in stage.runs:
         lines += run_lines(stage, s, vk, r)
     lines += output_lines(stage)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n")
-    return len(lines)
+    return commands.write_commands(path, lines)
 
 
 # ---- The parser of the files ----
 
-GATE_RE = re.compile(r"gate: screen=(\S+) thermal=(\d*) cap0=(\d*) cap7=(\d*) battery=(\d*)% temp=(\d*)")
-AFTER_RE = re.compile(r"after: thermal=(\d*) cap0=(\d*) cap7=(\d*) battery=(\d*) temp=(\d*)(?: nsp=(\d*))?")
 TIME_RE = re.compile(r"^TIME encode rep=(\d+) ms=([\d.]+)", re.M)
 STAMP_RE = re.compile(r"vitprobe: STAMP (\S+) rep=(\d+)")
 # One op of the profile of the Hexagon backend: the op name, the names, the dims, the types, then the time.
@@ -440,33 +431,17 @@ class Result:
 
 def read_result(root: Path, name: str) -> Result:
     """Read the gate file, the stdout and the stderr of one run. O(size of the files)."""
-    gate_path, out_path, log_path = (root / f"{name}{s}" for s in ("-gate.txt", ".out", ".log"))
-    gate = gate_path.read_text(errors="replace") if gate_path.exists() else ""
-    before, after = GATE_RE.search(gate), AFTER_RE.search(gate)
-    rc = re.search(r"^rc=(\d+)", gate, re.M)
-    ok = "gate: OK" in gate and rc is not None and rc.group(1) == "0"
-    removed = []
-    if not gate:
-        removed.append("no gate file")
-    elif "gate: OK" not in gate:
-        removed.append("the gate stopped the run")
-    elif not ok:
-        removed.append(f"exit code {rc.group(1) if rc else '?'}")
-    caps = f"{before.group(3)}/{before.group(4)}" if before else "?"
-    cap_values = [int(v) for v in ((before.group(3), before.group(4)) if before else ()) +
-                  ((after.group(2), after.group(3)) if after else ()) if v]
-    if cap_values and min(cap_values) < CAP_MIN_KHZ:
-        removed.append(f"a cap of {min(cap_values)} kHz")
-    if after and after.group(1) not in ("", "0"):
-        removed.append(f"thermal {after.group(1)} after the run")
-    out = out_path.read_text(errors="replace") if out_path.exists() else ""
-    log = log_path.read_text(errors="replace") if log_path.exists() else ""
-    return Result(name, ok, removed, caps, out, log)
+    text, out, log = logs.read_run(root, name)
+    c = gate.read(text, cap_min=gate.CAP_MIN_KHZ)
+    # A fault of the run and a condition of the phone both keep the run out of the tables of this stage. A change of
+    # the caps during the run comes from the runner log, thus gate.Conditions.marks stays out.
+    removed = c.faults + list(c.removed)
+    return Result(name, c.ok, removed, c.caps, out, log)
 
 
-def fmt(x, digits: int = 1) -> str:
-    """A number, or a dash for None."""
-    return "-" if x is None else f"{x:.{digits}f}"
+# The cells of the tables: the median of the values of a case, and a number with 1 decimal or with more.
+med = tables.med
+fmt = tables.fmt
 
 
 def time_table(stage: Stage, results: dict[str, Result], include_all: bool) -> list[str]:
@@ -488,9 +463,8 @@ def time_table(stage: Stage, results: dict[str, Result], include_all: bool) -> l
                 w = [v for k, v in t.items() if k > 1]
                 if w:
                     warms.append(statistics.median(w))
-                    per_run.append(f"{statistics.median(w):.1f}")
-            first = statistics.median(firsts) if firsts else None
-            warm = statistics.median(warms) if warms else None
+                    per_run.append(f"{warms[-1]:.1f}")
+            first, warm = med(firsts), med(warms)
             out.append(f"  {vk:5s} {stage.sets[s]:12s} runs {len(rs)}  first {fmt(first):>8}  warm {fmt(warm):>8}"
                        f"  (runs: {', '.join(per_run)})")
     return out
@@ -754,18 +728,7 @@ def checks(stage: Stage, results: dict[str, Result]) -> list[str]:
 def runner_marks(stage: Stage) -> dict[str, list[str]]:
     """The marks of the runner log build/vit/STAGE/runner.log (the copy of the log of the laptop runner): a run whose
     CAPS line says CAPS-CHANGED. O(size of the log)."""
-    path = STAGE_ROOT / stage.name / "runner.log"
-    marks: dict[str, list[str]] = defaultdict(list)
-    if not path.exists():
-        return marks
-    current = None
-    for line in path.read_text(errors="replace").splitlines():
-        m = re.match(r"# REAL-MODEL [^:]*: (\S+),", line)
-        if m:
-            current = m.group(1)
-        elif current and line.startswith("CAPS ") and "CAPS-CHANGED" in line:
-            marks[current].append("the runner marks CAPS-CHANGED")
-    return marks
+    return logs.runner_marks(STAGE_ROOT / stage.name / "runner.log")
 
 
 # A case line: the error prints of the compared tensors (a failed tensor, or each tensor of a test that writes its
@@ -858,7 +821,7 @@ def bench_table(stage: Stage, results: dict[str, Result], include_all: bool) -> 
     out = ["llama-bench of the 4B Q8_0 (t/s, the median of the rounds): " + ", ".join(f"{k} = {stage.sets[k]}" for k in keys)]
     for test, by_set in rates.items():
         cells = []
-        base = statistics.median(by_set[keys[0]]) if by_set.get(keys[0]) else None
+        base = med(by_set.get(keys[0], []))
         for k in keys:
             if by_set.get(k):
                 m = statistics.median(by_set[k])
@@ -886,7 +849,7 @@ def load_results(stage: Stage) -> tuple[Path, dict[str, Result]]:
     """The results of the runs that have a gate file, with the marks of the runner log."""
     root = STAGE_ROOT / stage.name / "phone-out"
     if not root.is_dir():
-        sys.exit(f"stage.py: {root} is not a directory. Pull the outputs of the stage first.")
+        sys.exit(cli.missing_root(root))
     names = [run_name(*r) for r in stage.runs]
     results = {n: read_result(root, n) for n in names if (root / f"{n}-gate.txt").exists()}
     for n, marks in runner_marks(stage).items():
