@@ -58,7 +58,6 @@ def _grid_like(grid: Grid, levels: torch.Tensor) -> Grid:
     """A grid of the same class with other levels."""
     out = grid.__class__.__new__(grid.__class__)
     Grid.__init__(out, levels)
-    out.name = grid.name
     return out
 
 

@@ -155,7 +155,7 @@ def cmd_quantize(args: argparse.Namespace) -> None:
     tied = _tie(src, ref, work)
     plan = _plan(args, num_layers(ROOT / "weights" / args.model), tied)
     opts = Options(method=args.method, init=args.init, scale=not args.no_scale, permute_mlp=not args.no_permute,
-                   mismatch=args.mismatch, damp=args.damp, refit_damp=args.refit_damp, batch=args.batch,
+                   mismatch=args.mismatch, damp=args.damp, refit_damp=args.refit_damp,
                    opt=OptOptions(epochs=args.epochs, batch=args.opt_batch, freeze_weights=args.freeze_weights,
                                   lr_weight=args.lr_weight,
                                   lr_scale=args.lr_scale, lr_other=args.lr_other, rank=args.rank,
@@ -172,7 +172,7 @@ def cmd_quantize(args: argparse.Namespace) -> None:
             work.model.norm.weight.data.zero_()
         print(f"applied {n_packs} packs and {n_folds} folded tensors from {packs}, "
               f"linked {_link_packs(packs, out)} layer packs into {out}", flush=True)
-    print(f"quantize {args.model}: tied={tied} stream={args.stream} {opts}", flush=True)
+    print(f"quantize {args.model}: tied={tied} stream={args.stream} batch={args.batch} {opts}", flush=True)
     step = Lockstep(ref, work, ids, args.batch, device=torch.device(args.device))
     quantizer = Quantizer(step, plan, out, opts)
     if args.head_only:

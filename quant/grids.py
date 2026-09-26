@@ -35,9 +35,11 @@ def divisor(d: torch.Tensor) -> torch.Tensor:
 
 
 class Grid:
-    """Sixteen levels in units of the block scale, sorted."""
+    """Sixteen levels in units of the block scale, sorted.
 
-    name: str = "grid"
+    The class of the grid selects the code path, not a name: blockopt.py and flow.py test the
+    class with isinstance, and the pack file stores the type of a tensor as its own string.
+    """
 
     def __init__(self, levels: torch.Tensor) -> None:
         self.levels = levels.to(torch.float32).sort().values
@@ -47,7 +49,6 @@ class Grid:
 
     def to(self, device: torch.device) -> "Grid":
         out = self.__class__.__new__(self.__class__)
-        out.name = self.name
         out.levels, out.mid, out.top = self.levels.to(device), self.mid.to(device), self.top.to(device)
         return out
 
@@ -93,8 +94,6 @@ class Grid:
 class Q4_0Grid(Grid):
     """The uniform ggml grid: levels −8 … 7, the signed maximum maps to −8."""
 
-    name = "Q4_0"
-
     def __init__(self) -> None:
         super().__init__(torch.arange(-8, 8, dtype=torch.float32))
 
@@ -106,16 +105,12 @@ class Q4_0Grid(Grid):
 class IQ4NLGrid(Grid):
     """The non-uniform integer table of ggml."""
 
-    name = "IQ4_NL"
-
     def __init__(self) -> None:
         super().__init__(torch.tensor(IQ4_NL_TABLE, dtype=torch.float32))
 
 
 class CodebookGrid(Grid):
     """A table per matrix with integer levels in −127 … 127."""
-
-    name = "CB4"
 
 
 def fit_codebook(w: torch.Tensor, col_weights: torch.Tensor | None = None, iters: int = 30) -> CodebookGrid:

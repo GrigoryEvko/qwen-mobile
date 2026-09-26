@@ -55,7 +55,6 @@ from .checkpoint import LM, MTP, MTP_HEAD_ROT, MTP_HNORM_ROT, OUTPUT_ROT
 
 GDN_INPUTS = ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_b", "linear_attn.in_proj_a")
 ATTN_INPUTS = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj")
-MLP_INPUTS = ("mlp.gate_proj", "mlp.up_proj")
 # The final norm weight divides the head map of the MTP block, thus it must stay away from zero.
 GAMMA_MIN = 1e-3
 

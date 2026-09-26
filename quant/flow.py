@@ -77,7 +77,6 @@ class Options:
     mismatch: str = "model"
     damp: float = 0.01
     refit_damp: float = 1e-6
-    batch: int = 8
     opt: OptOptions = field(default_factory=OptOptions)
 
 
