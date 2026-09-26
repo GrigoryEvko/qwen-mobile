@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write the seed inputs of the hexhost target fuzz_dirty into tests/fuzz/hexhost/corpus/dirty.
+"""Write the seed inputs of the hexhost target fuzz_dirty into corpus/dirty, and its regression inputs.
 
 fuzz_dirty reads its input with FuzzedDataProvider. Each integral value comes from the end of the
 input, the most significant byte first, with the number of bytes that its range needs (no byte for a
@@ -170,13 +170,35 @@ def seeds() -> dict[str, bytes]:
     return out
 
 
+def regressions() -> dict[str, bytes]:
+    """Give each regression input by its name: the smallest inputs of a known defect of the tracker.
+
+    htp_tensor_dirty_all gives an output of the op a range in its first loop when the output touches a
+    range, and it evicts ranges only for the outputs that touch no range. The eviction can pick the range
+    that holds an output of the same call, and the flush of the whole data cache keeps only the ranges of
+    the outputs that touched no range. In the two cases the op writes an output that no range holds, and
+    no later flush writes it to DDR (the check dirty-lost of fuzz_dirty).
+    """
+    out: dict[str, bytes] = {}
+    # 32 ranges in use. The op writes tensor 0 (it touches the range of slot 0) and tensor 32 (a new
+    # range): the eviction picks slot 0, the range of tensor 0.
+    out["evict-range-of-own-output"] = encode(1, {}, fill(0, 32) + [Op([], [0, 32])])
+    # The same with 5 MiB in slot 0: the flush of the whole data cache. The op writes tensor 1 (it touches
+    # the range of slot 1), and only tensor 32 gets a range after the flush.
+    out["flush-all-drops-own-output"] = encode(2, {0: Tensor(0x100000, 5 * MIB)},
+                                               fill(0, 32) + [Op([], [1, 32])])
+    return out
+
+
 def main() -> int:
-    """Write each seed to its directory."""
+    """Write each seed and each regression input to its directory."""
     root = Path(__file__).resolve().parents[1]
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--out", type=Path, default=root / "corpus" / "dirty", help="the directory of the seeds")
+    p.add_argument("--regress", type=Path, default=root / "regress" / "dirty",
+                   help="the directory of the regression inputs")
     a = p.parse_args()
-    for directory, inputs in ((a.out, seeds()),):
+    for directory, inputs in ((a.out, seeds()), (a.regress, regressions())):
         directory.mkdir(parents=True, exist_ok=True)
         for name, data in inputs.items():
             (directory / f"{name}.bin").write_bytes(data)
