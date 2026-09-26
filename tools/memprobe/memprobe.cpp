@@ -150,6 +150,8 @@
 #include "speculative.h"
 #include "state_cache.h"
 
+#include "../common/fnv.h"
+
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -339,12 +341,13 @@ ggml_type parse_type(const std::string & s) {
     std::exit(2);
 }
 
-/** FNV-1a 64 of n bytes. O(n). */
+/**
+ * The hash of n bytes. The basis is the short one, as in kvkl and outcheck, thus a value of this
+ * tool is comparable with a value of this tool only, and the recorded HASH lines of the phone
+ * stages hold that basis. O(n).
+ */
 uint64_t fnv_bytes(const void * p, size_t n) {
-    uint64_t h = 1469598103934665603ull;
-    const auto * b = static_cast<const uint8_t *>(p);
-    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
-    return h;
+    return fnv::hash64(p, n, fnv::kBasisShort);
 }
 
 /**

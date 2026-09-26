@@ -32,6 +32,8 @@
 #include "common.h"
 #include "llama.h"
 
+#include "../common/fnv.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -194,8 +196,10 @@ int main(int argc, char ** argv) {
         return 1;
     }
     tokens.resize(n_ctx);
-    uint64_t tok_hash = 1469598103934665603ull;
-    for (llama_token t : tokens) { tok_hash ^= (uint64_t) (uint32_t) t; tok_hash *= 1099511628211ull; }
+    // One step for each token id, and not one step for each byte of it, thus the value stays the
+    // value that the recorded runs of this tool hold.
+    uint64_t tok_hash = fnv::kBasisShort;
+    for (llama_token t : tokens) { tok_hash = fnv::step64(tok_hash, (uint32_t) t); }
 
     // The base of --base mode, read before the model runs.
     std::vector<BaseRow> base;

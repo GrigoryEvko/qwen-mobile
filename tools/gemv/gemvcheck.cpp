@@ -27,6 +27,8 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
+#include "../common/fnv.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
@@ -86,13 +88,11 @@ struct Rng {
     float uniform(float lo, float hi) { return lo + (hi - lo) * (float) (next() >> 40) / (float) (1ull << 24); }
 };
 
+// The hash of n bytes. This tool uses the basis of the FNV-1a specification, which the tools of
+// the memory work and of the vision work do not, thus a value of this tool is comparable with a
+// value of this tool only. O(n).
 uint64_t fnv1a(const void * p, size_t n) {
-    const auto * b = static_cast<const uint8_t *>(p);
-    uint64_t     h = 0xCBF29CE484222325ull;
-    for (size_t i = 0; i < n; i++) {
-        h = (h ^ b[i]) * 0x100000001B3ull;
-    }
-    return h;
+    return fnv::hash64(p, n, fnv::kBasisFnv1a);
 }
 
 uint64_t seed_of(const std::string & s, int salt) {

@@ -41,6 +41,8 @@
 #include "mtmd-helper.h"
 #include "mtmd.h"
 
+#include "../common/fnv.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
@@ -132,14 +134,11 @@ void stamp(const char * fmt, ...) {
     log_write_locked("\n");
 }
 
-// FNV-1a over the bytes. The tool uses it to show that two files hold the same bytes. O(n).
+// The hash over the bytes. The tool uses it to show that two runs hold the same bytes. The basis is
+// the short one, thus a value of this tool is comparable with a value of this tool only, and the
+// recorded embedding hashes of the encoder work hold that basis. O(n).
 uint64_t fnv1a(const void * data, size_t n) {
-    const auto * p = static_cast<const uint8_t *>(data);
-    uint64_t     h = 1469598103934665603ULL;
-    for (size_t i = 0; i < n; i++) {
-        h = (h ^ p[i]) * 1099511628211ULL;
-    }
-    return h;
+    return fnv::hash64(data, n, fnv::kBasisShort);
 }
 
 // The target size of the preprocessor of Qwen3-VL for an image of w x h and a maximum of max_tokens tokens: the
