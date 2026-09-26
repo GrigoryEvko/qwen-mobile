@@ -41,13 +41,6 @@ QUANTILES = (0.5, 0.99, 0.999)
 SAMPLE = 4_000_000
 
 
-def load_text_ids(tokenizer, path: Path, n_seq: int, seq_len: int) -> torch.Tensor:
-    """Consecutive windows of the text file as token ids [n_seq, seq_len]."""
-    ids = tokenizer(path.read_text()).input_ids
-    rows = [torch.tensor(ids[i:i + seq_len]) for i in range(0, min(len(ids), n_seq * seq_len), seq_len)]
-    return torch.stack(rows[:n_seq])
-
-
 def apply_packs(model, packs: Path) -> dict[str, tuple[float, float]]:
     """Put the solved blocks into the model. Returns (relative error, kurtosis of W) per GGUF name."""
     stats: dict[str, tuple[float, float]] = {}

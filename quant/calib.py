@@ -1,10 +1,37 @@
-"""The calibration set."""
+"""The token sets that the pipeline measures on: the calibration set, and a text file."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 import torch
+
+
+def load_text_ids(tokenizer, path: Path, n_seq: int, seq_len: int) -> torch.Tensor:
+    """Consecutive windows of a text file as token ids [n_seq, seq_len].
+
+    The windows follow each other with no overlap, thus each token of the file is in one window
+    at most. The file must hold a multiple of seq_len tokens in its first n_seq x seq_len tokens,
+    because the last window is a partial one otherwise and the rows do not stack.
+
+    Args:
+        tokenizer: A tokenizer with a call that gives input_ids
+        path: The text file
+        n_seq: The number of windows
+        seq_len: The number of tokens in one window
+
+    Returns:
+        The token ids [n_seq, seq_len]
+
+    Raises:
+        OSError: If the file cannot be read
+        RuntimeError: If the file gives a partial last window
+
+    Complexity: O(tokens of the file).
+    """
+    ids = tokenizer(path.read_text()).input_ids
+    rows = [torch.tensor(ids[i:i + seq_len]) for i in range(0, min(len(ids), n_seq * seq_len), seq_len)]
+    return torch.stack(rows[:n_seq])
 
 
 def build_calibration(tokenizer, n_seq: int, seq_len: int, seed: int, out: Path) -> torch.Tensor:

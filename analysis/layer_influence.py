@@ -9,7 +9,9 @@ token mixer (GDN or attention) and the MLP. The script reports, per sub-block:
 - skip KL: the mean per-token KL of the final logits against the full model
   when the sub-block output is set to zero, and the top-1 agreement
 
-Usage: python layer_influence.py <checkpoint dir> <output file> [--n-seq 32] [--seq-len 1024]
+Usage: python -m analysis.layer_influence <checkpoint dir> <output file> [--n-seq 16] [--seq-len 1024]
+
+The tracked table analysis/Qwen3.5-2B.layer-influence.txt comes from the preset values.
 """
 
 from __future__ import annotations
@@ -21,13 +23,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, Qwen3_5ForCausalLM
 
-
-def load_text_ids(tokenizer, path: Path, n_seq: int, seq_len: int) -> torch.Tensor:
-    """Consecutive windows of the text file as token ids [n_seq, seq_len]."""
-    ids = tokenizer(path.read_text()).input_ids
-    rows = [torch.tensor(ids[i:i + seq_len]) for i in range(0, min(len(ids), n_seq * seq_len), seq_len)]
-    return torch.stack(rows[:n_seq])
-
+from quant.calib import load_text_ids
 
 @torch.no_grad()
 def logprobs_of(model, ids: torch.Tensor, batch: int) -> list[torch.Tensor]:

@@ -106,7 +106,8 @@ def _tie(directory: Path, *models) -> bool:
 
 
 def _wiki_ids(tokenizer, n_seq: int, seq_len: int) -> torch.Tensor:
-    from .drift import load_text_ids
+    """The token ids of the evaluation text, [n_seq, seq_len]."""
+    from .calib import load_text_ids
 
     return load_text_ids(tokenizer, ROOT / "data" / "wiki.test.raw", n_seq, seq_len)
 
