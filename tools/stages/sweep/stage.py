@@ -4,7 +4,7 @@
 Usage (tools/stages/sweep/build.sh makes the binaries first and then runs "files"):
     stage.py files                        write phone/ (tests, libraries, SHA256SUMS) and phone-commands.txt
     stage.py plan                         print the kernel that the host selects for each case (no phone)
-    stage.py table [--root DIR] [--all]   print the tables from the pulled outputs (phone-out)
+    stage.py table [--root DIR]           print the tables from the pulled outputs (phone-out)
 
 The questions:
     1. The f16 rate of the HMX engine on this part (i8read: deep MAC chains from VTCM, no feed).
@@ -22,9 +22,10 @@ graph, and with the fusion on the backend merges these copies into MUL_MAT_NX of
 4 times, one activation conversion). The run "nx" measures that form on purpose.
 
 A run name is the stem of its three output files on the phone: <run>-gate.txt (the conditions and
-the exit code), <run>.out (stdout) and <run>.log (stderr). The table uses a run when its gate passed,
-its exit code is 0, the CPU caps did not change, the thermal status after it is 0, and the screen stayed
-on without the keyguard. --all also uses the other runs. The table only reads files.
+the exit code), <run>.out (stdout) and <run>.log (stderr). The table uses a run when its gate passed and
+its exit code is 0. A flag of the run (changed CPU caps, a thermal status that is not 0 after it, the
+screen off or the keyguard on) does not keep it out: the tables mark its values with "*", and section 0
+names the flag. The table only reads files.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TypeGuard
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from common import cli, commands, device, gate, logs  # noqa: E402
@@ -897,10 +899,9 @@ def op_series(log: str, cases: tuple[Case, ...]) -> dict[str, list[float]]:
     return dict(out)
 
 
-def usable(o: RunOut | None, include_all: bool) -> bool:
+def usable(o: RunOut | None) -> TypeGuard[RunOut]:
     """True when the run goes into the tables: its gate passed and its exit code is 0. A flag (changed
-    caps, heat, screen) does not drop the run: the tables mark it with "*" and section 0 names the flag.
-    include_all is kept for the command line and has no effect."""
+    caps, heat, screen) does not drop the run: the tables mark it with "*" and section 0 names the flag."""
     return o is not None and o.ok
 
 
@@ -959,7 +960,7 @@ def clock_mhz(outs: dict[str, RunOut]) -> tuple[float, str]:
     return CLOCK_MHZ, "assumed"
 
 
-def i8_tables(outs: dict[str, RunOut], clock: float, include_all: bool) -> tuple[list[str], Engine | None]:
+def i8_tables(outs: dict[str, RunOut], clock: float) -> tuple[list[str], Engine | None]:
     """The engine table: per output tile pcycles against k for each i8read run, and the fit."""
     lines = ["== 1. The HMX engine (i8read, measured): pcycles of one output tile against the k-tiles of its chain =="]
     engine = None
@@ -968,7 +969,7 @@ def i8_tables(outs: dict[str, RunOut], clock: float, include_all: bool) -> tuple
         if o is not None and o.truncated:
             lines.append(f"  {key}: SKIPPED, {o.truncated}")
             continue
-        if not usable(o, include_all) or "f16" not in o.i8:
+        if not usable(o) or "f16" not in o.i8:
             lines.append(f"  {key}: no usable result" + (f" ({', '.join(o.flags)})" if o and o.flags else ""))
             continue
         f16 = {k: v / N_I8_COLS for k, v in o.i8["f16"].items()}
@@ -1000,16 +1001,16 @@ def i8_tables(outs: dict[str, RunOut], clock: float, include_all: bool) -> tuple
     return lines, engine
 
 
-def case_us(outs: dict[str, RunOut], key: str, name: str, include_all: bool) -> float | None:
+def case_us(outs: dict[str, RunOut], key: str, name: str) -> float | None:
     """The us/run of one case of one run, or None."""
     o = outs.get(key)
-    return o.us.get(name) if usable(o, include_all) else None
+    return o.us.get(name) if usable(o) else None
 
 
-def find_us(outs: dict[str, RunOut], name: str, include_all: bool, keys: tuple[str, ...]) -> tuple[float | None, str]:
+def find_us(outs: dict[str, RunOut], name: str, keys: tuple[str, ...]) -> tuple[float | None, str]:
     """The us/run of a case from the first run of keys that has it."""
     for k in keys:
-        us = case_us(outs, k, name, include_all)
+        us = case_us(outs, k, name)
         if us is not None:
             return us, k
     return None, ""
@@ -1086,11 +1087,11 @@ def series_of(ops: list[float]) -> Series | None:
     return Series(len(ops), ops[0], fresh, statistics.median(tail), onset)
 
 
-def find_series(outs: dict[str, RunOut], name: str, include_all: bool, keys: tuple[str, ...]) -> Series | None:
+def find_series(outs: dict[str, RunOut], name: str, keys: tuple[str, ...]) -> Series | None:
     """The series of a case from the first run of keys that has it."""
     for k in keys:
         o = outs.get(k)
-        if usable(o, include_all) and name in o.series:
+        if usable(o) and name in o.series:
             st = series_of(o.series[name])
             if st:
                 return st
@@ -1105,7 +1106,7 @@ def cell(x: float | None, fmt: str, width: int) -> str:
     return f"{x:{width}{fmt}}" if x is not None else f"{'-':>{width}s}"
 
 
-def mm_tables(outs: dict[str, RunOut], engine: Engine | None, kmap: dict[tuple, str], include_all: bool) -> list[str]:
+def mm_tables(outs: dict[str, RunOut], engine: Engine | None, kmap: dict[tuple, str]) -> list[str]:
     """The MUL_MAT tables: per shape and type, the rate against n (the host us/run of the loop, and the DSP
     time of the fresh and of the sustained copies), the kernel, the HVX path and the NX form."""
     lines = ["", "== 2. MUL_MAT (measured: host us/run, DSP fresh and sustained us; computed from them: TFLOPS, weight "
@@ -1121,13 +1122,13 @@ def mm_tables(outs: dict[str, RunOut], engine: Engine | None, kmap: dict[tuple, 
         rows = []
         for n in sorted({*NS, 384, 640, 768, 2048}):
             c = mm(t, k, m, n)
-            us, src_key = find_us(outs, c.name, include_all, keys)
+            us, src_key = find_us(outs, c.name,keys)
             if us is None:
                 continue
             p = mm_plan(c)
-            sr = find_series(outs, c.name, include_all, PROFILE_KEYS)
-            hvx = case_us(outs, "hvx", mm(t, k, m, n, "hvx").name, include_all)
-            nx = case_us(outs, "nx", mm(t, k, m, n, "nx").name, include_all)
+            sr = find_series(outs, c.name,PROFILE_KEYS)
+            hvx = case_us(outs, "hvx", mm(t, k, m, n, "hvx").name)
+            nx = case_us(outs, "nx", mm(t, k, m, n, "nx").name)
             floor = engine.floor_us(p.out_tiles, p.tile_macs) if engine and p.tile_macs else None
             fresh = sr.fresh if sr else None
             ref = fresh or us
@@ -1157,15 +1158,15 @@ def mm_tables(outs: dict[str, RunOut], engine: Engine | None, kmap: dict[tuple, 
     for k, m in ((2560, 9216), (9216, 2560)):
         found = None
         for n in (5, 6, 8, 16, 32, 64, 128):
-            hvx = case_us(outs, "hvx", mm("q8_0", k, m, n, "hvx").name, include_all)
-            hmx, _ = find_us(outs, mm("q8_0", k, m, n).name, include_all, keys)
+            hvx = case_us(outs, "hvx", mm("q8_0", k, m, n, "hvx").name)
+            hmx, _ = find_us(outs, mm("q8_0", k, m, n).name,keys)
             if hvx and hmx and hmx < hvx and found is None:
                 found = n
         lines.append(f"    q8_0 {k}x{m}: {found if found else 'none in the sweep'}")
     return lines
 
 
-def prefill_tables(outs: dict[str, RunOut], engine: Engine | None, include_all: bool) -> list[str]:
+def prefill_tables(outs: dict[str, RunOut], engine: Engine | None) -> list[str]:
     """The 1024-token ubatch of the 4B from the isolated cases, against the bench-kv op split."""
     keys = ("q8a", "q8d", "q8b", "q8c", "rep", "map")
     lines = ["", "== 3. One 1024-token prefill ubatch of the 4B from the isolated MUL_MATs (computed from measured cases) =="]
@@ -1175,9 +1176,9 @@ def prefill_tables(outs: dict[str, RunOut], engine: Engine | None, include_all: 
     for k, m, cnt, what in (*MM_4B, ALPHA_BETA):
         t = "f32" if m == 32 else "q8_0"
         c = mm(t, k, m, 1024)
-        us, _ = find_us(outs, c.name, include_all, ("q4",) + keys if t == "f32" else keys)
-        sr = find_series(outs, c.name, include_all, PROFILE_KEYS + ("q4",))
-        nx = case_us(outs, "nx", mm(t, k, m, 1024, "nx").name, include_all)
+        us, _ = find_us(outs, c.name,("q4",) + keys if t == "f32" else keys)
+        sr = find_series(outs, c.name,PROFILE_KEYS + ("q4",))
+        nx = case_us(outs, "nx", mm(t, k, m, 1024, "nx").name)
         p = mm_plan(c)
         fl = engine.floor_us(p.out_tiles, p.tile_macs) if engine and p.tile_macs else 0.0
         if us is None:
@@ -1199,8 +1200,8 @@ def prefill_tables(outs: dict[str, RunOut], engine: Engine | None, include_all: 
                      f"{BENCH_KV['weight MUL_MAT d0']:.0f} ms at d0, {BENCH_KV['weight MUL_MAT d3072']:.0f} ms at d3072")
     for label, kv in (("d0", 1024), ("d3072", 4096)):
         c = fa("q8_0", 1024, kv)
-        us, _ = find_us(outs, c.name, include_all, ("faq8", "rep", "map2"))
-        sr = find_series(outs, c.name, include_all, ("faq8", "rep", "trfa"))
+        us, _ = find_us(outs, c.name,("faq8", "rep", "map2"))
+        sr = find_series(outs, c.name,("faq8", "rep", "trfa"))
         if us:
             fr = f"fresh {FA_LAYERS * sr.fresh / 1e3:.1f} ms, sustained {FA_LAYERS * sr.sustained / 1e3:.1f} ms, " if sr else ""
             lines.append(f"  FA {label} (n_kv {kv}): {FA_LAYERS} x: {fr}loop {FA_LAYERS * us / 1e3:.1f} ms; "
@@ -1208,7 +1209,7 @@ def prefill_tables(outs: dict[str, RunOut], engine: Engine | None, include_all: 
     return lines
 
 
-def fa_tables(outs: dict[str, RunOut], engine: Engine | None, include_all: bool) -> list[str]:
+def fa_tables(outs: dict[str, RunOut], engine: Engine | None) -> list[str]:
     """The FA table: us, the kernel TFLOPS (every KV block), the K and V GB/s, the HMX share."""
     lines = ["", "== 4. FLASH_ATTN_EXT, head dim 256, 16 query heads, 4 KV heads (measured us; TFLOPS over every KV "
              "block, the kernel skips none; HMX% from the plan at the deep-chain engine rate, computed) =="]
@@ -1218,10 +1219,10 @@ def fa_tables(outs: dict[str, RunOut], engine: Engine | None, include_all: bool)
         for n in (1, 1024):
             for kv in FA_KV:
                 c = fa(t, n, kv)
-                us, _ = find_us(outs, c.name, include_all, ("fa1", "faq8", "faq8b", "faf16", "rep", "map2"))
+                us, _ = find_us(outs, c.name,("fa1", "faq8", "faq8b", "faf16", "rep", "map2"))
                 if us is None:
                     continue
-                sr = find_series(outs, c.name, include_all, ("faq8", "faq8b", "faf16", "rep", "trfa", "trfa2"))
+                sr = find_series(outs, c.name,("faq8", "faq8b", "faf16", "rep", "trfa", "trfa2"))
                 ref = sr.fresh if sr else us
                 p = fa_plan(c)
                 fl = engine.floor_us(p.out_tiles, p.tile_macs) if engine else None
@@ -1231,11 +1232,11 @@ def fa_tables(outs: dict[str, RunOut], engine: Engine | None, include_all: bool)
     return lines
 
 
-def sustain_tables(outs: dict[str, RunOut], include_all: bool) -> list[str]:
+def sustain_tables(outs: dict[str, RunOut]) -> list[str]:
     """The pure HMX run of hmx_sustain: the rate against the time of the run, and after each pause."""
     lines = ["", "== 8. The HMX alone in a long run (hmx_sustain, measured): f16 deep chains of 80 k-tiles from VTCM =="]
     o = outs.get("hs")
-    if not usable(o, include_all) or not o.sustain:
+    if not usable(o) or not o.sustain:
         return lines + ["  no usable hs run" + (f" ({', '.join(o.flags)})" if o and o.flags else "")]
     flop_pass = 8 * 80 * TILE_MAC_FLOP
     edges = (0, 5, 20, 50, 100, 200, 400, 800, 10 ** 9)
@@ -1260,15 +1261,15 @@ def sustain_tables(outs: dict[str, RunOut], include_all: bool) -> list[str]:
     return lines
 
 
-def gdn_tables(outs: dict[str, RunOut], include_all: bool) -> list[str]:
+def gdn_tables(outs: dict[str, RunOut]) -> list[str]:
     """The GDN and conv table."""
     lines = ["", "== 5. GATED_DELTA_NET and SSM_CONV (measured us; GFLOPS of the chunk form, computed) =="]
     for c in (*(Case("gdn", "f32", n) for n in (1, 64, 256, 512, 1024)),
               *(Case("gdn", "f32", n, tag="seq") for n in (64, 1024)), Case("conv", "f32", 1024)):
-        us, key = find_us(outs, c.name, include_all, ("gdn", "gdnseq", "map2", "trfa2"))
+        us, key = find_us(outs, c.name,("gdn", "gdnseq", "map2", "trfa2"))
         if us is None:
             continue
-        sr = find_series(outs, c.name, include_all, ("gdn", "gdnseq", "trfa2"))
+        sr = find_series(outs, c.name,("gdn", "gdnseq", "trfa2"))
         ref = sr.fresh if sr else us
         per_layer = f"  x{GDN_LAYERS} = {GDN_LAYERS * ref / 1e3:.1f} ms per ubatch" if c.n == 1024 else ""
         lines.append(f"  {c.name:16s} loop {us:9.1f} us  fresh {cell(sr.fresh if sr else None, '.1f', 9)} us  "
@@ -1301,7 +1302,7 @@ def merge(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return out
 
 
-def trace_tables(outs: dict[str, RunOut], engine: Engine | None, include_all: bool) -> list[str]:
+def trace_tables(outs: dict[str, RunOut], engine: Engine | None) -> list[str]:
     """The phase split of the traced ops: the HMX busy share, the HMX pcycles per tile-MAC while busy,
     and the phase of thread 0 at each moment that the HMX waits. Each op that the trace holds in full
     (except the first op of each batch) counts, and the table gives the median over these ops."""
@@ -1313,7 +1314,7 @@ def trace_tables(outs: dict[str, RunOut], engine: Engine | None, include_all: bo
         return lines + [f"  tools/trace/htp_trace.py does not import: {e}"]
     for key in ("trmm", "trfa", "trfa2"):
         o = outs.get(key)
-        if not usable(o, include_all):
+        if not usable(o):
             lines.append(f"  {key}: no usable run")
             continue
         log = htp_trace.parse_lines(o.log.splitlines(), key)
@@ -1428,16 +1429,16 @@ def op_split(op, phases) -> dict:
     return out
 
 
-def drift_table(outs: dict[str, RunOut], include_all: bool) -> list[str]:
+def drift_table(outs: dict[str, RunOut]) -> list[str]:
     """The key cases of the run rep against their first run."""
     lines = ["", "== 7. Drift: the run rep (near the end) against the first run of each case (measured) =="]
     o = outs.get("rep")
-    if not usable(o, include_all):
+    if not usable(o):
         return lines + ["  no usable rep run"]
     for c in o.run.cases:
-        first, key = find_us(outs, c.name, include_all, ("q8a", "q8d", "q8b", "q8c", "peak", "faq8"))
+        first, key = find_us(outs, c.name,("q8a", "q8d", "q8b", "q8c", "peak", "faq8"))
         last = o.us.get(c.name)
-        f_first = find_series(outs, c.name, include_all, (key,)) if key else None
+        f_first = find_series(outs, c.name,(key,)) if key else None
         f_last = series_of(o.series.get(c.name, []))
         fresh = (f" fresh {f_first.fresh:9.1f} us, rep fresh {f_last.fresh:9.1f} us, "
                  f"{100 * (f_last.fresh / f_first.fresh - 1):+.1f}%") if f_first and f_last else ""
@@ -1458,16 +1459,16 @@ def conditions(outs: dict[str, RunOut]) -> list[str]:
     return lines
 
 
-def table(root: Path, include_all: bool) -> int:
+def table(root: Path) -> int:
     """Print the tables."""
     if not root.is_dir():
         return cli.missing_root(root)
     outs = {r.key: read_run(root, r) for r in runs() if (root / f"{r.key}-gate.txt").exists()}
     clock, how = clock_mhz(outs)
     parts = [conditions(outs), [f"  the DSP clock: {clock:.1f} MHz ({how})"]]
-    i8, engine = i8_tables(outs, clock, include_all)
+    i8, engine = i8_tables(outs, clock)
     hs = outs.get("hs")
-    if usable(hs, include_all) and hs.sustain:
+    if usable(hs) and hs.sustain:
         passes, pcyc = sum(w[1] for w in hs.sustain), sum(w[3] for w in hs.sustain)
         engine = Engine(0.0, pcyc / passes / (8 * 80), clock, {})
         i8.append(f"  the engine reference of the HMX% columns and of the floors: hmx_sustain, {engine.b:.2f} pcycles per "
@@ -1475,10 +1476,10 @@ def table(root: Path, include_all: bool) -> int:
                   f"{TILE_MAC_FLOP * clock * 1e6 / engine.b / 1e12:.2f} TFLOPS (measured)")
     parts.append(i8)
     kmap = kernel_map(outs)
-    parts += [mm_tables(outs, engine, kmap, include_all), prefill_tables(outs, engine, include_all),
-              fa_tables(outs, engine, include_all), gdn_tables(outs, include_all),
-              trace_tables(outs, engine, include_all), drift_table(outs, include_all),
-              sustain_tables(outs, include_all)]
+    parts += [mm_tables(outs, engine, kmap), prefill_tables(outs, engine),
+              fa_tables(outs, engine), gdn_tables(outs),
+              trace_tables(outs, engine), drift_table(outs),
+              sustain_tables(outs)]
     for p in parts:
         print("\n".join(p))
     return 0
@@ -1492,13 +1493,12 @@ def main() -> int:
     sub.add_parser("plan", help="print the host kernel choice of each case")
     t = sub.add_parser("table", help="print the tables from the pulled outputs")
     t.add_argument("--root", type=Path, default=STAGE_DIR / "phone-out")
-    t.add_argument("--all", action="store_true", help="also use the runs with flags")
     a = ap.parse_args()
     if a.cmd == "files":
         return write_files()
     if a.cmd == "plan":
         return print_plan()
-    return table(a.root, a.all)
+    return table(a.root)
 
 
 if __name__ == "__main__":
