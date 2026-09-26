@@ -71,28 +71,29 @@ from typing import Callable
 
 # The file is tools/stages/pmu/stage.py, and build/pmu/stage.py is a link to it. resolve() follows the link.
 REPO = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# tools/prof goes before tools/stages in the path: "import pmu" must find tools/prof/pmu.py, and the
+# directory of this stage has the same name.
 sys.path.insert(0, str(REPO / "tools" / "prof"))
 sys.path.insert(0, str(REPO / "tools" / "trace"))
+from common import cli, commands, device, gate, logs, tables  # noqa: E402
 import optable  # noqa: E402  # type: ignore[import-not-found]
 import pmu  # noqa: E402  # type: ignore[import-not-found]
 
-ADB = "adb -s 192.168.14.130:5555"
-PHONE = "/data/local/tmp/qwen/pmu"
-MODEL_FILE = "Qwen3.5-4B-Q8_0.gguf"
-MODEL = f"/data/local/tmp/qwen/models/{MODEL_FILE}"
-GATE_KB = 8388608
-LAPTOP_STAGE = "build/pmu"
-BOX = "grigory@10.10.20.200:airi/qwen-mobile/build/pmu"
-STAGE_DIR = REPO / LAPTOP_STAGE
+ADB = device.ADB
+PATHS = device.stage_paths("pmu", __file__)
+PHONE, LAPTOP_STAGE, BOX, STAGE_DIR = PATHS
+MODEL_FILE = device.MODEL_4B
+MODEL = f"{device.MODEL_DIR}/{MODEL_FILE}"
+GATE_KB = device.GATE_4B_KB
 SOURCE = REPO / "build" / "bench-kv" / "phone"
 STAGE_FILES = ("bin/gate.sh", "bin/memprobe", "lib/libggml-base.so", "lib/libggml-cpu.so", "lib/libggml-hexagon.so",
                "lib/libggml-htp-v79.so", "lib/libggml-opencl.so", "lib/libggml.so", "lib/libllama-common.so",
                "lib/libllama.so", "lib/libmtmd.so")
 # The environment of the app (init_impl in llama_jni.cpp) and the stage libraries: the variant B of bench-kv.
-LIB_ENV = (f"LD_LIBRARY_PATH={PHONE}/lib ADSP_LIBRARY_PATH={PHONE}/lib "
-           "GGML_HEXAGON_OPFUSION=1 GGML_HEXAGON_OPFUSION_STATE=1")
+LIB_ENV = f"{device.lib_env(PHONE)} {device.APP_ENV}"
 # The context of the app (load_impl in llama_jni.cpp), as the runs fdec of bench-kv.
-PROBE_ARGS = "-dev HTP0 -c 8192 -t 4 --outputs-max 5 --lazy on -ctk q8_0 -ctv q8_0"
+PROBE_ARGS = device.PROBE_ARGS
 UBATCH = 1024
 # The decode tokens of a short run and of a long run. The long runs catch the decode stall events of
 # about 3 ms, which occur 3 or 4 times in 8 tokens.
@@ -105,18 +106,10 @@ OPTRACE = 16384
 # command stays under 120 s. A long run takes about 17 s.
 LIMIT = 100
 
-THERMAL = f"{ADB} shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
-PGREP = f"{ADB} shell 'pgrep -x llama-bench; pgrep -x memprobe; echo pgrep-done'"
-# The highest temperature of the NPU thermal zones (type nsp*) in millidegrees, or an empty value when no
-# zone of that type is readable.
-NSP = ('$(for z in /sys/class/thermal/thermal_zone*; do case "$(cat $z/type 2>/dev/null)" in (nsp*) '
-       'cat $z/temp 2>/dev/null;; esac; done | sort -n | tail -n 1)')
-BEFORE = f'echo "before: nsp={NSP}"'
-AFTER = ('echo "after: thermal=$(dumpsys thermalservice | grep "Thermal Status" | head -n 1 | tr -dc 0-9)'
-         ' cap0=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)'
-         ' cap7=$(cat /sys/devices/system/cpu/cpu7/cpufreq/scaling_max_freq)'
-         ' battery=$(dumpsys battery | grep "^  level:" | tr -dc 0-9)'
-         f' temp=$(dumpsys battery | grep "temperature:" | tr -dc 0-9) nsp={NSP}"')
+# The tools of the stage, for the pgrep line: memprobe runs the stage, and llama-bench is the tool of the
+# other timing stages, which must not run at the same time.
+TOOLS = ("llama-bench", "memprobe")
+PGREP = device.pgrep(*TOOLS)
 
 # ---- The events ----
 
@@ -394,61 +387,28 @@ HEADER = f"""\
 
 def run_lines(run: Run) -> list[str]:
     """The lines of one run: a title, the thermal line, the run and the pgrep line."""
-    stem = f"{PHONE}/out/{run.name}"
     env = " ".join(x for x in (LIB_ENV, f"GGML_HEXAGON_PROFILE={run.profile}", run.env) if x)
-    cmd = (f"sh {PHONE}/bin/gate.sh {GATE_KB} > {stem}-gate.txt && {BEFORE} >> {stem}-gate.txt && "
-           f"timeout -s KILL {LIMIT} env {env} "
-           f"{PHONE}/bin/memprobe -m {MODEL} {PROBE_ARGS} {run.args} "
-           f"> {stem}.out 2> {stem}.log; echo \"rc=$?\" >> {stem}-gate.txt; {AFTER} >> {stem}-gate.txt; "
-           f"cat {stem}-gate.txt")
-    return ["#", f"# REAL-MODEL {MODEL_FILE.removesuffix('.gguf')}: {run.name}, {run.text}",
-            THERMAL, f"{ADB} shell '{cmd}'", PGREP]
+    cmd = commands.gated_run(f"{PHONE}/out/{run.name}", GATE_KB, LIMIT, env,
+                             f"{PHONE}/bin/memprobe -m {MODEL} {PROBE_ARGS} {run.args}", stage=PHONE)
+    return commands.run_lines(f"# REAL-MODEL {MODEL_FILE.removesuffix('.gguf')}: {run.name}, {run.text}", cmd, PGREP)
 
 
 def setup_lines() -> list[str]:
     """The lines that copy the stage to the laptop and to the phone and check its files."""
-    local_bin = " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in STAGE_FILES if f.startswith("bin/"))
-    local_lib = " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in STAGE_FILES if f.startswith("lib/"))
-    return [
-        f"mkdir -p {LAPTOP_STAGE} && rsync -a --delete {BOX}/phone/ {LAPTOP_STAGE}/phone/",
-        f"(cd {LAPTOP_STAGE}/phone && sha256sum -c SHA256SUMS)",
-        # No "models/Qwen3.5" in this line: the runner gates each line with that text as a model run.
-        f"{ADB} shell 'ls -l /data/local/tmp/qwen/models | grep -E \"{MODEL_FILE}\"'",
-        f"{ADB} shell 'rm -rf {PHONE} && mkdir -p {PHONE}/bin {PHONE}/lib {PHONE}/out'",
-        f"{ADB} push {local_bin} {PHONE}/bin/",
-        f"{ADB} push {local_lib} {PHONE}/lib/",
-        f"{ADB} push {LAPTOP_STAGE}/phone/SHA256SUMS {PHONE}/",
-        f"{ADB} shell 'cd {PHONE} && sha256sum -c SHA256SUMS | grep -c OK && chmod 755 {PHONE}/bin/*'",
-    ]
-
-
-def output_lines() -> list[str]:
-    """The lines that pull the outputs, copy them to the box and remove the phone directory. The phone
-    directory goes only when the pull has each of its files."""
-    return [
-        "#",
-        "# ---- The outputs ----",
-        "#",
-        THERMAL,
-        f"{ADB} shell 'pgrep -x llama-bench; pgrep -x memprobe; ls {PHONE}/out | wc -l; du -sh {PHONE}/out'",
-        f"rm -rf {LAPTOP_STAGE}/phone-out",
-        f"{ADB} pull {PHONE}/out {LAPTOP_STAGE}/phone-out",
-        f"rsync -a --delete {LAPTOP_STAGE}/phone-out/ {BOX}/phone-out/",
-        f"test \"$(ls {LAPTOP_STAGE}/phone-out | wc -l)\" -eq "
-        f"\"$({ADB} shell 'ls {PHONE}/out | wc -l' | tr -d '\\r')\" "
-        f"&& {ADB} shell 'rm -rf {PHONE}' && echo removed {PHONE}",
-    ]
+    files = {d: [f"{LAPTOP_STAGE}/phone/{f}" for f in STAGE_FILES if f.startswith(f"{d}/")] for d in ("bin", "lib")}
+    # No "models/Qwen3.5" in the model line: the runner gates each line with that text as a model run.
+    return commands.setup_lines(
+        PATHS, files, model_check=f"{ADB} shell 'ls -l {device.MODEL_DIR} | grep -E \"{MODEL_FILE}\"'")
 
 
 def write_commands(path: Path) -> int:
     """Write the command file and return its line count."""
-    lines = HEADER.rstrip("\n").split("\n") + setup_lines()
+    lines = commands.header_lines(HEADER) + setup_lines()
     lines += ["#", f"# ==== {MODEL_FILE.removesuffix('.gguf')}: {len(RUNS)} runs ===="]
     for run in RUNS:
         lines += run_lines(run)
-    lines += output_lines()
-    path.write_text("\n".join(lines) + "\n")
-    return len(lines)
+    lines += commands.output_lines(PATHS, tools=TOOLS)
+    return commands.write_commands(path, lines)
 
 
 def sha256(path: Path) -> str:
@@ -501,18 +461,15 @@ def print_events() -> int:
 
 # ---- The parse ----
 
-GATE_RE = re.compile(r"gate: screen=(\S+) thermal=(\d*) cap0=(\d*) cap7=(\d*) battery=(\d*)% temp=(\d*)")
-BEFORE_RE = re.compile(r"before: nsp=(\d*)")
-AFTER_RE = re.compile(r"after: thermal=(\d*) cap0=(\d*) cap7=(\d*) battery=(\d*) temp=(\d*)(?: nsp=(\d*))?")
 MODE_RE = re.compile(r"Profiling mode (\d+) : pmu-evt \[ ([^\]]*)\]")
 PREFILL_RE = re.compile(r"^TIME prefill ([\d.]+) tokens=(\d+)", re.M)
 STEPS_RE = re.compile(r"^TIME decode-steps min=([\d.]+) median=([\d.]+) max=([\d.]+)", re.M)
+# The profile line of the Hexagon backend with a group for each field. parse.OP_RE gives the op name only.
 OP_RE = re.compile(r"profile-op (?P<op>[A-Z0-9_+]+)\|(?P<names>[^|]*)\|(?P<dims>[^|]*)\|(?P<types>[^|]*)\|"
                    r"(?P<strides>[^|]*)\|(?P<kp>[^|]*)\|usec (?P<usec>\d+) cycles (?P<cycles>\d+) "
                    r"start (?P<start>\d+) mhz (?P<mhz>[\d.]+)(?: pmu \[(?P<pmu>[\d,]+)\])?")
-# A line of a log that removes the run from the tables (the rule of tools/stages/fixed/stage.py).
-FAILURE_RE = re.compile(r"follow-failed|AddressSanitizer|GGML_ASSERT|dspqueue_read failed")
-# The first DSP op of each graph of the model: the norm of layer 0 on the input embedding.
+# The first DSP op of each graph of the model: the norm of layer 0 on the input embedding. The names field of
+# a profile line holds no "|", thus parse.GRAPH_START does not fit this test.
 GRAPH_START = "-> attn_norm-0"
 # The bytes of one element of each type, for the weight bytes. A Q8_0 block holds 32 values in 34 bytes.
 TYPE_BYTES = optable.TYPE_BYTES
@@ -725,9 +682,9 @@ class RunData:
     steps_median: float | None
     log_path: Path
 
-    def usable(self, strict: bool) -> bool:
-        """True when the tables use the run."""
-        return self.ok and not self.flags and not (strict and self.notes)
+    def usable(self, include_all: bool) -> bool:
+        """True when the tables use the run. With include_all, a note does not remove the run."""
+        return self.ok and not self.flags and (include_all or not self.notes)
 
     def index(self, name: str) -> int | None:
         """The counter slot of one event in this run, or None."""
@@ -735,36 +692,22 @@ class RunData:
         return self.events.index(eid) if eid is not None and eid in self.events else None
 
 
-def read_run(root: Path, run: Run) -> RunData:
+def read_result(root: Path, run: Run) -> RunData:
     """Read the gate file, the stdout and the stderr of one run. O(size of the files)."""
-    gate_path, out_path, log_path = (root / f"{run.name}{s}" for s in ("-gate.txt", ".out", ".log"))
-    gate = gate_path.read_text(errors="replace") if gate_path.exists() else ""
-    before, after = GATE_RE.search(gate), AFTER_RE.search(gate)
-    rc = re.search(r"^rc=(\d+)", gate, re.M)
-    flags: list[str] = []
-    notes: list[str] = []
-    ok = "gate: OK" in gate and rc is not None and rc.group(1) == "0"
-    if not gate:
-        flags.append("no gate file")
-    elif "gate: OK" not in gate:
-        flags.append("gate stopped the run")
-    elif not ok:
-        flags.append(f"exit code {rc.group(1) if rc else '?'}")
-    caps = f"{before.group(3)}/{before.group(4)}" if before else "?"
-    if before and after and (before.group(3), before.group(4)) != (after.group(2), after.group(3)):
-        notes.append(f"caps {caps} -> {after.group(2)}/{after.group(3)}")
-    if after and after.group(1) not in ("", "0"):
-        flags.append(f"thermal {after.group(1)} after the run")
-    nb = BEFORE_RE.search(gate)
-    nsp = (int(nb.group(1)) / 1000 if nb and nb.group(1) else None,
-           int(after.group(6)) / 1000 if after and after.group(6) else None)
-    out = out_path.read_text(errors="replace") if out_path.exists() else ""
+    log_path = root / f"{run.name}.log"
+    text, out = logs.read_run(root, run.name, ("-gate.txt", ".out"))
+    c = gate.read(text)
+    # A thermal status above 0 after the run is a defect of the run. A change of the caps is a note only.
+    flags = c.faults + [m for m in c.marks if m.startswith("thermal ")]
+    notes = [m for m in c.marks if not m.startswith("thermal ")]
+    ok = c.ok
     events: tuple[int, ...] = ()
     graphs: list[GraphData] = []
     kinds: dict[str, dict[str, Agg]] = {}
     n_kind: dict[str, int] = {}
     if ok and run.mode != 3:
-        log = log_path.read_text(errors="replace") if log_path.exists() else ""
+        # The trace run has a log of about 100 MB, thus the log of a run goes in only where the table reads it.
+        log = logs.read_text(log_path)
         mode = MODE_RE.search(log)
         want = [EVENTS[n] for n in run.events]
         got_mode = int(mode.group(1)) if mode else None
@@ -775,7 +718,7 @@ def read_run(root: Path, run: Run) -> RunData:
             if want and got != want:
                 flags.append(f"events {got}, {want} expected")
             events = tuple(got)
-        if FAILURE_RE.search(log):
+        if gate.FAIL_RE.search(log):
             flags.append("the log has a failure line")
         graphs = parse_graphs(log)
         if len(graphs) != run.n_graphs:
@@ -791,7 +734,7 @@ def read_run(root: Path, run: Run) -> RunData:
                 n_kind[kind] = len(idx)
     pm = PREFILL_RE.search(out)
     sm = STEPS_RE.search(out)
-    return RunData(run, ok, flags, notes, caps, nsp, events, graphs, kinds, n_kind,
+    return RunData(run, ok, flags, notes, c.caps, c.nsp, events, graphs, kinds, n_kind,
                    float(pm.group(1)) if pm else None, float(sm.group(2)) if sm else None, log_path)
 
 
@@ -1429,11 +1372,10 @@ def timing(runs: dict[str, RunData]) -> list[str]:
         idx = kind_graphs(r.run)[kind]
         return sum(b.usec for gi in idx for b in r.graphs[gi].batches) / 1000 / len(idx) if idx else None
 
-    refs = [runs[k] for k in REF_KEYS if k in runs and runs[k].usable(False)]
-    base = {}
+    refs = [runs[k] for k in REF_KEYS if k in runs and runs[k].usable(True)]
+    base: dict[str, float | None] = {}
     for kind, _ in KINDS:
-        vals = [v for v in (kind_ms(r, kind) for r in refs) if v is not None]
-        base[kind] = statistics.median(vals) if vals else None
+        base[kind] = tables.med(kind_ms(r, kind) for r in refs)
     out = ["DSP time per graph (the sum of the batch times, for dec per token), and the difference to the median of "
            "the usable reference runs:",
            f"  {'run':12s} {'p0 ms':>9s} {'p3 ms':>9s} {'dec ms':>8s} {'p0':>7s} {'p3':>7s} {'dec':>7s} "
@@ -1487,14 +1429,14 @@ def decode_batches(store: Store) -> list[str]:
     return out
 
 
-def trace_summary(root: Path, strict: bool, top: int) -> list[str]:
+def trace_summary(root: Path, include_all: bool, top: int) -> list[str]:
     """The phases of the DSP threads in the ops of the trace run: for each group of ops, the time of each
     phase as a share of the op time, for the HMX thread and for the mean of the 6 HVX threads. An op goes
     into the table only when each thread has all its events in the op (the limit OPTRACE cuts the events of
     a thread in a long batch). O(events)."""
     run = RUN_BY_KEY["trace"]
-    rd = read_run(root, run)
-    if not rd.usable(strict):
+    rd = read_result(root, run)
+    if not rd.usable(include_all):
         return [f"trace: no usable run ({', '.join(rd.flags + rd.notes) or 'no files'})"]
     import htp_trace  # type: ignore[import-not-found]
     log = htp_trace.parse_file(rd.log_path)
@@ -1542,8 +1484,8 @@ def checks(runs: dict[str, RunData]) -> list[str]:
     """The conditions of the runs: gates, exit codes, caps, heat, the profile modes and the events."""
     got = [runs[r.key] for r in RUNS if r.key in runs]
     out = [f"{MODEL_FILE}: {len(got)} of {len(RUNS) - 1} counter and reference runs have a gate file, "
-           f"{sum(r.ok for r in got)} ran with exit code 0, {sum(r.usable(False) for r in got)} have no defect, "
-           f"{sum(r.usable(True) for r in got)} also have no change of the caps"]
+           f"{sum(r.ok for r in got)} ran with exit code 0, {sum(r.usable(True) for r in got)} have no defect, "
+           f"{sum(r.usable(False) for r in got)} also have no change of the caps"]
     caps: Counter = Counter()
     for r in got:
         if r.ok:
@@ -1562,13 +1504,12 @@ def checks(runs: dict[str, RunData]) -> list[str]:
 LAYER_GROUPS = ("MUL_MAT_NX hmx-tiled ffn_gate.weight", "MUL_MAT+ADD hmx-tiled ffn_down.weight")
 
 
-def table(root: Path, strict: bool, top: int) -> int:
+def table(root: Path, include_all: bool, top: int) -> int:
     """Print the tables of the stage."""
     if not root.is_dir():
-        print(f"stage.py: {root} is not a directory. Pull the outputs of the stage first.", file=sys.stderr)
-        return 1
-    runs = {r.key: read_run(root, r) for r in RUNS if r.mode != 3 and (root / f"{r.name}-gate.txt").exists()}
-    store = Store(runs, lambda r: r.usable(strict))
+        return cli.missing_root(root)
+    runs = {r.key: read_result(root, r) for r in RUNS if r.mode != 3 and (root / f"{r.name}-gate.txt").exists()}
+    store = Store(runs, lambda r: r.usable(include_all))
     parts = [checks(runs), timing(runs), decode_batches(store)]
     for kind, text in KINDS:
         groups = top_groups(store, kind, top)
@@ -1579,7 +1520,7 @@ def table(root: Path, strict: bool, top: int) -> int:
             parts.append(print_table(store, kind, name, groups))
     parts += [layer_table(store, g) for g in LAYER_GROUPS]
     parts += [decode_outliers(store, 12), hmx_confirm(store), zero_events(store), consistency(store),
-              trace_summary(root, strict, top)]
+              trace_summary(root, include_all, top)]
     for part in parts:
         print("\n".join(part))
         print()
@@ -1607,7 +1548,8 @@ def main() -> int:
         return 0
     if a.cmd == "events":
         return print_events()
-    return table(a.root, a.strict, a.top)
+    # --strict is the opposite of the --all flag of the other stages: it removes the runs with a note.
+    return table(a.root, not a.strict, a.top)
 
 
 if __name__ == "__main__":

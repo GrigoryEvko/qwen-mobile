@@ -17,7 +17,7 @@ directory out/: <name>-gate.txt (the conditions before and after the run and the
 stdout of memprobe) and <name>.log (its stderr).
 
 A run goes into the tables when its gate passed, its exit code is 0, the thermal status after it is 0, no CPU cap
-before or after it is less than 3.0 GHz (CAP_MIN_KHZ), and its log has no failure line. A change of the caps that
+before or after it is less than 3.0 GHz (gate.CAP_MIN_KHZ), and its log has no failure line. A change of the caps that
 stays at 3.0 GHz or more only marks the run in the list of conditions: the cap of cpu7 falls from 4320000 to
 4089600 or 4204800 kHz after almost each run. --all also uses the removed runs. The table only reads files.
 O(size of the files) time.
@@ -26,8 +26,6 @@ This file is tools/stages/fixed/stage.py, and build/fixed/stage.py is a link to 
 stay in build/fixed.
 """
 
-import argparse
-import os
 import re
 import statistics
 import sys
@@ -35,38 +33,25 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-ADB = "adb -s 192.168.14.130:5555"
-PHONE = "/data/local/tmp/qwen/fixed"
-MODEL_DIR = "/data/local/tmp/qwen/models"
-MODEL = "Qwen3.5-4B-Q8_0.gguf"
-GATE_KB = 8388608
-LAPTOP_STAGE = "build/fixed"
-BOX = "grigory@10.10.20.200:airi/qwen-mobile/build/fixed"
-# The stage directory of the repository (tools/stages/fixed/stage.py is three levels below the root),
-# relative to the working directory, for the default paths of the command file and of the outputs.
-STAGE_DIR = Path(os.path.relpath(Path(__file__).resolve().parents[3] / LAPTOP_STAGE))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common import cli, commands, device, gate, logs, tables  # noqa: E402
+
+ADB = device.ADB
+PATHS = device.stage_paths("fixed", __file__)
+PHONE, LAPTOP_STAGE, BOX, STAGE_DIR = PATHS
+MODEL_DIR = device.MODEL_DIR
+MODEL = device.MODEL_4B
+GATE_KB = device.GATE_4B_KB
 # The environment of the app (init_impl in llama_jni.cpp), the libraries of the stage and the host timers.
-LIB_ENV = (f"LD_LIBRARY_PATH={PHONE}/lib ADSP_LIBRARY_PATH={PHONE}/lib "
-           "GGML_HEXAGON_OPFUSION=1 GGML_HEXAGON_OPFUSION_STATE=1 LLAMA_HOSTPROF=1")
+LIB_ENV = f"{device.lib_env(PHONE)} {device.APP_ENV} LLAMA_HOSTPROF=1"
 # The context of the app (load_impl in llama_jni.cpp): the KV cache of the NPU engine is Q8_0, flash attention
 # stays AUTO, the output limit is the draft limit plus 1.
-PROBE_ARGS = "-dev HTP0 -c 8192 -t 4 --outputs-max 5 --lazy on -ctk q8_0 -ctv q8_0"
+PROBE_ARGS = device.PROBE_ARGS
 STAGE_FILES = ("bin/gate.sh", "bin/memprobe", "lib/libggml-base.so", "lib/libggml-cpu.so", "lib/libggml-hexagon.so",
                "lib/libggml-htp-v79.so", "lib/libggml-opencl.so", "lib/libggml.so", "lib/libllama-bench-impl.so",
                "lib/libllama-common.so", "lib/libllama.so", "lib/libmtmd.so")
-THERMAL = f"{ADB} shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
-PGREP = f"{ADB} shell 'pgrep -x memprobe; echo pgrep-done'"
-# The highest temperature of the NPU thermal zones (type nsp*) in millidegrees, or nothing.
-NSP = ('$(for z in /sys/class/thermal/thermal_zone*; do case "$(cat $z/type 2>/dev/null)" in (nsp*) '
-       'cat $z/temp 2>/dev/null;; esac; done | sort -n | tail -n 1)')
-BEFORE = f'echo "before: nsp={NSP}"'
-AFTER = ('echo "after: thermal=$(dumpsys thermalservice | grep "Thermal Status" | head -n 1 | tr -dc 0-9)'
-         ' cap0=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)'
-         ' cap7=$(cat /sys/devices/system/cpu/cpu7/cpufreq/scaling_max_freq)'
-         ' battery=$(dumpsys battery | grep "^  level:" | tr -dc 0-9)'
-         f' temp=$(dumpsys battery | grep "temperature:" | tr -dc 0-9) nsp={NSP}"')
-# A run with a CPU cap of less than this value (kHz) before or after it stays out of the tables.
-CAP_MIN_KHZ = 3000000
+TOOLS = ("memprobe",)
+PGREP = device.pgrep(*TOOLS)
 SWEEP_SIZES = (1, 8, 32, 40, 64, 128, 256, 512, 1024)
 SWEEP_DEPTHS = (0, 512)
 PROF_SIZES = (1, 8, 40, 128, 512)
@@ -164,18 +149,15 @@ def all_runs() -> list[Run]:
 def run_lines(run: Run) -> list[str]:
     """The lines of one run: a title, the thermal line, the run and the pgrep line."""
     b, v = run.block, run.variant
-    stem = f"{PHONE}/out/{run.name}"
     env = " ".join(x for x in (LIB_ENV, b.env) if x)
     state = f"{PHONE}/state"
     args = " ".join(x for x in (PROBE_ARGS, v.args, b.args, f"--state-dir {state}" if b.state_dir else "") if x)
-    prep = f"rm -rf {state} && mkdir -p {state} && " if b.state_dir else ""
-    clean = f"rm -rf {state}; " if b.state_dir else ""
-    cmd = (f"sh {PHONE}/bin/gate.sh {GATE_KB} > {stem}-gate.txt && {BEFORE} >> {stem}-gate.txt && {prep}"
-           f"timeout -s KILL {b.limit} env {env} {PHONE}/bin/memprobe -m {MODEL_DIR}/{MODEL} {args} "
-           f"> {stem}.out 2> {stem}.log; echo \"rc=$?\" >> {stem}-gate.txt; {clean}{AFTER} >> {stem}-gate.txt; "
-           f"cat {stem}-gate.txt")
-    return ["#", f"# REAL-MODEL {MODEL.removesuffix('.gguf')}: {run.name}, {b.text}, {v.key}: {v.name}",
-            THERMAL, f"{ADB} shell '{cmd}'", PGREP]
+    cmd = commands.gated_run(f"{PHONE}/out/{run.name}", GATE_KB, b.limit, env,
+                             f"{PHONE}/bin/memprobe -m {MODEL_DIR}/{MODEL} {args}", stage=PHONE,
+                             pre=f"rm -rf {state} && mkdir -p {state} && " if b.state_dir else "",
+                             clean=f"rm -rf {state}; " if b.state_dir else "")
+    return commands.run_lines(f"# REAL-MODEL {MODEL.removesuffix('.gguf')}: {run.name}, {b.text}, {v.key}: {v.name}",
+                              cmd, PGREP)
 
 
 HEADER = """\
@@ -225,56 +207,25 @@ HEADER = """\
 
 def setup_lines() -> list[str]:
     """The lines that copy the stage to the phone and check its files."""
-    bins = " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in STAGE_FILES if f.startswith("bin/"))
-    libs = " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in STAGE_FILES if f.startswith("lib/"))
-    return [
-        f"mkdir -p {LAPTOP_STAGE} && rsync -a --delete {BOX}/phone/ {LAPTOP_STAGE}/phone/",
-        f"(cd {LAPTOP_STAGE}/phone && sha256sum -c SHA256SUMS)",
-        # No "models/Qwen3.5" in this line: the runner gates each line with that text as a model run.
-        f"{ADB} shell 'ls -l {MODEL_DIR} | grep -E \"{MODEL}\"'",
-        f"{ADB} shell 'rm -rf {PHONE} && mkdir -p {PHONE}/bin {PHONE}/lib {PHONE}/out'",
-        f"{ADB} push {bins} {PHONE}/bin/",
-        f"{ADB} push {libs} {PHONE}/lib/",
-        f"{ADB} push {LAPTOP_STAGE}/phone/SHA256SUMS {PHONE}/",
-        f"{ADB} shell 'cd {PHONE} && sha256sum -c SHA256SUMS | grep -c OK && chmod 755 {PHONE}/bin/*'",
-    ]
-
-
-def output_lines() -> list[str]:
-    """The lines that pull the outputs, copy them to the box and remove the phone directory. The phone
-    directory goes only when the pull has each of its files."""
-    return [
-        "#",
-        "# ---- The outputs ----",
-        "#",
-        THERMAL,
-        f"{ADB} shell 'pgrep -x memprobe; ls {PHONE}/out | wc -l; du -sh {PHONE}/out'",
-        f"rm -rf {LAPTOP_STAGE}/phone-out",
-        f"{ADB} pull {PHONE}/out {LAPTOP_STAGE}/phone-out",
-        f"rsync -a --delete {LAPTOP_STAGE}/phone-out/ {BOX}/phone-out/",
-        f"test \"$(ls {LAPTOP_STAGE}/phone-out | wc -l)\" -eq "
-        f"\"$({ADB} shell 'ls {PHONE}/out | wc -l' | tr -d '\\r')\" "
-        f"&& {ADB} shell 'rm -rf {PHONE}' && echo removed {PHONE}",
-    ]
+    files = {d: [f"{LAPTOP_STAGE}/phone/{f}" for f in STAGE_FILES if f.startswith(f"{d}/")] for d in ("bin", "lib")}
+    # No "models/Qwen3.5" in the model line: the runner gates each line with that text as a model run.
+    return commands.setup_lines(PATHS, files,
+                                model_check=f"{ADB} shell 'ls -l {MODEL_DIR} | grep -E \"{MODEL}\"'")
 
 
 def write_commands(path: Path) -> int:
     """Write the command file and return its line count."""
     runs = all_runs()
-    lines = HEADER.rstrip("\n").split("\n") + setup_lines()
+    lines = commands.header_lines(HEADER) + setup_lines()
     lines += ["#", f"# ==== {MODEL.removesuffix('.gguf')}: {len(runs)} runs ===="]
     for run in runs:
         lines += run_lines(run)
-    lines += output_lines()
-    path.write_text("\n".join(lines) + "\n")
-    return len(lines)
+    lines += commands.output_lines(PATHS, tools=TOOLS)
+    return commands.write_commands(path, lines)
 
 
 # ---- The parser of the files ----
 
-GATE_RE = re.compile(r"gate: screen=(\S+) thermal=(\d*) cap0=(\d*) cap7=(\d*) battery=(\d*)% temp=(\d*)")
-BEFORE_RE = re.compile(r"before: nsp=(\d*)")
-AFTER_RE = re.compile(r"after: thermal=(\d*) cap0=(\d*) cap7=(\d*) battery=(\d*) temp=(\d*)(?: nsp=(\d*))?")
 # A log line with the time stamp of --log-ts: minutes, seconds, milliseconds, microseconds, the level letter.
 TS_RE = re.compile(r"^(\d+)\.(\d{2})\.(\d{3})\.(\d{3}) [A-Z] (.*)$")
 STAMP_RE = re.compile(r"memprobe: STAMP (\S+)(.*)$")
@@ -468,55 +419,20 @@ class Result:
 
 def read_result(root: Path, run: Run) -> Result:
     """Read the gate file, the stdout and the stderr of one run. O(size of the files)."""
-    gate_path, out_path, log_path = (root / f"{run.name}{s}" for s in ("-gate.txt", ".out", ".log"))
-    gate = gate_path.read_text(errors="replace") if gate_path.exists() else ""
-    before, after = GATE_RE.search(gate), AFTER_RE.search(gate)
-    rc = re.search(r"^rc=(\d+)", gate, re.M)
-    flags = []
-    ok = "gate: OK" in gate and rc is not None and rc.group(1) == "0"
-    if not gate:
-        flags.append("no gate file")
-    elif "gate: OK" not in gate:
-        flags.append("gate stopped the run")
-    elif not ok:
-        flags.append(f"exit code {rc.group(1) if rc else '?'}")
-    removed = []
-    caps = f"{before.group(3)}/{before.group(4)}" if before else "?"
-    if before and after and (before.group(3), before.group(4)) != (after.group(2), after.group(3)):
-        flags.append(f"caps {caps} -> {after.group(2)}/{after.group(3)}")
-    cap_values = [int(v) for v in ((before.group(3), before.group(4)) if before else ()) +
-                  ((after.group(2), after.group(3)) if after else ()) if v]
-    if cap_values and min(cap_values) < CAP_MIN_KHZ:
-        removed.append(f"a cap of {min(cap_values)} kHz")
-    if after and after.group(1) not in ("", "0"):
-        removed.append(f"thermal {after.group(1)} after the run")
-    nsp_b = BEFORE_RE.search(gate)
-    nsp = (int(nsp_b.group(1)) / 1000 if nsp_b and nsp_b.group(1) else None,
-           int(after.group(6)) / 1000 if after and after.group(6) else None)
-    out = out_path.read_text(errors="replace") if out_path.exists() else ""
-    log = log_path.read_text(errors="replace") if log_path.exists() else ""
+    text, out, log = logs.read_run(root, run.name)
+    c = gate.read(text, cap_min=gate.CAP_MIN_KHZ)
+    removed = list(c.removed)
     events, lines = parse_log(log)
-    if ok and "llama_kv_cache: size" in log and "K (q8_0)" not in log:
+    if c.ok and "llama_kv_cache: size" in log and "K (q8_0)" not in log:
         removed.append("the KV cache is not Q8_0")
-    if ok and re.search(r"follow-failed|AddressSanitizer|GGML_ASSERT|dspqueue_read failed", log):
+    if c.ok and gate.FAIL_RE.search(log):
         removed.append("the log has a failure line")
-    return Result(run, ok, flags, removed, caps, nsp, out, events, lines)
+    return Result(run, c.ok, c.flags, removed, c.caps, c.nsp, out, events, lines)
 
 
 def usable(res: Result, include_all: bool) -> bool:
     """True when the run goes into the tables: it ran, and no condition removes it (or --all)."""
     return res.ok and (include_all or not res.removed)
-
-
-def med(values) -> float | None:
-    """The median of the values that are not None, or None."""
-    v = [x for x in values if x is not None]
-    return statistics.median(v) if v else None
-
-
-def fmt(x: float | None, digits: int = 1) -> str:
-    """A number, or a dash for None."""
-    return "-" if x is None else f"{x:.{digits}f}"
 
 
 def fit(points: list[tuple[float, float]]) -> tuple[float, float] | None:
@@ -605,14 +521,14 @@ def sweep_table(results: dict[str, Result], block: str, include_all: bool) -> li
                     vals.append(w.session.get(key, 0))
                 elif where == "cpu":
                     vals.append(w.cpu_split_us)
-            return med(vals)
+            return tables.med(vals)
 
         fits: dict[tuple[int, bool], list[tuple[float, float]]] = defaultdict(list)
         for depth in sorted({d for d, _, _ in rows}):
             for size in sorted({s for d, s, _ in rows if d == depth}):
                 first, later = rows.get((depth, size, True), []), rows.get((depth, size, False), [])
-                f_ms = med(float(t["ms"]) for t, _ in first)
-                l_ms = med(float(t["ms"]) for t, _ in later)
+                f_ms = tables.med(float(t["ms"]) for t, _ in first)
+                l_ms = tables.med(float(t["ms"]) for t, _ in later)
                 if f_ms is not None:
                     fits[(depth, True)].append((size, f_ms))
                 if l_ms is not None:
@@ -620,30 +536,32 @@ def sweep_table(results: dict[str, Result], block: str, include_all: bool) -> li
                 diff = f_ms - l_ms if f_ms is not None and l_ms is not None else None
 
                 def pair(key: str, where: str = "tgt") -> str:
-                    return f"{fmt(host(first, key, where), 0)}/{fmt(host(later, key, where), 0)}"
+                    return f"{tables.fmt(host(first, key, where), 0)}/{tables.fmt(host(later, key, where), 0)}"
                 out.append(
-                    f"  {depth:>5} {size:>6} | {fmt(f_ms):>7} {fmt(l_ms):>7} {fmt(diff):>6} | later: "
-                    f"{fmt(med(float(t['decode_ms']) for t, _ in later)):>7} "
-                    f"{fmt(med(float(t['follow_ms']) for t, _ in later)):>6} "
-                    f"{fmt(med(float(t['sync_ms']) for t, _ in later)):>6} "
-                    f"{fmt(med(float(t['restore_ms']) for t, _ in later)):>7} | "
+                    f"  {depth:>5} {size:>6} | {tables.fmt(f_ms):>7} {tables.fmt(l_ms):>7} {tables.fmt(diff):>6} | later: "
+                    f"{tables.fmt(tables.med(float(t['decode_ms']) for t, _ in later)):>7} "
+                    f"{tables.fmt(tables.med(float(t['follow_ms']) for t, _ in later)):>6} "
+                    f"{tables.fmt(tables.med(float(t['sync_ms']) for t, _ in later)):>6} "
+                    f"{tables.fmt(tables.med(float(t['restore_ms']) for t, _ in later)):>7} | "
                     f"{pair('build'):>21} {pair('alloc'):>11} {pair('pack', 'session'):>11} "
                     f"{pair('', 'cpu'):>11} {pair('wait', 'session'):>13} {pair('get', 'session'):>9}")
         if cold:
-            t_ms = med(float(t["ms"]) for t, _ in cold)
-            first40 = med(float(t["ms"]) for t, _ in rows.get((0, 40, True), []))
-            out.append(f"  the first decode of the process, 40 tokens: {fmt(t_ms)} ms, against {fmt(first40)} ms for the "
-                       f"first call of 40 tokens later (the first use costs {fmt(t_ms - first40 if t_ms and first40 else None)} "
-                       f"ms). host us: build {fmt(host(cold, 'build'), 0)}, alloc {fmt(host(cold, 'alloc'), 0)}, pack "
-                       f"{fmt(host(cold, 'pack', 'session'), 0)}, cpu split {fmt(host(cold, '', 'cpu'), 0)}, DSP wait "
-                       f"{fmt(host(cold, 'wait', 'session'), 0)}")
+            t_ms = tables.med(float(t["ms"]) for t, _ in cold)
+            first40 = tables.med(float(t["ms"]) for t, _ in rows.get((0, 40, True), []))
+            out.append(f"  the first decode of the process, 40 tokens: {tables.fmt(t_ms)} ms, against "
+                       f"{tables.fmt(first40)} ms for the first call of 40 tokens later (the first use costs "
+                       f"{tables.fmt(t_ms - first40 if t_ms and first40 else None)} ms). host us: "
+                       f"build {tables.fmt(host(cold, 'build'), 0)}, alloc {tables.fmt(host(cold, 'alloc'), 0)}, "
+                       f"pack {tables.fmt(host(cold, 'pack', 'session'), 0)}, "
+                       f"cpu split {tables.fmt(host(cold, '', 'cpu'), 0)}, "
+                       f"DSP wait {tables.fmt(host(cold, 'wait', 'session'), 0)}")
         for (depth, first), pts in sorted(fits.items()):
             small = fit([p for p in pts if p[0] <= 64])
             large = fit([p for p in pts if p[0] >= 256])
             which = "first" if first else "later"
-            out.append(f"  fit depth {depth} {which}: sizes 1..64 T = {fmt(small[0]) if small else '-'} + "
-                       f"{fmt(small[1], 3) if small else '-'} x N ms; sizes 256..1024 T = {fmt(large[0]) if large else '-'} "
-                       f"+ {fmt(large[1], 3) if large else '-'} x N ms")
+            out.append(f"  fit depth {depth} {which}: sizes 1..64 T = {tables.fmt(small[0]) if small else '-'} + "
+                       f"{tables.fmt(small[1], 3) if small else '-'} x N ms; sizes 256..1024 T = "
+                       f"{tables.fmt(large[0]) if large else '-'} + {tables.fmt(large[1], 3) if large else '-'} x N ms")
         out.append("")
     return out
 
@@ -694,11 +612,11 @@ def turn_table(results: dict[str, Result], block: str, include_all: bool) -> lis
                 if k == "reuse":
                     return ",".join(sorted(set(v for v in vals if v))) or "-"
                 nums = [float(v) for v in vals if v not in (None, "-1.0")]
-                return fmt(med(nums)) if nums else "-"
+                return tables.fmt(tables.med(nums)) if nums else "-"
             out.append(f"  {key:16s} {val(first):>10} | {val(later):>10}")
 
         def part(rows: list, name: str, get) -> str:
-            return fmt(med(get(w[name]) for _, w in rows if name in w), 0)
+            return tables.fmt(tables.med(get(w[name]) for _, w in rows if name in w), 0)
         for name in ("base", "tail", "step0"):
             for label, get in (("target build us", lambda w: w.tgt.get("build", 0)),
                                ("target alloc us", lambda w: w.tgt.get("alloc", 0)),
@@ -773,8 +691,8 @@ def draft_summary(res: Result) -> list[str]:
     if not ran:
         return []
     return [f"  draft steps: {len(ran)}, asked length: " + ", ".join(f"{k} x{n}" for k, n in sorted(asked.items())) +
-            f"; MTP passes per step: median {med(ran):.0f}, min {min(ran)}, max {max(ran)}" +
-            (f"; HEAD ms per step: median {med(heads):.1f}" if any(heads) else "")]
+            f"; MTP passes per step: median {tables.med(ran):.0f}, min {min(ran)}, max {max(ran)}" +
+            (f"; HEAD ms per step: median {tables.med(heads):.1f}" if any(heads) else "")]
 
 
 def prof_row(label: str, w: Window) -> str:
@@ -786,11 +704,11 @@ def prof_row(label: str, w: Window) -> str:
 
 def prof_median(label: str, wins: list) -> str:
     """The row of the medians of several windows."""
-    mw = Window(0.0, med(w.wall_us for w in wins))
-    mw.dsp_us = med(w.dsp_us for w in wins)
-    mw.batches = int(med(w.batches for w in wins))
+    mw = Window(0.0, tables.med(w.wall_us for w in wins))
+    mw.dsp_us = tables.med(w.dsp_us for w in wins)
+    mw.batches = int(tables.med(w.batches for w in wins))
     mw.mhz = [x for w in wins for x in w.mhz]
-    mw.classes = Counter({c: med(w.classes.get(c, 0) for w in wins) for c in CLASSES})
+    mw.classes = Counter({c: tables.med(w.classes.get(c, 0) for w in wins) for c in CLASSES})
     return prof_row(label, mw)
 
 
@@ -803,12 +721,12 @@ def fu_value(items: list, key: str, where: str | None) -> str:
     """The median of one field over the calls: the wall ms, a field of the target decode line, of the session line,
     or the CPU split, in us."""
     if where is None:
-        return fmt(med(float(t["ms"]) for t, _ in items))
+        return tables.fmt(tables.med(float(t["ms"]) for t, _ in items))
     if where == "tgt":
-        return fmt(med(w.tgt.get(key, 0) for _, w in items if w), 0)
+        return tables.fmt(tables.med(w.tgt.get(key, 0) for _, w in items if w), 0)
     if where == "session":
-        return fmt(med(w.session.get(key, 0) for _, w in items if w), 0)
-    return fmt(med(w.cpu_split_us for _, w in items if w), 0)
+        return tables.fmt(tables.med(w.session.get(key, 0) for _, w in items if w), 0)
+    return tables.fmt(tables.med(w.cpu_split_us for _, w in items if w), 0)
 
 
 def first_use_table(results: dict[str, Result], include_all: bool) -> list[str]:
@@ -875,14 +793,14 @@ def decode_table(results: dict[str, Result], include_all: bool) -> list[str]:
             out.append("  no step stamps")
             continue
         out.append(f"  one decode token at the depth 4096, the median of {len(wins)} tokens (us): wall "
-                   f"{med(w.wall_us for w in wins):.0f}, DSP wait {med(w.session.get('wait', 0) for w in wins):.0f}, "
-                   f"host = wall - wait {med(w.wall_us - w.session.get('wait', 0) for w in wins):.0f}")
-        out.append("    decode: " + ", ".join(f"{k} {med(w.tgt.get(k, 0) for w in wins):.0f}" for k in
+                   f"{tables.med(w.wall_us for w in wins):.0f}, DSP wait {tables.med(w.session.get('wait', 0) for w in wins):.0f}, "
+                   f"host = wall - wait {tables.med(w.wall_us - w.session.get('wait', 0) for w in wins):.0f}")
+        out.append("    decode: " + ", ".join(f"{k} {tables.med(w.tgt.get(k, 0) for w in wins):.0f}" for k in
                    ("prologue", "apply", "reuse_check", "build", "alloc", "inputs", "compute", "logits_get", "loop_other",
                     "epilogue", "total", "reused")))
-        out.append("    session: " + ", ".join(f"{k} {med(w.session.get(k, 0) for w in wins):.0f}" for k in
+        out.append("    session: " + ", ".join(f"{k} {tables.med(w.session.get(k, 0) for w in wins):.0f}" for k in
                    ("batches", "pack", "submit", "wait", "pop", "get", "set", "turnaround")))
-        out.append(f"    cpu split (the embedding row) {med(w.cpu_split_us for w in wins):.0f}, max "
+        out.append(f"    cpu split (the embedding row) {tables.med(w.cpu_split_us for w in wins):.0f}, max "
                    f"{max(w.cpu_split_us for w in wins)}")
     return out
 
@@ -909,8 +827,7 @@ def pass_table(results: dict[str, Result], include_all: bool) -> list[str]:
 def table(root: Path, include_all: bool) -> int:
     """Print the tables."""
     if not root.is_dir():
-        print(f"stage.py: {root} is not a directory. Pull the outputs of the stage first.", file=sys.stderr)
-        return 1
+        return cli.missing_root(root)
     results = {r.name: read_result(root, r) for r in all_runs() if (root / f"{r.name}-gate.txt").exists()}
     parts = [checks(results), sweep_table(results, "sw", include_all), first_use_table(results, include_all),
              turn_table(results, "tn", include_all), turn_table(results, "ti", include_all),
@@ -928,19 +845,8 @@ def table(root: Path, include_all: bool) -> int:
 
 def main() -> int:
     """Run the subcommand of the command line."""
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    c = sub.add_parser("commands", help="write the phone command file")
-    c.add_argument("--out", type=Path, default=STAGE_DIR / "phone-commands.txt")
-    t = sub.add_parser("table", help="print the tables from the pulled files")
-    t.add_argument("--root", type=Path, default=STAGE_DIR / "phone-out")
-    t.add_argument("--all", action="store_true", help="also use the runs with changed caps or heat")
-    a = ap.parse_args()
-    if a.cmd == "commands":
-        n = write_commands(a.out)
-        print(f"{a.out}: {n} lines, {len(all_runs())} runs")
-        return 0
-    return table(a.root, a.all)
+    return cli.run(STAGE_DIR, __doc__, write=write_commands, count=lambda: len(all_runs()), table=table,
+                   table_help="print the tables from the pulled files")
 
 
 if __name__ == "__main__":

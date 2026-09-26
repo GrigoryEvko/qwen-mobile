@@ -21,51 +21,38 @@ A run name is 4b-<block>-<round>-<variant>, for example 4b-it-2-s. Each run writ
 out/: <name>-gate.txt, <name>.out (the stdout of memprobe) and <name>.log (its stderr with the STAMP lines).
 
 A run goes into the tables when its gate passed, its exit code is 0, the thermal status after it is 0, no CPU cap before
-or after it is less than 3.0 GHz (CAP_MIN_KHZ), and its log has no failure line. --all also uses the removed runs. The
-table only reads files. O(size of the files) time.
+or after it is less than 3.0 GHz (gate.CAP_MIN_KHZ), and its log has no failure line. --all also uses the removed runs.
+The table only reads files. O(size of the files) time.
 
 This file is tools/stages/imgturn/stage.py. The files of the stage stay in build/imgturn.
 """
 
-import argparse
-import os
 import re
-import statistics
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
-ADB = "adb -s 192.168.14.130:5555"
-PHONE = "/data/local/tmp/qwen/imgturn"
-MODEL_DIR = "/data/local/tmp/qwen/models"
-MODEL = "Qwen3.5-4B-Q8_0.gguf"
-MMPROJ = "Qwen3.5-4B-Q8_0.mmproj.gguf"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common import cli, commands, device, gate, logs, parse, tables  # noqa: E402
+
+ADB = device.ADB
+PATHS = device.stage_paths("imgturn", __file__)
+PHONE, LAPTOP_STAGE, BOX, STAGE_DIR = PATHS
+MODEL_DIR = device.MODEL_DIR
+MODEL = device.MODEL_4B
+MMPROJ = device.MMPROJ_4B
 # The saved copy of the photo of the chat of the user. A new chat of the app deletes its photos, thus the stage pushes it.
-PHOTO_COPY = "build/imgturn/photo.jpg"
-PHOTO_SHA1 = "a2200d1a726ec0a8576b4a18dc2ef1aa4e4c797d"
 PHOTO = f"{PHONE}/in/photo.jpg"
 DEPTH = 1647
-GATE_KB = 8388608
-LAPTOP_STAGE = "build/imgturn"
-BOX = "grigory@10.10.20.200:airi/qwen-mobile/build"
-STAGE_DIR = Path(os.path.relpath(Path(__file__).resolve().parents[3] / LAPTOP_STAGE))
-LIB_ENV = f"LD_LIBRARY_PATH={PHONE}/lib ADSP_LIBRARY_PATH={PHONE}/lib GGML_HEXAGON_OPFUSION=1 GGML_HEXAGON_OPFUSION_STATE=1"
-PROBE_ARGS = "-dev HTP0 -c 8192 -t 4 --outputs-max 5 --lazy on -ctk q8_0 -ctv q8_0"
+GATE_KB = device.GATE_4B_KB
+LIB_ENV = f"{device.lib_env(PHONE)} {device.APP_ENV}"
+PROBE_ARGS = device.PROBE_ARGS
 STAGE_FILES = ("bin/gate.sh", "bin/memprobe", "lib/libggml-base.so", "lib/libggml-cpu.so", "lib/libggml-hexagon.so",
                "lib/libggml-htp-v79.so", "lib/libggml-opencl.so", "lib/libggml.so", "lib/libllama-common.so",
                "lib/libllama.so", "lib/libmtmd.so")
-THERMAL = f"{ADB} shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
-PGREP = f"{ADB} shell 'pgrep -x memprobe; echo pgrep-done'"
-NSP = ('$(for z in /sys/class/thermal/thermal_zone*; do case "$(cat $z/type 2>/dev/null)" in (nsp*) '
-       'cat $z/temp 2>/dev/null;; esac; done | sort -n | tail -n 1)')
-BEFORE = f'echo "before: nsp={NSP}"'
-AFTER = ('echo "after: thermal=$(dumpsys thermalservice | grep "Thermal Status" | head -n 1 | tr -dc 0-9)'
-         ' cap0=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)'
-         ' cap7=$(cat /sys/devices/system/cpu/cpu7/cpufreq/scaling_max_freq)'
-         ' battery=$(dumpsys battery | grep "^  level:" | tr -dc 0-9)'
-         f' temp=$(dumpsys battery | grep "temperature:" | tr -dc 0-9) nsp={NSP}"')
-CAP_MIN_KHZ = 3000000
+TOOLS = ("memprobe",)
+PGREP = device.pgrep(*TOOLS)
 DRAFT = "--spec --draft-file auto"
 
 
@@ -140,13 +127,12 @@ def run_lines(run: Run) -> list[str]:
     env = " ".join(x for x in (LIB_ENV, v.env) if x)
     args = (f"{PROBE_ARGS} --mmproj $P --vision-dev HTP0 --image-turn {PHOTO} --image-depth {DEPTH} "
             f"--image-reps {b.reps} {v.args}")
-    cmd = (f"sh {PHONE}/bin/gate.sh {GATE_KB} > {stem}-gate.txt && {BEFORE} >> {stem}-gate.txt && "
-           f"P={MODEL_DIR}/{MMPROJ}; [ -f $P ] || P=/sdcard/qwen/models/{MMPROJ}; echo \"mmproj: $P\" >> {stem}-gate.txt; "
-           f"timeout -s KILL {b.limit} env {env} {PHONE}/bin/memprobe -m {MODEL_DIR}/{MODEL} {args} "
-           f"> {stem}.out 2> {stem}.log; echo \"rc=$?\" >> {stem}-gate.txt; {AFTER} >> {stem}-gate.txt; "
-           f"cat {stem}-gate.txt")
-    return ["#", f"# REAL-MODEL {MODEL.removesuffix('.gguf')}: {run.name}, {b.text}, {v.key}: {v.name}",
-            THERMAL, f"{ADB} shell '{cmd}'", PGREP]
+    pre = (f"P={MODEL_DIR}/{MMPROJ}; [ -f $P ] || P=/sdcard/qwen/models/{MMPROJ}; "
+           f"echo \"mmproj: $P\" >> {stem}-gate.txt; ")
+    cmd = commands.gated_run(stem, GATE_KB, b.limit, env, f"{PHONE}/bin/memprobe -m {MODEL_DIR}/{MODEL} {args}",
+                             stage=PHONE, pre=pre)
+    return commands.run_lines(f"# REAL-MODEL {MODEL.removesuffix('.gguf')}: {run.name}, {b.text}, {v.key}: {v.name}",
+                              cmd, PGREP)
 
 
 HEADER = """\
@@ -185,27 +171,18 @@ HEADER = """\
 """
 
 
-def photo_lines() -> list[str]:
-    """The lines that copy the saved photo from the box, check its sha1, and push it into the stage directory."""
-    return [
-        f"mkdir -p {Path(PHOTO_COPY).parent} && rsync -a {BOX}/imgturn/photo.jpg {PHOTO_COPY}",
-        f"echo '{PHOTO_SHA1}  {PHOTO_COPY}' | sha1sum -c",
-        f"{ADB} push {PHOTO_COPY} {PHOTO}",
-        f"{ADB} shell 'ls -l {PHOTO} && sha1sum {PHOTO}'",
-    ]
-
-
 def setup_lines() -> list[str]:
-    """The lines that copy the stage files and the photo to the phone and check them."""
+    """The lines that copy the stage files and the photo to the phone and check them. The files of the stage are the
+    phone files of the stage ttft, and the phone directory holds the photo in in/."""
     bins = " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in STAGE_FILES if f.startswith("bin/"))
     libs = " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in STAGE_FILES if f.startswith("lib/"))
     return [
-        f"mkdir -p {LAPTOP_STAGE} && rsync -a --delete {BOX}/ttft/phone/ {LAPTOP_STAGE}/phone/",
+        f"mkdir -p {LAPTOP_STAGE} && rsync -a --delete {device.BOX_BUILD}/ttft/phone/ {LAPTOP_STAGE}/phone/",
         f"(cd {LAPTOP_STAGE}/phone && sha256sum -c SHA256SUMS)",
         # No "models/Qwen3.5" in these lines: the runner gates each line with that text as a model run.
         f"{ADB} shell 'ls -l {MODEL_DIR} /sdcard/qwen/models | grep -E \"Qwen3.5-4B-Q8_0(-draft32k|.mmproj)?.gguf\"'",
         f"{ADB} shell 'rm -rf {PHONE} && mkdir -p {PHONE}/bin {PHONE}/lib {PHONE}/out {PHONE}/in'",
-        *photo_lines(),
+        *commands.photo_lines(device.BOX_BUILD, PHOTO),
         f"{ADB} push {bins} {PHONE}/bin/",
         f"{ADB} push {libs} {PHONE}/lib/",
         f"{ADB} push {LAPTOP_STAGE}/phone/SHA256SUMS {PHONE}/",
@@ -213,70 +190,33 @@ def setup_lines() -> list[str]:
     ]
 
 
-def output_lines() -> list[str]:
-    """The lines that pull the outputs, copy them to the box and remove the phone directory. The phone directory goes
-    only when the pull has each of its files."""
-    return [
-        "#",
-        "# ---- The outputs ----",
-        "#",
-        THERMAL,
-        f"{ADB} shell 'pgrep -x memprobe; ls {PHONE}/out | wc -l; du -sh {PHONE}/out'",
-        f"rm -rf {LAPTOP_STAGE}/phone-out",
-        f"{ADB} pull {PHONE}/out {LAPTOP_STAGE}/phone-out",
-        f"rsync -a --delete {LAPTOP_STAGE}/phone-out/ {BOX}/imgturn/phone-out/",
-        f"test \"$(ls {LAPTOP_STAGE}/phone-out | wc -l)\" -eq "
-        f"\"$({ADB} shell 'ls {PHONE}/out | wc -l' | tr -d '\\r')\" "
-        f"&& {ADB} shell 'rm -rf {PHONE}' && echo removed {PHONE}",
-    ]
-
-
 def write_commands(path: Path) -> int:
     """Write the command file and return its line count."""
     runs = all_runs()
-    lines = HEADER.rstrip("\n").split("\n") + setup_lines()
+    lines = commands.header_lines(HEADER) + setup_lines()
     lines += ["#", f"# ==== {MODEL.removesuffix('.gguf')}: {len(runs)} runs ===="]
     for run in runs:
         lines += run_lines(run)
-    lines += output_lines()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n")
-    return len(lines)
+    lines += commands.output_lines(PATHS, tools=TOOLS)
+    return commands.write_commands(path, lines)
 
 
 # ---- The parser of the files ----
 
-GATE_RE = re.compile(r"gate: screen=(\S+) thermal=(\d*) cap0=(\d*) cap7=(\d*) battery=(\d*)% temp=(\d*)")
-AFTER_RE = re.compile(r"after: thermal=(\d*) cap0=(\d*) cap7=(\d*) battery=(\d*) temp=(\d*)(?: nsp=(\d*))?")
 KV_RE = re.compile(r"([a-z_]+)=([-\w./]+)")
 STAMP_RE = re.compile(r"memprobe: STAMP (\S+)(.*)$")
-# One op of the profile of the Hexagon backend: the op name, and its time in microseconds. An OPBATCH line is one batch
-# of ops on the DSP, and its time is the busy time of the DSP.
+# One op of the profile of the Hexagon backend: the op name, and its time in microseconds. The stage reads the two
+# groups of one line, thus it keeps its own pattern. An OPBATCH line (parse.OPBATCH_RE) is one batch of ops on the DSP,
+# and its time is the busy time of the DSP.
 OP_RE = re.compile(r"profile-op ([A-Z0-9_+]+)\|.*\|usec (\d+) cycles")
-OPBATCH_RE = re.compile(r"profile-op OPBATCH\|.*\|usec (\d+) cycles")
 # One graph of a scheduler (LLAMA_HOSTPROF): the split count, then each split with its backend, its node count and its
 # host time. The compute time of an HTP0 split is the time to send it, because the DSP runs it asynchronously.
 SCHED_RE = re.compile(r"hostprof: sched splits (\d+)(.*) us")
 SPLIT_RE = re.compile(r"\[(\S+) nodes (\d+) inputs \d+ copy (\d+) compute (\d+)\]")
-# The laptop runner log: the title line of a run, and the check of the caps after it. The runner reads the caps some
-# seconds after the run, thus it removes the short drop of the cap of cpu7 that the "after:" line of the gate file
-# shows at the end of each run.
-RUNNER_TITLE_RE = re.compile(r"^# REAL-MODEL \S+: (\S+),")
-RUNNER_CAPS_RE = re.compile(r"^CAPS .*CAPS-CHANGED")
-
-
-def runner_rejects(path: Path | None) -> set[str]:
-    """The names of the runs that the runner log marks CAPS-CHANGED. O(lines of the log)."""
-    if path is None:
-        return set()
-    rejected, name = set(), None
-    for line in path.read_text(errors="replace").splitlines():
-        m = RUNNER_TITLE_RE.match(line)
-        if m:
-            name = m.group(1)
-        elif name is not None and RUNNER_CAPS_RE.match(line):
-            rejected.add(name)
-    return rejected
+# The log has a failure of the DSP session, of the load of a file, or of the image path.
+FAIL_RE = re.compile(r"GGML_ASSERT|dspqueue_read failed|did not load|did not decode|did not open|did not read|"
+                     r"mtmd_tokenize gave")
+TURN_FAIL_RE = re.compile(r"image-turn .* rc=[1-9-]")
 
 
 @dataclass
@@ -294,48 +234,16 @@ class Result:
 def read_result(root: Path, run: Run, rejected: set[str]) -> Result:
     """Read the gate file, the stdout and the stderr of one run. A run in rejected (the runner marked its caps) does
     not go into the tables. O(size of the files)."""
-    gate_path, out_path, log_path = (root / f"{run.name}{s}" for s in ("-gate.txt", ".out", ".log"))
-    gate = gate_path.read_text(errors="replace") if gate_path.exists() else ""
-    before, after = GATE_RE.search(gate), AFTER_RE.search(gate)
-    rc = re.search(r"^rc=(\d+)", gate, re.M)
-    flags = []
-    ok = "gate: OK" in gate and rc is not None and rc.group(1) == "0"
-    if not gate:
-        flags.append("no gate file")
-    elif "gate: OK" not in gate:
-        flags.append("gate stopped the run")
-    elif not ok:
-        flags.append(f"exit code {rc.group(1) if rc else '?'}")
-    removed = []
-    caps = f"{before.group(3)}/{before.group(4)}" if before else "?"
-    if before and after and (before.group(3), before.group(4)) != (after.group(2), after.group(3)):
-        flags.append(f"caps {caps} -> {after.group(2)}/{after.group(3)}")
-    cap_values = [int(v) for v in ((before.group(3), before.group(4)) if before else ()) +
-                  ((after.group(2), after.group(3)) if after else ()) if v]
-    if cap_values and min(cap_values) < CAP_MIN_KHZ:
-        removed.append(f"a cap of {min(cap_values)} kHz")
-    if after and after.group(1) not in ("", "0"):
-        removed.append(f"thermal {after.group(1)} after the run")
+    gate_text, out, log = logs.read_run(root, run.name)
+    conditions = gate.read(gate_text, cap_min=gate.CAP_MIN_KHZ)
+    removed = list(conditions.removed)
     if run.name in rejected:
         removed.append("the runner marked CAPS-CHANGED")
-    out = out_path.read_text(errors="replace") if out_path.exists() else ""
-    log = log_path.read_text(errors="replace") if log_path.exists() else ""
-    if ok and re.search(r"GGML_ASSERT|dspqueue_read failed|did not load|did not decode|did not open|did not read|mtmd_tokenize gave", log):
+    if conditions.ok and FAIL_RE.search(log):
         removed.append("the log has a failure line")
-    if ok and re.search(r"image-turn .* rc=[1-9-]", out):
+    if conditions.ok and TURN_FAIL_RE.search(out):
         removed.append("a turn failed")
-    return Result(run, ok, flags, removed, caps, out, log)
-
-
-def med(values) -> float | None:
-    """The median of the values that are not None, or None."""
-    v = [x for x in values if x is not None]
-    return statistics.median(v) if v else None
-
-
-def fmt(x: float | None, digits: int = 1) -> str:
-    """A number, or a dash for None."""
-    return "-" if x is None else f"{x:.{digits}f}"
+    return Result(run, conditions.ok, conditions.flags, removed, conditions.caps, out, log)
 
 
 def turns_of(res: Result) -> list[dict]:
@@ -372,9 +280,9 @@ def turn_table(results: dict[str, Result], include_all: bool) -> list[str]:
         for key in FIELDS:
             cells = []
             for r in reps:
-                v = med(float(t[key]) for t in by_rep[r] if key in t)
+                v = tables.med(float(t[key]) for t in by_rep[r] if key in t)
                 summary[vk].setdefault(r, {})[key] = v
-                cells.append(f"{fmt(v, 0 if key in COUNT_FIELDS else 1):>14}")
+                cells.append(f"{tables.fmt(v, 0 if key in COUNT_FIELDS else 1):>14}")
             out.append(f"  {key:16s} " + " ".join(cells))
         out.append("")
     out += proposals(summary)
@@ -407,7 +315,7 @@ def proposals(summary: dict[str, dict[int, dict[str, float | None]]]) -> list[st
     if 2 in summary.get("n", {}):
         rows.append(("a later image with the draft off", summary["n"][2].get("ttft_ms")))
     out = ["The time to the first token of the image turn of the user (draft on, 768 tokens), ms:"]
-    out += [f"  {label:50s} {fmt(v):>8}" for label, v in rows]
+    out += [f"  {label:50s} {tables.fmt(v):>8}" for label, v in rows]
     return out
 
 
@@ -443,7 +351,7 @@ def profile_table(results: dict[str, Result]) -> list[str]:
                         sched[f"{side}_nodes"] += int(sp.group(2))
                         sched[f"{side}_us"] += int(sp.group(3)) + int(sp.group(4))
                     continue
-                mb = OPBATCH_RE.search(line)
+                mb = parse.OPBATCH_RE.search(line)
                 if mb:
                     busy += int(mb.group(1))
                     continue
@@ -478,12 +386,13 @@ def checks(results: dict[str, Result]) -> list[str]:
 def table(root: Path, include_all: bool, runner_log: Path | None) -> int:
     """Print the tables."""
     if not root.is_dir():
-        print(f"stage.py: {root} is not a directory. Pull the outputs of the stage first.", file=sys.stderr)
-        return 1
+        return cli.missing_root(root)
     if runner_log is not None and not runner_log.is_file():
         print(f"stage.py: the runner log {runner_log} does not exist.", file=sys.stderr)
         return 1
-    rejected = runner_rejects(runner_log)
+    # The runner reads the caps some seconds after a run, thus its CAPS-CHANGED mark catches the short drop of the cap
+    # of cpu7 that the "after:" line of the gate file does not show.
+    rejected = set(logs.runner_marks(runner_log))
     results = {r.name: read_result(root, r, rejected) for r in all_runs() if (root / f"{r.name}-gate.txt").exists()}
     for part in (checks(results), turn_table(results, include_all), profile_table(results)):
         print("\n".join(part))
@@ -493,20 +402,9 @@ def table(root: Path, include_all: bool, runner_log: Path | None) -> int:
 
 def main() -> int:
     """Run the subcommand of the command line."""
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    c = sub.add_parser("commands", help="write the phone command file")
-    c.add_argument("--out", type=Path, default=STAGE_DIR / "phone-commands.txt")
-    t = sub.add_parser("table", help="print the tables from the pulled files")
-    t.add_argument("--root", type=Path, default=STAGE_DIR / "phone-out")
-    t.add_argument("--all", action="store_true", help="also use the runs with changed caps or heat")
-    t.add_argument("--runner-log", type=Path, help="the log of the laptop runner: its CAPS-CHANGED runs are removed")
-    a = ap.parse_args()
-    if a.cmd == "commands":
-        n = write_commands(a.out)
-        print(f"{a.out}: {n} lines, {len(all_runs())} runs")
-        return 0
-    return table(a.root, a.all, a.runner_log)
+    return cli.run(STAGE_DIR, __doc__, write=write_commands, count=lambda: len(all_runs()), table=table,
+                   table_help="print the tables from the pulled files",
+                   runner_log="the log of the laptop runner: its CAPS-CHANGED runs are removed")
 
 
 if __name__ == "__main__":

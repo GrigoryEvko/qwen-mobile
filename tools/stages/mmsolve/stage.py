@@ -44,8 +44,10 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common import cli, commands, device, gate, logs, tables  # noqa: E402
+
 REPO = Path(__file__).resolve().parents[3]
-HERE = REPO / "build/mmsolve"
 
 
 def _load_sweep():
@@ -63,23 +65,25 @@ mm = sweep.mm
 
 # ---- The stage paths and the phone lines ----
 
-ADB = "adb -s 192.168.14.130:5555"
-PHONE = "/data/local/tmp/qwen/mmsolve"
-LAPTOP_STAGE = "build/mmsolve"
-BOX = "grigory@10.10.20.200:airi/qwen-mobile/build/mmsolve"
-MODEL_DIR = "/data/local/tmp/qwen/models"
-MODEL = "Qwen3.5-4B-Q8_0.gguf"
-MODEL_GATE_KB = 8388608
+ADB = device.ADB
+PATHS = device.stage_paths("mmsolve", __file__)
+PHONE, LAPTOP_STAGE, BOX, STAGE_DIR = PATHS
+MODEL_DIR = device.MODEL_DIR
+MODEL = device.MODEL_4B
+MODEL_GATE_KB = device.GATE_4B_KB
 # The ls of this file makes the laptop runner treat a line as a model run: it waits for the unlocked phone,
 # stops the Qwen app, wakes the screen and checks MemAvailable. The runs with this marker load no model.
 MARKER = sweep.MARKER
-TOOL_GATE_KB = 2097152
-# The environment of the app (init_impl in llama_jni.cpp), as the stage bench-kv has it
-APP_ENV = "GGML_HEXAGON_OPFUSION=1 GGML_HEXAGON_OPFUSION_STATE=1"
+TOOL_GATE_KB = device.GATE_TOOL_KB
+# The environment of the app, as the stage bench-kv has it
+APP_ENV = device.APP_ENV
 # The llama-bench flags of the stage bench-kv, variant b (Q8_0 K and V, the rotation as FWHT)
 BENCH_ARGS = "-dev HTP0 -ngl 99 -t 4 -fa on -b 1024 -ub 1024 -ctk q8_0 -ctv q8_0 -o jsonl"
-THERMAL = sweep.THERMAL
-PGREP = f"{ADB} shell 'pgrep -x llama-bench; pgrep -x test-backend-op; pgrep -x mmcheck; echo pgrep-done'"
+THERMAL = device.THERMAL
+TOOLS = ("llama-bench", "test-backend-op", "mmcheck")
+PGREP = device.pgrep(*TOOLS)
+# The before line and the after line of the stage sweep: they also record the screen state and the keyguard
+# state, thus the two stages read a gate file with the same parser.
 BEFORE, AFTER = sweep.BEFORE, sweep.AFTER
 PHONE_FILES = ("bin/gate.sh", "bin/llama-bench", "bin/test-backend-ops", "bin/mmcheck", "lib/libggml-base.so",
                "lib/libggml-cpu.so", "lib/libggml-hexagon.so", "lib/libggml-htp-v79.so", "lib/libggml-opencl.so",
@@ -232,6 +236,12 @@ class Target:
         return PHONE + self.suffix
 
     @property
+    def paths(self) -> device.StagePaths:
+        """The directories of the target: the directories of the stage with the phone directory of the
+        target."""
+        return PATHS._replace(phone=self.phone)
+
+    @property
     def out(self) -> str:
         """The output directory below build/mmsolve, on the laptop and on the box."""
         return f"phone-out{self.suffix}"
@@ -317,28 +327,19 @@ HEADER_BX = """\
 
 
 def setup_lines(t: Target) -> list[str]:
-    """The lines that copy the files of a target to the phone and check them."""
+    """The lines that copy the files of a target to the phone and check them. Each target has its own
+    checksum file (SHA256SUMS-bx for the correctness stage), and the runs of a target can have no test
+    file."""
     files = t.files()
-    bins = " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in files if f.startswith("bin/"))
-    libs = " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in files if f.startswith("lib/"))
-    tests = " ".join(f"{LAPTOP_STAGE}/phone/tests/{r.key}.txt" for r in t.runs() if r.cases)
-    p = t.phone
-    lines = [
-        f"mkdir -p {LAPTOP_STAGE} && rsync -a --delete {BOX}/phone/ {LAPTOP_STAGE}/phone/",
-        f"(cd {LAPTOP_STAGE}/phone && sha256sum -c {t.sums})",
-        # No "models/Qwen3.5" in this line: the runner gates each line with that text as a model run.
-        f"{ADB} shell 'ls -l {MODEL_DIR} | grep {MODEL}'",
-        f"{ADB} shell 'rm -rf {p} && mkdir -p {p}/bin {p}/lib {p}/tests {p}/out'",
-        f"{ADB} push {bins} {p}/bin/",
-        f"{ADB} push {libs} {p}/lib/",
-    ]
-    if tests:
-        lines.append(f"{ADB} push {tests} {p}/tests/")
-    return lines + [
-        f"{ADB} push {LAPTOP_STAGE}/phone/{t.sums} {p}/",
-        f"{ADB} shell 'cd {p} && sha256sum -c {t.sums} | grep -c OK && chmod 755 {p}/bin/*'",
-        f"{ADB} shell 'echo gzip: $(command -v gzip) timeout: $(command -v timeout)'",
-    ]
+    pushes = {
+        "bin": [f"{LAPTOP_STAGE}/phone/{f}" for f in files if f.startswith("bin/")],
+        "lib": [f"{LAPTOP_STAGE}/phone/{f}" for f in files if f.startswith("lib/")],
+        "tests": [f"{LAPTOP_STAGE}/phone/tests/{r.key}.txt" for r in t.runs() if r.cases],
+    }
+    # No "models/Qwen3.5" in the model line: the runner gates each line with that text as a model run.
+    return commands.setup_lines(
+        t.paths, pushes, sums=t.sums, model_check=f"{ADB} shell 'ls -l {MODEL_DIR} | grep {MODEL}'",
+        extra=[f"{ADB} shell 'echo gzip: $(command -v gzip) timeout: $(command -v timeout)'"])
 
 
 def run_lines(r: Run, t: Target) -> list[str]:
@@ -347,10 +348,10 @@ def run_lines(r: Run, t: Target) -> list[str]:
     stem = f"{p}/out/{r.key}"
     model_run = r.kind in ("bench", "prof")
     gate_kb = MODEL_GATE_KB if model_run else TOOL_GATE_KB
-    marker = "" if model_run else f"{MARKER}; "
-    gate = f"{marker}sh {p}/bin/gate.sh {gate_kb} > {stem}-gate.txt && {BEFORE} >> {stem}-gate.txt && "
-    tail = f"echo \"rc=$?\" >> {stem}-gate.txt; {AFTER} >> {stem}-gate.txt; cat {stem}-gate.txt"
-    env = f"LD_LIBRARY_PATH={p}/lib ADSP_LIBRARY_PATH={p}/lib {r.env}"
+    prefix = "" if model_run else f"{MARKER}; "
+    head = commands.gate_head(stem, gate_kb, p, prefix=prefix, before=BEFORE)
+    tail = commands.gate_tail(stem, after=AFTER)
+    env = f"{device.lib_env(p)} {r.env}"
     if r.kind == "mmcheck":
         cmd = f"{p}/bin/mmcheck {r.args}"
     elif r.kind == "tbo-test":
@@ -359,33 +360,22 @@ def run_lines(r: Run, t: Target) -> list[str]:
         cmd = f"{p}/bin/test-backend-ops perf -b HTP0 --test-file {p}/tests/{r.key}.txt"
     else:
         cmd = f"{p}/bin/llama-bench -m {MODEL_DIR}/{MODEL} {BENCH_ARGS} {r.args}"
-    full = f"timeout -s KILL {r.limit} env {env} {cmd}"
+    full = commands.timeout_cmd(r.limit, env, cmd)
+    # The tool part is one group: a gate that fails skips all of it, and $? after the group is the exit code
+    # of the tool.
     if "GGML_HEXAGON_PROFILE" in r.env:
-        # One profile line for each op: gzip (when the phone has it) keeps the file small. The table reads a
-        # gzip file and a plain file alike. $? after the group is the exit code of the tool.
-        tool = (f"{{ Z=cat; command -v gzip > /dev/null && Z=\"gzip -1\"; set -o pipefail; "
-                f"{full} 2>&1 > {stem}.out | $Z > {stem}.log.z; }}; ")
+        tool = commands.gzip_group(stem, full)
     else:
-        tool = f"{{ {full} > {stem}.out 2> {stem}.log; }}; "
+        tool = f"{{ {commands.redirect(stem, full)}; }}; "
     title = f"# REAL-MODEL {MODEL.removesuffix('.gguf')}: " if model_run else "# MMSOLVE "
-    return ["#", f"{title}{r.key}: {r.text} (estimate {est_s(r):.0f} s, limit {r.limit} s)", THERMAL,
-            f"{ADB} shell '{gate}{tool}{tail}'", PGREP]
+    return commands.run_lines(f"{title}{r.key}: {r.text} (estimate {est_s(r):.0f} s, limit {r.limit} s)",
+                              f"{head}{tool}{tail}", PGREP)
 
 
 def output_lines(t: Target) -> list[str]:
     """The lines that pull the outputs of a target, copy them to the box and remove its phone directory. The phone
     directory goes only when the pull has each of its files."""
-    p, out = t.phone, f"{LAPTOP_STAGE}/{t.out}"
-    return [
-        "#", "# ---- The outputs ----", "#", THERMAL,
-        f"{ADB} shell 'pgrep -x llama-bench; pgrep -x test-backend-op; pgrep -x mmcheck; ls {p}/out | wc -l; "
-        f"du -sh {p}/out'",
-        f"rm -rf {out}",
-        f"{ADB} pull {p}/out {out}",
-        f"rsync -a --delete {out}/ {BOX}/{t.out}/",
-        f"test \"$(ls {out} | wc -l)\" -eq \"$({ADB} shell 'ls {p}/out | wc -l' | tr -d '\\r')\" "
-        f"&& {ADB} shell 'rm -rf {p}' && echo removed {p}",
-    ]
+    return commands.output_lines(t.paths, tools=TOOLS, out_dir=t.out)
 
 
 def check_points() -> None:
@@ -394,7 +384,7 @@ def check_points() -> None:
     Raises:
         RuntimeError: If a request has no layout in the budget, or plan is not built
     """
-    plan = HERE / "bin/plan"
+    plan = STAGE_DIR / "bin/plan"
     if not plan.exists():
         raise RuntimeError(f"{plan} is not there: run tools/stages/mmsolve/build.sh")
     for p in POINTS:
@@ -410,7 +400,7 @@ def write_files(t: Target) -> int:
     in phone/ from build.sh. The test files of each run are written for each target, thus the full stage and the
     correctness stage use one phone directory of the box."""
     ops = ggml_ops(REPO / "build/mmsolve/stage-src/ggml/include/ggml.h")
-    phone = HERE / "phone"
+    phone = STAGE_DIR / "phone"
     missing = [f for f in PHONE_FILES if not (phone / f).exists()]
     if missing:
         raise FileNotFoundError(f"{phone} has no {missing}: run tools/stages/mmsolve/build.sh")
@@ -429,19 +419,20 @@ def write_files(t: Target) -> int:
     files = list(t.files()) + [f"tests/{r.key}.txt" for r in t_runs if r.cases]
     sums = [f"{hashlib.sha256((phone / f).read_bytes()).hexdigest()}  {f}" for f in files]
     (phone / t.sums).write_text("\n".join(sums) + "\n")
-    patch_line = (HERE / "patch.sha256").read_text().split() if (HERE / "patch.sha256").exists() else ["?", "?"]
+    patch = STAGE_DIR / "patch.sha256"
+    patch_line = patch.read_text().split() if patch.exists() else ["?", "?"]
     tool = sum(est_s(r) for r in t_runs)
     head = (HEADER_BX if t.suffix else HEADER).format(
         patch=patch_line[1], patch_sha=patch_line[0][:16], n_runs=len(t_runs), tool_min=tool / 60,
         total_min=(tool + 12 * len(t_runs)) / 60)
-    lines = head.rstrip("\n").split("\n") + setup_lines(t)
+    lines = commands.header_lines(head) + setup_lines(t)
     for r in t_runs:
         lines += run_lines(r, t)
     lines += output_lines(t)
-    (HERE / t.commands).write_text("\n".join(lines) + "\n")
+    n = commands.write_commands(STAGE_DIR / t.commands, lines)
     for r in t_runs:
         print(f"  {r.key:28s} {r.kind:9s} {len(r.cases):3d} cases  estimate {est_s(r):4.0f} s  limit {r.limit:3d} s")
-    print(f"{t.commands}: {len(lines)} lines, {len(t_runs)} runs, tool time about {tool / 60:.1f} min")
+    print(f"{t.commands}: {n} lines, {len(t_runs)} runs, tool time about {tool / 60:.1f} min")
     return 0
 
 
@@ -460,7 +451,6 @@ PROF_RE = re.compile(r"profile-op ([A-Z_0-9+]+)\|([^|]*)\|([^|]*)\|([^|]*)\|[^|]
                      r"start \d+ mhz ([\d.]+)")
 MMCHECK_RE = re.compile(r"^mmcheck case=(\S+) hash=(\S+) nonfinite=(\d+)(?: nmse=(\S+) maxerr=(\S+))? us=(\d+)( FAILED)?",
                         re.M)
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 TEST_RE = re.compile(r"^\s+[A-Z_]+\(name=([A-Za-z0-9_x]+),[^\n]*?\):\s*(?:\S+\s+)?(OK|FAIL|not supported)", re.M)
 
 
@@ -481,31 +471,17 @@ class RunOut:
 
 def read_run(root: Path, r: Run) -> RunOut:
     """Read the gate file, the stdout and the stderr of one run. O(size of the files)."""
-    gate_p = root / f"{r.key}-gate.txt"
-    gate = gate_p.read_text(errors="replace") if gate_p.exists() else ""
-    before, bnsp, after = sweep.GATE_RE.search(gate), sweep.BEFORE_RE.search(gate), sweep.AFTER_RE.search(gate)
-    rc = re.search(r"^rc=(\d+)", gate, re.M)
-    flags: list[str] = []
-    ok = "gate: OK" in gate and rc is not None and rc.group(1) == "0"
-    if not gate:
-        flags.append("no gate file")
-    elif "gate: OK" not in gate:
-        flags.append("the gate stopped the run")
-    elif not ok:
-        flags.append(f"exit code {rc.group(1) if rc else '?'}")
-    caps = f"{before.group(3)}/{before.group(4)}" if before else "?"
-    if before and after and (before.group(3), before.group(4)) != (after.group(2), after.group(3)):
-        flags.append(f"caps {caps} -> {after.group(2)}/{after.group(3)}")
-    if after and after.group(1) not in ("", "0"):
-        flags.append(f"thermal {after.group(1)} after the run")
-    for label, m, si, ki in (("before", bnsp, 2, 3), ("after", after, 7, 8)):
+    text = logs.read_text(root / f"{r.key}-gate.txt")
+    cond = gate.read(text)
+    flags = cond.flags
+    before, after = sweep.BEFORE_RE.search(text), sweep.AFTER_RE.search(text)
+    for label, m, si, ki in (("before", before, 2, 3), ("after", after, 7, 8)):
         if m and (m.group(si) != "Awake" or m.group(ki) != "false"):
             flags.append(f"screen {m.group(si)} keyguard {m.group(ki)} {label} the run")
-    res = RunOut(r, ok, flags, caps)
-    out_p = root / f"{r.key}.out"
+    res = RunOut(r, cond.ok, flags, cond.caps)
     # test-backend-ops writes its OK and FAIL with ANSI color codes
-    res.out = ANSI_RE.sub("", out_p.read_text(errors="replace")) if out_p.exists() else ""
-    res.log = sweep.read_log(root, r.key)
+    res.out = logs.read_text(root / f"{r.key}.out", strip_ansi=True)
+    res.log = logs.read_text(root / f"{r.key}.log")
     both = res.out + "\n" + res.log
     if r.kind == "tbo-perf":
         names = list(sweep.NAME_RE.finditer(res.out))
@@ -515,7 +491,7 @@ def read_run(root: Path, r: Run) -> RunOut:
             if t and not m.group(2):
                 res.us[m.group(1)] = float(t.group(2))
         missing = [c.name for c in r.cases if c.name not in res.us]
-        if ok and missing:
+        if cond.ok and missing:
             flags.append(f"{len(missing)} cases without a result, the first {missing[0]}")
     if r.kind in ("tbo-perf", "mmcheck", "prof"):
         for m in PROF_RE.finditer(both):
@@ -539,9 +515,9 @@ def read_run(root: Path, r: Run) -> RunOut:
                 if rec.get("type_k") != "q8_0" or rec.get("flash_attn") != 1:
                     flags.append(f"llama-bench ran type_k {rec.get('type_k')} flash_attn {rec.get('flash_attn')}")
     want = "GGML_HEXAGON_MM_SOLVER=0" in r.env
-    if ok and want and "old cost model (GGML_HEXAGON_MM_SOLVER=0)" not in both:
+    if cond.ok and want and "old cost model (GGML_HEXAGON_MM_SOLVER=0)" not in both:
         flags.append("the log has no line of GGML_HEXAGON_MM_SOLVER=0")
-    if ok and "GGML_HEXAGON_MM_CHUNKS=" in r.env and "(GGML_HEXAGON_MM_CHUNKS)" not in both:
+    if cond.ok and "GGML_HEXAGON_MM_CHUNKS=" in r.env and "(GGML_HEXAGON_MM_CHUNKS)" not in both:
         flags.append("the log has no line of GGML_HEXAGON_MM_CHUNKS")
     return res
 
@@ -671,20 +647,18 @@ def op_table(outs: dict[str, RunOut]) -> list[str]:
                 if c.name in o.us:
                     lp.append(o.us[c.name])
                 ch |= o.chunks.get(c.name, set())
-            vals[model] = (statistics.median(fr) if fr else None, statistics.median(su) if su else None,
-                           statistics.median(lp) if lp else None, ch)
+            vals[model] = (tables.med(fr), tables.med(su), tables.med(lp), ch)
 
         def d(i: int) -> str:
-            a, b = vals["old"][i], vals["new"][i]
-            return f"{100 * (b / a - 1):+6.1f}%" if a and b else f"{'-':>7s}"
+            """The change of the new model against the old one for one column."""
+            return f"{tables.change(vals['new'][i], vals['old'][i]):>7s}"
 
-        def f(x) -> str:
-            return f"{x:.1f}" if x is not None else "-"
         och, nch = vals["old"][3], vals["new"][3]
         lines.append(f"  {c.name:28s} {','.join(f'{a}x{b}' for a, b in sorted(och)) or '-':>11s} {passes(och, c.n):>2s} "
                      f"{','.join(f'{a}x{b}' for a, b in sorted(nch)) or '-':>11s} {passes(nch, c.n):>2s} "
-                     f"{f(vals['old'][0]):>10s} {f(vals['new'][0]):>10s} {d(0)} {f(vals['old'][1]):>9s} "
-                     f"{f(vals['new'][1]):>9s} {d(1)} {f(vals['old'][2]):>9s} {f(vals['new'][2]):>9s} {d(2)}")
+                     f"{tables.fmt(vals['old'][0]):>10s} {tables.fmt(vals['new'][0]):>10s} {d(0)} "
+                     f"{tables.fmt(vals['old'][1]):>9s} {tables.fmt(vals['new'][1]):>9s} {d(1)} "
+                     f"{tables.fmt(vals['old'][2]):>9s} {tables.fmt(vals['new'][2]):>9s} {d(2)}")
     return lines
 
 
@@ -814,8 +788,7 @@ def split_table(outs: dict[str, RunOut]) -> list[str]:
 def table(root: Path, t: Target) -> int:
     """Print the tables of the runs of a target. The correctness stage has only the sections 0 and 1."""
     if not root.is_dir():
-        print(f"stage.py: {root} is not a directory. Pull the outputs of the stage first.", file=sys.stderr)
-        return 1
+        return cli.missing_root(root)
     outs = {r.key: read_run(root, r) for r in t.runs() if (root / f"{r.key}-gate.txt").exists()}
     parts = [conditions(outs), bitexact_table(outs)]
     if not t.suffix:
@@ -840,7 +813,7 @@ def main() -> int:
     target = TARGETS[a.only or "all"]
     if a.cmd == "files":
         return write_files(target)
-    return table(a.root or HERE / target.out, target)
+    return table(a.root or STAGE_DIR / target.out, target)
 
 
 if __name__ == "__main__":

@@ -18,22 +18,23 @@ The variants, each in the app configuration of the stage quick:
     c  GGML_HEXAGON_UNARY_FLAT=8: only SCALE (the clear of a recurrent state)
 """
 
-import argparse
 import importlib.util
-import os
 import re
 import struct
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common import cli, commands, device, logs  # noqa: E402
+
 _spec = importlib.util.spec_from_file_location("quick_stage", Path(__file__).resolve().parents[1] / "quick" / "stage.py")
 q = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(q)
 
-q.PHONE = "/data/local/tmp/qwen/unary-rows"
-q.LAPTOP_STAGE = "build/unary-rows"
-q.BOX = "grigory@10.10.20.200:airi/qwen-mobile/build/unary-rows"
-STAGE_DIR = Path(os.path.relpath(Path(__file__).resolve().parents[3] / q.LAPTOP_STAGE))
+# The stage quick writes the lines that copy the files, thus its module takes the directories of this stage
+q.PATHS = device.stage_paths("unary-rows", __file__)
+q.PHONE, q.LAPTOP_STAGE, q.BOX, q.STAGE_DIR = q.PATHS
+STAGE_DIR = q.STAGE_DIR
 q.BINS = ("gate.sh", "memprobe", "test-backend-ops", "unarycheck")
 q.LIBS = ("libggml-base.so", "libggml-cpu.so", "libggml-hexagon.so", "libggml-htp-v79.so", "libggml-opencl.so",
           "libggml.so", "libllama-common.so", "libllama.so", "libmtmd.so")
@@ -50,11 +51,11 @@ q.VARIANTS = {v.key: v for v in (
     q.Variant("c", "lib-new", "GGML_HEXAGON_UNARY_FLAT=8", "new, only SCALE gets new rows"),
 )}
 q.BLOCKS = [
-    q.Block("h", "memprobe", "--hash -p 1024 -n 16", "azbspc", 1, 90, 8388608, "",
+    q.Block("h", "memprobe", "--hash -p 1024 -n 16", "azbspc", 1, 90, device.GATE_4B_KB, "",
             "memprobe --hash, a prompt of 1024 tokens and 16 decode tokens: the logits hashes"),
-    q.Block("u", "unarycheck", "--cpu", "azb", 1, 60, 2097152, "",
+    q.Block("u", "unarycheck", "--cpu", "azb", 1, 60, device.GATE_TOOL_KB, "",
             "unarycheck --cpu: the ops of the model shapes on HTP0 against the CPU of the phone"),
-    q.Block("k", "test-backend-ops", "-o SIGMOID,SOFTPLUS,SCALE -b HTP0", "azb", 1, 100, 2097152, "",
+    q.Block("k", "test-backend-ops", "-o SIGMOID,SOFTPLUS,SCALE -b HTP0", "azb", 1, 100, device.GATE_TOOL_KB, "",
             "test-backend-ops of SIGMOID, SOFTPLUS and SCALE on HTP0 against the CPU"),
 ]
 CHECK_CASES = ("sigmoid_beta_t1024", "sigmoid_beta_t1", "softplus_gate_t1024", "softplus_gate_t1")
@@ -80,10 +81,8 @@ def run_lines(b: q.Block, rnd: int, v: q.Variant) -> list[str]:
     else:
         tool = f"{q.PHONE}/bin/{b.tool} {b.args}"
         title = f"# KERNEL: {name}, {b.text}, {v.key.upper()}: {v.text}"
-    cmd = (f"sh {q.PHONE}/bin/gate.sh {b.gate_kb} > {stem}-gate.txt && {q.BEFORE} >> {stem}-gate.txt && {pre}"
-           f"timeout -s KILL {b.limit} env {env} {tool} > {stem}.out 2> {stem}.log; "
-           f"echo \"rc=$?\" >> {stem}-gate.txt; {q.AFTER} >> {stem}-gate.txt; cat {stem}-gate.txt")
-    return ["#", title, q.THERMAL, f"{q.ADB} shell '{cmd}'", q.PGREP]
+    cmd = commands.gated_run(stem, b.gate_kb, b.limit, env, tool, stage=q.PHONE, pre=pre)
+    return commands.run_lines(title, cmd, q.PGREP)
 
 
 q.run_lines = run_lines
@@ -128,7 +127,7 @@ CHECK_RE = re.compile(r"^unarycheck case=(\S+) flat=\S+ hash=([0-9a-f]{16}) nonf
 
 def hashes(root: Path, name: str) -> list[tuple[str, str]]:
     """The HASH lines of one run as (what, hex) pairs, in order."""
-    return re.findall(r"^HASH (.*) ([0-9a-f]{16})$", q.read(root, name)[1], re.M)
+    return re.findall(r"^HASH (.*) ([0-9a-f]{16})$", logs.read_text(root / f"{name}.out"), re.M)
 
 
 def dump(root: Path, run: str, case: str) -> list[float]:
@@ -143,11 +142,10 @@ def dump(root: Path, run: str, case: str) -> list[float]:
 def table(root: Path) -> int:
     """Print the results of each block."""
     if not root.is_dir():
-        print(f"stage.py: {root} is not a directory. Pull the outputs of the stage first.", file=sys.stderr)
-        return 1
+        return cli.missing_root(root)
     for b, rnd, v in q.runs():
-        gate, _, _ = q.read(root, f"{b.key}-{rnd}-{v.key}")
-        print(f"{b.key}-{rnd}-{v.key}: {q.conditions(gate) if gate else 'no gate file'}")
+        text, _, _ = logs.read_run(root, f"{b.key}-{rnd}-{v.key}")
+        print(f"{b.key}-{rnd}-{v.key}: {q.conditions(text) if text else 'no gate file'}")
     print()
 
     h = {k: hashes(root, f"h-1-{k}") for k in "azbspc"}
@@ -160,7 +158,7 @@ def table(root: Path) -> int:
               f"the first line that differs from A: {first}")
     print()
 
-    checks = {k: {m.group(1): m for m in CHECK_RE.finditer(q.read(root, f"u-1-{k}")[1])} for k in "azb"}
+    checks = {k: {m.group(1): m for m in CHECK_RE.finditer(logs.read_text(root / f"u-1-{k}.out"))} for k in "azb"}
     cases = list(dict.fromkeys(c for k in "azb" for c in checks[k]))
     for case in cases:
         print(f"u {case}:")
@@ -181,7 +179,7 @@ def table(root: Path) -> int:
     print()
 
     for k in "azb":
-        _, out, log = q.read(root, f"k-1-{k}")
+        _, out, log = logs.read_run(root, f"k-1-{k}")
         summary = re.findall(r"(\d+)/(\d+) tests passed", out + log)
         fails = [ln.strip() for ln in (out + log).splitlines() if "FAIL" in ln]
         print(f"k {k.upper()}: tests passed {summary}, FAIL lines {len(fails)}")
@@ -192,18 +190,8 @@ def table(root: Path) -> int:
 
 def main() -> int:
     """Run the subcommand of the command line."""
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    c = sub.add_parser("commands", help="write the phone command file")
-    c.add_argument("--out", type=Path, default=STAGE_DIR / "phone-commands.txt")
-    t = sub.add_parser("table", help="print the results from the pulled logs")
-    t.add_argument("--root", type=Path, default=STAGE_DIR / "phone-out")
-    a = ap.parse_args()
-    if a.cmd == "commands":
-        n = q.write_commands(a.out)
-        print(f"{a.out}: {n} lines, {len(q.runs())} runs")
-        return 0
-    return table(a.root)
+    return cli.run(STAGE_DIR, __doc__, write=q.write_commands, count=lambda: len(q.runs()), table=table,
+                   all_flag=False, table_help="print the results from the pulled logs")
 
 
 if __name__ == "__main__":

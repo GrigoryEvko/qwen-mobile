@@ -40,41 +40,31 @@ caps after the run are the caps before it, and the thermal status after it is 0.
 changed caps or heat. The table only reads files. O(size of the logs) time.
 """
 
-import argparse
-import json
-import os
 import re
 import statistics
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-ADB = "adb -s 192.168.14.130:5555"
-PHONE = "/data/local/tmp/qwen/unary-kl"
-MODELS = "/data/local/tmp/qwen/models"
-MODEL_4B = f"{MODELS}/Qwen3.5-4B-Q8_0.gguf"
-MODEL_2B = f"{MODELS}/Qwen3.5-2B-Q8_0.gguf"
-EVAL = "/data/local/tmp/qwen/eval"
-MODEL_KB = 8388608  # the MemAvailable (KiB) that the gate requires
-LAPTOP_STAGE = "build/unary-kl"
-BOX = "grigory@10.10.20.200:airi/qwen-mobile/build/unary-kl"
-STAGE_DIR = Path(os.path.relpath(Path(__file__).resolve().parents[3] / LAPTOP_STAGE))
-APP_ENV = "GGML_HEXAGON_OPFUSION=1 GGML_HEXAGON_OPFUSION_STATE=1"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common import cli, commands, device, gate, logs, parse  # noqa: E402
+
+ADB = device.ADB
+PATHS = device.stage_paths("unary-kl", __file__)
+PHONE, LAPTOP_STAGE, BOX, STAGE_DIR = PATHS
+MODEL_4B = f"{device.MODEL_DIR}/{device.MODEL_4B}"
+MODEL_2B = f"{device.MODEL_DIR}/{device.MODEL_2B}"
+EVAL = device.EVAL_DIR
+MODEL_KB = device.GATE_4B_KB
+APP_ENV = device.APP_ENV
 BENCH_ARGS = "-dev HTP0 -ngl 99 -t 4 -fa on -b 1024 -ub 1024 -ctk q8_0 -ctv q8_0 -o jsonl"
-PROBE_ARGS = "-dev HTP0 -c 8192 -t 4 --outputs-max 5 --lazy on -ctk q8_0 -ctv q8_0"
+PROBE_ARGS = device.PROBE_ARGS
 PPL_ARGS = (f"-dev HTP0 -ngl 99 -t 4 -fa on -ctk q8_0 -ctv q8_0 -f {EVAL}/wiki.test.raw -c 512 "
             f"--kl-divergence-base {EVAL}/naive-4B-q8.kld --kl-divergence")
+# The kernel keeps 15 characters of a process name, thus llama-perplexity goes in cut to 15 characters
 TOOLS = ("llama-bench", "llama-perplexit", "memprobe")
-THERMAL = f"{ADB} shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
-PGREP = f"{ADB} shell '" + "; ".join(f"pgrep -x {t}" for t in TOOLS) + "; echo pgrep-done'"
-NSP = ('$(for z in /sys/class/thermal/thermal_zone*; do case "$(cat $z/type 2>/dev/null)" in (nsp*) '
-       'cat $z/temp 2>/dev/null;; esac; done | sort -n | tail -n 1)')
-BEFORE = f'echo "before: nsp={NSP}"'
-AFTER = ('echo "after: thermal=$(dumpsys thermalservice | grep "Thermal Status" | head -n 1 | tr -dc 0-9)'
-         ' cap0=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)'
-         ' cap7=$(cat /sys/devices/system/cpu/cpu7/cpufreq/scaling_max_freq)'
-         ' battery=$(dumpsys battery | grep "^  level:" | tr -dc 0-9)'
-         f' temp=$(dumpsys battery | grep "temperature:" | tr -dc 0-9) nsp={NSP}"')
+THERMAL = device.THERMAL
+PGREP = device.pgrep(*TOOLS)
 
 
 @dataclass(frozen=True)
@@ -134,17 +124,14 @@ def runs() -> list[tuple[Block, int, Variant]]:
 def run_lines(b: Block, rnd: int, v: Variant) -> list[str]:
     """The lines of one run: a title, the thermal line, the run and the pgrep line."""
     name = f"{b.key}-{rnd}-{v.key}"
-    stem = f"{PHONE}/out/{name}"
     lib = f"{PHONE}/{v.lib}"
     ld = lib if v.lib == "lib-base" else f"{lib}:{PHONE}/lib-base"
     # The row change does not change the DSP code, thus each run loads the DSP library of lib-base
     env = " ".join(x for x in (f"LD_LIBRARY_PATH={ld} ADSP_LIBRARY_PATH={PHONE}/lib-base", APP_ENV, v.env) if x)
-    cmd = (f"sh {PHONE}/bin/gate.sh {MODEL_KB} > {stem}-gate.txt && {BEFORE} >> {stem}-gate.txt && "
-           f"timeout -s KILL {b.limit} env {env} {PHONE}/bin/{b.tool} {b.args} > {stem}.out 2> {stem}.log; "
-           f"echo \"rc=$?\" >> {stem}-gate.txt; {AFTER} >> {stem}-gate.txt; cat {stem}-gate.txt")
+    cmd = commands.gated_run(f"{PHONE}/out/{name}", MODEL_KB, b.limit, env,
+                             f"{PHONE}/bin/{b.tool} {b.args}", stage=PHONE)
     model = "Qwen3.5-2B-Q8_0" if MODEL_2B in b.args else "Qwen3.5-4B-Q8_0"
-    return ["#", f"# REAL-MODEL {model}: {name}, {b.text}, {v.key.upper()}: {v.text}", THERMAL,
-            f"{ADB} shell '{cmd}'", PGREP]
+    return commands.run_lines(f"# REAL-MODEL {model}: {name}, {b.text}, {v.key.upper()}: {v.text}", cmd, PGREP)
 
 
 HEADER = """\
@@ -191,92 +178,33 @@ def stage_files() -> list[str]:
 def setup_lines() -> list[str]:
     """The lines that copy the stage to the phone and check its files."""
     files = stage_files()
-    lines = [
-        f"mkdir -p {LAPTOP_STAGE} && rsync -a --delete {BOX}/phone/ {LAPTOP_STAGE}/phone/",
-        f"(cd {LAPTOP_STAGE}/phone && sha256sum -c SHA256SUMS)",
-        # No "models/Qwen3.5" in these lines: the runner gates each line with that text as a model run.
-        f"{ADB} shell 'ls -l {MODELS} | grep -E \"(2B|4B)-Q8_0.gguf\"; ls -l {EVAL} | grep -E \"naive-4B-q8|wiki.test\"'",
-        f"{ADB} shell 'rm -rf {PHONE} && mkdir -p {PHONE}/bin {PHONE}/lib-base {PHONE}/lib-new {PHONE}/out'",
-    ]
-    for d in ("bin", "lib-base", "lib-new"):
-        part = [f for f in files if f.startswith(d + "/")]
-        if part:
-            lines.append(f"{ADB} push " + " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in part) + f" {PHONE}/{d}/")
-    lines += [
-        f"{ADB} push {LAPTOP_STAGE}/phone/SHA256SUMS {PHONE}/",
-        f"{ADB} shell 'cd {PHONE} && sha256sum -c SHA256SUMS | grep -c OK; echo {len(files)} files; "
-        f"chmod 755 {PHONE}/bin/*'",
-    ]
-    return lines
-
-
-def output_lines() -> list[str]:
-    """The lines that pull the outputs, copy them to the box and remove the phone directory. The phone directory goes
-    only when the pull has each of its files."""
-    return [
-        "#",
-        "# ---- The outputs ----",
-        "#",
-        THERMAL,
-        f"{ADB} shell '" + "; ".join(f"pgrep -x {t}" for t in TOOLS) + f"; ls {PHONE}/out | wc -l; du -sh {PHONE}/out'",
-        f"rm -rf {LAPTOP_STAGE}/phone-out",
-        f"{ADB} pull {PHONE}/out {LAPTOP_STAGE}/phone-out",
-        f"rsync -a --delete {LAPTOP_STAGE}/phone-out/ {BOX}/phone-out/",
-        f"test \"$(ls {LAPTOP_STAGE}/phone-out | wc -l)\" -eq "
-        f"\"$({ADB} shell 'ls {PHONE}/out | wc -l' | tr -d '\\r')\" "
-        f"&& {ADB} shell 'rm -rf {PHONE}' && echo removed {PHONE}",
-    ]
+    pushes = {d: [f"{LAPTOP_STAGE}/phone/{f}" for f in files if f.startswith(f"{d}/")]
+              for d in ("bin", "lib-base", "lib-new")}
+    # No "models/Qwen3.5" in the model line: the runner gates each line with that text as a model run.
+    return commands.setup_lines(
+        PATHS, pushes, count=len(files),
+        model_check=f"{ADB} shell 'ls -l {device.MODEL_DIR} | grep -E \"(2B|4B)-Q8_0.gguf\"; "
+                    f"ls -l {EVAL} | grep -E \"naive-4B-q8|wiki.test\"'")
 
 
 def write_commands(path: Path) -> int:
     """Write the command file and return its line count."""
-    lines = HEADER.rstrip("\n").split("\n") + setup_lines()
+    lines = commands.header_lines(HEADER) + setup_lines()
     lines += ["#", f"# ==== {len(runs())} runs ===="]
     for b, rnd, v in runs():
         lines += run_lines(b, rnd, v)
-    lines += output_lines()
-    path.write_text("\n".join(lines) + "\n")
-    return len(lines)
+    lines += commands.output_lines(PATHS, tools=TOOLS)
+    return commands.write_commands(path, lines)
 
 
 # ---- The table ----
 
-GATE_RE = re.compile(r"gate: screen=(\S+) thermal=(\d*) cap0=(\d*) cap7=(\d*) battery=(\d*)% temp=(\d*)")
-AFTER_RE = re.compile(r"after: thermal=(\d*) cap0=(\d*) cap7=(\d*)")
-KLD_RE = re.compile(r"Mean\s+KLD:\s+([\d.]+) ±\s+([\d.]+)")
-TOP_RE = re.compile(r"Same top p:\s+([\d.]+) ±\s+([\d.]+)")
-MAXKL_RE = re.compile(r"Maximum KLD:\s+([\d.]+)")
 PPL_RE = re.compile(r"Mean PPL\(Q\)\s+:\s+([\d.]+)")
-
-
-def read(root: Path, name: str) -> tuple[str, str, str]:
-    """The gate file, the stdout and the stderr of one run, or empty strings."""
-    return tuple((root / f"{name}{s}").read_text(errors="replace") if (root / f"{name}{s}").exists() else ""
-                 for s in ("-gate.txt", ".out", ".log"))
-
-
-def flags(gate: str) -> tuple[bool, list[str]]:
-    """True when the run ran with rc 0, and each condition that makes the run not comparable."""
-    before, after = GATE_RE.search(gate), AFTER_RE.search(gate)
-    rc = re.search(r"^rc=(\d+)", gate, re.M)
-    ok = "gate: OK" in gate and rc is not None and rc.group(1) == "0"
-    out = []
-    if not gate:
-        out.append("no gate file")
-    elif "gate: OK" not in gate:
-        out.append("gate stopped the run")
-    elif not ok:
-        out.append(f"rc={rc.group(1) if rc else '?'}")
-    if before and after and (before.group(3), before.group(4)) != (after.group(2), after.group(3)):
-        out.append(f"caps {before.group(3)}/{before.group(4)} -> {after.group(2)}/{after.group(3)}")
-    if after and after.group(1) not in ("", "0"):
-        out.append(f"thermal {after.group(1)}")
-    return ok, out
 
 
 def hashes(root: Path, name: str) -> list[tuple[str, str]]:
     """The HASH lines of one run as (what, hex) pairs, in order."""
-    return re.findall(r"^HASH (.*) ([0-9a-f]{16})$", read(root, name)[1], re.M)
+    return re.findall(r"^HASH (.*) ([0-9a-f]{16})$", logs.read_text(root / f"{name}.out"), re.M)
 
 
 def kl_checks(key: str, vals: dict[str, list[tuple[float, float, float, float, float]]]) -> str:
@@ -305,11 +233,11 @@ def kl_checks(key: str, vals: dict[str, list[tuple[float, float, float, float, f
 def table(root: Path, include_all: bool) -> int:
     """Print the results of each block."""
     if not root.is_dir():
-        print(f"stage.py: {root} is not a directory. Pull the outputs of the stage first.", file=sys.stderr)
-        return 1
+        return cli.missing_root(root)
     for b, rnd, v in runs():
-        ok, fl = flags(read(root, f"{b.key}-{rnd}-{v.key}")[0])
-        print(f"{b.key}-{rnd}-{v.key}: {'ok' if ok else 'NOT OK'}" + (f" [{', '.join(fl)}]" if fl else ""))
+        name = f"{b.key}-{rnd}-{v.key}"
+        c = gate.read(logs.read_text(root / f"{name}-gate.txt"))
+        print(f"{name}: {'ok' if c.ok else 'NOT OK'}" + (f" [{', '.join(c.flags)}]" if c.flags else ""))
     print()
 
     for key, model in (("h", "4B"), ("i", "2B")):
@@ -326,9 +254,10 @@ def table(root: Path, include_all: bool) -> int:
         vals: dict[str, list[tuple[float, float, float, float, float]]] = {}
         for k in block.variants:
             for rnd in range(1, block.rounds + 1):
-                _, out, log = read(root, f"{key}-{rnd}-{k}")
+                _, out, log = logs.read_run(root, f"{key}-{rnd}-{k}")
                 text = out + log
-                m, t, mx, ppl = KLD_RE.search(text), TOP_RE.search(text), MAXKL_RE.search(text), PPL_RE.search(text)
+                m, t = parse.KLD_RE.search(text), parse.TOP_RE.search(text)
+                mx, ppl = parse.MAXKL_RE.search(text), PPL_RE.search(text)
                 if m and t and mx:
                     vals.setdefault(k, []).append((float(m.group(1)), float(m.group(2)), float(mx.group(1)),
                                                    float(t.group(1)), float(t.group(2))))
@@ -343,15 +272,12 @@ def table(root: Path, include_all: bool) -> int:
     for b, rnd, v in runs():
         if b.tool != "llama-bench":
             continue
-        gate, out, _ = read(root, f"{b.key}-{rnd}-{v.key}")
-        ok, fl = flags(gate)
-        if not ok or (fl and not include_all):
+        text, out, _ = logs.read_run(root, f"{b.key}-{rnd}-{v.key}")
+        c = gate.read(text)
+        if not c.ok or (c.flags and not include_all):
             continue
-        for line in out.splitlines():
-            if line.startswith("{"):
-                rec = json.loads(line)
-                key = (rec["n_prompt"], rec["n_gen"], rec["n_depth"])
-                rates.setdefault(key, {}).setdefault(v.key, {})[rnd] = statistics.median(rec["samples_ts"])
+        for key, ts in parse.bench_values(out).items():
+            rates.setdefault(key, {}).setdefault(v.key, {})[rnd] = ts
     print("llama-bench t/s: the median of the rounds, and the median change to A over the paired rounds [range]"
           + ("" if include_all else " (--all also uses the runs with changed caps or heat)"))
     for key, per in sorted(rates.items()):
@@ -373,19 +299,8 @@ def table(root: Path, include_all: bool) -> int:
 
 def main() -> int:
     """Run the subcommand of the command line."""
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    c = sub.add_parser("commands", help="write the phone command file")
-    c.add_argument("--out", type=Path, default=STAGE_DIR / "phone-commands.txt")
-    t = sub.add_parser("table", help="print the results from the pulled logs")
-    t.add_argument("--root", type=Path, default=STAGE_DIR / "phone-out")
-    t.add_argument("--all", action="store_true", help="also use the runs with changed caps or heat")
-    a = ap.parse_args()
-    if a.cmd == "commands":
-        n = write_commands(a.out)
-        print(f"{a.out}: {n} lines, {len(runs())} runs")
-        return 0
-    return table(a.root, a.all)
+    return cli.run(STAGE_DIR, __doc__, write=write_commands, count=lambda: len(runs()), table=table,
+                   table_help="print the results from the pulled logs")
 
 
 if __name__ == "__main__":

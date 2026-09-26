@@ -73,7 +73,7 @@ def read(gate: str, *, ok_codes: tuple[int, ...] = (0,), cap_min: int | None = N
     if not gate:
         faults.append("no gate file")
     elif "gate: OK" not in gate:
-        faults.append("gate stopped the run")
+        faults.append("the gate stopped the run")
     elif rc != 0:
         faults.append(f"exit code {rc if rc is not None else '?'}")
     caps = f"{before.group(3)}/{before.group(4)}" if before else "?"

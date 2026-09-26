@@ -25,37 +25,28 @@ build/unary-tg/runner.log on the box. Without a runner log, the table uses the g
 table only reads files. O(size of the logs) time.
 """
 
-import argparse
-import json
-import os
 import re
 import statistics
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-ADB = "adb -s 192.168.14.130:5555"
-PHONE = "/data/local/tmp/qwen/unary-tg"
-MODEL = "/data/local/tmp/qwen/models/Qwen3.5-4B-Q8_0.gguf"
-MODEL_KB = 8388608  # the MemAvailable (KiB) that the gate requires
-LAPTOP_STAGE = "build/unary-tg"
-BOX = "grigory@10.10.20.200:airi/qwen-mobile/build/unary-tg"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common import cli, commands, device, gate, logs, parse  # noqa: E402
+
+ADB = device.ADB
+PATHS = device.stage_paths("unary-tg", __file__)
+PHONE, LAPTOP_STAGE, BOX, STAGE_DIR = PATHS
+MODEL = f"{device.MODEL_DIR}/{device.MODEL_4B}"
+MODEL_KB = device.GATE_4B_KB
 RUNNER_LOG = "/tmp/unary-tg.log"
-STAGE_DIR = Path(os.path.relpath(Path(__file__).resolve().parents[3] / LAPTOP_STAGE))
-APP_ENV = "GGML_HEXAGON_OPFUSION=1 GGML_HEXAGON_OPFUSION_STATE=1"
+APP_ENV = device.APP_ENV
 BENCH_ARGS = "-dev HTP0 -ngl 99 -t 4 -fa on -b 1024 -ub 1024 -ctk q8_0 -ctv q8_0 -o jsonl"
 LIMIT = 110  # seconds; one run takes about 70 s (load 6 s, 2 x tg128 at d0, 2 x (depth 4096 + tg128))
 ROUNDS = 5
-THERMAL = f"{ADB} shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
-PGREP = f"{ADB} shell 'pgrep -x llama-bench; echo pgrep-done'"
-NSP = ('$(for z in /sys/class/thermal/thermal_zone*; do case "$(cat $z/type 2>/dev/null)" in (nsp*) '
-       'cat $z/temp 2>/dev/null;; esac; done | sort -n | tail -n 1)')
-BEFORE = f'echo "before: nsp={NSP}"'
-AFTER = ('echo "after: thermal=$(dumpsys thermalservice | grep "Thermal Status" | head -n 1 | tr -dc 0-9)'
-         ' cap0=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)'
-         ' cap7=$(cat /sys/devices/system/cpu/cpu7/cpufreq/scaling_max_freq)'
-         ' battery=$(dumpsys battery | grep "^  level:" | tr -dc 0-9)'
-         f' temp=$(dumpsys battery | grep "temperature:" | tr -dc 0-9) nsp={NSP}"')
+THERMAL = device.THERMAL
+TOOLS = ("llama-bench",)
+PGREP = device.pgrep(*TOOLS)
 
 
 @dataclass(frozen=True)
@@ -83,14 +74,12 @@ def runs() -> list[tuple[int, Variant]]:
 def run_lines(rnd: int, v: Variant) -> list[str]:
     """The lines of one run: a title, the thermal line, the run and the pgrep line."""
     name = f"t-{rnd}-{v.key}"
-    stem = f"{PHONE}/out/{name}"
-    env = " ".join(x for x in (f"LD_LIBRARY_PATH={PHONE}/lib ADSP_LIBRARY_PATH={PHONE}/lib", APP_ENV, v.env) if x)
+    env = " ".join(x for x in (device.lib_env(PHONE), APP_ENV, v.env) if x)
     tool = f"{PHONE}/bin/llama-bench -m {MODEL} {BENCH_ARGS} -p 0 -n 128 -d 0,4096 -r 2"
-    cmd = (f"sh {PHONE}/bin/gate.sh {MODEL_KB} > {stem}-gate.txt && {BEFORE} >> {stem}-gate.txt && "
-           f"timeout -s KILL {LIMIT} env {env} {tool} > {stem}.out 2> {stem}.log; "
-           f"echo \"rc=$?\" >> {stem}-gate.txt; {AFTER} >> {stem}-gate.txt; cat {stem}-gate.txt")
-    return ["#", f"# REAL-MODEL Qwen3.5-4B-Q8_0: {name}, llama-bench tg128 at the depths 0 and 4096, -r 2, "
-                 f"{v.key.upper()}: {v.text}", THERMAL, f"{ADB} shell '{cmd}'", PGREP]
+    cmd = commands.gated_run(f"{PHONE}/out/{name}", MODEL_KB, LIMIT, env, tool, stage=PHONE)
+    title = (f"# REAL-MODEL Qwen3.5-4B-Q8_0: {name}, llama-bench tg128 at the depths 0 and 4096, -r 2, "
+             f"{v.key.upper()}: {v.text}")
+    return commands.run_lines(title, cmd, PGREP)
 
 
 HEADER = f"""\
@@ -127,52 +116,29 @@ def stage_files() -> list[str]:
 def setup_lines() -> list[str]:
     """The lines that copy the stage to the phone and check its files."""
     files = stage_files()
-    lines = [
-        f"mkdir -p {LAPTOP_STAGE} && rsync -a --delete {BOX}/phone/ {LAPTOP_STAGE}/phone/",
-        f"(cd {LAPTOP_STAGE}/phone && sha256sum -c SHA256SUMS)",
-        # No "models/Qwen3.5" in this line: the runner gates each line with that text as a model run.
-        f"{ADB} shell 'ls -l /data/local/tmp/qwen/models | grep 4B-Q8_0.gguf'",
-        f"{ADB} shell 'rm -rf {PHONE} && mkdir -p {PHONE}/bin {PHONE}/lib {PHONE}/out'",
-    ]
-    for d in ("bin", "lib"):
-        part = [f for f in files if f.startswith(d + "/")]
-        lines.append(f"{ADB} push " + " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in part) + f" {PHONE}/{d}/")
-    lines += [
-        f"{ADB} push {LAPTOP_STAGE}/phone/SHA256SUMS {PHONE}/",
-        f"{ADB} shell 'cd {PHONE} && sha256sum -c SHA256SUMS | grep -c OK; echo {len(files)} files; chmod 755 {PHONE}/bin/*'",
-    ]
-    return lines
+    pushes = {d: [f"{LAPTOP_STAGE}/phone/{f}" for f in files if f.startswith(f"{d}/")] for d in ("bin", "lib")}
+    # No "models/Qwen3.5" in the model line: the runner gates each line with that text as a model run.
+    return commands.setup_lines(PATHS, pushes, count=len(files),
+                                model_check=f"{ADB} shell 'ls -l {device.MODEL_DIR} | grep 4B-Q8_0.gguf'")
 
 
 def output_lines() -> list[str]:
     """The lines that pull the outputs, copy them and the runner log to the box, and remove the phone directory. The
     phone directory goes only when the pull has each of its files."""
-    return [
-        "#",
-        "# ---- The outputs ----",
-        "#",
-        THERMAL,
-        f"{ADB} shell 'pgrep -x llama-bench; ls {PHONE}/out | wc -l; du -sh {PHONE}/out'",
-        f"rm -rf {LAPTOP_STAGE}/phone-out",
-        f"{ADB} pull {PHONE}/out {LAPTOP_STAGE}/phone-out",
-        f"rsync -a --delete {LAPTOP_STAGE}/phone-out/ {BOX}/phone-out/",
-        f"test \"$(ls {LAPTOP_STAGE}/phone-out | wc -l)\" -eq "
-        f"\"$({ADB} shell 'ls {PHONE}/out | wc -l' | tr -d '\\r')\" "
-        f"&& {ADB} shell 'rm -rf {PHONE}' && echo removed {PHONE}",
+    return commands.output_lines(PATHS, tools=TOOLS, extra=[
         f"(cp {RUNNER_LOG} {LAPTOP_STAGE}/runner.log && rsync -a {LAPTOP_STAGE}/runner.log {BOX}/runner.log "
         f"&& echo copied the runner log) || echo 'no runner log {RUNNER_LOG}: copy the runner log to {BOX}/runner.log'",
-    ]
+    ])
 
 
 def write_commands(path: Path) -> int:
     """Write the command file and return its line count."""
-    lines = HEADER.rstrip("\n").split("\n") + setup_lines()
+    lines = commands.header_lines(HEADER) + setup_lines()
     lines += ["#", f"# ==== {len(runs())} runs ===="]
     for rnd, v in runs():
         lines += run_lines(rnd, v)
     lines += output_lines()
-    path.write_text("\n".join(lines) + "\n")
-    return len(lines)
+    return commands.write_commands(path, lines)
 
 
 # ---- The table ----
@@ -195,17 +161,10 @@ def runner_marks(path: Path) -> dict[str, list[str]] | None:
     return marks
 
 
-def read(root: Path, name: str) -> tuple[str, str]:
-    """The gate file and the stdout of one run, or empty strings."""
-    return tuple((root / f"{name}{s}").read_text(errors="replace") if (root / f"{name}{s}").exists() else ""
-                 for s in ("-gate.txt", ".out"))
-
-
 def table(root: Path, log: Path) -> int:
     """Print the validity of each run, the rates of each round and the decision for each depth."""
     if not root.is_dir():
-        print(f"stage.py: {root} is not a directory. Pull the outputs of the stage first.", file=sys.stderr)
-        return 1
+        return cli.missing_root(root)
     marks = runner_marks(log)
     if marks is None:
         print(f"NOTE: no runner log {log}. The table cannot see SCREEN-OFF and CAPS-CHANGED, thus it uses the gate "
@@ -213,26 +172,17 @@ def table(root: Path, log: Path) -> int:
     rates: dict[int, dict[str, dict[int, float]]] = {}
     for rnd, v in runs():
         name = f"t-{rnd}-{v.key}"
-        gate, out = read(root, name)
-        rc = re.search(r"^rc=(\d+)", gate, re.M)
-        why = []
-        if "gate: OK" not in gate:
-            why.append("gate did not pass" if gate else "no gate file")
-        elif not rc or rc.group(1) != "0":
-            why.append(f"rc={rc.group(1) if rc else 'missing'}")
+        text, out = logs.read_run(root, name, ("-gate.txt", ".out"))
+        removed = list(gate.read(text).faults)
         if marks is not None:
             if name not in marks:
-                why.append("not in the runner log")
+                removed.append("not in the runner log")
             else:
-                why += marks[name]
-        values = {}
-        for line in out.splitlines():
-            if line.startswith("{"):
-                rec = json.loads(line)
-                values[rec["n_depth"]] = statistics.median(rec["samples_ts"])
+                removed += marks[name]
+        values = {depth: ts for (_, _, depth), ts in parse.bench_values(out).items()}
         cells = " ".join(f"d{d} {values[d]:.3f}" for d in sorted(values)) or "no rate"
-        print(f"{name} {v.text:26s}: {cells}  {'VALID' if not why else 'NOT VALID: ' + ', '.join(why)}")
-        if not why:
+        print(f"{name} {v.text:26s}: {cells}  {'VALID' if not removed else 'NOT VALID: ' + ', '.join(removed)}")
+        if not removed:
             for d, ts in values.items():
                 rates.setdefault(d, {}).setdefault(v.key, {})[rnd] = ts
     print()
@@ -249,7 +199,7 @@ def table(root: Path, log: Path) -> int:
         print(f"d{d}: O median {med_o:.3f} t/s (spread {spread:.3f}: {min(o.values()):.3f} to {max(o.values()):.3f}, "
               f"{len(o)} runs), F median {med_f:.3f} t/s ({len(f)} runs), F - O {med_f - med_o:+.3f} t/s "
               f"({100 * (med_f / med_o - 1):+.2f} %)")
-        print(f"     F against O in each round with two valid runs: "
+        print("     F against O in each round with two valid runs: "
               + (", ".join(f"{x:+.2f} %" for x in ratios) if ratios else "none"))
         print(f"     {'F IS SLOWER BY MORE THAN THE SPREAD OF O: change the default to 0' if slower else 'F is inside the spread of O: the preset stays 1'}")
     return 0
@@ -257,19 +207,10 @@ def table(root: Path, log: Path) -> int:
 
 def main() -> int:
     """Run the subcommand of the command line."""
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    c = sub.add_parser("commands", help="write the phone command file")
-    c.add_argument("--out", type=Path, default=STAGE_DIR / "phone-commands.txt")
-    t = sub.add_parser("table", help="print the table from the pulled logs")
-    t.add_argument("--root", type=Path, default=STAGE_DIR / "phone-out")
-    t.add_argument("--runner-log", type=Path, default=STAGE_DIR / "runner.log")
-    a = ap.parse_args()
-    if a.cmd == "commands":
-        n = write_commands(a.out)
-        print(f"{a.out}: {n} lines, {len(runs())} runs")
-        return 0
-    return table(a.root, a.runner_log)
+    return cli.run(STAGE_DIR, __doc__, write=write_commands, count=lambda: len(runs()), table=table,
+                   all_flag=False, table_help="print the table from the pulled logs",
+                   runner_log="the log of the laptop runner, for the marks SCREEN-OFF and CAPS-CHANGED",
+                   runner_log_default=True)
 
 
 if __name__ == "__main__":

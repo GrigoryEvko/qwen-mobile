@@ -89,7 +89,8 @@ def run_lines(title: str, cmd: str, pgrep_line: str, *, adb: str = ADB,
 
 
 def setup_lines(paths: StagePaths, pushes: dict[str, Iterable[str]], *, model_check: str = "",
-                sub: str = "phone", adb: str = ADB, extra: Iterable[str] = ()) -> list[str]:
+                sub: str = "phone", adb: str = ADB, extra: Iterable[str] = (), sums: str = "SHA256SUMS",
+                count: int = 0, chmod: Iterable[str] = ("bin",)) -> list[str]:
     """The lines that copy the stage from the box to the laptop, check its files, and push them.
 
     The checksum file of the stage goes to the phone last, and `sha256sum -c` on the phone makes sure
@@ -98,26 +99,35 @@ def setup_lines(paths: StagePaths, pushes: dict[str, Iterable[str]], *, model_ch
 
     Args:
         paths: The directories of the stage
-        pushes: The directory of the phone stage for each group of files of the laptop stage
+        pushes: The directory of the phone stage for each group of files of the laptop stage. An empty
+            group gets its directory on the phone and no push line
         model_check: One line that tests the model files, or an empty text for a stage with no model
         sub: The directory of the laptop stage that holds the files
         adb: The adb command
         extra: More lines after the checksum check
+        sums: The name of the checksum file, for a stage whose targets have one file each
+        count: The file count of the stage. With a value, the last line prints it, thus the reader sees
+            that the push moved each file that the build wrote
+        chmod: The directories of the phone stage whose files become executable
     """
     stage, local = paths.phone, paths.local
     dirs = " ".join(f"{stage}/{d}" for d in list(pushes) + ["out"])
     lines = [
         f"mkdir -p {local} && rsync -a --delete {paths.box}/{sub}/ {local}/{sub}/",
-        f"(cd {local}/{sub} && sha256sum -c SHA256SUMS)",
+        f"(cd {local}/{sub} && sha256sum -c {sums})",
     ]
     if model_check:
         lines.append(model_check)
     lines.append(f"{adb} shell 'rm -rf {stage} && mkdir -p {dirs}'")
     for d, files in pushes.items():
-        lines.append(f"{adb} push {' '.join(files)} {stage}/{d}/")
+        group = " ".join(files)
+        if group:
+            lines.append(f"{adb} push {group} {stage}/{d}/")
+    tail = f"; echo {count} files; " if count else " && "
     lines += [
-        f"{adb} push {local}/{sub}/SHA256SUMS {stage}/",
-        f"{adb} shell 'cd {stage} && sha256sum -c SHA256SUMS | grep -c OK && chmod 755 {stage}/bin/*'",
+        f"{adb} push {local}/{sub}/{sums} {stage}/",
+        f"{adb} shell 'cd {stage} && sha256sum -c {sums} | grep -c OK{tail}"
+        + "chmod 755 " + " ".join(f"{stage}/{d}/*" for d in chmod) + "'",
     ]
     return lines + list(extra)
 

@@ -28,40 +28,32 @@ A run name is <block>-<round>-<variant>, for example t-2-c. Each run writes <nam
 <name>.log to the phone directory out/. The table only reads files. O(size of the logs) time.
 """
 
-import argparse
-import json
-import os
 import re
 import statistics
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-ADB = "adb -s 192.168.14.130:5555"
-PHONE = "/data/local/tmp/qwen/quick"
-MODEL = "/data/local/tmp/qwen/models/Qwen3.5-4B-Q8_0.gguf"
-LAPTOP_STAGE = "build/quick"
-BOX = "grigory@10.10.20.200:airi/qwen-mobile/build/quick"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common import cli, commands, device, gate, logs, parse  # noqa: E402
+
+ADB = device.ADB
 # The link build/quick/stage.py and the file in tools/stages/quick find the same stage directory
-STAGE_DIR = Path(os.path.relpath(Path(__file__).resolve().parents[3] / LAPTOP_STAGE))
-APP_ENV = "GGML_HEXAGON_OPFUSION=1 GGML_HEXAGON_OPFUSION_STATE=1"
+PATHS = device.stage_paths("quick", __file__)
+PHONE, LAPTOP_STAGE, BOX, STAGE_DIR = PATHS
+MODEL = f"{device.MODEL_DIR}/{device.MODEL_4B}"
+APP_ENV = device.APP_ENV
 BENCH_ARGS = "-dev HTP0 -ngl 99 -t 4 -fa on -b 1024 -ub 1024 -o jsonl -ctk q8_0 -ctv q8_0"
-PROBE_ARGS = "-dev HTP0 -c 8192 -t 4 --outputs-max 5 --lazy on -ctk q8_0 -ctv q8_0"
+PROBE_ARGS = device.PROBE_ARGS
 LIBS = ("libggml-base.so", "libggml-cpu.so", "libggml-hexagon.so", "libggml-htp-v79.so", "libggml-opencl.so",
         "libggml.so", "libllama-bench-impl.so", "libllama-common.so", "libllama.so", "libmtmd.so")
 NEW_LIBS = ("libggml-hexagon.so", "libggml-htp-v79.so")
 BINS = ("gate.sh", "llama-bench", "memprobe", "test-backend-ops")
 UNARY_OPS = "SCALE,CLAMP,LEAKY_RELU,SQR,SQRT,NEG,EXP,SIGMOID,SILU,GELU,GELU_QUICK,SOFTPLUS,TANH,ABS,LOG,RELU"
-THERMAL = f"{ADB} shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
-PGREP = f"{ADB} shell 'pgrep -x llama-bench; pgrep -x memprobe; pgrep -x test-backend-op; echo pgrep-done'"
-NSP = ('$(for z in /sys/class/thermal/thermal_zone*; do case "$(cat $z/type 2>/dev/null)" in (nsp*) '
-       'cat $z/temp 2>/dev/null;; esac; done | sort -n | tail -n 1)')
-BEFORE = f'echo "before: nsp={NSP}"'
-AFTER = ('echo "after: thermal=$(dumpsys thermalservice | grep "Thermal Status" | head -n 1 | tr -dc 0-9)'
-         ' cap0=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)'
-         ' cap7=$(cat /sys/devices/system/cpu/cpu7/cpufreq/scaling_max_freq)'
-         ' battery=$(dumpsys battery | grep "^  level:" | tr -dc 0-9)'
-         f' temp=$(dumpsys battery | grep "temperature:" | tr -dc 0-9) nsp={NSP}"')
+THERMAL = device.THERMAL
+# The kernel keeps 15 characters of a process name, thus test-backend-ops goes in cut to 15 characters
+TOOLS = ("llama-bench", "memprobe", "test-backend-op")
+PGREP = device.pgrep(*TOOLS)
 
 
 @dataclass(frozen=True)
@@ -98,19 +90,19 @@ VARIANTS = {v.key: v for v in (
     Variant("p", "lib-new", "GGML_HEXAGON_OPPOLL=1", "new, the host polls the queue"),
 )}
 BLOCKS = [
-    Block("k", "test-backend-ops", f"-o {UNARY_OPS} -b HTP0", "ab", 1, 100, 2097152, "",
+    Block("k", "test-backend-ops", f"-o {UNARY_OPS} -b HTP0", "ab", 1, 100, device.GATE_TOOL_KB, "",
           "test-backend-ops of the pointwise unary ops on HTP0 against the CPU"),
-    Block("h", "memprobe", "--hash -p 1024 -n 16", "abc", 1, 90, 8388608, "",
+    Block("h", "memprobe", "--hash -p 1024 -n 16", "abc", 1, 90, device.GATE_4B_KB, "",
           "memprobe --hash, a prompt of 1024 tokens and 16 decode tokens: the logits hashes"),
-    Block("p", "llama-bench", "-p 512 -n 0 -d 0 -r 3", "abc", 3, 60, 8388608, "",
+    Block("p", "llama-bench", "-p 512 -n 0 -d 0 -r 3", "abc", 3, 60, device.GATE_4B_KB, "",
           "llama-bench pp512 at the depth 0, 3 repetitions"),
-    Block("t", "llama-bench", "-p 0 -n 32 -d 0,4096 -r 2", "abcp", 3, 90, 8388608, "",
+    Block("t", "llama-bench", "-p 0 -n 32 -d 0,4096 -r 2", "abcp", 3, 90, device.GATE_4B_KB, "",
           "llama-bench tg32 at the depths 0 and 4096, 2 repetitions"),
-    Block("f", "memprobe", "-p 1024 -n 8", "abcl", 1, 90, 8388608, "GGML_HEXAGON_PROFILE=1",
+    Block("f", "memprobe", "-p 1024 -n 8", "abcl", 1, 90, device.GATE_4B_KB, "GGML_HEXAGON_PROFILE=1",
           "op profile, a prompt of 1024 tokens and 8 decode tokens"),
-    Block("q", "memprobe", "-p 64 -n 24", "abmcp", 1, 60, 8388608, "LLAMA_HOSTPROF=1",
+    Block("q", "memprobe", "-p 64 -n 24", "abmcp", 1, 60, device.GATE_4B_KB, "LLAMA_HOSTPROF=1",
           "host times (LLAMA_HOSTPROF), a prompt of 64 tokens and 24 decode tokens"),
-    Block("v", "llama-bench", "-p 0 -n 8 -r 1", "v", 1, 60, 8388608, "",
+    Block("v", "llama-bench", "-p 0 -n 8 -r 1", "v", 1, 60, device.GATE_4B_KB, "",
           "llama-bench tg8 with the VA limit that the backend measures"),
 ]
 
@@ -129,7 +121,6 @@ def runs() -> list[tuple[Block, int, Variant]]:
 def run_lines(b: Block, rnd: int, v: Variant) -> list[str]:
     """The lines of one run: a title, the thermal line, the run and the pgrep line."""
     name = f"{b.key}-{rnd}-{v.key}"
-    stem = f"{PHONE}/out/{name}"
     # lib-new holds only the two libraries that differ (the Hexagon backend and the DSP library)
     lib = f"{PHONE}/{v.lib}"
     ld = lib if v.lib == "lib-base" else f"{lib}:{PHONE}/lib-base"
@@ -141,10 +132,8 @@ def run_lines(b: Block, rnd: int, v: Variant) -> list[str]:
         fixed = BENCH_ARGS if b.tool == "llama-bench" else PROBE_ARGS
         tool = f"{PHONE}/bin/{b.tool} -m {MODEL} {fixed} {b.args}"
         title = f"# REAL-MODEL Qwen3.5-4B-Q8_0: {name}, {b.text}, {v.key.upper()}: {v.text}"
-    cmd = (f"sh {PHONE}/bin/gate.sh {b.gate_kb} > {stem}-gate.txt && {BEFORE} >> {stem}-gate.txt && "
-           f"timeout -s KILL {b.limit} env {env} {tool} > {stem}.out 2> {stem}.log; "
-           f"echo \"rc=$?\" >> {stem}-gate.txt; {AFTER} >> {stem}-gate.txt; cat {stem}-gate.txt")
-    return ["#", title, THERMAL, f"{ADB} shell '{cmd}'", PGREP]
+    cmd = commands.gated_run(f"{PHONE}/out/{name}", b.gate_kb, b.limit, env, tool, stage=PHONE)
+    return commands.run_lines(title, cmd, PGREP)
 
 
 HEADER = """\
@@ -197,89 +186,60 @@ HEADER = """\
 
 def setup_lines() -> list[str]:
     """The lines that copy the stage to the phone and check its files."""
-    bins = " ".join(f"{LAPTOP_STAGE}/phone/bin/{f}" for f in BINS)
-    base = " ".join(f"{LAPTOP_STAGE}/phone/lib-base/{f}" for f in LIBS)
-    new = " ".join(f"{LAPTOP_STAGE}/phone/lib-new/{f}" for f in NEW_LIBS)
-    return [
-        f"mkdir -p {LAPTOP_STAGE} && rsync -a --delete {BOX}/phone/ {LAPTOP_STAGE}/phone/",
-        f"(cd {LAPTOP_STAGE}/phone && sha256sum -c SHA256SUMS)",
-        f"{ADB} shell 'ls -l /data/local/tmp/qwen/models | grep -E \"Qwen3.5-4B-Q8_0.gguf\"'",
-        f"{ADB} shell 'rm -rf {PHONE} && mkdir -p {PHONE}/bin {PHONE}/lib-base {PHONE}/lib-new {PHONE}/out'",
-        f"{ADB} push {bins} {PHONE}/bin/",
-        f"{ADB} push {base} {PHONE}/lib-base/",
-        f"{ADB} push {new} {PHONE}/lib-new/",
-        f"{ADB} push {LAPTOP_STAGE}/phone/SHA256SUMS {PHONE}/",
-        f"{ADB} shell 'cd {PHONE} && sha256sum -c SHA256SUMS | grep -c OK && chmod 755 {PHONE}/bin/*'",
-    ]
-
-
-def output_lines() -> list[str]:
-    """The lines that pull the outputs, copy them to the box and remove the phone directory."""
-    return [
-        "#",
-        "# ---- The outputs ----",
-        "#",
-        THERMAL,
-        f"{ADB} shell 'ls {PHONE}/out | wc -l; du -sh {PHONE}/out'",
-        f"rm -rf {LAPTOP_STAGE}/phone-out",
-        f"{ADB} pull {PHONE}/out {LAPTOP_STAGE}/phone-out",
-        f"rsync -a --delete {LAPTOP_STAGE}/phone-out/ {BOX}/phone-out/",
-        f"test \"$(ls {LAPTOP_STAGE}/phone-out | wc -l)\" -eq "
-        f"\"$({ADB} shell 'ls {PHONE}/out | wc -l' | tr -d '\\r')\" "
-        f"&& {ADB} shell 'rm -rf {PHONE}' && echo removed {PHONE}",
-    ]
+    files = {
+        "bin": [f"{LAPTOP_STAGE}/phone/bin/{f}" for f in BINS],
+        "lib-base": [f"{LAPTOP_STAGE}/phone/lib-base/{f}" for f in LIBS],
+        "lib-new": [f"{LAPTOP_STAGE}/phone/lib-new/{f}" for f in NEW_LIBS],
+    }
+    # No "models/Qwen3.5" in the model line: the runner gates each line with that text as a model run.
+    return commands.setup_lines(
+        PATHS, files,
+        model_check=f"{ADB} shell 'ls -l {device.MODEL_DIR} | grep -E \"Qwen3.5-4B-Q8_0.gguf\"'")
 
 
 def write_commands(path: Path) -> int:
     """Write the command file and return its line count."""
-    lines = HEADER.rstrip("\n").split("\n") + setup_lines()
+    lines = commands.header_lines(HEADER) + setup_lines()
     lines += ["#", f"# ==== Qwen3.5-4B-Q8_0: {len(runs())} runs ===="]
     for b, rnd, v in runs():
         lines += run_lines(b, rnd, v)
-    lines += output_lines()
-    path.write_text("\n".join(lines) + "\n")
-    return len(lines)
+    lines += commands.output_lines(PATHS)
+    return commands.write_commands(path, lines)
 
 
 # ---- The results ----
 
-GATE_RE = re.compile(r"gate: screen=(\S+) thermal=(\d*) cap0=(\d*) cap7=(\d*) battery=(\d*)% temp=(\d*)")
-AFTER_RE = re.compile(r"after: thermal=(\d*) cap0=(\d*) cap7=(\d*)")
 HOSTPROF_RE = re.compile(r"hostprof: HTP0 graphs \d+ ops (\d+) hits (\d+) replays (\d+) verified \d+ batches (\d+) \| "
                          r"pack (\d+) submit (\d+) wait (\d+) .*turnaround (-?\d+) us")
 
 
-def read(root: Path, name: str) -> tuple[str, str, str]:
-    """The gate file, the stdout and the stderr of one run, or empty strings."""
-    return tuple((root / f"{name}{s}").read_text(errors="replace") if (root / f"{name}{s}").exists() else ""
-                 for s in ("-gate.txt", ".out", ".log"))
+def conditions(text: str) -> str:
+    """The exit code, the caps before the run, and each flag of one run, in one line.
 
-
-def conditions(gate: str) -> str:
-    """The exit code, the caps before and after, and the flags of one run."""
-    before, after = GATE_RE.search(gate), AFTER_RE.search(gate)
-    rc = re.search(r"^rc=(\d+)", gate, re.M)
-    flags = [] if "gate: OK" in gate else ["gate stopped the run"]
-    caps = f"{before.group(3)}/{before.group(4)}" if before else "?"
+    The stage names the caps after the run and the thermal status in its own words, thus the function
+    reads the two lines of the gate file again.
+    """
+    c = gate.read(text)
+    before, after = gate.GATE_RE.search(text), gate.AFTER_RE.search(text)
+    flags = [] if "gate: OK" in text else ["gate stopped the run"]
     if before and after and (before.group(3), before.group(4)) != (after.group(2), after.group(3)):
         flags.append(f"caps changed to {after.group(2)}/{after.group(3)}")
     if after and after.group(1) not in ("", "0"):
         flags.append(f"thermal {after.group(1)}")
-    return f"rc={rc.group(1) if rc else '?'} caps {caps}" + (" " + ", ".join(flags) if flags else "")
+    return f"rc={c.rc if c.rc is not None else '?'} caps {c.caps}" + (" " + ", ".join(flags) if flags else "")
 
 
 def table(root: Path) -> int:
     """Print the results of each block."""
     if not root.is_dir():
-        print(f"stage.py: {root} is not a directory. Pull the outputs of the stage first.", file=sys.stderr)
-        return 1
+        return cli.missing_root(root)
     for b, rnd, v in runs():
-        gate, _, _ = read(root, f"{b.key}-{rnd}-{v.key}")
-        print(f"{b.key}-{rnd}-{v.key}: {conditions(gate) if gate else 'no gate file'}")
+        text, _, _ = logs.read_run(root, f"{b.key}-{rnd}-{v.key}")
+        print(f"{b.key}-{rnd}-{v.key}: {conditions(text) if text else 'no gate file'}")
     print()
 
     for k in "ab":
-        _, out, log = read(root, f"k-1-{k}")
+        _, out, log = logs.read_run(root, f"k-1-{k}")
         summary = re.findall(r"(\d+)/(\d+) tests passed", out + log)
         fails = [ln.strip() for ln in (out + log).splitlines() if "FAIL" in ln]
         print(f"k {k.upper()}: tests passed {summary}, FAIL lines {len(fails)}")
@@ -287,7 +247,7 @@ def table(root: Path) -> int:
             print(f"    {ln[:160]}")
     print()
 
-    hashes = {k: re.findall(r"^HASH (.*)$", read(root, f"h-1-{k}")[1], re.M) for k in "abc"}
+    hashes = {k: re.findall(r"^HASH (.*)$", logs.read_text(root / f"h-1-{k}.out"), re.M) for k in "abc"}
     for k in "bc":
         same = hashes[k] == hashes["a"] and hashes["a"]
         print(f"h {k.upper()} against A: {len(hashes[k])} and {len(hashes['a'])} HASH lines, "
@@ -298,11 +258,8 @@ def table(root: Path) -> int:
     for b, rnd, v in runs():
         if b.key not in ("p", "t"):
             continue
-        for line in read(root, f"{b.key}-{rnd}-{v.key}")[1].splitlines():
-            if line.startswith("{"):
-                rec = json.loads(line)
-                key = (rec["n_prompt"], rec["n_gen"], rec["n_depth"])
-                tests.setdefault(key, {}).setdefault(v.key, {})[rnd] = statistics.median(rec["samples_ts"])
+        for key, ts in parse.bench_values(logs.read_text(root / f"{b.key}-{rnd}-{v.key}.out")).items():
+            tests.setdefault(key, {}).setdefault(v.key, {})[rnd] = ts
     for key, per in sorted(tests.items()):
         cells = []
         for k in "abcp":
@@ -322,7 +279,7 @@ def table(root: Path) -> int:
     print()
 
     for k in "abmcp":
-        rows = [m for m in HOSTPROF_RE.finditer(read(root, f"q-1-{k}")[2])]
+        rows = [m for m in HOSTPROF_RE.finditer(logs.read_text(root / f"q-1-{k}.log"))]
         dec = [m for m in rows if int(m.group(1)) < 2000][4:]
         if dec:
             med = lambda i: statistics.median(int(m.group(i)) for m in dec)  # noqa: E731
@@ -332,25 +289,15 @@ def table(root: Path) -> int:
     print()
     for k in "abcl":
         print(f"f {k.upper()}: python3 tools/prof/optable.py graphs {root}/f-1-{k}.log")
-    vm = re.findall(r"measured max vmem (\d+)", read(root, "v-1-v")[2])
+    vm = re.findall(r"measured max vmem (\d+)", logs.read_text(root / "v-1-v.log"))
     print(f"\nv: measured max vmem {vm}")
     return 0
 
 
 def main() -> int:
     """Run the subcommand of the command line."""
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    c = sub.add_parser("commands", help="write the phone command file")
-    c.add_argument("--out", type=Path, default=STAGE_DIR / "phone-commands.txt")
-    t = sub.add_parser("table", help="print the results from the pulled logs")
-    t.add_argument("--root", type=Path, default=STAGE_DIR / "phone-out")
-    a = ap.parse_args()
-    if a.cmd == "commands":
-        n = write_commands(a.out)
-        print(f"{a.out}: {n} lines, {len(runs())} runs")
-        return 0
-    return table(a.root)
+    return cli.run(STAGE_DIR, __doc__, write=write_commands, count=lambda: len(runs()), table=table,
+                   all_flag=False, table_help="print the results from the pulled logs")
 
 
 if __name__ == "__main__":

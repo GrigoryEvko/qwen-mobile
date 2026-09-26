@@ -16,21 +16,22 @@ The variants, each in the app configuration of the stage quick:
     n  b with the two switches of l and m
 """
 
-import argparse
 import importlib.util
-import os
 import re
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common import cli, device, logs  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location("quick_stage", Path(__file__).resolve().parents[1] / "quick" / "stage.py")
 q = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(q)
 
-q.PHONE = "/data/local/tmp/qwen/quick-hash"
-q.LAPTOP_STAGE = "build/quick-hash"
-q.BOX = "grigory@10.10.20.200:airi/qwen-mobile/build/quick-hash"
-STAGE_DIR = Path(os.path.relpath(Path(__file__).resolve().parents[3] / q.LAPTOP_STAGE))
+# The stage quick writes the run lines, thus its module takes the directories of this stage
+q.PATHS = device.stage_paths("quick-hash", __file__)
+q.PHONE, q.LAPTOP_STAGE, q.BOX, q.STAGE_DIR = q.PATHS
+STAGE_DIR = q.STAGE_DIR
 
 q.VARIANTS = {v.key: v for v in (
     q.Variant("a", "lib-base", "", "HEAD"),
@@ -41,11 +42,11 @@ q.VARIANTS = {v.key: v for v in (
               "new, previous eviction and replay of one batch only"),
 )}
 q.BLOCKS = [
-    q.Block("h", "memprobe", "--hash -p 1024 -n 16", "ablmn", 2, 90, 8388608, "",
+    q.Block("h", "memprobe", "--hash -p 1024 -n 16", "ablmn", 2, 90, device.GATE_4B_KB, "",
             "memprobe --hash, a prompt of 1024 tokens and 16 decode tokens: the logits hashes"),
-    q.Block("r", "memprobe", "--hash --reps 2 -p 1024 -n 4", "ab", 1, 90, 8388608, "",
+    q.Block("r", "memprobe", "--hash --reps 2 -p 1024 -n 4", "ab", 1, 90, device.GATE_4B_KB, "",
             "memprobe --hash --reps 2: the prompt again into a cleared memory, then 4 decode tokens"),
-    q.Block("v", "memprobe", "-p 64 -n 4", "ab", 1, 90, 8388608, "GGML_HEXAGON_VMEM=0",
+    q.Block("v", "memprobe", "-p 64 -n 4", "ab", 1, 90, device.GATE_4B_KB, "GGML_HEXAGON_VMEM=0",
             "memprobe with the VA limit that the backend measures (GGML_HEXAGON_VMEM=0)"),
 ]
 
@@ -85,17 +86,16 @@ q.HEADER = """\
 
 def hashes(root: Path, name: str) -> list[tuple[str, str]]:
     """The HASH lines of one run as (what, hex) pairs, in order."""
-    return re.findall(r"^HASH (.*) ([0-9a-f]{16})$", q.read(root, name)[1], re.M)
+    return re.findall(r"^HASH (.*) ([0-9a-f]{16})$", logs.read_text(root / f"{name}.out"), re.M)
 
 
 def table(root: Path) -> int:
     """Print the results of each block."""
     if not root.is_dir():
-        print(f"stage.py: {root} is not a directory. Pull the outputs of the stage first.", file=sys.stderr)
-        return 1
+        return cli.missing_root(root)
     for b, rnd, v in q.runs():
-        gate, _, _ = q.read(root, f"{b.key}-{rnd}-{v.key}")
-        print(f"{b.key}-{rnd}-{v.key}: {q.conditions(gate) if gate else 'no gate file'}")
+        text, _, _ = logs.read_run(root, f"{b.key}-{rnd}-{v.key}")
+        print(f"{b.key}-{rnd}-{v.key}: {q.conditions(text) if text else 'no gate file'}")
     print()
 
     h = {(k, r): hashes(root, f"h-{r}-{k}") for k in "ablmn" for r in (1, 2)}
@@ -119,11 +119,11 @@ def table(root: Path) -> int:
     print()
 
     for k in "ab":
-        log = q.read(root, f"v-1-{k}")[2]
+        text, _, log = logs.read_run(root, f"v-1-{k}")
         # The query of the domains fails in each run of the phone, thus its line is not news
         lines = [ln for ln in log.splitlines()
                  if re.search(r"measured max vmem|failed|error|Error", ln) and "FASTRPC_GET_DOMAINS" not in ln]
-        print(f"v {k.upper()}: {q.conditions(q.read(root, f'v-1-{k}')[0])}")
+        print(f"v {k.upper()}: {q.conditions(text)}")
         for ln in lines[:12]:
             print(f"    {ln[:200]}")
     return 0
@@ -131,18 +131,8 @@ def table(root: Path) -> int:
 
 def main() -> int:
     """Run the subcommand of the command line."""
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    c = sub.add_parser("commands", help="write the phone command file")
-    c.add_argument("--out", type=Path, default=STAGE_DIR / "phone-commands.txt")
-    t = sub.add_parser("table", help="print the results from the pulled logs")
-    t.add_argument("--root", type=Path, default=STAGE_DIR / "phone-out")
-    a = ap.parse_args()
-    if a.cmd == "commands":
-        n = q.write_commands(a.out)
-        print(f"{a.out}: {n} lines, {len(q.runs())} runs")
-        return 0
-    return table(a.root)
+    return cli.run(STAGE_DIR, __doc__, write=q.write_commands, count=lambda: len(q.runs()), table=table,
+                   all_flag=False, table_help="print the results from the pulled logs")
 
 
 if __name__ == "__main__":

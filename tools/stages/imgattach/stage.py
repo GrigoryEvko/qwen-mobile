@@ -33,47 +33,35 @@ log (--runner-log) does not mark it CAPS-CHANGED. The comparisons of the answers
 This file is tools/stages/imgattach/stage.py. The files of the stage stay in build/imgattach.
 """
 
-import argparse
 import array
 import math
-import os
 import re
-import statistics
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
-ADB = "adb -s 192.168.14.130:5555"
-PHONE = "/data/local/tmp/qwen/imgattach"
-MODEL_DIR = "/data/local/tmp/qwen/models"
-MODEL = "Qwen3.5-4B-Q8_0.gguf"
-MMPROJ = "Qwen3.5-4B-Q8_0.mmproj.gguf"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common import cli, commands, device, gate, logs, tables  # noqa: E402
+
+ADB = device.ADB
+PATHS = device.stage_paths("imgattach", __file__)
+PHONE, LAPTOP_STAGE, BOX, STAGE_DIR = PATHS
+MODEL_DIR = device.MODEL_DIR
+MODEL = device.MODEL_4B
+MMPROJ = device.MMPROJ_4B
 # The saved copy of the photo of the chat of the user. A new chat of the app deletes its photos, thus the stage pushes it.
-PHOTO_COPY = "build/imgturn/photo.jpg"
-PHOTO_SHA1 = "a2200d1a726ec0a8576b4a18dc2ef1aa4e4c797d"
 PHOTO = f"{PHONE}/in/photo.jpg"
-GATE_KB = 8388608
-LAPTOP_STAGE = "build/imgattach"
-BOX = "grigory@10.10.20.200:airi/qwen-mobile/build"
-STAGE_DIR = Path(os.path.relpath(Path(__file__).resolve().parents[3] / LAPTOP_STAGE))
+GATE_KB = device.GATE_4B_KB
 STAGE_FILES = ("bin/app_fuzz_driver", "bin/gate.sh", "lib/libggml-base.so", "lib/libggml-cpu.so",
                "lib/libggml-hexagon.so", "lib/libggml-htp-v79.so", "lib/libggml-opencl.so", "lib/libggml.so",
                "lib/libllama-common.so", "lib/libllama.so", "lib/libmtmd.so")
-ENV = (f"LD_LIBRARY_PATH={PHONE}/lib ADSP_LIBRARY_PATH={PHONE}/lib FUZZ_APP_LIBDIR={PHONE}/lib "
+ENV = (f"{device.lib_env(PHONE)} FUZZ_APP_LIBDIR={PHONE}/lib "
        f"FUZZ_APP_WORK={PHONE}/work FUZZ_APP_MODEL_DIR={PHONE}/work FUZZ_APP_DEVICE=HTP0 "
        f"FUZZ_APP_REAL_MODEL={MODEL_DIR}/{MODEL} FUZZ_APP_REAL_MMPROJ={MODEL_DIR}/{MMPROJ} FUZZ_APP_IMAGE={PHOTO} "
        f"FUZZ_APP_IMAGE_TOKENS=768 FUZZ_APP_STAGE_TOKENS=32 FUZZ_APP_STAGE_STRICT=0")
-THERMAL = f"{ADB} shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
-PGREP = f"{ADB} shell 'pgrep -x app_fuzz_driver; echo pgrep-done'"
-NSP = ('$(for z in /sys/class/thermal/thermal_zone*; do case "$(cat $z/type 2>/dev/null)" in (nsp*) '
-       'cat $z/temp 2>/dev/null;; esac; done | sort -n | tail -n 1)')
-BEFORE = f'echo "before: nsp={NSP}"'
-AFTER = ('echo "after: thermal=$(dumpsys thermalservice | grep "Thermal Status" | head -n 1 | tr -dc 0-9)'
-         ' cap0=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)'
-         ' cap7=$(cat /sys/devices/system/cpu/cpu7/cpufreq/scaling_max_freq)'
-         ' battery=$(dumpsys battery | grep "^  level:" | tr -dc 0-9)'
-         f' temp=$(dumpsys battery | grep "temperature:" | tr -dc 0-9) nsp={NSP}"')
+TOOLS = ("app_fuzz_driver",)
+PGREP = device.pgrep(*TOOLS)
 LIMIT_S = 100
 
 
@@ -102,13 +90,11 @@ def run_lines(run: Run) -> list[str]:
     stem = f"{PHONE}/out/{run.name}"
     env = (f"{ENV} FUZZ_APP_SPECULATIVE={1 if run.draft else 0} QWEN_IMAGE_TEXT_ROWS={1 if run.merged else 0} "
            f"FUZZ_APP_STAGE_DUMP={stem}-logits FUZZ_APP_STAGE_FLOWS={run.flows}")
-    cmd = (f"sh {PHONE}/bin/gate.sh {GATE_KB} > {stem}-gate.txt && {BEFORE} >> {stem}-gate.txt && "
-           f"rm -rf {PHONE}/work && mkdir -p {PHONE}/work && "
-           f"timeout -s KILL {LIMIT_S} env {env} {PHONE}/bin/app_fuzz_driver --scenario image-stage "
-           f"> {stem}.out 2> {stem}.log; echo \"rc=$?\" >> {stem}-gate.txt; {AFTER} >> {stem}-gate.txt; "
-           f"cat {stem}-gate.txt")
-    return ["#", f"# REAL-MODEL {MODEL.removesuffix('.gguf')}: {run.name}, {run.text}: {run.flows}",
-            THERMAL, f"{ADB} shell '{cmd}'", PGREP]
+    # Each flow of the scenario writes into the work directory, thus each run starts with an empty one.
+    cmd = commands.gated_run(stem, GATE_KB, LIMIT_S, env, f"{PHONE}/bin/app_fuzz_driver --scenario image-stage",
+                             stage=PHONE, pre=f"rm -rf {PHONE}/work && mkdir -p {PHONE}/work && ")
+    return commands.run_lines(f"# REAL-MODEL {MODEL.removesuffix('.gguf')}: {run.name}, {run.text}: {run.flows}",
+                              cmd, PGREP)
 
 
 HEADER = """\
@@ -148,27 +134,18 @@ HEADER = """\
 """
 
 
-def photo_lines() -> list[str]:
-    """The lines that copy the saved photo from the box, check its sha1, and push it into the stage directory."""
-    return [
-        f"mkdir -p {Path(PHOTO_COPY).parent} && rsync -a {BOX}/imgturn/photo.jpg {PHOTO_COPY}",
-        f"echo '{PHOTO_SHA1}  {PHOTO_COPY}' | sha1sum -c",
-        f"{ADB} push {PHOTO_COPY} {PHOTO}",
-        f"{ADB} shell 'ls -l {PHOTO} && sha1sum {PHOTO}'",
-    ]
-
-
 def setup_lines() -> list[str]:
-    """The lines that copy the stage files and the photo to the phone and check them."""
+    """The lines that copy the stage files and the photo to the phone and check them. The phone directory holds the
+    photo in in/ and the files of the harness in work/, thus the stage makes those two directories also."""
     bins = " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in STAGE_FILES if f.startswith("bin/"))
     libs = " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in STAGE_FILES if f.startswith("lib/"))
     return [
-        f"mkdir -p {LAPTOP_STAGE} && rsync -a --delete {BOX}/imgattach/phone/ {LAPTOP_STAGE}/phone/",
+        f"mkdir -p {LAPTOP_STAGE} && rsync -a --delete {BOX}/phone/ {LAPTOP_STAGE}/phone/",
         f"(cd {LAPTOP_STAGE}/phone && sha256sum -c SHA256SUMS)",
         # No "models/Qwen3.5" in these lines: the runner gates each line with that text as a model run.
         f"{ADB} shell 'ls -l {MODEL_DIR} | grep -E \"Qwen3.5-4B-Q8_0(-draft32k|.mmproj)?.gguf\"'",
         f"{ADB} shell 'rm -rf {PHONE} && mkdir -p {PHONE}/bin {PHONE}/lib {PHONE}/out {PHONE}/in {PHONE}/work'",
-        *photo_lines(),
+        *commands.photo_lines(device.BOX_BUILD, PHOTO),
         f"{ADB} push {bins} {PHONE}/bin/",
         f"{ADB} push {libs} {PHONE}/lib/",
         f"{ADB} push {LAPTOP_STAGE}/phone/SHA256SUMS {PHONE}/",
@@ -176,58 +153,22 @@ def setup_lines() -> list[str]:
     ]
 
 
-def output_lines() -> list[str]:
-    """The lines that pull the outputs, copy them to the box and remove the phone directory."""
-    return [
-        "#",
-        "# ---- The outputs ----",
-        "#",
-        THERMAL,
-        f"{ADB} shell 'pgrep -x app_fuzz_driver; ls {PHONE}/out | wc -l; du -sh {PHONE}/out'",
-        f"rm -rf {LAPTOP_STAGE}/phone-out",
-        f"{ADB} pull {PHONE}/out {LAPTOP_STAGE}/phone-out",
-        f"rsync -a --delete {LAPTOP_STAGE}/phone-out/ {BOX}/imgattach/phone-out/",
-        f"test \"$(ls {LAPTOP_STAGE}/phone-out | wc -l)\" -eq "
-        f"\"$({ADB} shell 'ls {PHONE}/out | wc -l' | tr -d '\\r')\" "
-        f"&& {ADB} shell 'rm -rf {PHONE}' && echo removed {PHONE}",
-    ]
-
-
 def write_commands(path: Path) -> int:
     """Write the command file and return its line count."""
-    lines = HEADER.rstrip("\n").split("\n") + setup_lines()
+    lines = commands.header_lines(HEADER) + setup_lines()
     lines += ["#", f"# ==== {MODEL.removesuffix('.gguf')}: {len(RUNS)} runs ===="]
     for run in RUNS:
         lines += run_lines(run)
-    lines += output_lines()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n")
-    return len(lines)
+    lines += commands.output_lines(PATHS, tools=TOOLS)
+    return commands.write_commands(path, lines)
 
 
 # ---- The parser of the files ----
 
-AFTER_RE = re.compile(r"after: thermal=(\d*) cap0=(\d*) cap7=(\d*)")
 STAGE_RE = re.compile(r"^STAGE flow=(\S+) ref=(\S+) first_image=(\d) stage_ms=([\d.]+) staged=(-?\d+) chat_ms=([\d.]+) "
                       r"ttft_ms=([\d.]+) tokens=(\d+) same=(\S+) dlogit=(\S+) kl=(\S+) top1=(-?\d+) lead=(\d+) "
                       r"compute0_mib=([\d.]+) compute1_mib=([\d.]+) part=(\S+) next=(\S+) stats=(.*)$")
 VISION_RE = re.compile(r"^STAGE-VISION ms=([\d.]+) ready=(\d)")
-RUNNER_TITLE_RE = re.compile(r"^# REAL-MODEL \S+: (\S+),")
-RUNNER_CAPS_RE = re.compile(r"^CAPS .*CAPS-CHANGED")
-
-
-def runner_rejects(path: Path | None) -> set[str]:
-    """The names of the runs that the runner log marks CAPS-CHANGED. O(lines of the log)."""
-    if path is None:
-        return set()
-    rejected, name = set(), None
-    for line in path.read_text(errors="replace").splitlines():
-        m = RUNNER_TITLE_RE.match(line)
-        if m:
-            name = m.group(1)
-        elif name is not None and RUNNER_CAPS_RE.match(line):
-            rejected.add(name)
-    return rejected
 
 
 @dataclass
@@ -256,18 +197,18 @@ class Flow:
 
 def read_run(root: Path, run: Run, rejected: set[str]) -> tuple[list[Flow], list[str], list[str]]:
     """The flows of one run, the reasons to remove it from the times (empty when it stays), and its vision lines."""
-    gate_path, out_path, log_path = (root / f"{run.name}{s}" for s in ("-gate.txt", ".out", ".log"))
-    gate = gate_path.read_text(errors="replace") if gate_path.exists() else ""
-    out = out_path.read_text(errors="replace") if out_path.exists() else ""
-    log = log_path.read_text(errors="replace") if log_path.exists() else ""
+    gate_text, out, log = logs.read_run(root, run.name)
+    conditions = gate.read(gate_text)
     removed = []
-    rc = re.search(r"^rc=(\d+)", gate, re.M)
-    if "gate: OK" not in gate:
-        removed.append("no gate file" if not gate else "the gate stopped the run")
-    elif rc is None or rc.group(1) != "0":
-        tail = [ln for ln in log.splitlines() if "image-stage" in ln or "FAKEJNI" in ln][-1:]
-        removed.append(f"exit code {rc.group(1) if rc else '?'}" + (f": {tail[0][:200]}" if tail else ""))
-    after = AFTER_RE.search(gate)
+    if not conditions.ok:
+        if "gate: OK" not in gate_text:
+            removed.append("no gate file" if not gate_text else "the gate stopped the run")
+        else:
+            tail = [ln for ln in log.splitlines() if "image-stage" in ln or "FAKEJNI" in ln][-1:]
+            removed.append(f"exit code {conditions.rc if conditions.rc is not None else '?'}"
+                           + (f": {tail[0][:200]}" if tail else ""))
+    # A changed cap does not remove a run here, thus the thermal status comes from the gate file itself.
+    after = gate.AFTER_RE.search(gate_text)
     if after and after.group(1) not in ("", "0"):
         removed.append(f"thermal {after.group(1)} after the run")
     if run.name in rejected:
@@ -312,17 +253,16 @@ def top(values: array.array) -> int:
     return max(range(len(values)), key=values.__getitem__)
 
 
-def med(values: list[float]) -> str:
-    """The median as text, or a dash."""
-    return f"{statistics.median(values):.0f}" if values else "-"
-
-
 def table(root: Path, runner_log: Path | None) -> int:
     """Print the checks, the answers, the times and the comparisons across runs."""
-    if not root.is_dir():
-        print(f"stage.py: {root} is not a directory. Pull the outputs of the stage first.", file=sys.stderr)
+    if runner_log is not None and not runner_log.is_file():
+        print(f"stage.py: the runner log {runner_log} does not exist.", file=sys.stderr)
         return 1
-    rejected = runner_rejects(runner_log)
+    if not root.is_dir():
+        return cli.missing_root(root)
+    # The runner reads the caps some seconds after a run, thus its CAPS-CHANGED mark catches a change that the
+    # "after:" line of the gate file does not show.
+    rejected = set(logs.runner_marks(runner_log))
     timed: list[Flow] = []
     by_run: dict[str, list[Flow]] = {}
     print("The runs:")
@@ -378,8 +318,10 @@ def table(root: Path, runner_log: Path | None) -> int:
         groups[(f.run, f.name, f.first_image)].append(f)
     for (run, name, first_image), fs in sorted(groups.items(), key=lambda kv: ([r.name for r in RUNS].index(kv[0][0]), kv[0][1])):
         print(f"  {run:3s} {name:12s} {'first' if first_image else 'later':6s} {len(fs):2d} "
-              f"{med([f.ttft_ms for f in fs]):>6s} {med([f.chat_ms for f in fs]):>6s} "
-              f"{med([f.stage_ms for f in fs if f.stage_ms > 0]):>6s} {med([f.staged for f in fs if f.staged > 0]):>6s}")
+              f"{tables.fmt(tables.med(f.ttft_ms for f in fs), 0):>6s} "
+              f"{tables.fmt(tables.med(f.chat_ms for f in fs), 0):>6s} "
+              f"{tables.fmt(tables.med(f.stage_ms for f in fs if f.stage_ms > 0), 0):>6s} "
+              f"{tables.fmt(tables.med(f.staged for f in fs if f.staged > 0), 0):>6s}")
     print()
     print("The staged part and the first item of the send after it (a flow of each kind):")
     seen = set()
@@ -399,22 +341,9 @@ def table(root: Path, runner_log: Path | None) -> int:
 
 def main() -> int:
     """Run the subcommand of the command line."""
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    c = sub.add_parser("commands", help="write the phone command file")
-    c.add_argument("--out", type=Path, default=STAGE_DIR / "phone-commands.txt")
-    t = sub.add_parser("table", help="print the tables from the pulled files")
-    t.add_argument("--root", type=Path, default=STAGE_DIR / "phone-out")
-    t.add_argument("--runner-log", type=Path, help="the log of the laptop runner: its CAPS-CHANGED runs leave the times")
-    a = ap.parse_args()
-    if a.cmd == "commands":
-        n = write_commands(a.out)
-        print(f"{a.out}: {n} lines, {len(RUNS)} runs")
-        return 0
-    if a.runner_log is not None and not a.runner_log.is_file():
-        print(f"stage.py: the runner log {a.runner_log} does not exist.", file=sys.stderr)
-        return 1
-    return table(a.root, a.runner_log)
+    return cli.run(STAGE_DIR, __doc__, write=write_commands, count=lambda: len(RUNS), table=table, all_flag=False,
+                   table_help="print the tables from the pulled files",
+                   runner_log="the log of the laptop runner: its CAPS-CHANGED runs leave the times")
 
 
 if __name__ == "__main__":

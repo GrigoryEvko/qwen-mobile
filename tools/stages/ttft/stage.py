@@ -34,49 +34,37 @@ This file is tools/stages/ttft/stage.py. The files of the stage stay in build/tt
 """
 
 import argparse
-import os
 import re
-import statistics
 import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
-ADB = "adb -s 192.168.14.130:5555"
-PHONE = "/data/local/tmp/qwen/ttft"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common import cli, commands, device, gate, logs, tables  # noqa: E402
+
+ADB = device.ADB
+PATHS = device.stage_paths("ttft", __file__)
+PHONE, LAPTOP_STAGE, BOX, STAGE_DIR = PATHS
 # The directory of the outputs below build/ttft, on the laptop and on the box.
 OUT_NAME = "phone-out"
-MODEL_DIR = "/data/local/tmp/qwen/models"
-MODEL = "Qwen3.5-4B-Q8_0.gguf"
+MODEL_DIR = device.MODEL_DIR
+MODEL = device.MODEL_4B
 DRAFT_MODEL = "Qwen3.5-4B-Q8_0-draft32k.gguf"
 # The sha256 of the draft-head file on the box (/home/grigory/airi/qwen-mobile-calib/Qwen3.5-4B-Q8_0-draft32k.gguf).
 DRAFT_SHA256 = "f6526095f501bfb70e0877da528b69741d695b6b6cc41d9deb9102c72b54063b"
-GATE_KB = 8388608
-LAPTOP_STAGE = "build/ttft"
-BOX = "grigory@10.10.20.200:airi/qwen-mobile/build/ttft"
-# The stage directory of the repository (tools/stages/ttft/stage.py is three levels below the root), relative to the
-# working directory, for the default paths of the command file and of the outputs.
-STAGE_DIR = Path(os.path.relpath(Path(__file__).resolve().parents[3] / LAPTOP_STAGE))
+GATE_KB = device.GATE_4B_KB
 # The environment of the app (init_impl in llama_jni.cpp) and the libraries of the stage.
-LIB_ENV = f"LD_LIBRARY_PATH={PHONE}/lib ADSP_LIBRARY_PATH={PHONE}/lib GGML_HEXAGON_OPFUSION=1 GGML_HEXAGON_OPFUSION_STATE=1"
+LIB_ENV = f"{device.lib_env(PHONE)} {device.APP_ENV}"
 # The context of the app (load_impl in llama_jni.cpp).
-PROBE_ARGS = "-dev HTP0 -c 8192 -t 4 --outputs-max 5 --lazy on -ctk q8_0 -ctv q8_0"
+PROBE_ARGS = device.PROBE_ARGS
 STAGE_FILES = ("bin/gate.sh", "bin/memprobe", "lib/libggml-base.so", "lib/libggml-cpu.so", "lib/libggml-hexagon.so",
                "lib/libggml-htp-v79.so", "lib/libggml-opencl.so", "lib/libggml.so", "lib/libllama-common.so",
                "lib/libllama.so", "lib/libmtmd.so")
-THERMAL = f"{ADB} shell 'dumpsys thermalservice | grep \"Thermal Status\"'"
-PGREP = f"{ADB} shell 'pgrep -x memprobe; echo pgrep-done'"
-# The highest temperature of the NPU thermal zones (type nsp*) in millidegrees, or nothing.
-NSP = ('$(for z in /sys/class/thermal/thermal_zone*; do case "$(cat $z/type 2>/dev/null)" in (nsp*) '
-       'cat $z/temp 2>/dev/null;; esac; done | sort -n | tail -n 1)')
-BEFORE = f'echo "before: nsp={NSP}"'
-AFTER = ('echo "after: thermal=$(dumpsys thermalservice | grep "Thermal Status" | head -n 1 | tr -dc 0-9)'
-         ' cap0=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)'
-         ' cap7=$(cat /sys/devices/system/cpu/cpu7/cpufreq/scaling_max_freq)'
-         ' battery=$(dumpsys battery | grep "^  level:" | tr -dc 0-9)'
-         f' temp=$(dumpsys battery | grep "temperature:" | tr -dc 0-9) nsp={NSP}"')
-# A run with a CPU cap of less than this value (kHz) before or after it stays out of the tables.
-CAP_MIN_KHZ = 3000000
+TOOLS = ("memprobe",)
+PGREP = device.pgrep(*TOOLS)
+# A log line of a failure of the DSP session, of a check, or of the cache of the stage.
+FAIL_RE = re.compile(r"follow-failed|GGML_ASSERT|dspqueue_read failed|did not copy out|cannot extend")
 
 OLD = "--render template --first-token late"
 NEW = "--render live --first-token early"
@@ -152,13 +140,14 @@ ONLY: dict[str, str] | None = None
 
 def configure(name: str, only: str) -> None:
     """Give a partial stage its own phone directory and output directory (--name), thus a later stage does not
-    replace the files of an earlier one, and keep the runs of --only."""
-    global PHONE, OUT_NAME, LIB_ENV, ONLY
+    replace the files of an earlier one, and keep the runs of --only. The laptop directory and the box directory
+    stay those of the full stage."""
+    global PATHS, PHONE, OUT_NAME, LIB_ENV, ONLY
     if name:
-        PHONE = f"/data/local/tmp/qwen/ttft-{name}"
+        PHONE = f"{PATHS.phone}-{name}"
+        PATHS = PATHS._replace(phone=PHONE)
         OUT_NAME = f"phone-out-{name}"
-        LIB_ENV = (f"LD_LIBRARY_PATH={PHONE}/lib ADSP_LIBRARY_PATH={PHONE}/lib GGML_HEXAGON_OPFUSION=1 "
-                   "GGML_HEXAGON_OPFUSION_STATE=1")
+        LIB_ENV = f"{device.lib_env(PHONE)} {device.APP_ENV}"
     if only:
         ONLY = {}
         for item in only.split(","):
@@ -185,17 +174,15 @@ def all_runs() -> list[Run]:
 def run_lines(run: Run) -> list[str]:
     """The lines of one run: a title, the thermal line, the run and the pgrep line."""
     b, v = run.block, run.variant
-    stem = f"{PHONE}/out/{run.name}"
     state = f"{PHONE}/state"
     args = " ".join(x for x in (PROBE_ARGS, b.args, v.args, f"--state-dir {state}" if b.state_dir else "") if x)
-    prep = f"rm -rf {state} && mkdir -p {state} && " if b.state_dir else ""
-    clean = f"rm -rf {state}; " if b.state_dir else ""
-    cmd = (f"sh {PHONE}/bin/gate.sh {GATE_KB} > {stem}-gate.txt && {BEFORE} >> {stem}-gate.txt && {prep}"
-           f"timeout -s KILL {b.limit} env {LIB_ENV} {PHONE}/bin/memprobe -m {MODEL_DIR}/{MODEL} {args} "
-           f"> {stem}.out 2> {stem}.log; echo \"rc=$?\" >> {stem}-gate.txt; {clean}{AFTER} >> {stem}-gate.txt; "
-           f"cat {stem}-gate.txt")
-    return ["#", f"# REAL-MODEL {MODEL.removesuffix('.gguf')}: {run.name}, {b.text}, {v.key}: {v.name}",
-            THERMAL, f"{ADB} shell '{cmd}'", PGREP]
+    cmd = commands.gated_run(f"{PHONE}/out/{run.name}", GATE_KB, b.limit, LIB_ENV,
+                             f"{PHONE}/bin/memprobe -m {MODEL_DIR}/{MODEL} {args}", stage=PHONE,
+                             pre=f"rm -rf {state} && mkdir -p {state} && " if b.state_dir else "",
+                             clean=f"rm -rf {state}; " if b.state_dir else "")
+    # The runner gates each line with "models/Qwen3.5" as a model run
+    return commands.run_lines(f"# REAL-MODEL {MODEL.removesuffix('.gguf')}: {run.name}, {b.text}, "
+                              f"{v.key}: {v.name}", cmd, PGREP)
 
 
 HEADER = """\
@@ -236,44 +223,20 @@ HEADER = """\
 
 def setup_lines() -> list[str]:
     """The lines that copy the stage to the phone and check its files and the two models."""
-    bins = " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in STAGE_FILES if f.startswith("bin/"))
-    libs = " ".join(f"{LAPTOP_STAGE}/phone/{f}" for f in STAGE_FILES if f.startswith("lib/"))
-    return [
-        f"mkdir -p {LAPTOP_STAGE} && rsync -a --delete {BOX}/phone/ {LAPTOP_STAGE}/phone/",
-        f"(cd {LAPTOP_STAGE}/phone && sha256sum -c SHA256SUMS)",
-        # No "models/Qwen3.5" in these lines: the runner gates each line with that text as a model run.
-        f"{ADB} shell 'ls -l {MODEL_DIR} | grep -E \"Qwen3.5-4B-Q8_0(-draft32k)?.gguf\"'",
-        f"{ADB} shell 'cd {MODEL_DIR} && echo \"{DRAFT_SHA256}  {DRAFT_MODEL}\" | timeout -s KILL 100 sha256sum -c'",
-        f"{ADB} shell 'rm -rf {PHONE} && mkdir -p {PHONE}/bin {PHONE}/lib {PHONE}/out'",
-        f"{ADB} push {bins} {PHONE}/bin/",
-        f"{ADB} push {libs} {PHONE}/lib/",
-        f"{ADB} push {LAPTOP_STAGE}/phone/SHA256SUMS {PHONE}/",
-        f"{ADB} shell 'cd {PHONE} && sha256sum -c SHA256SUMS | grep -c OK && chmod 755 {PHONE}/bin/*'",
-    ]
-
-
-def output_lines() -> list[str]:
-    """The lines that pull the outputs, copy them to the box and remove the phone directory. The phone directory goes
-    only when the pull has each of its files."""
-    return [
-        "#",
-        "# ---- The outputs ----",
-        "#",
-        THERMAL,
-        f"{ADB} shell 'pgrep -x memprobe; ls {PHONE}/out | wc -l; du -sh {PHONE}/out'",
-        f"rm -rf {LAPTOP_STAGE}/{OUT_NAME}",
-        f"{ADB} pull {PHONE}/out {LAPTOP_STAGE}/{OUT_NAME}",
-        f"rsync -a --delete {LAPTOP_STAGE}/{OUT_NAME}/ {BOX}/{OUT_NAME}/",
-        f"test \"$(ls {LAPTOP_STAGE}/{OUT_NAME} | wc -l)\" -eq "
-        f"\"$({ADB} shell 'ls {PHONE}/out | wc -l' | tr -d '\\r')\" "
-        f"&& {ADB} shell 'rm -rf {PHONE}' && echo removed {PHONE}",
-    ]
+    files = {d: [f"{LAPTOP_STAGE}/phone/{f}" for f in STAGE_FILES if f.startswith(f"{d}/")] for d in ("bin", "lib")}
+    # No "models/Qwen3.5" in these two lines: the runner gates each line with that text as a model run.
+    model_check = f"{ADB} shell 'ls -l {MODEL_DIR} | grep -E \"Qwen3.5-4B-Q8_0(-draft32k)?.gguf\"'"
+    draft_check = (f"{ADB} shell 'cd {MODEL_DIR} && echo \"{DRAFT_SHA256}  {DRAFT_MODEL}\" "
+                   f"| timeout -s KILL 100 sha256sum -c'")
+    lines = commands.setup_lines(PATHS, files, model_check=model_check)
+    lines.insert(lines.index(model_check) + 1, draft_check)
+    return lines
 
 
 def write_commands(path: Path) -> int:
     """Write the command file and return its line count."""
     runs = all_runs()
-    lines = HEADER.rstrip("\n").split("\n")
+    lines = commands.header_lines(HEADER)
     if ONLY is not None:
         lines += [f"# THIS FILE IS A PARTIAL STAGE: {len(runs)} runs ({', '.join(f'{b} {v}' for b, v in ONLY.items())}), "
                   f"the phone directory {PHONE}, the outputs {LAPTOP_STAGE}/{OUT_NAME}. Time: about "
@@ -282,16 +245,12 @@ def write_commands(path: Path) -> int:
     lines += ["#", f"# ==== {MODEL.removesuffix('.gguf')}: {len(runs)} runs ===="]
     for run in runs:
         lines += run_lines(run)
-    lines += output_lines()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n")
-    return len(lines)
+    lines += commands.output_lines(PATHS, tools=TOOLS, out_dir=OUT_NAME)
+    return commands.write_commands(path, lines)
 
 
 # ---- The parser of the files ----
 
-GATE_RE = re.compile(r"gate: screen=(\S+) thermal=(\d*) cap0=(\d*) cap7=(\d*) battery=(\d*)% temp=(\d*)")
-AFTER_RE = re.compile(r"after: thermal=(\d*) cap0=(\d*) cap7=(\d*) battery=(\d*) temp=(\d*)(?: nsp=(\d*))?")
 # A log line with the time stamp of --log-ts: minutes, seconds, milliseconds, microseconds, the level letter.
 TS_RE = re.compile(r"^(\d+)\.(\d{2})\.(\d{3})\.(\d{3}) [A-Z] memprobe: STAMP (\S+)(.*)$")
 KV_RE = re.compile(r"([a-z_]+)=([-\w./]+)")
@@ -323,37 +282,16 @@ def parse_stamps(log: str) -> list[tuple[float, str, dict]]:
 
 def read_result(root: Path, run: Run) -> Result:
     """Read the gate file, the stdout and the stderr of one run. O(size of the files)."""
-    gate_path, out_path, log_path = (root / f"{run.name}{s}" for s in ("-gate.txt", ".out", ".log"))
-    gate = gate_path.read_text(errors="replace") if gate_path.exists() else ""
-    before, after = GATE_RE.search(gate), AFTER_RE.search(gate)
-    rc = re.search(r"^rc=(\d+)", gate, re.M)
-    flags = []
-    ok = "gate: OK" in gate and rc is not None and rc.group(1) == "0"
-    if not gate:
-        flags.append("no gate file")
-    elif "gate: OK" not in gate:
-        flags.append("gate stopped the run")
-    elif not ok:
-        flags.append(f"exit code {rc.group(1) if rc else '?'}")
-    removed = []
-    caps = f"{before.group(3)}/{before.group(4)}" if before else "?"
-    if before and after and (before.group(3), before.group(4)) != (after.group(2), after.group(3)):
-        flags.append(f"caps {caps} -> {after.group(2)}/{after.group(3)}")
-    cap_values = [int(v) for v in ((before.group(3), before.group(4)) if before else ()) +
-                  ((after.group(2), after.group(3)) if after else ()) if v]
-    if cap_values and min(cap_values) < CAP_MIN_KHZ:
-        removed.append(f"a cap of {min(cap_values)} kHz")
-    if after and after.group(1) not in ("", "0"):
-        removed.append(f"thermal {after.group(1)} after the run")
-    out = out_path.read_text(errors="replace") if out_path.exists() else ""
-    log = log_path.read_text(errors="replace") if log_path.exists() else ""
-    if ok and "llama_kv_cache: size" in log and "K (q8_0)" not in log:
+    text, out, log = logs.read_run(root, run.name)
+    c = gate.read(text, cap_min=gate.CAP_MIN_KHZ)
+    removed = list(c.removed)
+    if c.ok and "llama_kv_cache: size" in log and "K (q8_0)" not in log:
         removed.append("the KV cache is not Q8_0")
-    if ok and re.search(r"follow-failed|GGML_ASSERT|dspqueue_read failed|did not copy out|cannot extend", log):
+    if c.ok and FAIL_RE.search(log):
         removed.append("the log has a failure line")
-    if ok and re.search(r"failed=1", out):
+    if c.ok and "failed=1" in out:
         removed.append("a turn failed")
-    return Result(run, ok, flags, removed, caps, out, parse_stamps(log))
+    return Result(run, c.ok, c.flags, removed, c.caps, out, parse_stamps(log))
 
 
 def usable(res: Result, include_all: bool) -> bool:
@@ -361,15 +299,9 @@ def usable(res: Result, include_all: bool) -> bool:
     return res.ok and (include_all or not res.removed)
 
 
-def med(values) -> float | None:
-    """The median of the values that are not None, or None."""
-    v = [x for x in values if x is not None]
-    return statistics.median(v) if v else None
-
-
-def fmt(x: float | None, digits: int = 1) -> str:
-    """A number, or a dash for None."""
-    return "-" if x is None else f"{x:.{digits}f}"
+# The cells of the tables: the median of the values of a case, and a number with 1 decimal or with more.
+med = tables.med
+fmt = tables.fmt
 
 
 def kv_lines(text: str, tag: str) -> list[dict]:
@@ -561,8 +493,7 @@ def draft_ops_table(results: dict[str, Result]) -> list[str]:
 def table(root: Path, include_all: bool) -> int:
     """Print the tables."""
     if not root.is_dir():
-        print(f"stage.py: {root} is not a directory. Pull the outputs of the stage first.", file=sys.stderr)
-        return 1
+        return cli.missing_root(root)
     results = {r.name: read_result(root, r) for r in all_runs() if (root / f"{r.name}-gate.txt").exists()}
     for part in (checks(results), turn_table(results, include_all), first_message_table(results, include_all),
                  draft_ops_table(results)):
