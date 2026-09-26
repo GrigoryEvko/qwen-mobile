@@ -336,6 +336,43 @@ fuzz_wait_for_slot() {
     done
 }
 
+# The background jobs of one mode: the process ID and the name of each job.
+FUZZ_JOB_PIDS=()
+FUZZ_JOB_NAMES=()
+
+# Start one job of a mode in the background when a slot is free. The job
+# inherits the standard output of the call, thus a redirection of the call
+# applies to the job.
+# Arguments: the maximum number of jobs, the name of the job, then the command.
+fuzz_start_job() {
+    local max=$1 name=$2
+    shift 2
+    fuzz_wait_for_slot "$max"
+    "$@" &
+    FUZZ_JOB_PIDS+=("$!")
+    FUZZ_JOB_NAMES+=("$name")
+}
+
+# Wait for each job that fuzz_start_job started, then forget the jobs. A job
+# gives the code 0 when it ran its target, also with a finding: the result line
+# holds the finding. A job with another code stopped at an error of the script
+# (a failed build step, an unset variable) before it wrote its result line.
+# Without this check the mode ends with the code 0 and the target has no result.
+# Output: one line for each job that stopped with an error.
+# Return status: 1 if a job stopped with an error.
+fuzz_wait_jobs() {
+    local i status=0
+    for i in "${!FUZZ_JOB_PIDS[@]}"; do
+        if ! wait "${FUZZ_JOB_PIDS[$i]}"; then
+            echo "run.sh: the job ${FUZZ_JOB_NAMES[$i]} stopped with an error, thus it has no result line"
+            status=1
+        fi
+    done
+    FUZZ_JOB_PIDS=()
+    FUZZ_JOB_NAMES=()
+    return $status
+}
+
 # Print the sanitizer runtime library that a phone build needs next to its
 # executables, or nothing. The none and ubsan builds link the UBSan runtime
 # statically (-static-libsan, refer to the vptr text in the CMakeLists.txt of

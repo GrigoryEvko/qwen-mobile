@@ -459,15 +459,14 @@ run_fuzz() {
     [[ ${#groups[@]} -gt 0 ]] || read -r -a groups <<< "$ALL_GROUPS"
     build_oracle
     build_config "$profile" "$config"
-    local g
+    local g status=0
     for g in "${groups[@]}"; do
-        while [[ $(jobs -rp | wc -l) -ge $jobs ]]; do
-            wait -n || true
-        done
-        fuzz_group "$profile" "$config" "$g" "$budget" &
+        fuzz_start_job "$jobs" "$g" fuzz_group "$profile" "$config" "$g" "$budget"
     done
-    wait
+    # A job that stopped with an error has no result line: the run fails.
+    fuzz_wait_jobs || status=1
     summary "$profile" "$config"
+    return $status
 }
 
 # Print the merged statistics of the fuzz runs of one build.
@@ -876,7 +875,7 @@ suite() {
         if [[ $mode == test ]]; then
             run_test "$p" "$config" || rc=1
         else
-            run_fuzz "$p" "$config" "$budget" "$jobs" "${groups[@]}"
+            run_fuzz "$p" "$config" "$budget" "$jobs" "${groups[@]}" || rc=1
         fi
     done
     return $rc

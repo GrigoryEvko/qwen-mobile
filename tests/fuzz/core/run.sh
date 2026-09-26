@@ -333,7 +333,8 @@ test_one() {
 }
 
 # Run the mode $1 (test or fuzz) with the profile $2 and the configuration $3 on the targets that
-# follow, JOBS at a time. Returns 1 when the test mode has a finding.
+# follow, JOBS at a time. Returns 1 when the test mode has a finding, and when a job stops with an
+# error before its result line.
 run_mode() {
     local mode=$1 profile=$2 san=$3
     shift 3
@@ -348,19 +349,14 @@ run_mode() {
     dir=$(tree_dir "$profile" "$san")
     local summary="$dir/$mode-summary.txt"
     : > "$summary"
-    local fz
+    local fz jobs_ok=1
     for fz in $targets; do
-        fuzz_wait_for_slot "$JOBS"
-        if [[ $mode == fuzz ]]; then
-            fuzz_one "$profile" "$san" "$fz" >> "$summary" &
-        else
-            test_one "$profile" "$san" "$fz" >> "$summary" &
-        fi
+        fuzz_start_job "$JOBS" "$fz" "${mode}_one" "$profile" "$san" "$fz" >> "$summary"
     done
-    wait
+    fuzz_wait_jobs >> "$summary" || jobs_ok=0
     cat "$summary"
     echo "run.sh: the JSON lines are in $dir/results.jsonl"
-    if [[ $mode == test ]] && grep -qE ', [1-9][0-9]* findings' "$summary"; then
+    if [[ $jobs_ok == 0 ]] || { [[ $mode == test ]] && grep -qE ', [1-9][0-9]* findings' "$summary"; }; then
         return 1
     fi
     return 0

@@ -383,12 +383,10 @@ mode_fuzz() {
     results="$(bdir "$san")/results.jsonl"
     [[ -f "$results" ]] && lines=$(wc -l < "$results")
     for target in $TARGETS; do
-        fuzz_one "$target" "$san" "$budget" &
-        while (($(jobs -rp | wc -l) >= jobs)); do
-            wait -n || true
-        done
+        fuzz_start_job "$jobs" "$target" fuzz_one "$target" "$san" "$budget"
     done
-    wait
+    # A job that stopped with an error has no result line: the run fails.
+    fuzz_wait_jobs || return 1
     # The exit code is not 0 when one target of this run reported a defect.
     found=$(tail -n +$((lines + 1)) "$results" | jq -s 'map(.findings) | add // 0')
     ((found == 0))

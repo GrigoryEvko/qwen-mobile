@@ -198,20 +198,25 @@ fuzz_one() {
     local prof=$1 cfg=$2 t=$3 dir
     dir=$(x86_dir "$prof" "$cfg")
     local out="$dir/runs/$t"
-    mkdir -p "$out/corpus" "$out/artifacts" "$HERE/corpus/$t"
+    mkdir -p "$out/corpus" "$out/artifacts"
     local log="$out/log.txt"
     : > "$log"
     # A file of the artifacts directory that is not newer than this mark comes from an earlier
     # run, thus it is not a finding of this run.
     local mark="$out/.fuzz-start"
     touch "$mark"
-    local -a envs
+    local -a envs seeds=() d
     mapfile -t envs < <(run_env "$cfg" 1)
     envs+=("FUZZ_ARTIFACT_DIR=$out/artifacts")
+    # The seeds: the seed corpus and the regression inputs of the target, as the test mode reads
+    # them. libFuzzer writes new inputs only to the first directory, the corpus of the build.
+    for d in "$HERE/corpus/$t" "$HERE/regress/$t"; do
+        [[ -d $d ]] && seeds+=("$d")
+    done
     # One start of libFuzzer with the seconds of $1 that are left. The outer kill of rule L9 stops a
     # hang that libFuzzer cannot stop (a TSan report can deadlock in the death callback).
     hexhost_fuzz_start() {
-        timeout -s KILL $(( $1 + 180 )) env "${envs[@]}" nice -n 10 "$dir/fuzz_$t" "$out/corpus" "$HERE/corpus/$t" \
+        timeout -s KILL $(( $1 + 180 )) env "${envs[@]}" nice -n 10 "$dir/fuzz_$t" "$out/corpus" "${seeds[@]}" \
             -max_total_time="$1" -rss_limit_mb=4096 -malloc_limit_mb=4096 -timeout=60 -max_len=4096 \
             -artifact_prefix="$out/artifacts/" -print_final_stats=1 >> "$log" 2>&1
     }
@@ -272,7 +277,7 @@ cancel_one() {
     rm -rf "$out"
     mkdir -p "$out/artifacts"
     : > "$log"
-    local -a envs seeds
+    local -a envs seeds=()
     mapfile -t envs < <(run_env "$cfg" 0)
     envs+=("FUZZ_ARTIFACT_DIR=$out/artifacts" "HEXHOST_EINTR=cancel:2")
     [[ -d "$HERE/corpus/graph" ]] && mapfile -t -O 0 seeds < <(fd -t f . "$HERE/corpus/graph" | sort)
@@ -308,12 +313,13 @@ cancel_one() {
 }
 
 # Run the mode $1 (test or fuzz) with the config $2 on the targets that follow, JOBS at a time,
-# for each profile. Gives the code 1 in the test mode when a target has a finding.
+# for each profile. Gives the code 1 in the test mode when a target has a finding, and in each
+# mode when a job stops with an error before its result line.
 run_mode() {
     local mode=$1 cfg=$2
     shift 2
     fuzz_check_config "$cfg" host
-    local targets="${*:-$ALL_TARGETS}" t prof dir summary bad=0
+    local targets="${*:-$ALL_TARGETS}" t prof dir summary bad=0 job_error=0
     for t in $targets; do
         [[ " $ALL_TARGETS " == *" $t "* ]] || fuzz_die "no target $t. The targets: $ALL_TARGETS"
     done
@@ -323,14 +329,9 @@ run_mode() {
         summary="$dir/$mode-summary.txt"
         : > "$summary"
         for t in $targets; do
-            fuzz_wait_for_slot "$JOBS"
-            if [[ $mode == fuzz ]]; then
-                fuzz_one "$prof" "$cfg" "$t" >> "$summary" &
-            else
-                test_one "$prof" "$cfg" "$t" >> "$summary" &
-            fi
+            fuzz_start_job "$JOBS" "$t" "${mode}_one" "$prof" "$cfg" "$t" >> "$summary"
         done
-        wait
+        fuzz_wait_jobs >> "$summary" || job_error=1
         if [[ $mode == test && " $targets " == *" graph "* ]]; then
             cancel_one "$prof" "$cfg" >> "$summary"
         fi
@@ -340,6 +341,7 @@ run_mode() {
             bad=1
         fi
     done
+    [[ $job_error == 1 ]] && return 1
     [[ $mode == test && $bad == 1 ]] && return 1
     return 0
 }
