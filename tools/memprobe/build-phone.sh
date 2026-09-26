@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 # Build the phone stage of the memory measurements from a private llama.cpp tree (the pinned
 # llama.cpp with the series) with the preset and the flags of scripts/build-native.sh, plus the
-# tools memprobe and kvkl. Output: build/memory/phone-<name>/ with SHA256SUMS.
+# tools memprobe, kvkl and outcheck. Output: build/memory/phone-<name>/ with SHA256SUMS.
 #
 #   TREE=build/memory/src BDIR=build/memory/android tools/memprobe/build-phone.sh <name>
 #
 # TREE is the private llama.cpp tree and BDIR its Android build directory. Make the tree of HEAD
-# with tests/sanitizers/llama-copy.sh TREE. The NDK clang++ compiles tools/memprobe/memprobe.cpp
-# with the sources of the app that it calls (state_cache.cpp, cache_io.cpp, spec_policy.cpp,
-# chat_prompt.cpp, engine_tasks.cpp),
-# and tools/memprobe/kvkl.cpp. The stage also holds the gate tools/phone/gate.sh.
+# with tests/sanitizers/llama-copy.sh TREE. The NDK clang++ compiles three tools:
+#   memprobe   tools/memprobe/memprobe.cpp, with the sources of the app that it calls
+#              (state_cache.cpp, cache_io.cpp, spec_policy.cpp, chat_prompt.cpp, engine_tasks.cpp)
+#   kvkl       tools/memprobe/kvkl.cpp
+#   outcheck   tools/memprobe/outcheck.cpp, which needs -I TREE/src for llama-ext.h
+# The stage also holds the gate tools/phone/gate.sh.
+#
+# The container runs under build/.container.lock, as each container build of the repository does.
+# The lock covers the container only, thus the copy of the stage files runs without it.
 set -euo pipefail
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../scripts/lib.sh"
 name=${1:?usage: build-phone.sh <name>}
@@ -21,8 +26,10 @@ out=build/memory/phone-$name
 app_src=android/app/src/main/cpp
 [[ -f $tree/CMakeLists.txt ]] || die "$tree is not a llama.cpp tree. Make it with tests/sanitizers/llama-copy.sh $tree"
 cp -f android/snapdragon/CMakeUserPresets.json "$tree/CMakeUserPresets.json"
-mkdir -p "$bdir"
-container_run "$SNAPDRAGON_IMAGE" bash -euo pipefail -c "
+mkdir -p "$bdir" build
+(
+    flock 9
+    container_run "$SNAPDRAGON_IMAGE" bash -euo pipefail -c "
 repro='-ffile-prefix-map=/workspace=. -fdebug-prefix-map=/workspace=. -Werror=date-time'
 flags=\$(python3 -c 'import json, sys; p = [x for x in json.load(open(sys.argv[1]))[\"configurePresets\"] if x[\"name\"] == \"arm64-android-snapdragon\"][0]; print(p[\"cacheVariables\"][\"CMAKE_C_FLAGS\"])' $tree/CMakeUserPresets.json)
 export CFLAGS=\"\$repro\" CXXFLAGS=\"\$repro\"
@@ -39,7 +46,12 @@ cxx=\$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-a
 \$cxx -O2 -std=c++17 -I$tree/include -I$tree/common -I$tree/ggml/include -I$tree/vendor \
     tools/memprobe/kvkl.cpp -o $bdir/bin/kvkl -L$bdir/bin -lllama-common -lllama -lggml -lggml-base \
     -Wl,-rpath,'\$ORIGIN/../lib'
-" > build/memory/phone-build-$name.log 2>&1 || die "the build failed, refer to build/memory/phone-build-$name.log"
+\$cxx -O2 -std=c++17 -I$tree/include -I$tree/common -I$tree/src -I$tree/ggml/include -I$tree/vendor \
+    tools/memprobe/outcheck.cpp -o $bdir/bin/outcheck -L$bdir/bin -lllama-common -lllama -lggml -lggml-base \
+    -Wl,-rpath,'\$ORIGIN/../lib'
+"
+) 9> build/.container.lock > build/memory/phone-build-$name.log 2>&1 \
+    || die "the build failed, refer to build/memory/phone-build-$name.log"
 rm -rf "$out"
 mkdir -p "$out/bin" "$out/lib"
 for lib in $LLAMA_LIBS; do
@@ -51,7 +63,7 @@ for tool in llama-bench llama-completion llama-perplexity; do
     impl="$bdir/bin/lib$tool-impl.so"
     [[ -f $impl ]] && cp -f "$impl" "$out/lib/"
 done
-cp -f "$bdir/bin/memprobe" "$bdir/bin/kvkl" "$out/bin/"
+cp -f "$bdir/bin/memprobe" "$bdir/bin/kvkl" "$bdir/bin/outcheck" "$out/bin/"
 cp -f tools/phone/gate.sh "$out/bin/"
 (cd "$out" && sha256sum bin/* lib/* > SHA256SUMS)
 cat "$out/SHA256SUMS"

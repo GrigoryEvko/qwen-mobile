@@ -19,8 +19,9 @@
  * into a context of 4096 (llama_state_seq_get_data, a new context, llama_state_seq_set_data),
  * as a context that grows with the conversation does. Without --spec only.
  *
- * Build: as kvkl in tools/memprobe/build-phone.sh, with -I TREE/src for llama-ext.h. The link
- * takes -lllama-common -lllama -lggml -lggml-base.
+ * Build: tools/memprobe/build-phone.sh, which puts the program in the stage beside memprobe and
+ * kvkl. The compile takes -I TREE/src for llama-ext.h, and the link takes -lllama-common -lllama
+ * -lggml -lggml-base.
  *
  * It is a measurement tool, not part of the app.
  */
@@ -29,6 +30,8 @@
 #include "llama-ext.h"
 #include "llama.h"
 #include "speculative.h"
+
+#include "../common/fnv.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -40,14 +43,12 @@
 
 namespace {
 
-/** FNV-1a 64 over n bytes, continued from h. O(n). */
-uint64_t fnv(const void * p, size_t n, uint64_t h = 1469598103934665603ull) {
-    const auto * b = static_cast<const uint8_t *>(p);
-    for (size_t i = 0; i < n; ++i) {
-        h ^= b[i];
-        h *= 1099511628211ull;
-    }
-    return h;
+/**
+ * The hash of n bytes, continued from h. The basis is the short one, as in memprobe and kvkl, thus
+ * a value of this tool is comparable with a value of this tool only. O(n).
+ */
+uint64_t hash_bytes(const void * p, size_t n, uint64_t h = fnv::kBasisShort) {
+    return fnv::hash64(p, n, h);
 }
 
 /** The index of the largest logit. O(n_vocab). */
@@ -143,9 +144,22 @@ int main(int argc, char ** argv) {
     }
 
     std::ifstream f(text_path);
+    if (!f) {
+        fprintf(stderr, "outcheck: cannot read the text %s\n", text_path.c_str());
+        return 1;
+    }
     std::stringstream ss;
     ss << f.rdbuf();
-    std::vector<llama_token> prompt = common_tokenize(vocab, ss.str().substr(0, 200000), true, false);
+    // A prefix of the text is enough: about 4 characters for each token.
+    std::vector<llama_token> prompt =
+        common_tokenize(vocab, ss.str().substr(0, (size_t) n_prompt * 8 + 1024), true, false);
+    // A shorter text would grow the vector with the token id 0, thus the hashes would be stable and
+    // they would say nothing about the model.
+    if ((int) prompt.size() < n_prompt) {
+        fprintf(stderr, "outcheck: %s gives %zu tokens and -p asks for %d. Give a longer text, or a smaller -p.\n",
+                text_path.c_str(), prompt.size(), n_prompt);
+        return 1;
+    }
     prompt.resize(n_prompt);
 
     // 1. The prompt, as decode_text with logits_last.
@@ -161,12 +175,12 @@ int main(int argc, char ** argv) {
         if (rc != 0) { printf("RC prefill %d\n", rc); return 1; }
         if (spec) {
             const float * nx = llama_get_embeddings_nextn(ctx);
-            printf("HASH prefill-nextn %d %016llx\n", i, (unsigned long long) fnv(nx, (size_t) count * n_embd * sizeof(float)));
+            printf("HASH prefill-nextn %d %016llx\n", i, (unsigned long long) hash_bytes(nx, (size_t) count * n_embd * sizeof(float)));
             if (!common_speculative_process(sp, b)) { printf("RC process-prefill failed\n"); return 1; }
         }
     }
     const float * lg = llama_get_logits_ith(ctx, -1);
-    printf("HASH prefill-logits %016llx\n", (unsigned long long) fnv(lg, (size_t) n_vocab * sizeof(float)));
+    printf("HASH prefill-logits %016llx\n", (unsigned long long) hash_bytes(lg, (size_t) n_vocab * sizeof(float)));
 
     int n_past = n_prompt;
     llama_token id_last = argmax(lg, n_vocab);
@@ -198,7 +212,7 @@ int main(int argc, char ** argv) {
             if (rc != 0) { printf("RC decode %d\n", rc); return 1; }
             n_past += 1;
             lg = llama_get_logits_ith(ctx, -1);
-            printf("HASH step %d token=%d logits=%016llx\n", step, id_last, (unsigned long long) fnv(lg, (size_t) n_vocab * sizeof(float)));
+            printf("HASH step %d token=%d logits=%016llx\n", step, id_last, (unsigned long long) hash_bytes(lg, (size_t) n_vocab * sizeof(float)));
             id_last = argmax(lg, n_vocab);
             continue;
         }
@@ -214,10 +228,10 @@ int main(int argc, char ** argv) {
         }
         const int rc = llama_decode(ctx, b);
         if (rc != 0) { printf("RC verify %d\n", rc); return 1; }
-        uint64_t h = fnv(nullptr, 0);
-        for (int i = 0; i < b.n_tokens; ++i) h = fnv(llama_get_logits_ith(ctx, i), (size_t) n_vocab * sizeof(float), h);
+        uint64_t h = hash_bytes(nullptr, 0);
+        for (int i = 0; i < b.n_tokens; ++i) h = hash_bytes(llama_get_logits_ith(ctx, i), (size_t) n_vocab * sizeof(float), h);
         const float * nx = llama_get_embeddings_nextn(ctx);
-        const uint64_t hn = fnv(nx, (size_t) b.n_tokens * n_embd * sizeof(float));
+        const uint64_t hn = hash_bytes(nx, (size_t) b.n_tokens * n_embd * sizeof(float));
         const bool followed = common_speculative_process(sp, b);
         std::vector<llama_token> out;
         size_t i = 0;
@@ -253,8 +267,8 @@ int main(int argc, char ** argv) {
         const int rc = llama_decode(ctx, b);
         printf("RC six %d\n", rc);
         if (rc == 0) {
-            uint64_t h = fnv(nullptr, 0);
-            for (int i = 0; i < 6; ++i) h = fnv(llama_get_logits_ith(ctx, i), (size_t) n_vocab * sizeof(float), h);
+            uint64_t h = hash_bytes(nullptr, 0);
+            for (int i = 0; i < 6; ++i) h = hash_bytes(llama_get_logits_ith(ctx, i), (size_t) n_vocab * sizeof(float), h);
             printf("HASH six %016llx\n", (unsigned long long) h);
         }
     }
