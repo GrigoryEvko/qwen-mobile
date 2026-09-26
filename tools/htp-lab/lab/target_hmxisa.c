@@ -39,6 +39,7 @@
 #include <string.h>
 
 #include "hmx-utils.h"
+#include "hmx-i8.h"  // the int8 macros of the census, with the reason that the backend does not hold them
 
 #define TILE_BYTES    2048u
 #define I8_ACT_BYTES  2048u  // one u8 activation tile: 64 rows x 32 channels
