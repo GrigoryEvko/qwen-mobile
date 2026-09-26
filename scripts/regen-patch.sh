@@ -10,20 +10,69 @@
 # target from the live submodule and takes the difference.
 #
 # For a patch that patches/series already names, the script keeps the header
-# of the old file, which is everything before the first `diff --git`, and it
-# takes the file list from the old body. For a new patch, name the files on
-# the command line, and add the patch to patches/series yourself. A new patch
-# goes on top of the whole series.
+# of the old file, which is everything before the first line of the diff body,
+# and it takes the file list from the old body. For a new patch, name the files
+# on the command line, and add the patch to patches/series yourself. A new
+# patch goes on top of the whole series.
 #
-# Two traps that this script avoids:
+# THE TARGET MUST BE THE LAST PATCH THAT TOUCHES ITS FILES. The script takes
+# the files from the live submodule, which holds the whole series. Thus a target
+# with a later patch on one of its files absorbs the change of that later patch,
+# and the rebuilt patch is wrong. The script finds each such patch and stops.
+# ggml/src/ggml-hexagon/ggml-hexagon.cpp has 39 patches and
+# tests/test-backend-ops.cpp has 17, thus this condition is the usual one.
+#
+# Environment:
+#   REGEN_ALLOW_LATER=1   Rebuild the patch although a later patch of the series
+#                         touches one of its files. Use it only when you give the
+#                         file list on the command line and no later patch
+#                         touches those files. The applied tree of the series is
+#                         the proof: run scripts/check-patches.sh after the
+#                         rebuild.
+#
+# Three traps that this script avoids:
 #   - `git apply --include` reports success for a patch that touches none of
 #     the selected files, which would give a base with patches missing. Each
 #     patch applies in full and the script stops when one fails.
 #   - A diff written inside the scratch repository becomes part of the next
 #     `git add`. The script writes to a temporary file outside the scratch.
+#   - A patch body does not always start with `diff --git`. 20 patches of the
+#     series start with `--- a/<file>`, thus a cut at `diff --git` keeps the
+#     whole body as the header. The header stops at the first line of the body.
 
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+# Print the header of a patch: each line before the first line of the diff body.
+patch_header() {
+    local line
+    while IFS= read -r line; do
+        case "$line" in
+            'diff --git '*|'diff -urN '*|'--- '*) return 0 ;;
+        esac
+        printf '%s\n' "$line"
+    done < "$1"
+}
+
+# Print the files that a patch touches, one for each line, without the leading
+# path component that `git apply -p1` removes. A file header is a line that
+# starts with "--- " and a line that starts with "+++ " after it. A content line
+# of the body can start with the same characters, thus the pair is the test.
+patch_file_list() {
+    local -a lines
+    local i src dst
+    mapfile -t lines < "$1"
+    for ((i = 0; i < ${#lines[@]} - 1; i++)); do
+        [[ "${lines[i]}" == '--- '* && "${lines[i + 1]}" == '+++ '* ]] || continue
+        src="${lines[i]#--- }"
+        src="${src%%$'\t'*}"
+        dst="${lines[i + 1]#+++ }"
+        dst="${dst%%$'\t'*}"
+        [[ "$dst" == /dev/null ]] && dst="$src"
+        [[ "$dst" == /dev/null ]] && continue
+        printf '%s\n' "${dst#*/}"
+    done | sort -u
+}
 
 target="${1:-}"
 [[ -n "$target" ]] || die "usage: scripts/regen-patch.sh patches/<group>/<name>.patch [file ...]"
@@ -34,25 +83,52 @@ cd "$REPO_ROOT"
 [[ "$target" == patches/* ]] || die "the target must be below patches/: $target"
 rel="${target#patches/}"
 
-# The patches that come before the target. A target that the series does not
-# name yet goes on top of all of them.
+# The patches that come before the target, and the patches after it. A target
+# that the series does not name yet goes on top of all of them.
 before=()
+after=()
 found=0
 while IFS= read -r line; do
     [[ -z "$line" || "$line" == \#* ]] && continue
-    if [[ "$line" == "$rel" ]]; then found=1; break; fi
-    before+=("$line")
+    if [[ "$line" == "$rel" ]]; then found=1; continue; fi
+    if [[ $found -eq 0 ]]; then before+=("$line"); else after+=("$line"); fi
 done < patches/series
 
 header=""
 if [[ -f "$target" ]]; then
-    header=$(sed '/^diff --git /,$d' "$target")
+    header=$(patch_header "$target")
     if [[ ${#files[@]} -eq 0 ]]; then
-        mapfile -t files < <(grep '^diff --git ' "$target" | sed 's|^diff --git a/||; s| b/.*$||')
+        mapfile -t files < <(patch_file_list "$target")
     fi
 fi
 [[ ${#files[@]} -gt 0 ]] || die "no file list: give the files on the command line"
 [[ $found -eq 1 || ! -f "$target" ]] || die "patches/series does not name $rel"
+
+# The guard: a later patch of the series must not touch a file of the target.
+conflicts=""
+for line in "${after[@]}"; do
+    shared=""
+    while IFS= read -r f; do
+        for want in "${files[@]}"; do
+            [[ "$f" == "$want" ]] && shared+="               $f"$'\n'
+        done
+    done < <(patch_file_list "$REPO_ROOT/patches/$line")
+    [[ -n "$shared" ]] && conflicts+="           patches/$line"$'\n'"$shared"
+done
+if [[ -n "$conflicts" ]]; then
+    if [[ "${REGEN_ALLOW_LATER:-0}" == 1 ]]; then
+        echo "regen: REGEN_ALLOW_LATER=1, and these later patches touch the files of the target:" >&2
+        printf '%s' "$conflicts" >&2
+    else
+        echo "error: $rel is not the last patch that touches its files." >&2
+        echo "       The script takes the files from the live submodule, which holds the whole" >&2
+        echo "       series. Thus the rebuilt patch would absorb the change of each patch below." >&2
+        printf '%s' "$conflicts" >&2
+        echo "       Give the file list on the command line and set REGEN_ALLOW_LATER=1 when no" >&2
+        echo "       later patch touches the files that you name." >&2
+        exit 1
+    fi
+fi
 
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/regen-patch.XXXXXX")
 out=$(mktemp "${TMPDIR:-/tmp}/regen-patch-body.XXXXXX")
@@ -85,7 +161,9 @@ git -C "$scratch" diff --cached --binary -- "${files[@]}" > "$out" || true
 [[ -s "$out" ]] || die "the difference is empty: the submodule matches the base for those files"
 
 old_lines=0
-[[ -f "$target" ]] && old_lines=$(grep -c '' < <(sed -n '/^diff --git /,$p' "$target") || true)
+if [[ -f "$target" ]]; then
+    old_lines=$(( $(grep -c '' < "$target") - $(printf '%s\n' "$header" | grep -c '') ))
+fi
 new_lines=$(grep -c '' < "$out")
 
 mkdir -p "$(dirname "$target")"
