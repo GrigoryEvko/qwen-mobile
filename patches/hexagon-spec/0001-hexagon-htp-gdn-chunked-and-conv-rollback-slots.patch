@@ -128,9 +128,9 @@ The host still refuses the conv chain of a batch with more than one snapshot slo
 ggml/src/ggml-hexagon/htp-gdn-match.h:327. That line belongs to the host side. The kernel is ready
 for it now.
 
-diff -urN A/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c B/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
---- A/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c	2026-09-20 04:51:12.278264803 +0300
-+++ B/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c	2026-09-20 04:58:58.019655700 +0300
+diff -urN a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
+--- a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c	2026-09-20 04:51:12.278264803 +0300
++++ b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c	2026-09-20 04:58:58.019655700 +0300
 @@ -6,6 +6,7 @@
  #include "hex-fastdiv.h"
  #include "hex-common.h"
@@ -549,9 +549,9 @@ diff -urN A/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c B/ggml/src/ggml-hexa
          GDN_STATE_FAIL(GDN_STATE_ERR_DST, HTP_STATUS_INVAL_PARAMS);
      }
  
-diff -urN A/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c B/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c
---- A/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c	2026-09-20 04:51:12.283587384 +0300
-+++ B/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c	2026-09-20 04:58:58.021169709 +0300
+diff -urN a/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c b/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c
+--- a/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c	2026-09-20 04:51:12.283587384 +0300
++++ b/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c	2026-09-20 04:58:58.021169709 +0300
 @@ -49,6 +49,7 @@
  #include "hex-fastdiv.h"
  #include "hex-common.h"
@@ -730,9 +730,9 @@ diff -urN A/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c B/ggml/src/ggml-hexagon/ht
  
      work_queue_t wq = octx->ctx->work_queue;
  
-diff -urN A/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c B/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
---- A/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c	2026-09-20 04:51:12.298340322 +0300
-+++ B/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c	2026-09-20 04:58:58.022512836 +0300
+diff -urN a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
+--- a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c	2026-09-20 04:51:12.298340322 +0300
++++ b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c	2026-09-20 04:58:58.022512836 +0300
 @@ -324,6 +324,16 @@
      gdn_conv_c_to_slot(mk, c, n0, n1, n2);
  }
@@ -852,9 +852,9 @@ diff -urN A/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c B/ggml/src/ggml-hexagon/htp
  
      work_queue_run(octx->ctx->work_queue, gdn_conv_chunk_thread, &cctx, n_threads);
  
-diff -urN A/ggml/src/ggml-hexagon/htp/gdn-step.h B/ggml/src/ggml-hexagon/htp/gdn-step.h
---- A/ggml/src/ggml-hexagon/htp/gdn-step.h	1970-01-01 03:00:00.000000000 +0300
-+++ B/ggml/src/ggml-hexagon/htp/gdn-step.h	2026-09-20 04:58:58.023975546 +0300
+diff -urN a/ggml/src/ggml-hexagon/htp/gdn-step.h b/ggml/src/ggml-hexagon/htp/gdn-step.h
+--- a/ggml/src/ggml-hexagon/htp/gdn-step.h	1970-01-01 03:00:00.000000000 +0300
++++ b/ggml/src/ggml-hexagon/htp/gdn-step.h	2026-09-20 04:58:58.023975546 +0300
 @@ -0,0 +1,41 @@
 +// One token of the gated delta rule, on one (sequence, head) row.
 +//
@@ -897,9 +897,9 @@ diff -urN A/ggml/src/ggml-hexagon/htp/gdn-step.h B/ggml/src/ggml-hexagon/htp/gdn
 +                        float * restrict attn_out, uint32_t S_v, bool kda, float scale);
 +
 +#endif // GDN_STEP_H
-diff -urN A/tests/test-backend-ops.cpp B/tests/test-backend-ops.cpp
---- A/tests/test-backend-ops.cpp	2026-09-20 04:51:12.274959904 +0300
-+++ B/tests/test-backend-ops.cpp	2026-09-20 04:58:58.024490783 +0300
+diff -urN a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+--- a/tests/test-backend-ops.cpp	2026-09-20 04:51:12.274959904 +0300
++++ b/tests/test-backend-ops.cpp	2026-09-20 04:58:58.024490783 +0300
 @@ -4667,10 +4667,15 @@
      // those with a margin of 6.6 and still catches a regression of 7. The predicate is the gate of the
      // kernel (gdn-chunk-ops.c): another shape runs the sequential kernel and keeps the tight bound, as
