@@ -1,0 +1,4 @@
+# The seed corpus of the op group "data" (cpy, set_rows, get_rows, concat). The pattern "data/" of
+# the root .gitignore is for the measurement data of the repository, and without this line it also
+# keeps these seeds out of each commit: a clean checkout then runs no input for the group.
+!data/
