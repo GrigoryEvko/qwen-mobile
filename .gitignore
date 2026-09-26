@@ -1,21 +1,39 @@
+# Model files and the data of a measurement. Each one is large, and each one comes from a
+# command that a record names.
 weights/
 *.gguf
 *.safetensors
-.venv/
-/llama.cpp/
-*.pftrace
-.DS_Store
 quant-out/
 data/
 eval/
+*.pftrace
+
+# The environments and the caches of the tools.
+.venv/
+.venv-repro/
 __pycache__/
+.hypothesis/
+.ruff_cache/
+.DS_Store
+
+# The output of a build. /build holds every generated tree, command file and phone output.
+/build/
+/llama.cpp/
 android/snapdragon/jniLibs/
 android/snapdragon/build/
 android/snapdragon/*.apk
 android/.device-lock
-/build/
-.venv-repro/
 tools/htp-lab/out/
 tools/htp-lab/out-*/
 tools/hmx-bench/build/
-/docs/report/
+
+# The output of the LaTeX report. Its sources (main.tex, qwen.sty, Makefile, tex2docx.py and
+# .latexmkrc) stay visible, because no command in this repository makes them again.
+/docs/report/*.aux
+/docs/report/*.docx
+/docs/report/*.fdb_latexmk
+/docs/report/*.fls
+/docs/report/*.log
+/docs/report/*.out
+/docs/report/*.pdf
+/docs/report/*.synctex.gz
