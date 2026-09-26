@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the phone stage "bench-kv": the libraries of the app from a private tree of HEAD, and
-# llama-bench and memprobe against them. The switch GGML_HEXAGON_FWHT (patches/memory/0007) gives
+# llama-bench and memprobe against them. The switch GGML_HEXAGON_FWHT (patches/hexagon-fwht/0001) gives
 # the MUL_MAT form of the KV cache rotation on the same libraries.
 #
 #   JOBS=24 tools/stages/bench-kv/build.sh

@@ -7,8 +7,8 @@ Usage:
 
 The four forms. Each one has flash attention on HTP0 and the one library set of build/bench-kv/build.sh:
     A  F16 K and V
-    B  Q8_0 K and V, the rotation as the DSP op FWHT where patches/memory/0006 sends it (the app)
-    C  Q8_0 K and V, each rotation as MUL_MAT (GGML_HEXAGON_FWHT=0, patches/memory/0007)
+    B  Q8_0 K and V, the rotation as the DSP op FWHT where patches/hexagon-fwht/0001 sends it (the app)
+    C  Q8_0 K and V, each rotation as MUL_MAT (GGML_HEXAGON_FWHT=0, patches/hexagon-fwht/0001)
     D  Q8_0 K and V without the rotation (LLAMA_ATTN_ROT_DISABLE=1)
 
 One run matrix (BLOCKS, GROUPS) gives the command file and the parser, thus the two agree on each run
@@ -174,7 +174,7 @@ HEADER = """\
 #
 # The four forms, all with flash attention on HTP0:
 #   A  F16 K and V
-#   B  Q8_0 K and V, the rotation as the DSP op FWHT where patches/memory/0006 sends it (HEAD, the app)
+#   B  Q8_0 K and V, the rotation as the DSP op FWHT where patches/hexagon-fwht/0001 sends it (HEAD, the app)
 #   C  Q8_0 K and V, each rotation as MUL_MAT (the environment switch GGML_HEXAGON_FWHT=0)
 #   D  Q8_0 K and V without the rotation (LLAMA_ATTN_ROT_DISABLE=1)
 #
@@ -182,7 +182,7 @@ HEADER = """\
 # plus build/bench-kv/fwht-switch.patch (the switch GGML_HEXAGON_FWHT, preset 1), built with the preset, the flags,
 # the LTO and the build number of scripts/build-native.sh. libllama, libllama-common, libmtmd, libggml, libggml-cpu and
 # libggml-opencl have the bytes of the APK libraries. libggml-base has another ggml commit string, libggml-hexagon has
-# the switch, and libggml-htp-v79 has fuzz-ops/0019 (the MUL_MAT_ID store, which the dense models do not call).
+# the switch, and libggml-htp-v79 has hexagon-mm/0008 (the MUL_MAT_ID store, which the dense models do not call).
 #
 # The runs, 58 for each model. The variants run A B C D in an odd round and D C B A in an even round:
 #   p       llama-bench pp512 at d0 and d4096, -r 3, A B C D, 3 rounds

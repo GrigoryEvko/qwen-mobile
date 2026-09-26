@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the phone stage "unary-tg": the decode speed of the landed row change of the pointwise unary ops
-# (patches/hexagon-host/0008), with GGML_HEXAGON_UNARY_FLAT=0 against the preset 1 on one library set.
+# (patches/hexagon-host/0013), with GGML_HEXAGON_UNARY_FLAT=0 against the preset 1 on one library set.
 #
 #   JOBS=16 tools/stages/unary-tg/build.sh
 #

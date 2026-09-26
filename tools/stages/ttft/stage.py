@@ -201,7 +201,7 @@ HEADER = """\
 #      file (f).
 #
 # The files (tools/stages/ttft/build.sh phone): the libraries of the app from the llama.cpp tree of HEAD with
-# patches/spec-mtp/0001 (the MTP drafter stops at the draft length of the call), the DSP library v79, and memprobe
+# patches/common/0002 (the MTP drafter stops at the draft length of the call), the DSP library v79, and memprobe
 # with the sources of the app (chat_prompt.cpp, engine_tasks.cpp, state_cache.cpp, cache_io.cpp, spec_policy.cpp).
 # The phone must hold Qwen3.5-4B-Q8_0.gguf and Qwen3.5-4B-Q8_0-draft32k.gguf in /data/local/tmp/qwen/models.
 #

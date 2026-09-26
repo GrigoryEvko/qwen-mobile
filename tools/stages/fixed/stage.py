@@ -245,7 +245,7 @@ CLASSES = ("HEAD", "W MUL_MAT", "FA", "GDN", "rest")
 
 
 # The src0 names of a matmul of the output head: the head of the model, the tied head (the 4B Q8_0 reads the token
-# embedding), and the reduced draft head of patches/draft-head/0001. blk.N.attn_output.weight is not a head.
+# embedding), and the reduced draft head of patches/qwen35/0003. blk.N.attn_output.weight is not a head.
 HEAD_SRC0 = re.compile(r"^(output\.weight|token_embd\.weight|blk\.\d+\.nextn\.draft_head\.weight)\b")
 
 

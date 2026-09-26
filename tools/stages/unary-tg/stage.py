@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The phone stage "unary-tg": the decode speed of the row change of the pointwise unary ops
-(patches/hexagon-host/0008), with GGML_HEXAGON_UNARY_FLAT=0 against the preset 1 on the same library set.
+(patches/hexagon-host/0013), with GGML_HEXAGON_UNARY_FLAT=0 against the preset 1 on the same library set.
 
 Usage:
     stage.py commands [--out PATH]                  write the phone command file (build/unary-tg/phone-commands.txt)
@@ -83,7 +83,7 @@ def run_lines(rnd: int, v: Variant) -> list[str]:
 
 
 HEADER = f"""\
-# Phone stage "unary-tg": the decode speed of the row change of the pointwise unary ops (patches/hexagon-host/0008,
+# Phone stage "unary-tg": the decode speed of the row change of the pointwise unary ops (patches/hexagon-host/0013,
 # landed), with GGML_HEXAGON_UNARY_FLAT=0 (O, the old rows) against the preset 1 (F, the new rows) on one library set:
 # the tree of HEAD (tools/stages/unary-tg/build.sh). The app configuration: Q8_0 K and V with the FWHT rotation,
 # GGML_HEXAGON_OPFUSION=1, OPFUSION_STATE=1.

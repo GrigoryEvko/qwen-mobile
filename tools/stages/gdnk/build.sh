@@ -6,11 +6,11 @@
 #
 #   JOBS=24 [GDNK_STAGE=build/gdnk] [GDNK_PART=all|hexagon] tools/stages/gdnk/build.sh [PATCH...]
 #
-# PATCH is a llama.cpp patch file that is not yet in patches/ (wip/gdnk/NNNN-*.patch, a path relative to
-# the root of the repository), applied in the order of the command line. With no PATCH the stage is the
-# tree of HEAD. build/gdnk/build.sh is a link to this file. The files of the stage go to GDNK_STAGE (the
-# preset value is build/gdnk). A second stage directory keeps the files of a stage that the phone runs
-# while a different set builds.
+# PATCH is a llama.cpp patch file that is not yet in patches/ (a path relative to the root of the
+# repository, for example wip/<area>/NNNN-*.patch), applied in the order of the command line. With no
+# PATCH the stage is the tree of HEAD. build/gdnk/build.sh is a link to this file. The files of the stage
+# go to GDNK_STAGE (the preset value is build/gdnk). A second stage directory keeps the files of a stage
+# that the phone runs while a different set builds.
 #
 # GDNK_PART selects the files: "all" (the preset value) builds each library and program of the stage.
 # "hexagon" builds only libggml-hexagon.so and libggml-htp-v79.so, a second backend for the libraries of

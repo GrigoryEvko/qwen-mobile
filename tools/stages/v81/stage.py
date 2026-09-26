@@ -259,9 +259,10 @@ HEADER = """\
 # {title}
 #
 # The libraries: tools/stages/v81/build.sh (build/v81/{stage}): the patched llama.cpp tree of HEAD plus the
-# patches of build/v81/patches (build/v81/{stage}/patches.sha256 lists them). The series has the patches of
-# patches/hexagon-v81: v81 uses the f32 to f16 conversion of v79, the start-up self-test of the DSP (the canary),
-# and the stride of the transpose tile copy.{base_text}
+# patches of build/v81/patches (build/v81/{stage}/patches.sha256 lists them). The series has the three changes
+# for v81: v81 uses the f32 to f16 conversion of v79 (patches/hexagon-arch/0003), the start-up self-test of the
+# DSP, the canary (patches/hexagon-arch/0004), and the stride of the transpose tile copy
+# (patches/hexagon-kernels/0006).{base_text}
 #
 # The runs and the decision of each:
 {runs}
@@ -305,7 +306,7 @@ KIT_DECISIONS = {
 MINI_DECISIONS = {
     "can-1, can-2": ("canarytime GGML_HEXAGON_CANARY=1: the log line \"canary pass\" and exit 0 in each run. A line "
                      "\"canary FAIL\" names the first value outside its bound: then do not build the APK"),
-    "tbo-mm": "test-backend-ops MUL_MAT: each case must pass (673 of 673 on the libraries before hexagon-gemv/0001)",
+    "tbo-mm": "test-backend-ops MUL_MAT: each case must pass (673 of 673 on the libraries before hexagon-mm/0012)",
 }
 
 
