@@ -1,4 +1,5 @@
-// Stub of htp/htp-ctx.h for the x86 build of htp/htp-tensor.c in fuzz_dirty. It
+// Stub of htp/htp-ctx.h for the x86 build of htp/htp-tensor.c (fuzz_dirty and the
+// tracker replay of hexhost_graphs). It
 // gives the fields of the DSP context that htp-tensor.c reads, with the same
 // names and the same limits as the real header.
 #pragma once

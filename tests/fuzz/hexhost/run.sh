@@ -109,8 +109,11 @@ Modes:
                         4 recurrent state snapshots, prefill 512, the MTP draft step and the image
                         turn at 576 and 768 image tokens. A run fails when a llama_decode fails, a
                         node of a later split reads the state tail of a fused GDN state chain, a
-                        decode path does not fuse the GDN conv step, or an image turn does not fuse
-                        the attention input of each layer or a LayerNorm of the vision encoder.
+                        decode path does not fuse the GDN conv step, an image turn does not fuse
+                        the attention input of each layer or a LayerNorm of the vision encoder, or
+                        the replay of the dirty range tracker of the DSP loses a written byte. Each
+                        run gives the evictions of the tracker, and two runs of the 2B decode with
+                        reserved ranges are the positive control of that count.
   fuzz <config>         Build, then fuzz each target for the budget. A crash does not stop the
                         target: it starts again until the budget ends.
   phone-build <config>  Build the phone driver (phone/driver.cpp) and the ggml libraries for arm64
@@ -511,10 +514,13 @@ phone_commands() {
 # snapshots of speculative decoding, prefill 512, the MTP draft step and the image turn at 576 and
 # 768 image tokens, on the 2B and on the 4B Q8_0. A run fails when a llama_decode fails, when a node
 # of a later split reads the state tail of a fused GDN state chain, when a decode path does not
-# fuse the GDN conv step (the matcher rejects the layout of the app), or when an image turn does not
+# fuse the GDN conv step (the matcher rejects the layout of the app), when an image turn does not
 # fuse the attention input of each layer (HTP_OP_ROPE_QKV) or leaves a NORM of the vision encoder (the
-# text model has no NORM). The program loads full models, thus it has no sanitizer. Gives the code 1
-# when a run fails.
+# text model has no NORM), or when the replay of the dirty range tracker of the DSP sees no op or finds
+# a lost byte, a stale input or a dirty byte after a fence. Each run writes the tracker counts (the
+# evictions and the flushes of the whole cache). Two more runs of the 2B decode are the positive
+# control of these counts: with reserved ranges the decode must evict and flush the whole cache. The
+# program loads full models, thus it has no sanitizer. Gives the code 1 when a run fails.
 graphs_check() {
     local dir="$REPO/build/fuzz/$AREA-graphs${BUILD_TAG:+-$BUILD_TAG}" m model mmproj rc bad=0
     refresh_llama
@@ -535,15 +541,40 @@ graphs_check() {
         local -a labels=("decode" "decode-rs4" "prefill" "mtp" "vision576" "vision768")
         local -a args=("decode" "decode" "prefill 512" "mtp 8" "vision $mmproj 576" "vision $mmproj 768")
         local -a rs=(0 4 0 0 0 0)
-        local i name conv
+        local -a reserve=("" "" "" "" "" "")
+        # The positive control of the tracker counts, on one model: with 31 ranges in use at the start of
+        # each batch the decode must evict, and with ranges of 5 MiB it must flush the whole cache
+        if [[ $m == 2B ]]; then
+            labels+=("decode-rs4-evict" "decode-rs4-flush-all")
+            args+=("decode" "decode")
+            rs+=(4 4)
+            reserve+=(31 31:5242880)
+        fi
+        local i name conv tracker
+        local tre='([0-9]+) ops, ([0-9]+) evictions, ([0-9]+) flushes of the whole cache, [0-9]+ bytes of evicted lines, ([0-9]+) ops with a lost byte, ([0-9]+) ops with a stale input, [0-9]+ fences, ([0-9]+) fences with a dirty byte left, ([0-9]+) ranges at most'
         for i in "${!labels[@]}"; do
             name="$m-${labels[i]}"
             rc=0
             # shellcheck disable=SC2086
-            timeout -s KILL 900 env HEXHOST_RS_SEQ="${rs[i]}" HEXHOST_EINTR="$TEST_EINTR" "$dir/hexhost_graphs" "$model" ${args[i]} "$dir/out/$name" \
-                > "$dir/out/$name.stdout" 2>&1 || rc=$?
+            timeout -s KILL 900 env HEXHOST_RS_SEQ="${rs[i]}" HEXHOST_EINTR="$TEST_EINTR" ${reserve[i]:+HEXHOST_TRACKER_RESERVE=${reserve[i]}} \
+                "$dir/hexhost_graphs" "$model" ${args[i]} "$dir/out/$name" > "$dir/out/$name.stdout" 2>&1 || rc=$?
             conv=$(rg -o '^GDN_CONV_STEP [0-9]+' "$dir/out/$name.ops.txt" 2> /dev/null | cut -d' ' -f2 || true)
             echo "$AREA graphs $name: code $rc, ${conv:-0} fused conv steps, $(tail -n 1 "$dir/out/$name.stdout" | rg -o '[0-9]+ fused state chains, [0-9]+ state tail readers in a later split' || echo 'no summary')"
+            # The dirty range tracker of the DSP on the batches (graphs/tracker_replay.h): no op may lose
+            # a written byte, and the replay must see the ops
+            tracker=$(rg -m 1 -o 'tracker: .*' "$dir/out/$name.stdout" || true)
+            if [[ $tracker =~ $tre ]] && (( BASH_REMATCH[1] > 0 && BASH_REMATCH[4] == 0 && BASH_REMATCH[5] == 0 && BASH_REMATCH[6] == 0 )); then
+                echo "$AREA graphs $name: tracker: ${BASH_REMATCH[2]} evictions, ${BASH_REMATCH[3]} flushes of the whole cache," \
+                     "${BASH_REMATCH[7]} ranges at most, no lost byte"
+                if [[ ${labels[i]} == *-evict && ${BASH_REMATCH[2]} == 0 ]] || [[ ${labels[i]} == *-flush-all && ${BASH_REMATCH[3]} == 0 ]]; then
+                    echo "$AREA graphs $name: the positive control counts no ${labels[i]#decode-rs4-} path of the tracker"
+                    rc=1
+                fi
+            else
+                echo "$AREA graphs $name: the tracker replay reports no op, a lost byte, a stale input or a dirty byte after" \
+                     "a fence (${tracker:-no tracker line}). Read $dir/out/$name.tracker.txt."
+                rc=1
+            fi
             if [[ ${labels[i]} == decode* && -z $conv ]]; then
                 echo "$AREA graphs $name: the host does not fuse the GDN conv step of the app"
                 rc=1

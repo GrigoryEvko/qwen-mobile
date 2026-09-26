@@ -6,6 +6,7 @@
 
 #include "ggml.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cstdarg>
 #include <cstdio>
@@ -1233,7 +1234,14 @@ void fence_write(uint64_t addr, uint32_t seq, uint32_t status) {
     __atomic_store_n(&f[0], seq, __ATOMIC_RELEASE);
 }
 
+// The observer of the batches (set_batch_observer). A DSP thread of the async mode reads it.
+std::atomic<batch_observer> g_observer{ nullptr };
+
 } // namespace
+
+void set_batch_observer(batch_observer f) {
+    g_observer.store(f);
+}
 
 void process_batch(const dsp_ctx & ctx, const htp_opbatch_req & req, const struct dspqueue_buffer & dbuf,
                    batch_record & rec, htp_opbatch_rsp & rsp) {
@@ -1421,6 +1429,10 @@ void process_batch(const dsp_ctx & ctx, const htp_opbatch_req & req, const struc
         }
 
         rec.ops.push_back(std::move(r));
+    }
+
+    if (const batch_observer f = g_observer.load()) {
+        f(bufs, req.n_bufs, rec);
     }
 }
 

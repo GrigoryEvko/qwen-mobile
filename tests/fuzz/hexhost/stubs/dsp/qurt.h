@@ -1,5 +1,6 @@
-// Stub of the QuRT headers for the x86 build of htp/htp-tensor.c in fuzz_dirty.
-// fuzz_dirty.cpp gives qurt_mem_cache_clean, which records a flush of the whole cache.
+// Stub of the QuRT headers for the x86 build of htp/htp-tensor.c (fuzz_dirty and the
+// tracker replay of hexhost_graphs). common/dirty_model.cpp gives
+// qurt_mem_cache_clean, which records a flush of the whole cache.
 #pragma once
 
 #include <stdint.h>

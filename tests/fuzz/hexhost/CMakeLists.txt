@@ -193,9 +193,12 @@ set_target_properties(hexhost_repack_bytes PROPERTIES ENABLE_EXPORTS ON)
 
 # The dirty range tracker of the DSP (htp/htp-tensor.c) runs on x86 with the
 # stubs of stubs/dsp. A copy of the source goes into the build directory, thus
-# its quoted includes find the stubs before the real headers of htp/.
+# its quoted includes find the stubs before the real headers of htp/. The dirty
+# model (common/dirty_model.cpp) gives the cache functions that the stubs declare.
+include("${CMAKE_CURRENT_SOURCE_DIR}/stubs/dsp/check-constants.cmake")
+hexhost_check_dsp_constants("${HEX}")
 configure_file("${HEX}/htp/htp-tensor.c" "${CMAKE_CURRENT_BINARY_DIR}/dsp/htp-tensor.c" COPYONLY)
-target_sources(fuzz_dirty PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/dsp/htp-tensor.c")
+target_sources(fuzz_dirty PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/dsp/htp-tensor.c" common/dirty_model.cpp)
 target_include_directories(fuzz_dirty BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/stubs/dsp)
 set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/dsp/htp-tensor.c" PROPERTIES COMPILE_OPTIONS "-w")
 

@@ -5,24 +5,22 @@
 // fuzz input is a sequence of ops as proc_op_req of htp/main.c runs them:
 // htp_tensor_flush_all on the inputs, htp_tensor_dirty_all on the outputs, the
 // writes of the op, and at times htp_flush_dirty_ranges (a fence) or the end of
-// the batch. A second model keeps the true set of the bytes that the ops wrote
-// and that no flush covered. The invariants:
+// the batch. The dirty model (common/dirty_model.h) keeps the true set of the
+// bytes that the ops wrote and that no flush covered. The invariants:
 //   - no input of an op holds a byte that a previous op wrote and no flush covered
 //     (else the DMA of the op reads stale DDR),
 //   - each such byte is inside a range of the tracker (else no later flush covers it),
 //   - after a fence no such byte remains.
-// The harness also counts the bytes that the tracker flushes: the fused state op
-// declares its whole output dirty, and each such byte costs a flush.
+// With HEXHOST_STATS=1 the harness counts the path of each htp_tensor_dirty_all
+// call ("tracker keep", "tracker evict", "tracker flush-all") and prints the
+// counts at exit.
 
 #include <fuzzer/FuzzedDataProvider.h>
 
 #include <cinttypes>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <iterator>
-#include <map>
+#include <string>
 #include <vector>
 
 extern "C" {
@@ -32,96 +30,19 @@ extern "C" {
 #include "htp-tensor.h"
 }
 
+#include "dirty_model.h"
 #include "fake_dsp.h"
 #include "fuzz_death.h"
-
-namespace {
-
-// The true set of dirty bytes as disjoint intervals [start, end)
-std::map<uint64_t, uint64_t> g_dirty;
-uint64_t                     g_flushed_bytes = 0;
-bool                         g_flushed_all   = false;
-
-// Removes [s, e) from the true dirty set.
-void clean(uint64_t s, uint64_t e) {
-    auto it = g_dirty.lower_bound(s);
-    if (it != g_dirty.begin()) {
-        --it;
-    }
-    while (it != g_dirty.end() && it->first < e) {
-        const uint64_t a = it->first, b = it->second;
-        if (b <= s) {
-            ++it;
-            continue;
-        }
-        it = g_dirty.erase(it);
-        if (a < s) {
-            g_dirty[a] = s;
-        }
-        if (b > e) {
-            g_dirty[e] = b;
-        }
-    }
-}
-
-// Adds [s, e) to the true dirty set.
-void mark(uint64_t s, uint64_t e) {
-    clean(s, e);
-    g_dirty[s] = e;
-}
-
-// Gives the first dirty byte in [s, e), or 0.
-uint64_t first_dirty(uint64_t s, uint64_t e) {
-    auto it = g_dirty.lower_bound(s);
-    if (it != g_dirty.begin()) {
-        auto p = std::prev(it);
-        if (p->second > s) {
-            return s;
-        }
-    }
-    if (it != g_dirty.end() && it->first < e) {
-        return it->first;
-    }
-    return 0;
-}
-
-} // namespace
-
-extern "C" {
-
-// The flush of a range of lines, with the rounding of the real hex_l2flush
-void hex_l2flush(void * addr, size_t size) {
-    const uint64_t a = (uint64_t) (uintptr_t) addr;
-    const uint64_t s = a & ~(uint64_t) (HEX_L2_LINE_SIZE - 1);
-    const uint64_t e = (a + size + HEX_L2_LINE_SIZE - 1) & ~(uint64_t) (HEX_L2_LINE_SIZE - 1);
-    clean(s, e);
-    g_flushed_bytes += e - s;
-}
-
-// The flush of the whole data cache
-int qurt_mem_cache_clean(qurt_addr_t addr, qurt_size_t size, int op, int type) {
-    (void) addr;
-    (void) size;
-    (void) type;
-    if (op == QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL) {
-        g_dirty.clear();
-        g_flushed_all = true;
-    }
-    return 0;
-}
-
-} // extern "C"
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
     fuzz_death_note_input(data, size);
     FuzzedDataProvider fdp(data, size);
-    g_dirty.clear();
-    g_flushed_bytes = 0;
 
     struct htp_context ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.n_threads     = fdp.ConsumeIntegralInRange<uint32_t>(1, HTP_MAX_NTHREADS);
     ctx.n_threads_div = init_fastdiv_values(ctx.n_threads);
+    dirty_model::batch_edge(ctx);
 
     // The arena of the tensors: a DSP address range above zero
     const uint32_t ARENA = 0x40000000u;
@@ -152,56 +73,29 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
             dsts[d] = &pool[fdp.ConsumeIntegralInRange<size_t>(0, pool.size() - 1)];
         }
 
-        // proc_op_req (main.c:1069): the inputs must be clean in DDR after this call
-        htp_tensor_flush_all(&ctx, srcs, HTP_OP_MAX_INPUTS);
-        for (int s = 0; s < n_src; s++) {
-            const uint64_t a = srcs[s]->data, b = a + srcs[s]->size;
-            if (const uint64_t x = first_dirty(a, b)) {
-                fakedsp::violation("dirty-stale-input", "op %d: input %d [0x%" PRIx64 ", 0x%" PRIx64 ") holds the dirty byte 0x%" PRIx64
-                                   " after htp_tensor_flush_all (the DMA reads stale DDR)", i, s, a, b, x);
-            }
+        const dirty_model::op_result r = dirty_model::run_op(ctx, srcs, dsts);
+        static const std::string counter[] = { std::string("tracker ") + dirty_model::path_name(dirty_model::dirty_path::keep),
+                                               std::string("tracker ") + dirty_model::path_name(dirty_model::dirty_path::evict),
+                                               std::string("tracker ") + dirty_model::path_name(dirty_model::dirty_path::flush_all) };
+        fakedsp::count(counter[(int) r.path]);
+        if (r.stale_input >= 0) {
+            const uint64_t a = srcs[r.stale_input]->data, b = a + srcs[r.stale_input]->size;
+            fakedsp::violation("dirty-stale-input", "op %d: input %d [0x%" PRIx64 ", 0x%" PRIx64 ") holds the dirty byte 0x%" PRIx64
+                               " after htp_tensor_flush_all (the DMA reads stale DDR)", i, r.stale_input, a, b, r.stale_byte);
         }
-
-        // proc_op_req (main.c:1087): the outputs go into the tracker, then the op writes them
-        htp_tensor_dirty_all(&ctx, dsts, HTP_OP_MAX_OUTPUTS);
-        for (int d = 0; d < n_dst; d++) {
-            if (!(dsts[d]->flags & (HTP_TENSOR_WEIGHT | HTP_TENSOR_FENCE))) {
-                mark(dsts[d]->data, (uint64_t) dsts[d]->data + dsts[d]->size);
-            }
-        }
-
-        // Each dirty byte must be inside a range of the tracker
-        for (const auto & kv : g_dirty) {
-            for (uint64_t x = kv.first; x < kv.second;) {
-                bool     inside = false;
-                uint64_t next   = kv.second;
-                for (int r = 0; r < HTP_MAX_DIRTY_RANGES; r++) {
-                    const auto & dr = ctx.dirty_ranges[r];
-                    if (dr.start && x >= dr.start && x < dr.end) {
-                        inside = true;
-                        next   = dr.end < kv.second ? dr.end : kv.second;
-                        break;
-                    }
-                }
-                if (!inside) {
-                    fakedsp::violation("dirty-lost", "op %d: the dirty byte 0x%" PRIx64 " is in no range of the tracker", i, x);
-                }
-                x = next;
-            }
+        if (r.lost_byte) {
+            fakedsp::violation("dirty-lost", "op %d: the dirty byte 0x%" PRIx64 " is in no range of the tracker", i, r.lost_byte);
         }
 
         const int ev = fdp.ConsumeIntegralInRange<int>(0, 9);
         if (ev == 0) {
-            // op_fence (main.c:723): every dirty byte goes to DDR
-            htp_flush_dirty_ranges(&ctx);
-            if (!g_dirty.empty()) {
-                fakedsp::violation("dirty-fence-leftover", "op %d: after htp_flush_dirty_ranges the byte 0x%" PRIx64 " is dirty", i,
-                                   g_dirty.begin()->first);
+            // op_fence of htp/main.c: each dirty byte goes to DDR
+            if (const uint64_t x = dirty_model::fence(ctx)) {
+                fakedsp::violation("dirty-fence-leftover", "op %d: after htp_flush_dirty_ranges the byte 0x%" PRIx64 " is dirty", i, x);
             }
         } else if (ev == 1) {
-            // the end of a batch (main.c:1216) and the start of the next (main.c:1147-1149)
-            qurt_mem_cache_clean(0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
-            memset(ctx.dirty_ranges, 0, sizeof(ctx.dirty_ranges));
+            // the end of a batch and the start of the next (process_opbatch of htp/main.c)
+            dirty_model::batch_edge(ctx);
         }
     }
     return 0;

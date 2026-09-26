@@ -1,6 +1,7 @@
 # hexhost_graphs: the llama.cpp graphs of a real model on the fake DSP of the hexhost harness
-# (refer to graphs.cpp). It gives the supports_op decisions of HTP0 and the fused op counts of a
-# decode and a prefill graph, thus a fix of the host can show that it keeps both.
+# (refer to graphs.cpp). It gives the supports_op decisions of HTP0, the fused op counts and the
+# paths of the dirty range tracker of the DSP for the graphs of the app, thus a fix of the host or of
+# the tracker can show what it changes.
 #
 #   cmake -S tests/fuzz/hexhost/graphs -B build/fuzz/hexhost/graphs-<name> -G Ninja \
 #         -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release \
@@ -45,3 +46,16 @@ target_compile_definitions(hexhost_graphs PRIVATE HEXHOST_ASYNC_DSP=0 _GNU_SOURC
 target_compile_options(hexhost_graphs PRIVATE -w)
 target_link_libraries(hexhost_graphs PRIVATE llama-common mtmd llama ggml ggml-base ggml-cpu)
 target_include_directories(hexhost_graphs PRIVATE "${HEXHOST_LLAMA_DIR}/common" "${HEXHOST_LLAMA_DIR}/tools/mtmd")
+
+# The tracker replay (tracker_replay.h): the dirty range tracker of the DSP (htp/htp-tensor.c) on x86 with
+# the stubs of stubs/dsp, as fuzz_dirty builds it. A copy of the source goes into the build directory, thus
+# its quoted includes find the stubs before the real headers of htp/.
+include("${H}/stubs/dsp/check-constants.cmake")
+hexhost_check_dsp_constants("${HEX}")
+configure_file("${HEX}/htp/htp-tensor.c" "${CMAKE_CURRENT_BINARY_DIR}/dsp/htp-tensor.c" COPYONLY)
+add_library(hexhost_tracker STATIC tracker_replay.cpp "${H}/common/dirty_model.cpp" "${CMAKE_CURRENT_BINARY_DIR}/dsp/htp-tensor.c")
+target_include_directories(hexhost_tracker PRIVATE "${H}/stubs/dsp" "${H}/stubs" "${H}/common" "${HEX}/htp" "${HEX}"
+                           "${HEXHOST_LLAMA_DIR}/ggml/src" "${HEXHOST_LLAMA_DIR}/ggml/include")
+target_compile_definitions(hexhost_tracker PRIVATE _GNU_SOURCE)
+target_compile_options(hexhost_tracker PRIVATE -w)
+target_link_libraries(hexhost_graphs PRIVATE hexhost_tracker)

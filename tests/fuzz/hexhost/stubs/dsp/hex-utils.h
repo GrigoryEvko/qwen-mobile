@@ -1,6 +1,7 @@
-// Stub of htp/hex-utils.h for the x86 build of htp/htp-tensor.c in fuzz_dirty.
-// The constants are those of the DSP. fuzz_dirty.cpp gives hex_l2flush, which
-// records the flushed lines, with the line rounding of the real function.
+// Stub of htp/hex-utils.h for the x86 build of htp/htp-tensor.c (fuzz_dirty and the
+// tracker replay of hexhost_graphs). The constants are those of the DSP.
+// common/dirty_model.cpp gives hex_l2flush, which records the flushed lines, with
+// the line rounding of the real function.
 #pragma once
 
 #include <stdbool.h>

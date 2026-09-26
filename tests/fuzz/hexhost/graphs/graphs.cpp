@@ -13,26 +13,31 @@
 //     product through a view (that node reads bytes that no op wrote)
 //   - each node of a later split that reads the state tail of a GATED_DELTA_NET output whose
 //     chain the host fuses (the fused op does not write that tail)
+//   - the paths of the dirty range tracker of the DSP on the batches (tracker_replay.h): the
+//     evictions, the flushes of the whole cache, and the bytes that the tracker loses
 // The fake DSP runs the checks of dsp_model.cpp on each op. It computes no values. The vision path
 // also decodes the text and the image embeddings of each photo with the model (the image turn).
 //
 //   hexhost_graphs MODEL.gguf {prefill N | decode | mtp N_PROMPT | vision MMPROJ MAX_TOKENS} OUT_PREFIX
 //
 // Outputs: OUT_PREFIX.supports.txt, OUT_PREFIX.ops.txt, OUT_PREFIX.log.txt, OUT_PREFIX.hazards.txt,
-// OUT_PREFIX.tails.txt. The exit code is 1 when a llama_decode fails or a state tail has a reader in a
-// later split. The vision mode also writes the line "vision: I images, B blocks, Q ROPE_QKV, L NORM_MUL_ADD,
-// N NORM" (B is clip.vision.block_count of the mmproj). run.sh checks that the host fuses the attention input
-// of each layer (Q = I * B) and each LayerNorm (N = 0, the text model has no NORM).
+// OUT_PREFIX.tails.txt, OUT_PREFIX.tracker.txt, and the line "tracker: ..." on stdout. The exit code is 1
+// when a llama_decode fails or a state tail has a reader in a later split. The vision mode also writes the
+// line "vision: I images, B blocks, Q ROPE_QKV, L NORM_MUL_ADD, N NORM" (B is clip.vision.block_count of the
+// mmproj). run.sh checks that the host fuses the attention input of each layer (Q = I * B) and each
+// LayerNorm (N = 0, the text model has no NORM).
 // Environment: GGML_HEXAGON_* as for the app. HEXHOST_IGNORE lists the checks of the fake DSP
 // that do not stop the run (refer to run.sh). HEXHOST_TOUCH=1 makes the fake DSP write the outputs.
 // HEXHOST_RS_SEQ=N gives the decode and prefill modes N recurrent state snapshots, as the app has
 // with speculative decoding (the mtp mode always has 4). HEXHOST_LOG=1 writes each log line of ggml
-// and llama.cpp to stderr.
+// and llama.cpp to stderr. HEXHOST_TRACKER_GAP and HEXHOST_TRACKER_RESERVE set the tracker replay
+// (refer to tracker_replay.h).
 // The fake DSP has 6 HVX threads, 1 HMX unit and 8 MB of VTCM, as the v79 NPU of the phone.
 
 #include "dsp_model.h"
 #include "fake_dsp.h"
 #include "matmul-ops.h"
+#include "tracker_replay.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -464,6 +469,7 @@ int main(int argc, char ** argv) {
     fakedsp::config cfg;
     cfg.touch = getenv("HEXHOST_TOUCH") != nullptr;
     fakedsp::configure(cfg);
+    tracker_replay::install();
     ggml_log_set(log_keep, nullptr);
     llama_log_set(log_keep, nullptr);
 
@@ -531,8 +537,9 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // The ops of the graphs: the counters of the fake DSP from here
+    // The ops of the graphs: the counters of the fake DSP and of the tracker replay from here
     fakedsp::reset_record();
+    tracker_replay::reset();
     const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
     int           rc      = 0;
     if (mtp) {
@@ -547,6 +554,9 @@ int main(int argc, char ** argv) {
         rc = decode_checked(ctx, llama_batch_get_one(toks.data(), n_tokens));
     }
     llama_synchronize(ctx);
+    const tracker_replay::counts tracker = tracker_replay::total();
+    std::vector<std::string>     tracker_lines = tracker_replay::lines();
+    tracker_lines.insert(tracker_lines.begin(), "tracker: " + tracker_replay::summary(tracker));
 
     // The count of each HTP op, and for each matmul op also its kernel type, the kernel params of
     // HMX or HVX, and the shape of its first weight (a row count that is not a multiple of 32
@@ -600,6 +610,8 @@ int main(int argc, char ** argv) {
     write_lines(out + ".log.txt", g_log);
     write_lines(out + ".hazards.txt", g_hazards);
     write_lines(out + ".tails.txt", g_tail_hazards);
+    write_lines(out + ".tracker.txt", tracker_lines);
+    printf("hexhost_graphs: %s\n", tracker_lines.front().c_str());
     if (vision) {
         auto count = [&](const char * name) {
             const auto it = ops.find(name);

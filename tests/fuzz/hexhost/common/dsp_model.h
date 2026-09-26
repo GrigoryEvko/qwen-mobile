@@ -51,6 +51,13 @@ std::string verdict_id(const op_verdict & v, const char * op_name);
 void process_batch(const dsp_ctx & ctx, const htp_opbatch_req & req, const struct dspqueue_buffer & dbuf,
                    batch_record & rec, htp_opbatch_rsp & rsp);
 
+// A function that process_batch calls after the ops of each batch, with the buffer table of the batch
+// and the record of its ops. The tracker replay of hexhost_graphs is one.
+using batch_observer = void (*)(const htp_buf_desc * bufs, uint32_t n_bufs, const batch_record & rec);
+
+// Sets the observer of the batches. nullptr removes it. Set it before the host sends a batch.
+void set_batch_observer(batch_observer f);
+
 // Gives the verdict of the DSP op function for one op.
 op_verdict model_op(const dsp_ctx & ctx, const op_record & op);
 
