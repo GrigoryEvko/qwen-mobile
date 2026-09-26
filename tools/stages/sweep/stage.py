@@ -797,6 +797,7 @@ class RunOut:
     series: dict[str, list[float]] = field(default_factory=dict)   # case -> DSP us of each copy, in order
     sustain: list[tuple[int, int, int, int]] = field(default_factory=list)      # (t_us, passes, us, pcycles)
     recovery: list[tuple[int, int, int, int, int, int, int]] = field(default_factory=list)
+    truncated: str = ""     # for a result of i8read with no last line: the file and its last complete record
 
 
 def read_run(root: Path, r: Run) -> RunOut:
@@ -839,18 +840,32 @@ RECOVERY_RE = re.compile(r"sustain: recovery pause_ms=(\d+) window=(\d+) passes=
 
 
 def read_program(root: Path, r: Run, res: RunOut) -> None:
-    """Read the result file of a DSP program (i8read or hmx_sustain), else its logcat lines."""
+    """Read the result file of a DSP program (i8read or hmx_sustain), else its logcat lines.
+
+    Only a complete line is a record: the kill of the timeout can cut the last line in a number, and the
+    cut value is not a measurement. i8read writes "i8read: done" as its last line, thus a result of i8read
+    with records and no such line is truncated, and res.truncated names the file and its last complete
+    record."""
     tag = "i8read:" if r.program == "i8read.so" else "sustain:"
     txt = root / f"{r.key}.txt"
+    source = txt.name
     text = txt.read_text(errors="replace") if txt.exists() else ""
     if tag not in text:
         lc = root / f"{r.key}-logcat.txt"
+        source = lc.name
         text = lc.read_text(errors="replace") if lc.exists() else ""
         first = "i8read: check p4 k=64" if tag == "i8read:" else "sustain: config"
         start = text.rfind(first)
         text = text[start:] if start >= 0 else text
         if text:
             res.flags.append(f"{r.program}: the result file is empty, the logcat lines are used")
+    if text and not text.endswith("\n"):
+        text = text[:text.rfind("\n") + 1]
+    if tag == "i8read:" and I8_RE.search(text) and "i8read: done" not in text:
+        last = [ln for ln in text.splitlines() if tag in ln][-1]
+        res.truncated = (f"{source} is truncated: it has no line \"i8read: done\", and its last complete record is "
+                         f"\"{last[last.find(tag):]}\"")
+        res.flags.append("truncated result")
     for m in I8_RE.finditer(text):
         res.i8.setdefault(m.group(1), {})[int(m.group(2))] = int(m.group(3))
     res.sustain = [tuple(int(x) for x in m.groups()) for m in SUSTAIN_RE.finditer(text)]
@@ -920,8 +935,14 @@ I8_KMIN = 48
 
 
 def fit(points: dict[int, float], kmin: int = I8_KMIN) -> tuple[float, float]:
-    """The least squares line c = a + b k over the points with k >= kmin."""
+    """The least squares line c = a + b k over the points with k >= kmin.
+
+    Raises:
+        ValueError: If fewer than 2 points have k >= kmin. The caller tells the reader why the run has no fit
+    """
     xs = [k for k in points if k >= kmin]
+    if len(xs) < 2:
+        raise ValueError(f"sweep.fit: {len(xs)} points with k >= {kmin}, the line needs 2")
     ys = [points[k] for k in xs]
     mx, my = statistics.fmean(xs), statistics.fmean(ys)
     b = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sum((x - mx) ** 2 for x in xs)
@@ -944,10 +965,18 @@ def i8_tables(outs: dict[str, RunOut], clock: float, include_all: bool) -> tuple
     engine = None
     for key in ("i8a", "i8b"):
         o = outs.get(key)
+        if o is not None and o.truncated:
+            lines.append(f"  {key}: SKIPPED, {o.truncated}")
+            continue
         if not usable(o, include_all) or "f16" not in o.i8:
             lines.append(f"  {key}: no usable result" + (f" ({', '.join(o.flags)})" if o and o.flags else ""))
             continue
         f16 = {k: v / N_I8_COLS for k, v in o.i8["f16"].items()}
+        n_fit = sum(1 for k in f16 if k >= I8_KMIN)
+        if n_fit < 2:
+            lines.append(f"  {key}: SKIPPED, the fit needs 2 points of f16 with k >= {I8_KMIN}, and the result of the "
+                         f"run has {n_fit}")
+            continue
         a, b = fit(f16)
         lines.append(f"  {key}: f16 per output tile = {a:.1f} + {b:.3f} x k-tiles pcycles (fit over k >= {I8_KMIN}); "
                      f"{TILE_MAC_FLOP * clock * 1e6 / b / 1e12:.2f} TFLOPS at the marginal rate, clock {clock:.0f} MHz")

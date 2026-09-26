@@ -60,6 +60,9 @@ GATE_KB = 3145728
 REPO = Path(__file__).resolve().parents[3]
 APP_ENV = device.APP_ENV
 PROFILE_ENV = "GGML_HEXAGON_PROFILE=1 LLAMA_HOSTPROF=1"
+# The layers of the vision encoder of the 4B projector. Each complete encode window of a level-1 profile run of the
+# stages vit1 to vit7 has one QKV matmul and one up matmul for each of them.
+ENCODER_LAYERS = 24
 # The phase events of each DSP thread (profile level 3). The preset trace size (256 events for each op of the
 # largest batch, 327680 for each thread) holds the events of one encode.
 TRACE_ENV = "GGML_HEXAGON_PROFILE=3 LLAMA_HOSTPROF=1"
@@ -578,10 +581,21 @@ def profile_summary(stage: Stage, results: dict[str, Result]) -> list[str]:
     return out
 
 
+def last_record(log: str) -> str:
+    """The last complete line of a log that is a profile line or a STAMP line, or an empty text. The kill of the
+    timeout can cut the last line of a log, thus a line with no newline after it is not complete."""
+    lines = log.split("\n")[:-1]
+    return next((ln.strip() for ln in reversed(lines) if OP_RE.search(ln) or STAMP_RE.search(ln)), "")
+
+
 def layer_summary(stage: Stage, results: dict[str, Result]) -> list[str]:
     """For each level-1 profile run: the time of the QKV and the up matmul of the layers of the last encode, in us.
     The layers 0, 3, 6 ... 21 and the other layers have different output addresses, and a process can be slow in
-    one group, in the two groups or in no group. O(size of the logs)."""
+    one group, in the two groups or in no group.
+
+    Each level-1 profile run gets one row. A run with no gate file, a run with no usable output, and a run whose
+    last complete encode window does not have one matmul of each kind for each layer get a row that tells why. The
+    row of the third kind names the log file and its last complete record. O(size of the logs)."""
     out = ["The QKV and up matmuls of each layer, us: the median of the layers 0, 3 ... 21, the median of the other "
            "layers, and the minimum and the maximum:"]
     for s, vk, r in stage.runs:
@@ -589,14 +603,24 @@ def layer_summary(stage: Stage, results: dict[str, Result]) -> list[str]:
             continue
         name = run_name(s, vk, r)
         res = results.get(name)
-        if res is None or not res.ok:
+        if res is None:
+            out.append(f"  {name:10s} no run: no gate file")
+            continue
+        if not res.ok:
+            out.append(f"  {name:10s} no data: {', '.join(res.removed) or 'the run failed'}")
+            continue
+        window = last_encode_lines(res)
+        times = {kind: [int(mo.group(5)) for mo in map(OP_RE.search, window)
+                        if mo and mo.group(1).startswith("MUL_MAT") and f".{key}." in mo.group(2)]
+                 for key, kind in (("attn_qkv", "qkv"), ("ffn_up", "up"))}
+        if any(len(t) != ENCODER_LAYERS for t in times.values()):
+            out.append(f"  {name:10s} SKIPPED, the last complete encode window of {name}.log has "
+                       + " and ".join(f"{len(t)} {kind}" for kind, t in times.items())
+                       + f" matmuls, and the encoder has {ENCODER_LAYERS} layers; the last complete record of the log is "
+                       f"\"{last_record(res.log)[:160]}\"")
             continue
         cells = []
-        for key, kind in (("attn_qkv", "qkv"), ("ffn_up", "up")):
-            t = [int(mo.group(5)) for mo in map(OP_RE.search, last_encode_lines(res))
-                 if mo and mo.group(1).startswith("MUL_MAT") and f".{key}." in mo.group(2)]
-            if not t:
-                continue
+        for kind, t in times.items():
             third = [v for i, v in enumerate(t) if i % 3 == 0]
             rest = [v for i, v in enumerate(t) if i % 3 != 0]
             cells.append(f"{kind} {statistics.median(third):5.0f} {statistics.median(rest):5.0f} "
