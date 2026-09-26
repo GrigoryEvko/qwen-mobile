@@ -170,6 +170,24 @@ from the project root with the `.venv`:
 The prompt: "Explain how the TCP three-way handshake works, why it is needed, and what happens when
 a packet of the handshake is lost."
 
+### How to read the proposals of the drafter itself
+
+`llama-speculative-simple` with `-lv 5` prints one line for each candidate of each draft position,
+on standard error. The line has this form, and this regular expression reads it:
+
+    draft candidate\s+(?P<rank>\d+), pos\s+\d+:\s+(?P<id>\d+)\s+\(\s*(?P<prob>[\d.]+)\)
+
+Rank 0 is the greedy proposal. A greedy drafter draws rank 0 only, thus a count of the greedy
+proposals gives the token set that the head really proposes. The full command:
+
+    llama-speculative-simple -m <file>.gguf --spec-type draft-mtp -p "<prompt>" -n <gen> --temp 0 \
+        --seed <s> -c <ctx> --spec-draft-n-max <depth> -lv 5
+
+The shortlist of the shipped draft file did not come from these lines. It came from the count tables
+of the harvest of `tools/mtp-calib/calib_server.py`, which reads the per-depth acceptance from the
+`/metrics` endpoint of `llama-server`. The drafter-side count above is the alternative that needs no
+server, and it is the only way to count what one checkpoint proposes without a harvest.
+
 ## Q8_0 files of the original checkpoints, 2B and 4B (2026-09-18)
 
 The packer of the pipeline (`q8_0_quantize` and `pack_q8_0` in `quant/grid.py`) wrote these files
