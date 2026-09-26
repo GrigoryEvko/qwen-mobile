@@ -11,60 +11,15 @@
 // The work queue of the lab runs the jobs of a call one after the other on one thread.
 //
 // Arguments: --iters 2
+// lab-run: mode=functional
 #include "lab.h"
 
 #include <stdio.h>
 #include <string.h>
 
-// ---- the synchronous DMA shim of target_gdnk.c: the engine of the standalone runtime raises "No Access"
-#define HTP_DMA_H
-
-typedef struct {
-    void *       dst;
-    const void * src;
-} dma_ptr;
-
+// The transposed path pushes one descriptor for each row of a block, thus the queue is deep.
 #define LAB_DMA_CAPACITY 1024
-
-typedef struct dma_queue_s {
-    dma_ptr  ptr[LAB_DMA_CAPACITY];
-    uint32_t push_idx;
-    uint32_t pop_idx;
-} dma_queue;
-typedef dma_queue * dma_queue_t;
-
-static inline dma_ptr dma_make_ptr(void * dst, const void * src) {
-    dma_ptr p = { dst, src };
-    return p;
-}
-
-static inline bool dma_queue_push(dma_queue * q, dma_ptr p, size_t dst_stride, size_t src_stride,
-                                  size_t row_size, size_t nrows) {
-    if (q->push_idx - q->pop_idx >= LAB_DMA_CAPACITY) {
-        printf("lab: error: the DMA shim queue is full\n");
-        return false;
-    }
-    for (size_t r = 0; r < nrows; r++) {
-        memcpy((uint8_t *) p.dst + r * dst_stride, (const uint8_t *) p.src + r * src_stride, row_size);
-    }
-    q->ptr[q->push_idx & (LAB_DMA_CAPACITY - 1)] = p;
-    q->push_idx++;
-    return true;
-}
-
-static inline dma_ptr dma_queue_pop(dma_queue * q) {
-    dma_ptr p = { NULL, NULL };
-    if (q->pop_idx == q->push_idx) {
-        return p;
-    }
-    p = q->ptr[q->pop_idx & (LAB_DMA_CAPACITY - 1)];
-    q->pop_idx++;
-    return p;
-}
-
-static inline void dma_queue_flush(dma_queue * q) {
-    q->pop_idx = q->push_idx;
-}
+#include "lab-dma.h"
 
 #include "concat-ops.c"
 

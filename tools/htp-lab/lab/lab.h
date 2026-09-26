@@ -149,9 +149,16 @@ size_t lab_metric_report(const lab_metric * m, const char * target, double abs_t
 
 // ---- output hashes ----
 
-// The FNV-1a hash of n bytes, offset basis 0xCBF29CE484222325, prime 0x100000001B3. Two kernel
-// trees give the same bits when they give the same hash for the same inputs. Complexity O(n).
+// The offset basis of the FNV-1a hash
+#define LAB_FNV1A_BASIS 0xCBF29CE484222325ull
+
+// The FNV-1a hash of n bytes, offset basis LAB_FNV1A_BASIS, prime 0x100000001B3. Two kernel trees
+// give the same bits when they give the same hash for the same inputs. Complexity O(n).
 uint64_t lab_fnv1a(const void * p, size_t n);
+
+// Adds n bytes to a hash that a previous call gave, thus one hash covers a list of buffers. Start
+// the chain with LAB_FNV1A_BASIS. Complexity O(n).
+uint64_t lab_fnv1a_update(uint64_t h, const void * p, size_t n);
 
 // ---- the result lines ----
 

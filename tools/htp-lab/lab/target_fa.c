@@ -17,110 +17,16 @@
 //            --mask 1 --probe 0
 // --probe 1 runs a DMA sanity check only: the kernel needs the user DMA engine of the core, and
 // this mode reports whether the simulator completes a descriptor at all.
+// lab-run: mode=functional
 #include "lab.h"
 
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
 
-// The synchronous DMA shim of the lab. The kernel moves K, V and the mask with the user DMA
-// engine of the core (dmstart / dmpoll inline asm in dma-queue.h). The standalone runtime of the
-// simulator does not grant that thread access to the engine: a descriptor raises the exception
-// 0x28, "No Access". Thus the lab defines the guard of dma-queue.h and supplies a FIFO whose push
-// copies at once and whose pop returns the destinations in the order of the pushes, which is the
-// order contract the kernel depends on. The copies then appear as ordinary loads and stores, thus
-// the cycle numbers of this target hold the transfer cost in the kernel rather than beside it.
-// Every other behaviour, and every instruction of the compute path, is that of the phone.
-#define HTP_DMA_H
-
-typedef struct {
-    void *       dst;
-    const void * src;
-} dma_ptr;
-
-#define LAB_DMA_CAPACITY 256
-
-typedef struct dma_queue_s {
-    void *   dst[LAB_DMA_CAPACITY];
-    uint32_t push_idx;
-    uint32_t pop_idx;
-} dma_queue;
-typedef dma_queue * dma_queue_t;
-
-static inline dma_ptr dma_make_ptr(void * dst, const void * src) {
-    dma_ptr p = { dst, src };
-    return p;
-}
-
-// Copies nrows rows of row_size bytes at once, then records the destination for the pop.
-// nrows == 0 is the dummy transfer that the line cache uses for a hit: it records only.
-static inline bool dma_queue_push(dma_queue * q, dma_ptr p, size_t dst_stride, size_t src_stride,
-                                  size_t row_size, size_t nrows) {
-    for (size_t r = 0; r < nrows; r++) {
-        memcpy((uint8_t *) p.dst + r * dst_stride, (const uint8_t *) p.src + r * src_stride, row_size);
-    }
-    q->dst[q->push_idx & (LAB_DMA_CAPACITY - 1)] = p.dst;
-    q->push_idx++;
-    return true;
-}
-
-static inline dma_ptr dma_queue_pop(dma_queue * q) {
-    dma_ptr p = { NULL, NULL };
-    if (q->pop_idx == q->push_idx) {
-        return p;
-    }
-    p.dst = q->dst[q->pop_idx & (LAB_DMA_CAPACITY - 1)];
-    q->pop_idx++;
-    return p;
-}
-
-#define DMA_CACHE_MAX_SIZE 128
-
-// The line cache of the mask, with the replacement rule of dma-queue.h: a hit refreshes the age
-// and pushes a dummy transfer, a miss takes the oldest line and pushes a real one.
-typedef struct {
-    uint8_t * base;
-    uint32_t  line_size;
-    uint32_t  capacity;
-    uint32_t  src[DMA_CACHE_MAX_SIZE];
-    uint16_t  age[DMA_CACHE_MAX_SIZE];
-} dma_cache;
-
-static inline void dma_cache_init(dma_cache * c, uint8_t * base, uint32_t line_size, uint32_t capacity) {
-    c->capacity  = (capacity > DMA_CACHE_MAX_SIZE) ? DMA_CACHE_MAX_SIZE : capacity;
-    c->base      = base;
-    c->line_size = line_size;
-    for (unsigned i = 0; i < c->capacity; i++) {
-        c->src[i] = 0;
-        c->age[i] = 0;
-    }
-}
-
-static inline bool dma_cache_push(dma_queue * q, dma_cache * c, const uint8_t * src, uint32_t dst_stride,
-                                  uint32_t src_stride, uint32_t row_size, uint32_t nrows) {
-    uint32_t  o_idx = 0;
-    uint16_t  o_age = 0;
-    uint8_t * dst   = 0;
-    for (unsigned i = 0; i < c->capacity; i++) {
-        if (c->src[i] == (uint32_t) (uintptr_t) src) {
-            c->age[i] = 0;
-            dst = c->base + (i * c->line_size);
-            nrows = 0;
-        } else {
-            c->age[i]++;
-            if (c->age[i] > o_age) {
-                o_age = c->age[i];
-                o_idx = i;
-            }
-        }
-    }
-    if (!dst) {
-        c->age[o_idx] = 0;
-        c->src[o_idx] = (uint32_t) (uintptr_t) src;
-        dst = c->base + o_idx * c->line_size;
-    }
-    return dma_queue_push(q, dma_make_ptr(dst, src), dst_stride, src_stride, row_size, nrows);
-}
+// The DMA shim of the lab: the copies of the transfers appear as ordinary loads and stores,
+// thus the cycle numbers of this target hold the transfer cost in the kernel and not beside it.
+#include "lab-dma.h"
 
 #include "flash-attn-ops.c"
 
@@ -403,5 +309,6 @@ int main(int argc, char ** argv) {
     lab_report(TARGET, "us_at_2112_mhz", (double) best / 2112.0, "us");
     lab_report(TARGET, "nmse_out", sr > 0.0 ? se / sr : 0.0, "");
     lab_report(TARGET, "mismatches", (double) bad, "");
-    return 0;
+    const uint32_t ring = lab_dma_report(TARGET);
+    return (bad != 0 || ring != 0) ? 1 : 0;
 }

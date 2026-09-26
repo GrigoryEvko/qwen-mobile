@@ -8,6 +8,7 @@
 // The kernel is HVX only, thus the cycles here are real.
 //
 // Arguments: --n_ch 8192 --tokens 16 --threads 1 --iters 3 --range 4 --slots 5
+// lab-run: mode=functional
 #include "lab.h"
 
 #include <stdio.h>

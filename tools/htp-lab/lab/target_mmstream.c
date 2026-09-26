@@ -29,6 +29,7 @@
 #pragma clang diagnostic ignored "-Wunused-function"
 #pragma clang diagnostic ignored "-Wunused-variable"
 #pragma clang diagnostic ignored "-Wunused-but-set-variable"
+// lab-run: mode=timing
 
 #include "lab.h"
 

@@ -28,6 +28,7 @@
 // The program stops with the status 1 when one path is outside its tolerance at one count.
 //
 // Arguments: --n 2048 --rows 8 --iters 3 --range 12
+// lab-run: mode=functional
 #include "lab.h"
 
 #include <stdio.h>

@@ -20,6 +20,7 @@
 // -0. On v81, (a) gives the CPU bits.
 //
 // Arguments: --iters 50 --sweep 1 (0 skips the sweep)
+// lab-run: mode=functional
 #include "lab.h"
 
 #include <math.h>

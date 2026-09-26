@@ -13,6 +13,7 @@
 // for one vector of 32 angles.
 //
 // Arguments: --iters 200
+// lab-run: mode=functional
 #include "lab.h"
 
 #include <math.h>

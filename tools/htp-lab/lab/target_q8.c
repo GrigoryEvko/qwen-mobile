@@ -19,6 +19,7 @@
 #pragma clang diagnostic ignored "-Wunused-function"
 #pragma clang diagnostic ignored "-Wunused-variable"
 #pragma clang diagnostic ignored "-Wunused-but-set-variable"
+// lab-run: mode=functional
 
 #include "lab.h"
 
@@ -182,15 +183,6 @@ static float ref_dot(const struct q8_block * wrow, const int8_t * qa, const floa
     return acc;
 }
 
-// The FNV-1a hash of n bytes, continued from h. O(n).
-static uint64_t fnv1a(const void * p, size_t n, uint64_t h) {
-    const uint8_t * b = p;
-    for (size_t i = 0; i < n; i++) {
-        h = (h ^ b[i]) * 0x100000001B3ull;
-    }
-    return h;
-}
-
 static uint64_t g_best;
 
 static void timing_reset(void) {
@@ -210,14 +202,14 @@ static size_t report_rows(const char * variant, uint32_t n, double tiles, float 
     snprintf(key, sizeof(key), "rows%u_%s_weight_bytes_per_cycle", n, variant);
     lab_report(TARGET, key, (double) Q8_W_TILE * tiles / (double) g_best, "B/cycle");
     size_t bad = 0, bits = 0;
-    uint64_t h = 0xCBF29CE484222325ull;
+    uint64_t h = LAB_FNV1A_BASIS;
     for (uint32_t r = 0; r < n; r++) {
         snprintf(key, sizeof(key), "rows%u_%s_out%u", n, variant, r);
         bad += lab_compare_f32(key, out[r], ref[r], n_w_rows, 1e-2f, 1e-4f);
         for (uint32_t i = 0; i < n_w_rows; i++) {
             bits += memcmp(&out[r][i], &ref[r][i], sizeof(float)) != 0;
         }
-        h = fnv1a(out[r], (size_t) n_w_rows * sizeof(float), h);
+        h = lab_fnv1a_update(h, out[r], (size_t) n_w_rows * sizeof(float));
     }
     snprintf(key, sizeof(key), "rows%u_%s_bits_different", n, variant);
     lab_report(TARGET, key, (double) bits, "of the outputs");

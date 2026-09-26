@@ -8,6 +8,7 @@
 // kernels use today, over data in the L2.
 //
 // Arguments: --vectors 8192 --timing 0
+// lab-run: mode=functional
 #include "lab.h"
 
 #include <stdio.h>

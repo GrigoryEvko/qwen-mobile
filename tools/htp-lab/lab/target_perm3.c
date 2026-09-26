@@ -10,6 +10,7 @@
 // the network has no conflict, thus this program measures which of the needed patterns work.
 //
 // Arguments: none
+// lab-run: mode=functional
 #include "lab.h"
 
 #include <stdio.h>

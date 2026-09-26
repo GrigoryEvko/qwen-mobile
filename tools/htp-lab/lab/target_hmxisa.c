@@ -29,6 +29,7 @@
 //   --list            Print the case names and stop
 #pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
 #pragma clang diagnostic ignored "-Wunused-function"
+// lab-run: mode=functional
 
 #include "lab.h"
 

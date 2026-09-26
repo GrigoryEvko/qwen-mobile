@@ -10,6 +10,7 @@
 // of a reduction with one accumulator: each add waits two packets for the one before it.
 //
 // Arguments: --n 2560 --nsm 512 --iters 20 --range 4
+// lab-run: mode=functional
 #include "lab.h"
 
 #include <stdio.h>

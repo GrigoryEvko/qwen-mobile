@@ -17,6 +17,7 @@
 // reference with tolerance 0: a move must be exact.
 //
 // Arguments: --iters 8 --ne 128 --nrows 64
+// lab-run: mode=functional
 #include "lab.h"
 
 #include <stdio.h>

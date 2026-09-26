@@ -6,6 +6,7 @@
 // error of each helper, and the worst points. Run it with MODE=functional, the timing is not the point.
 //
 // Arguments: --lo -12 --hi 12
+// lab-run: mode=functional
 #include "lab.h"
 
 #include <stdio.h>

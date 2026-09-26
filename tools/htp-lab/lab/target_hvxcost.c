@@ -10,6 +10,7 @@
 // refer to the header of each case for its packets.
 //
 // Arguments: --iters 2048
+// lab-run: mode=timing
 #include "lab.h"
 
 #include <stdio.h>

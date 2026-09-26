@@ -3,8 +3,8 @@
 //
 // The program includes the op files verbatim and calls the op entry points with the kernel params that the host
 // computes (ggml_hexagon_precompute_get_rows_params, _set_rows_params, _rope_params and _unary_params). The DMA is
-// the synchronous shim of target_fa.c: a push copies at once, a pop returns the destinations in the order of the
-// pushes. Run it in the functional mode (MODE=functional).
+// the shim of lab-dma.h: a push copies at once, a pop returns the destinations in the order of the pushes. Run it
+// in the functional mode (MODE=functional).
 //
 // The cases (the shapes of the 4B and of its vision encoder):
 //   cpy_f16     CPY of 3 rows of 2560 f32 values to f16, plus 1 row of 2500 values (a tail): the special values
@@ -28,6 +28,7 @@
 #pragma clang diagnostic ignored "-Wunused-function"
 #pragma clang diagnostic ignored "-Wunused-variable"
 #pragma clang diagnostic ignored "-Wunused-but-set-variable"
+// lab-run: mode=functional
 
 #include "lab.h"
 
@@ -36,71 +37,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-// --- the synchronous DMA shim (refer to target_fa.c) ---
-#define HTP_DMA_H
-
-typedef struct {
-    void *       dst;
-    const void * src;
-} dma_ptr;
-
-#define LAB_DMA_CAPACITY 256
-
-typedef struct dma_queue_s {
-    dma_ptr  ptr[LAB_DMA_CAPACITY];
-    uint32_t push_idx;
-    uint32_t pop_idx;
-} dma_queue;
-typedef dma_queue * dma_queue_t;
-
-static inline dma_ptr dma_make_ptr(void * dst, const void * src) {
-    dma_ptr p = { dst, src };
-    return p;
-}
-
-static inline bool dma_queue_push(dma_queue * q, dma_ptr p, size_t dst_stride, size_t src_stride, size_t row_size,
-                                  size_t nrows) {
-    for (size_t r = 0; r < nrows; r++) {
-        memcpy((uint8_t *) p.dst + r * dst_stride, (const uint8_t *) p.src + r * src_stride, row_size);
-    }
-    q->ptr[q->push_idx & (LAB_DMA_CAPACITY - 1)] = p;
-    q->push_idx++;
-    return true;
-}
-
-static inline dma_ptr dma_queue_pop(dma_queue * q) {
-    dma_ptr p = { NULL, NULL };
-    if (q->pop_idx == q->push_idx) {
-        return p;
-    }
-    p = q->ptr[q->pop_idx & (LAB_DMA_CAPACITY - 1)];
-    q->pop_idx++;
-    return p;
-}
-
-static inline bool dma_queue_push_ddr_to_vtcm(dma_queue * q, dma_ptr p, size_t dst_row_size, size_t src_row_size,
-                                              size_t nrows) {
-    return dma_queue_push(q, p, dst_row_size, src_row_size, src_row_size, nrows);
-}
-
-static inline bool dma_queue_push_vtcm_to_ddr(dma_queue * q, dma_ptr p, size_t dst_row_size, size_t src_row_size,
-                                              size_t nrows) {
-    return dma_queue_push(q, p, dst_row_size, src_row_size, dst_row_size, nrows);
-}
-
-static inline void dma_queue_flush(dma_queue * q) {
-    while (dma_queue_pop(q).dst != NULL) {
-    }
-}
-
-// The transfers that the queue holds. Each push of the shim is complete at once.
-static inline uint32_t dma_queue_depth(dma_queue * q) {
-    return q->push_idx - q->pop_idx;
-}
-
-static inline dma_ptr dma_queue_pop_nowait(dma_queue * q) {
-    return dma_queue_pop(q);
-}
+#include "lab-dma.h"
 
 #include "cpy-ops.c"
 #include "get-rows-ops.c"
@@ -119,16 +56,6 @@ void htp_flush_dirty_ranges(struct htp_context * ctx) {
 static struct htp_context g_ctx;
 static dma_queue          g_dma[HTP_MAX_NTHREADS];
 static size_t             g_fail = 0;
-
-// The FNV-1a hash of n bytes. O(n).
-static uint64_t fnv1a(const void * p, size_t n) {
-    const uint8_t * b = p;
-    uint64_t        h = 0xCBF29CE484222325ull;
-    for (size_t i = 0; i < n; i++) {
-        h = (h ^ b[i]) * 0x100000001B3ull;
-    }
-    return h;
-}
 
 // A tensor with 4 dimensions and the given strides
 static struct htp_tensor mk(void * data, uint32_t type, uint32_t ne0, uint32_t ne1, uint32_t ne2, uint32_t ne3,
@@ -203,7 +130,7 @@ static uint16_t f16_of(double x) {
 static void report(const char * name, const void * out, size_t bytes, double max_err, double max_ref, size_t n_bad,
                    double bound) {
     const double rel = max_ref > 0.0 ? max_err / max_ref : max_err;
-    printf("lab: %s %s hash = 0x%016llx fnv1a\n", TARGET, name, (unsigned long long) fnv1a(out, bytes));
+    printf("lab: %s %s hash = 0x%016llx fnv1a\n", TARGET, name, (unsigned long long) lab_fnv1a(out, bytes));
     printf("lab: %s %s max_err %.6e of max_ref %.6e (relative %.3e), bad %zu\n", TARGET, name, max_err, max_ref, rel,
            n_bad);
     if (n_bad || !(rel <= bound)) {
@@ -573,6 +500,7 @@ int main(int argc, char ** argv) {
     case_softmax(1000, 16);
     case_gelu(4304, 4);
 
+    g_fail += lab_dma_report(TARGET);
     lab_report(TARGET, "failures", (double) g_fail, "cases");
     printf("lab: check %s %s\n", TARGET, g_fail == 0 ? "PASS" : "FAIL");
     return g_fail == 0 ? 0 : 1;

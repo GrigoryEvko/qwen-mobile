@@ -15,6 +15,7 @@
 // ISA_BENCH_UNROLL independent iterations, and one line "lab: isa-bench <op> <cycles per iteration>
 // <output vectors per iteration>". The inputs are ordinary values: f32, f16 and bf16 in +-[1, 2),
 // their canonical qf encodings, random integers.
+// lab-run: mode=functional
 #include "lab.h"
 
 #include <stdio.h>

@@ -11,6 +11,7 @@
 // against the same chain as one fused pass, which is the change that removes bytes.
 //
 // Arguments: --n 9216 --iters 8
+// lab-run: mode=functional
 #include "lab.h"
 
 #include <stdio.h>

@@ -28,6 +28,7 @@
 // accumulator, 3 f16 taps with an f16 accumulator, 4 the packed path: f16 taps, a 16-bit qfloat
 // accumulator, the int16 SiLU, 3 token rows in each iteration). The kernel of the checkout has
 // mode 0 only.
+// lab-run: mode=functional
 #include "lab.h"
 
 #include <stdio.h>

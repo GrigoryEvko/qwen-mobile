@@ -27,6 +27,7 @@
 #pragma clang diagnostic ignored "-Wunused-function"
 #pragma clang diagnostic ignored "-Wunused-variable"
 #pragma clang diagnostic ignored "-Wunused-but-set-variable"
+// lab-run: mode=functional
 
 #include "lab.h"
 
@@ -34,65 +35,10 @@
 #include <stdio.h>
 #include <string.h>
 
-// The kernel file needs the DMA queue of dma-queue.h, and the standalone runtime of the simulator
-// does not give the user DMA engine to the thread (refer to target_fa.c). This target calls no
-// function that moves data with the DMA, thus a copy-at-once queue is sufficient for the build.
-#define HTP_DMA_H
-
-typedef struct {
-    void *       dst;
-    const void * src;
-} dma_ptr;
-
+// The kernel file uses the DMA queue of dma-queue.h. This target calls no function that moves data
+// with the DMA, thus the queue stays empty and a small capacity is sufficient.
 #define LAB_DMA_CAPACITY 64
-
-typedef struct dma_queue_s {
-    void *   dst[LAB_DMA_CAPACITY];
-    uint32_t push_idx;
-    uint32_t pop_idx;
-} dma_queue;
-typedef dma_queue * dma_queue_t;
-
-static inline dma_ptr dma_make_ptr(void * dst, const void * src) {
-    dma_ptr p = { dst, src };
-    return p;
-}
-
-static inline bool dma_queue_push(dma_queue * q, dma_ptr p, size_t dst_stride, size_t src_stride, size_t row_size,
-                                  size_t nrows) {
-    for (size_t r = 0; r < nrows; r++) {
-        memcpy((uint8_t *) p.dst + r * dst_stride, (const uint8_t *) p.src + r * src_stride, row_size);
-    }
-    q->dst[q->push_idx++ & (LAB_DMA_CAPACITY - 1)] = p.dst;
-    return true;
-}
-
-static inline dma_ptr dma_queue_pop(dma_queue * q) {
-    dma_ptr p = { NULL, NULL };
-    if (q->pop_idx != q->push_idx) {
-        p.dst = q->dst[q->pop_idx++ & (LAB_DMA_CAPACITY - 1)];
-    }
-    return p;
-}
-
-#define DMA_CACHE_MAX_SIZE 128
-
-typedef struct {
-    uint8_t * base;
-    uint32_t  line_size;
-    uint32_t  capacity;
-} dma_cache;
-
-static inline void dma_cache_init(dma_cache * c, uint8_t * base, uint32_t line_size, uint32_t capacity) {
-    c->base      = base;
-    c->line_size = line_size;
-    c->capacity  = capacity;
-}
-
-static inline bool dma_cache_push(dma_queue * q, dma_cache * c, const uint8_t * src, uint32_t dst_stride,
-                                  uint32_t src_stride, uint32_t row_size, uint32_t nrows) {
-    return dma_queue_push(q, dma_make_ptr(c->base, src), dst_stride, src_stride, row_size, nrows);
-}
+#include "lab-dma.h"
 
 #include "flash-attn-ops.c"
 
@@ -341,5 +287,6 @@ int main(int argc, char ** argv) {
         lab_report(TARGET, "exhaustive_subnormal_or_zero_scale", (double) g_sub, "");
         lab_report(TARGET, "exhaustive_normal_scale", (double) g_norm, "");
     }
-    return 0;
+    // The counters must stay at 0: this target calls no function that moves data with the DMA.
+    return lab_dma_report(TARGET) == 0 ? 0 : 1;
 }

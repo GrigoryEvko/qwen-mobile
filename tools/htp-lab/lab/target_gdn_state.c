@@ -18,6 +18,7 @@
 // Each helper runs on its own, thus the numbers are throughput at a warm cache and no DMA.
 //
 // Arguments: --d 128 --iters 8
+// lab-run: mode=functional
 #include "lab.h"
 
 #include <stdio.h>

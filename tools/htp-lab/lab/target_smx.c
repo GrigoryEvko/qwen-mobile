@@ -20,6 +20,7 @@
 // Arguments: --nsm 512 --iters 12 --dist 0
 //   --dist 0 a realistic attention-logit row (normal, sigma 4, one peak), 1 a uniform sweep,
 //            2 a row whose maximum arrives last, which is the worst case for the running maximum.
+// lab-run: mode=functional
 #include "lab.h"
 
 #include <stdio.h>

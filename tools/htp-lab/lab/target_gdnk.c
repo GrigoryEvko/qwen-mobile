@@ -25,6 +25,7 @@
 //            --defer 0
 // --ver sets kernel_params[1], the version of the chunked kernel (2 selects version 2, another value
 // version 1). --defer 1 runs each HMX job of version 2 at its wait (refer to the shim below).
+// lab-run: mode=functional args=--vtcm_kb 1024
 #include "lab.h"
 
 #include <stdatomic.h>
@@ -32,62 +33,13 @@
 #include <string.h>
 #include <math.h>
 
-// ---- the synchronous DMA shim, as in target_fa.c
-#define HTP_DMA_H
-
-typedef struct {
-    void *       dst;
-    const void * src;
-} dma_ptr;
-
+// The op pushes one descriptor for each row of a band, thus the queue is deep.
 #define LAB_DMA_CAPACITY 1024
+#include "lab-dma.h"
 
-typedef struct dma_queue_s {
-    dma_ptr  ptr[LAB_DMA_CAPACITY];
-    uint32_t push_idx;
-    uint32_t pop_idx;
-} dma_queue;
-typedef dma_queue * dma_queue_t;
-
-static inline dma_ptr dma_make_ptr(void * dst, const void * src) {
-    dma_ptr p = { dst, src };
-    return p;
-}
-
-// Copies nrows rows of row_size bytes at once, then records the pointers for the pop.
-static inline bool dma_queue_push(dma_queue * q, dma_ptr p, size_t dst_stride, size_t src_stride,
-                                  size_t row_size, size_t nrows) {
-    if (q->push_idx - q->pop_idx >= LAB_DMA_CAPACITY) {
-        printf("lab: error: the DMA shim queue is full\n");
-        return false;
-    }
-    for (size_t r = 0; r < nrows; r++) {
-        memcpy((uint8_t *) p.dst + r * dst_stride, (const uint8_t *) p.src + r * src_stride, row_size);
-    }
-    q->ptr[q->push_idx & (LAB_DMA_CAPACITY - 1)] = p;
-    q->push_idx++;
-    return true;
-}
-
-static inline dma_ptr dma_queue_pop(dma_queue * q) {
-    dma_ptr p = { NULL, NULL };
-    if (q->pop_idx == q->push_idx) {
-        return p;
-    }
-    p = q->ptr[q->pop_idx & (LAB_DMA_CAPACITY - 1)];
-    q->pop_idx++;
-    return p;
-}
-
-static inline void dma_queue_flush(dma_queue * q) {
-    q->pop_idx = q->push_idx;
-}
-
-static inline bool dma_queue_empty(dma_queue * q) {
-    return q->pop_idx == q->push_idx;
-}
-
-// ---- the synchronous HMX queue shim, with the fields that gdn_ch_hmx_submit reads
+// The HMX queue shim of this target, with the fields that gdn_ch_hmx_submit reads. The shared shim
+// of lab-hmx.h does not fit here: the chunked kernel of version 2 reads the ring fields of the real
+// queue (desc, idx_write, idx_pop, idx_mask), and this target needs a job that runs at its wait.
 #define HMX_QUEUE_H
 
 #include "hex-profile.h"
@@ -443,7 +395,8 @@ int main(int argc, char ** argv) {
     lab_report(TARGET, "nmse_state", nmse_s, "");
     lab_report(TARGET, "nmse_slots_above_0", nmse_k, "");
     lab_report(TARGET, "not_finite", (double) n_bad, "");
-    const bool pass = n_bad == 0 && nmse_a < 2e-6 && nmse_s < 2e-6 && nmse_k < 2e-6;
+    const uint32_t ring = lab_dma_report(TARGET);
+    const bool pass = n_bad == 0 && ring == 0 && nmse_a < 2e-6 && nmse_s < 2e-6 && nmse_k < 2e-6;
     printf("lab: %s check %s (bound 2e-6)\n", TARGET, pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }

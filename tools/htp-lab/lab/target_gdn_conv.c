@@ -11,6 +11,7 @@
 // y does not depend on the layout, thus the base run and the proposal run must give the same y.
 //
 // Arguments: --n_ch 6144 --threads 1 --iters 20
+// lab-run: mode=functional
 #include "lab.h"
 
 #include <stdio.h>

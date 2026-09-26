@@ -7,6 +7,7 @@
 // entries far from the diagonal are 0 or below the f16 range, the case of the fallback of E.
 //
 // Arguments: --gate_min_milli -500 --d 128 --iters 1
+// lab-run: mode=functional
 #include "lab.h"
 
 #include <math.h>

@@ -367,13 +367,16 @@ size_t lab_metric_report(const lab_metric * m, const char * target, double abs_t
     return bad;
 }
 
-uint64_t lab_fnv1a(const void * p, size_t n) {
+uint64_t lab_fnv1a_update(uint64_t h, const void * p, size_t n) {
     const uint8_t * b = (const uint8_t *) p;
-    uint64_t        h = 0xCBF29CE484222325ull;
     for (size_t i = 0; i < n; i++) {
         h = (h ^ b[i]) * 0x100000001B3ull;
     }
     return h;
+}
+
+uint64_t lab_fnv1a(const void * p, size_t n) {
+    return lab_fnv1a_update(LAB_FNV1A_BASIS, p, n);
 }
 
 void lab_report(const char * target, const char * key, double value, const char * unit) {

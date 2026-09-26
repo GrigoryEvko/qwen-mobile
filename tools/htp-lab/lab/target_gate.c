@@ -22,58 +22,14 @@
 //            each token)  --swap 0|1  --block 0 (the largest block that fits) or N rows  --specials 0|1
 //            --iters 1
 //            --compute 1 --rows 64: the cycles of the compute of one block on one thread (timing mode)
+// lab-run: mode=functional
 #include "lab.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
 
-#define HTP_DMA_H
-
-typedef struct {
-    void *       dst;
-    const void * src;
-} dma_ptr;
-
-#define LAB_DMA_CAPACITY 256
-
-typedef struct dma_queue_s {
-    dma_ptr  ptr[LAB_DMA_CAPACITY];
-    uint32_t push_idx;
-    uint32_t pop_idx;
-} dma_queue;
-typedef dma_queue * dma_queue_t;
-
-static inline dma_ptr dma_make_ptr(void * dst, const void * src) {
-    dma_ptr p = { dst, src };
-    return p;
-}
-
-// Copies nrows rows of row_size bytes at once, then records the transfer for the pop
-static inline bool dma_queue_push(dma_queue * q, dma_ptr p, size_t dst_stride, size_t src_stride, size_t row_size,
-                                  size_t nrows) {
-    for (size_t r = 0; r < nrows; r++) {
-        memcpy((uint8_t *) p.dst + r * dst_stride, (const uint8_t *) p.src + r * src_stride, row_size);
-    }
-    q->ptr[q->push_idx & (LAB_DMA_CAPACITY - 1)] = p;
-    q->push_idx++;
-    return true;
-}
-
-static inline dma_ptr dma_queue_pop(dma_queue * q) {
-    dma_ptr p = { NULL, NULL };
-    if (q->pop_idx == q->push_idx) {
-        return p;
-    }
-    p = q->ptr[q->pop_idx & (LAB_DMA_CAPACITY - 1)];
-    q->pop_idx++;
-    return p;
-}
-
-static inline void dma_queue_flush(dma_queue * q) {
-    while (dma_queue_pop(q).dst != NULL) {
-    }
-}
+#include "lab-dma.h"
 
 #include "unary-ops.c"
 #include "binary-ops.c"
@@ -461,5 +417,6 @@ int main(int argc, char ** argv) {
     lab_report(TARGET, "bits_differ", (double) n_diff, "values");
     lab_report(TARGET, "ref_rows_checked", n_rows_checked, "rows");
     lab_report(TARGET, "ref_max_abs_error", max_abs, "");
-    return n_diff ? 1 : 0;
+    const uint32_t dma_faults = lab_dma_report(TARGET);
+    return (n_diff || dma_faults) ? 1 : 0;
 }

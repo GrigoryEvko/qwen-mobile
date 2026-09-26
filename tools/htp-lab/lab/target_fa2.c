@@ -26,6 +26,7 @@
 #pragma clang diagnostic ignored "-Wunused-function"
 #pragma clang diagnostic ignored "-Wunused-variable"
 #pragma clang diagnostic ignored "-Wunused-but-set-variable"
+// lab-run: mode=functional
 
 #include "lab.h"
 
@@ -34,181 +35,8 @@
 #include <stdio.h>
 #include <string.h>
 
-// ---- The DMA shim (the interface of dma-queue.h) ----
-#define HTP_DMA_H
-
-typedef struct {
-    void *       dst;
-    const void * src;
-} dma_ptr;
-
-#define LAB_DMA_CAPACITY 256
-
-typedef struct dma_queue_s {
-    void *   dst[LAB_DMA_CAPACITY];
-    uint32_t push_idx;
-    uint32_t pop_idx;
-} dma_queue;
-typedef dma_queue * dma_queue_t;
-
-static inline dma_ptr dma_make_ptr(void * dst, const void * src) {
-    dma_ptr p = { dst, src };
-    return p;
-}
-
-// The DMA engine of a hardware thread follows one descriptor chain: a push links its descriptor to the
-// tail of its queue (dmlink in dma-queue.h). On the chip, a push to a queue while a different queue has
-// transfers of the same thread in flight links to a chain that the engine does not read, thus the
-// transfer never starts and its pop waits forever. The shim copies at once, thus it cannot hang. It
-// counts each such push instead (lab_dma_ring_violations), for the calling hardware thread.
-#define LAB_DMA_THREADS 32
-
-static struct {
-    unsigned int tid;
-    dma_queue *  q;  // the last queue that this thread pushed to
-} lab_dma_active[LAB_DMA_THREADS];
-static uint32_t lab_dma_ring_violations;
-static int      lab_dma_mutex;
-
-static inline uint32_t lab_dma_in_flight(const dma_queue * q);
-
-static void lab_dma_note_push(dma_queue * q) {
-    const unsigned int tid = (unsigned int) thread_get_tnum();
-    lockMutex(&lab_dma_mutex);
-    int slot = -1;
-    for (int i = 0; i < LAB_DMA_THREADS; i++) {
-        if (lab_dma_active[i].q && lab_dma_active[i].tid == tid) {
-            slot = i;
-            break;
-        }
-        if (!lab_dma_active[i].q && slot < 0) {
-            slot = i;
-        }
-    }
-    if (slot >= 0) {
-        dma_queue * last = lab_dma_active[slot].q;
-        if (last && last != q && lab_dma_in_flight(last) > 0) {
-            if (lab_dma_ring_violations++ == 0) {
-                printf("lab: fa2 dma: thread %u pushes to queue %p while queue %p has %u transfers in flight\n", tid,
-                       (void *) q, (void *) last, lab_dma_in_flight(last));
-            }
-        }
-        lab_dma_active[slot].tid = tid;
-        lab_dma_active[slot].q   = q;
-    }
-    unlockMutex(&lab_dma_mutex);
-}
-
-static inline bool dma_queue_push(dma_queue * q, dma_ptr p, size_t dst_stride, size_t src_stride, size_t row_size,
-                                  size_t nrows) {
-    lab_dma_note_push(q);
-    for (size_t r = 0; r < nrows; r++) {
-        memcpy((uint8_t *) p.dst + r * dst_stride, (const uint8_t *) p.src + r * src_stride, row_size);
-    }
-    q->dst[q->push_idx & (LAB_DMA_CAPACITY - 1)] = p.dst;
-    q->push_idx++;
-    return true;
-}
-
-static inline dma_ptr dma_queue_pop(dma_queue * q) {
-    dma_ptr p = { NULL, NULL };
-    if (q->pop_idx == q->push_idx) {
-        return p;
-    }
-    p.dst = q->dst[q->pop_idx & (LAB_DMA_CAPACITY - 1)];
-    q->pop_idx++;
-    return p;
-}
-
-static inline uint32_t lab_dma_in_flight(const dma_queue * q) {
-    return q->push_idx - q->pop_idx;
-}
-
-#define DMA_CACHE_MAX_SIZE 128
-
-// The line cache of the mask, with the replacement rule of dma-queue.h.
-typedef struct {
-    uint8_t * base;
-    uint32_t  line_size;
-    uint32_t  capacity;
-    uint32_t  src[DMA_CACHE_MAX_SIZE];
-    uint16_t  age[DMA_CACHE_MAX_SIZE];
-} dma_cache;
-
-static inline void dma_cache_init(dma_cache * c, uint8_t * base, uint32_t line_size, uint32_t capacity) {
-    c->capacity  = (capacity > DMA_CACHE_MAX_SIZE) ? DMA_CACHE_MAX_SIZE : capacity;
-    c->base      = base;
-    c->line_size = line_size;
-    for (unsigned i = 0; i < c->capacity; i++) {
-        c->src[i] = 0;
-        c->age[i] = 0;
-    }
-}
-
-static inline bool dma_cache_push(dma_queue * q, dma_cache * c, const uint8_t * src, uint32_t dst_stride,
-                                  uint32_t src_stride, uint32_t row_size, uint32_t nrows) {
-    uint32_t  o_idx = 0;
-    uint16_t  o_age = 0;
-    uint8_t * dst   = 0;
-    for (unsigned i = 0; i < c->capacity; i++) {
-        if (c->src[i] == (uint32_t) (uintptr_t) src) {
-            c->age[i] = 0;
-            dst       = c->base + (i * c->line_size);
-            nrows     = 0;
-        } else {
-            c->age[i]++;
-            if (c->age[i] > o_age) {
-                o_age = c->age[i];
-                o_idx = i;
-            }
-        }
-    }
-    if (!dst) {
-        c->age[o_idx] = 0;
-        c->src[o_idx] = (uint32_t) (uintptr_t) src;
-        dst           = c->base + o_idx * c->line_size;
-    }
-    return dma_queue_push(q, dma_make_ptr(dst, src), dst_stride, src_stride, row_size, nrows);
-}
-
-// ---- The HMX queue shim (the interface of hmx-queue.h): a push runs the job at once ----
-#define HMX_QUEUE_H
-
-typedef void (*hmx_queue_func)(void *);
-
-struct hmx_queue_desc {
-    hmx_queue_func func;
-    void *         data;
-};
-
-struct hmx_queue_s {
-    uint32_t pushed;
-    uint32_t popped;
-};
-
-typedef struct hmx_queue_s * hmx_queue_t;
-
-static inline struct hmx_queue_desc hmx_queue_make_desc(hmx_queue_func func, void * data) {
-    struct hmx_queue_desc d = { func, data };
-    return d;
-}
-
-static inline bool hmx_queue_push(hmx_queue_t q, struct hmx_queue_desc d) {
-    d.func(d.data);
-    q->pushed++;
-    return true;
-}
-
-static inline struct hmx_queue_desc hmx_queue_pop(hmx_queue_t q) {
-    struct hmx_queue_desc d = { NULL, NULL };
-    if (q->popped == q->pushed) {
-        printf("lab: error: an HMX queue pop without a job\n");
-        return d;
-    }
-    q->popped++;
-    d.func = (hmx_queue_func) 1;
-    return d;
-}
+#include "lab-dma.h"
+#include "lab-hmx.h"
 
 #include "flash-attn-ops.c"
 
@@ -865,9 +693,7 @@ static int mode_full(int argc, char ** argv) {
     for (size_t i = 0; i < (size_t) n_tokens * n_heads * DK; i++) {
         od[i] = NAN;
     }
-    lab_dma_mutex = 0;
-    memset(lab_dma_active, 0, sizeof(lab_dma_active));
-    lab_dma_ring_violations = 0;
+    lab_dma_reset();
     const int st = op_flash_attn_ext(&octx);
     if (st != HTP_STATUS_OK) {
         printf("lab: fa2 full: the kernel gave the status %d\n", st);
@@ -882,6 +708,7 @@ static int mode_full(int argc, char ** argv) {
         }
     }
     lab_report(TARGET, "full_dma_ring_violations", lab_dma_ring_violations, "");
+    lab_dma_report(TARGET);
     // --check-stride 0 runs the kernel and the queue checks only, without the reference.
     if (stride == 0) {
         return (lab_dma_ring_violations || hq.pushed != hq.popped) ? 1 : 0;

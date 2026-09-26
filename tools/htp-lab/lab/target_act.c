@@ -21,6 +21,7 @@
 // which is not a fair comparison. Use --only for every number that goes into a report.
 //
 // Arguments: --nc 9216 --iters 3 --range 8 --only <name>
+// lab-run: mode=functional
 #include "lab.h"
 
 #include <stdio.h>
@@ -58,32 +59,15 @@ static void ref_swiglu(const float * x0, const float * x1, double * y, uint32_t 
     }
 }
 
-// The normalized mean squared error against the double reference
-static double nmse(const float * got, const double * ref, uint32_t n) {
-    double se = 0.0;
-    double sr = 0.0;
+// Fills the metric of one case from the result, the reference and the input. The relative error of
+// lab_metric divides by |ref| and by nothing else, thus a small reference does not floor it.
+// Complexity O(n).
+static void act_metric(lab_metric * m, const char * what, const float * got, const double * ref,
+                       const float * x, uint32_t n) {
+    lab_metric_start(m, what);
     for (uint32_t i = 0; i < n; i++) {
-        const double d = (double) got[i] - ref[i];
-        se += d * d;
-        sr += ref[i] * ref[i];
+        lab_metric_add(m, (double) got[i], ref[i], i, (double) x[i]);
     }
-    return sr > 0.0 ? se / sr : 0.0;
-}
-
-// The largest relative error, and where it is
-static double worst_rel(const float * got, const double * ref, uint32_t n, const float * x, uint32_t * at) {
-    double w = 0.0;
-    *at = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        const double r = fabs(ref[i]);
-        const double e = fabs((double) got[i] - ref[i]) / (r + 1e-6);
-        if (e > w) {
-            w = e;
-            *at = i;
-        }
-    }
-    (void) x;
-    return w;
 }
 
 // The kernels of the checkout, as the op calls them. Each is a function of its own and none of
@@ -180,12 +164,11 @@ int main(int argc, char ** argv) {
         }                                                                                         \
         memcpy(got, dst, bytes);                                                                  \
         ref_call;                                                                                 \
-        uint32_t at = 0;                                                                          \
-        const double w = worst_rel(got, ref, nc, x0, &at);                                        \
-        printf("lab: %s %-16s %8.2f cycles/vector  %7.2f packets/vector  nmse %9.3g"              \
-               "  worst rel %8.3g at x = % .4f\n",                                                \
-               TARGET, name, (double) best / nvec, (double) best / nvec / 2.0,                    \
-               nmse(got, ref, nc), w, (double) x0[at]);                                           \
+        lab_metric m;                                                                             \
+        act_metric(&m, name, got, ref, x0, nc);                                                   \
+        printf("lab: %s %-16s %8.2f cycles/vector  %7.2f packets/vector\n",                       \
+               TARGET, name, (double) best / nvec, (double) best / nvec / 2.0);                   \
+        lab_metric_report(&m, TARGET, 0.0, 0.0);                                                  \
     } while (0)
 
     RUN_CASE("sigmoid.base", ref_sigmoid(x0, ref, nc),

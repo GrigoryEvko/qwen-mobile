@@ -9,6 +9,7 @@
 // and the cycles here are real. The float64 check runs after the timing.
 //
 // Arguments: --d 128 --iters 8 --kda 0
+// lab-run: mode=functional
 #include "lab.h"
 
 #include <stdio.h>

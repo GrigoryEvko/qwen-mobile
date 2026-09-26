@@ -26,6 +26,7 @@
 //   --in <path>    The operation stream. Preset value: i8probe.in
 //   --out <path>   The dump file. Preset value: i8probe.out
 #pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
+// lab-run: skip=it needs an operation stream file
 
 #include "lab.h"
 

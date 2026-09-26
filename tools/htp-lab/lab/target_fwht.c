@@ -22,6 +22,7 @@
 // error against the largest value of the row).
 //
 // Arguments: --rows 64 --iters 3
+// lab-run: mode=functional
 #include "lab.h"
 
 #include <math.h>

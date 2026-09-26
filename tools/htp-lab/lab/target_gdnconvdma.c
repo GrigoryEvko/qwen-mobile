@@ -3,7 +3,7 @@
 //
 // The program includes the kernel file verbatim and calls the op through its context, thus the run
 // covers the thread split, the prologue of the planes, the bands and the snapshot walk. The DMA queue
-// is the synchronous shim of target_fa.c. With --copy 1 the shim copies the rows at the push (the
+// is the shim of lab-dma.h. With --copy 1 the shim copies the rows at the push (the
 // check needs that). With --copy 0 the push only records, thus a timing run measures the compute of the
 // DMA path without the cost of a copy that the phone does on the DMA engine.
 //
@@ -12,63 +12,14 @@
 // the packed path in that target.
 //
 // Arguments: --n_ch 8192 --tokens 76 --slots 1 --threads 6 --dma 1 --copy 1 --iters 1 --range 4
+// lab-run: mode=functional
 #include "lab.h"
 
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
 
-// ---- the synchronous DMA shim
-#define HTP_DMA_H
-
-typedef struct {
-    void *       dst;
-    const void * src;
-} dma_ptr;
-
-#define LAB_DMA_CAPACITY 256
-
-typedef struct dma_queue_s {
-    dma_ptr  ptr[LAB_DMA_CAPACITY];
-    uint32_t push_idx;
-    uint32_t pop_idx;
-} dma_queue;
-typedef dma_queue * dma_queue_t;
-
-static int g_dma_copy = 1;
-
-static inline dma_ptr dma_make_ptr(void * dst, const void * src) {
-    dma_ptr p = { dst, src };
-    return p;
-}
-
-static inline bool dma_queue_push(dma_queue * q, dma_ptr p, size_t dst_stride, size_t src_stride,
-                                  size_t row_size, size_t nrows) {
-    if (q->push_idx - q->pop_idx >= LAB_DMA_CAPACITY) {
-        printf("lab: error: the DMA shim queue is full\n");
-        return false;
-    }
-    for (size_t r = 0; g_dma_copy && r < nrows; r++) {
-        memcpy((uint8_t *) p.dst + r * dst_stride, (const uint8_t *) p.src + r * src_stride, row_size);
-    }
-    q->ptr[q->push_idx & (LAB_DMA_CAPACITY - 1)] = p;
-    q->push_idx++;
-    return true;
-}
-
-static inline dma_ptr dma_queue_pop(dma_queue * q) {
-    dma_ptr p = { NULL, NULL };
-    if (q->pop_idx == q->push_idx) {
-        return p;
-    }
-    p = q->ptr[q->pop_idx & (LAB_DMA_CAPACITY - 1)];
-    q->pop_idx++;
-    return p;
-}
-
-static inline void dma_queue_flush(dma_queue * q) {
-    q->pop_idx = q->push_idx;
-}
+#include "lab-dma.h"
 
 #include "gdn-conv-ops.c"
 
@@ -109,7 +60,7 @@ int main(int argc, char ** argv) {
     const uint32_t use_dma = (uint32_t) lab_arg_long(argc, argv, "--dma", 1);
     const uint32_t iters   = (uint32_t) lab_arg_long(argc, argv, "--iters", 1);
     const float    range   = (float) lab_arg_long(argc, argv, "--range", 4);
-    g_dma_copy             = (int) lab_arg_long(argc, argv, "--copy", 1);
+    lab_dma_copy           = (int) lab_arg_long(argc, argv, "--copy", 1);
 
     if (n_ch % 32 != 0 || T < 4 || nth == 0 || nth > HTP_MAX_NTHREADS || n_slots == 0) {
         printf("lab: %s the shape is not supported\n", TARGET);
@@ -118,7 +69,7 @@ int main(int argc, char ** argv) {
 
     lab_init();
     printf("lab: %s n_ch %u tokens %u slots %u threads %u dma %u copy %d\n", TARGET, n_ch, T, n_slots, nth, use_dma,
-           g_dma_copy);
+           lab_dma_copy);
 
     const uint32_t row = 3 * n_ch;
     // The projection has the layout of the graph: the token rows of the qkv matmul output, one after
@@ -191,10 +142,11 @@ int main(int argc, char ** argv) {
     lab_report(TARGET, "cycles_per_op", (double) best, "cycles");
     lab_report(TARGET, "cycles_per_token", (double) best / T, "cycles");
     lab_report(TARGET, "ms_per_1024_tokens_24_layers", (double) best / 2112.0 / 1000.0 * 24.0 * 1024.0 / T, "ms");
+    const uint32_t dma_faults = lab_dma_report(TARGET);
 
-    if (!g_dma_copy) {
+    if (!lab_dma_copy) {
         lab_report(TARGET, "checked", 0, "");
-        return 0;
+        return dma_faults == 0 ? 0 : 1;
     }
 
     // ---- the reference
@@ -261,7 +213,7 @@ int main(int argc, char ** argv) {
     lab_report(TARGET, "y_failures", (double) fail, "");
     lab_report(TARGET, "not_finite", (double) n_nonfinite, "");
     lab_report(TARGET, "slot_mismatches", (double) slot_bad, "");
-    const bool pass = fail == 0 && n_nonfinite == 0 && slot_bad == 0 && nmse < 1e-5;
+    const bool pass = fail == 0 && n_nonfinite == 0 && slot_bad == 0 && nmse < 1e-5 && dma_faults == 0;
     printf("lab: %s check %s\n", TARGET, pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }
