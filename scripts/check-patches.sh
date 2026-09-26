@@ -16,6 +16,10 @@
 #      tracked files of the commit and the files that the series touches.
 #   4. The submodule has no other new file. CMakeUserPresets.json is the one
 #      permitted extra file, and build directories are ignored by llama.cpp.
+#   5. patches/series names every file under patches/, or the file carries the
+#      line "Proposal: patches/series does not apply this patch." Such a file is
+#      a proposal, and the series does not apply it. A file with no such line and
+#      no entry in the series is a patch that the series lost.
 
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -102,6 +106,31 @@ if [[ -n "$extra" ]]; then
     status=1
 else
     echo "files    ok   no new file outside the series"
+fi
+
+# 5. Each file under patches/ that the series does not name.
+readonly PROPOSAL_LINE="Proposal: patches/series does not apply this patch."
+lost=0
+proposals=0
+while IFS= read -r path; do
+    rel="${path#"$REPO_ROOT"/patches/}"
+    [[ "$rel" == series ]] && continue
+    named=0
+    for line in "${patches[@]}"; do
+        [[ "$line" == "$rel" ]] && { named=1; break; }
+    done
+    [[ $named -eq 1 ]] && continue
+    if grep -q -x -F -- "$PROPOSAL_LINE" "$path"; then
+        proposals=$((proposals + 1))
+        echo "proposal ok   patches/$rel"
+    else
+        echo "series   FAIL patches/$rel has no entry in patches/series and no line \"$PROPOSAL_LINE\"" >&2
+        lost=$((lost + 1))
+        status=1
+    fi
+done < <(find "$REPO_ROOT/patches" -type f | sort)
+if [[ $lost -eq 0 ]]; then
+    echo "series   ok   $proposals proposal file(s) outside the series"
 fi
 
 exit $status

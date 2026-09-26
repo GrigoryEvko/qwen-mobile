@@ -1,10 +1,13 @@
 hexagon: the host matcher gives the conv chunk the snapshot slots of a batch
+Proposal: patches/series does not apply this patch.
 
-Base: llama.cpp commit c6824a9 plus the patches before this one in patches/series.
+Base: the text comes from an earlier state of patches/series. git apply of this file on the
+applied tree of the series fails in ggml/src/ggml-hexagon/htp-gdn-match.h. Thus a rebase is
+necessary before the patch enters the series.
 
-Needs patches/hexagon-spec/0001 before it, which makes the conv chunk kernel write K slots.
-Without that kernel the fused op writes one window into every slot and the conv state of a
-rollback is wrong.
+This patch needs patches/hexagon-spec/0001 before it, which makes the conv chunk kernel write K
+slots. Without that kernel the fused op writes one window into every slot, and the conv state of
+a rollback is wrong. That patch is in the series.
 
 Files:
     ggml/src/ggml-hexagon/htp-gdn-match.h   the refusal of a batch with several snapshot slots

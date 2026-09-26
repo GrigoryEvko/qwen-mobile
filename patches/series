@@ -5,7 +5,12 @@
 # the order is part of the series and a reader must take it from the top.
 #
 # scripts/regen-patch.sh rebuilds one patch from the live submodule. It gives a
-# correct result only for the last patch that touches the files of that patch.
+# correct result only for the last patch that touches the files of that patch, and
+# it stops when a later patch of the series touches one of them.
+#
+# A file under patches/ that this file does not name is a proposal. It carries the
+# line "Proposal: patches/series does not apply this patch.", and
+# scripts/check-patches.sh accepts it only with that line.
 
 # ggml and the CPU backend
 fuzz-ops/0001-ggml-graph-size-with-integers.patch
