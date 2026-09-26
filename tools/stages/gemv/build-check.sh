@@ -28,12 +28,12 @@
 set -euo pipefail
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../../scripts/lib.sh"
 cd "$REPO_ROOT"
+source tools/stages/common/buildlib.sh
 
 readonly src=build/gemv
 readonly stage=build/gemv-check
 readonly out=$stage/phone
 readonly tool=tools/stages/gemv
-readonly repro="-ffile-prefix-map=/workspace=. -fdebug-prefix-map=/workspace=. -Werror=date-time"
 
 # Stop when a program or a library in $1/bin or $1/lib has a NEEDED entry for a llama, ggml or mtmd library, or for
 # libc++_shared.so, that is not in $1/lib. The files that are not ELF files (gate.sh) have no NEEDED entry.
@@ -75,12 +75,11 @@ rm -rf "${stage:?}/bin"
 mkdir -p "$stage/bin"
 (
     flock 9
-    container_run -e FLAGS_EXTRA="$repro" "$SNAPDRAGON_IMAGE" bash -euo pipefail -c '
-cxx=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang++
-$cxx -O2 -std=c++17 -Wall -Wextra -Werror $FLAGS_EXTRA -static-libstdc++ -Ibuild/gemv/new/ggml/include \
+    # shellcheck disable=SC2016
+    snapdragon_run '
+"$(ndk_cxx)" -O2 -std=c++17 -Wall -Wextra -Werror $FLAGS_EXTRA -static-libstdc++ -Ibuild/gemv/new/ggml/include \
     tools/gemv/gemvcheck.cpp -o build/gemv-check/bin/gemvcheck \
-    -Lbuild/gemv/android-new/bin -lggml -lggml-cpu -lggml-base -Wl,-rpath,"\$ORIGIN/../lib"
-'
+    -Lbuild/gemv/android-new/bin -lggml -lggml-cpu -lggml-base -Wl,-rpath,"\$ORIGIN/../lib"' -e FLAGS_EXTRA="$STAGE_REPRO"
 ) 9> build/.container.lock > "$stage/build.log" 2>&1 || die "the build failed, refer to $stage/build.log"
 # -W: without it readelf cuts the long symbol names. No grep -q in a pipe: with pipefail, readelf can get
 # SIGPIPE when grep stops early.

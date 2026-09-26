@@ -30,13 +30,12 @@ set -euo pipefail
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../../scripts/lib.sh"
 JOBS=${JOBS:-24}
 cd "$REPO_ROOT"
+source tools/stages/common/buildlib.sh
 
 readonly stage=build/bench-kv
 readonly tree=$stage/src
 readonly bdir=$stage/android
 readonly out=$stage/phone
-readonly repro="-ffile-prefix-map=/workspace=. -fdebug-prefix-map=/workspace=. -Werror=date-time"
-readonly remap="-ffile-prefix-map=/workspace/$tree=./third_party/llama.cpp -ffile-prefix-map=/workspace/$bdir=./build/native/llama"
 
 # 1. The tree.
 tests/sanitizers/llama-copy.sh "$tree"
@@ -44,37 +43,12 @@ cp -f android/snapdragon/CMakeUserPresets.json "$tree/CMakeUserPresets.json"
 
 # 2. The build.
 mkdir -p "$bdir"
-SOURCE_DATE_EPOCH=$(source_date_epoch)
-echo "bench-kv: SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH JOBS=$JOBS"
+echo "bench-kv: SOURCE_DATE_EPOCH=$(source_date_epoch) JOBS=$JOBS"
 (
     flock 9
-    container_run \
-        -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
-        -e LLAMA_BUILD_NUMBER="$LLAMA_BUILD_NUMBER" \
-        -e LLAMA_BUILD_COMMIT_SHORT="${LLAMA_COMMIT:0:7}" \
-        -e TARGETS="$LLAMA_LIBS htp-v79 llama-bench" \
-        -e JOBS="$JOBS" \
-        -e FLAGS_EXTRA="$repro $remap" \
-        -e TREE="$tree" -e BDIR="$bdir" -e APP_SRC=android/app/src/main/cpp \
-        "$SNAPDRAGON_IMAGE" bash -euo pipefail -c '
-source tools/stages/common/buildlib.sh
-c_flags="$(preset_flag "$TREE" CMAKE_C_FLAGS) $FLAGS_EXTRA"
-cxx_flags="$(preset_flag "$TREE" CMAKE_CXX_FLAGS) $FLAGS_EXTRA"
-export CFLAGS="$FLAGS_EXTRA" CXXFLAGS="$FLAGS_EXTRA"
-cmake -S "$TREE" --preset arm64-android-snapdragon-release -B "$BDIR" \
-    -DLLAMA_BUILD_NUMBER="$LLAMA_BUILD_NUMBER" \
-    -DLLAMA_BUILD_COMMIT="$LLAMA_BUILD_COMMIT_SHORT" \
-    -DCMAKE_C_FLAGS="$c_flags" \
-    -DCMAKE_CXX_FLAGS="$cxx_flags"
-# shellcheck disable=SC2086
-cmake --build "$BDIR" -j"$JOBS" --target $TARGETS
-cxx=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang++
-$cxx -O2 -std=c++17 $FLAGS_EXTRA -I"$TREE/include" -I"$TREE/common" -I"$TREE/src" -I"$TREE/ggml/include" \
-    -I"$TREE/vendor" -I"$TREE/tools/mtmd" -I"$APP_SRC" tools/memprobe/memprobe.cpp "$APP_SRC/state_cache.cpp" \
-    "$APP_SRC/cache_io.cpp" "$APP_SRC/spec_policy.cpp" "$APP_SRC/chat_prompt.cpp" "$APP_SRC/engine_tasks.cpp" \
-    -o "$BDIR/bin/memprobe" \
-    -L"$BDIR/bin" -lmtmd -lllama-common -lllama -lggml -lggml-cpu -lggml-base -Wl,-rpath,"\$ORIGIN/../lib"
-'
+    # shellcheck disable=SC2016
+    stage_build "$tree" "$bdir" "$LLAMA_LIBS htp-v79 llama-bench" '
+memprobe_build "$TREE" "$BDIR" "$BDIR/bin/memprobe" "$FLAGS_EXTRA"'
 ) 9> build/.container.lock > "$stage/build.log" 2>&1 || die "the build failed, refer to $stage/build.log"
 
 # 3. The stage files and the comparison with the APK libraries.

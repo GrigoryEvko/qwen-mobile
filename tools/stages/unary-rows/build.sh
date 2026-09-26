@@ -26,6 +26,7 @@ set -euo pipefail
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../../scripts/lib.sh"
 JOBS=${JOBS:-16}
 cd "$REPO_ROOT"
+source tools/stages/common/buildlib.sh
 
 patch_file=${1:?usage: tools/stages/unary-rows/build.sh PATCH}
 [[ -f $patch_file ]] || die "no patch file $patch_file"
@@ -33,9 +34,6 @@ patch_file=$(readlink -f "$patch_file")
 
 readonly stage=build/unary-rows
 readonly out=$stage/phone
-readonly repro="-ffile-prefix-map=/workspace=. -fdebug-prefix-map=/workspace=. -Werror=date-time"
-readonly app_src=android/app/src/main/cpp
-readonly app_files="$app_src/state_cache.cpp $app_src/cache_io.cpp $app_src/spec_policy.cpp $app_src/chat_prompt.cpp $app_src/engine_tasks.cpp"
 
 # 1. The trees
 mkdir -p "$stage"
@@ -52,50 +50,17 @@ sha256sum "$patch_file" | python3 -c "import sys; h = sys.stdin.read().split()[0
     "$(basename "$patch_file")" > "$stage/patch.sha256"
 
 # 2. The builds
-SOURCE_DATE_EPOCH=$(source_date_epoch)
-echo "unary-rows: SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH JOBS=$JOBS"
+echo "unary-rows: SOURCE_DATE_EPOCH=$(source_date_epoch) JOBS=$JOBS"
 (
     flock 9
-    container_run \
-        -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
-        -e LLAMA_BUILD_NUMBER="$LLAMA_BUILD_NUMBER" \
-        -e LLAMA_BUILD_COMMIT_SHORT="${LLAMA_COMMIT:0:7}" \
-        -e LIBS="$LLAMA_LIBS htp-v79" \
-        -e JOBS="$JOBS" \
-        -e REPRO="$repro" \
-        -e STAGE="$stage" \
-        -e APP_SRC="$app_src" -e APP_FILES="$app_files" \
-        "$SNAPDRAGON_IMAGE" bash -euo pipefail -c '
-source tools/stages/common/buildlib.sh
-for name in base src; do
-    tree=$STAGE/$name
-    bdir=$STAGE/android-$name
-    flags="$REPRO -ffile-prefix-map=/workspace/$tree=./third_party/llama.cpp -ffile-prefix-map=/workspace/$bdir=./build/native/llama"
-    targets="$LIBS"
-    [[ $name == base ]] && targets="$targets test-backend-ops"
-    # The DSP library is an external project that the build step configures, thus it reads CFLAGS at that time
-    export CFLAGS="$flags" CXXFLAGS="$flags"
-    cmake -S "$tree" --preset arm64-android-snapdragon-release -B "$bdir" \
-        -DLLAMA_BUILD_NUMBER="$LLAMA_BUILD_NUMBER" \
-        -DLLAMA_BUILD_COMMIT="$LLAMA_BUILD_COMMIT_SHORT" \
-        -DCMAKE_C_FLAGS="$(preset_flag "$tree" CMAKE_C_FLAGS) $flags" \
-        -DCMAKE_CXX_FLAGS="$(preset_flag "$tree" CMAKE_CXX_FLAGS) $flags"
-    # shellcheck disable=SC2086
-    cmake --build "$bdir" -j"$JOBS" --target $targets
-done
-tree=$STAGE/base
-bdir=$STAGE/android-base
-flags="$REPRO -ffile-prefix-map=/workspace/$tree=./third_party/llama.cpp -ffile-prefix-map=/workspace/$bdir=./build/native/llama"
-cxx=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang++
-# shellcheck disable=SC2086
-$cxx -O2 -std=c++17 -Wall -Wextra -Wno-unused-parameter $flags -I"$tree/include" -I"$tree/common" -I"$tree/src" \
-    -I"$tree/ggml/include" -I"$tree/vendor" -I"$tree/tools/mtmd" -I"$APP_SRC" tools/memprobe/memprobe.cpp $APP_FILES \
-    -o "$bdir/bin/memprobe" -L"$bdir/bin" -lmtmd -lllama-common -lllama -lggml -lggml-cpu -lggml-base \
-    -Wl,-rpath,"\$ORIGIN/../lib"
-# unarycheck calls only the C API of ggml, thus it links the C++ runtime statically.
-$cxx -O2 -std=c++17 -Wall -Wextra $flags -I"$tree/ggml/include" tools/stages/unary-rows/unarycheck.cpp \
-    -o "$bdir/bin/unarycheck" -static-libstdc++ -L"$bdir/bin" -lggml -lggml-cpu -lggml-base -Wl,-rpath,"\$ORIGIN/../lib"
-'
+    # The base build also compiles memprobe and unarycheck against its libraries. unarycheck calls only the C API of
+    # ggml, thus it links the C++ runtime statically.
+    # shellcheck disable=SC2016
+    stage_build "$stage/base" "$stage/android-base" "$LLAMA_LIBS htp-v79 test-backend-ops" '
+memprobe_build "$TREE" "$BDIR" "$BDIR/bin/memprobe" "-Wall -Wextra -Wno-unused-parameter $FLAGS_EXTRA"
+"$(ndk_cxx)" -O2 -std=c++17 -Wall -Wextra $FLAGS_EXTRA -I"$TREE/ggml/include" tools/stages/unary-rows/unarycheck.cpp \
+    -o "$BDIR/bin/unarycheck" -static-libstdc++ -L"$BDIR/bin" -lggml -lggml-cpu -lggml-base -Wl,-rpath,"\$ORIGIN/../lib"'
+    stage_build "$stage/src" "$stage/android-src" "$LLAMA_LIBS htp-v79"
 ) 9> build/.container.lock > "$stage/build.log" 2>&1 || die "the build failed, refer to $stage/build.log"
 
 # 3. The stage files

@@ -37,11 +37,11 @@ source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../../scripts/lib.sh"
 JOBS=${JOBS:-24}
 PATCH=${PATCH:?give the patch file: PATCH=path/to/0001-....patch}
 cd "$REPO_ROOT"
+source tools/stages/common/buildlib.sh
 
 readonly stage=build/gemv
 readonly out=$stage/phone
 readonly tool=tools/stages/gemv
-readonly repro="-ffile-prefix-map=/workspace=. -fdebug-prefix-map=/workspace=. -Werror=date-time"
 
 [[ -f $PATCH ]] || die "the patch $PATCH does not exist"
 avail=$(free -g | { read -r _; read -r _ _ _ _ _ _ a _; echo "$a"; })
@@ -59,42 +59,15 @@ for t in base new; do
 done
 
 # 2. The builds.
-SOURCE_DATE_EPOCH=$(source_date_epoch)
-echo "gemv: SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH JOBS=$JOBS"
+echo "gemv: SOURCE_DATE_EPOCH=$(source_date_epoch) JOBS=$JOBS"
 (
     flock 9
-    for t in new base; do
-        targets="htp-v73 htp-v75 htp-v79"
-        [[ $t == new ]] && targets="$LLAMA_LIBS htp-v73 htp-v75 htp-v79 htp-v81 llama-bench test-backend-ops"
-        remap="-ffile-prefix-map=/workspace/$stage/$t=./third_party/llama.cpp -ffile-prefix-map=/workspace/$stage/android-$t=./build/native/llama"
-        container_run \
-            -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
-            -e LLAMA_BUILD_NUMBER="$LLAMA_BUILD_NUMBER" \
-            -e LLAMA_BUILD_COMMIT_SHORT="${LLAMA_COMMIT:0:7}" \
-            -e TARGETS="$targets" \
-            -e JOBS="$JOBS" \
-            -e FLAGS_EXTRA="$repro $remap" \
-            -e TREE="$stage/$t" -e BDIR="$stage/android-$t" -e CHECKER="$([[ $t == new ]] && echo 1 || echo 0)" \
-            "$SNAPDRAGON_IMAGE" bash -euo pipefail -c '
-source tools/stages/common/buildlib.sh
-c_flags="$(preset_flag "$TREE" CMAKE_C_FLAGS) $FLAGS_EXTRA"
-cxx_flags="$(preset_flag "$TREE" CMAKE_CXX_FLAGS) $FLAGS_EXTRA"
-export CFLAGS="$FLAGS_EXTRA" CXXFLAGS="$FLAGS_EXTRA"
-cmake -S "$TREE" --preset arm64-android-snapdragon-release -B "$BDIR" \
-    -DLLAMA_BUILD_NUMBER="$LLAMA_BUILD_NUMBER" \
-    -DLLAMA_BUILD_COMMIT="$LLAMA_BUILD_COMMIT_SHORT" \
-    -DLLAMA_BUILD_TESTS=ON \
-    -DCMAKE_C_FLAGS="$c_flags" \
-    -DCMAKE_CXX_FLAGS="$cxx_flags"
-# shellcheck disable=SC2086
-cmake --build "$BDIR" -j"$JOBS" --target $TARGETS
-if [ "$CHECKER" = 1 ]; then
-    cxx=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang++
-    $cxx -O2 -std=c++17 -Wall -Wextra $FLAGS_EXTRA -static-libstdc++ -I"$TREE/ggml/include" tools/gemv/gemvcheck.cpp \
-        -o "$BDIR/bin/gemvcheck" -L"$BDIR/bin" -lggml -lggml-cpu -lggml-base -Wl,-rpath,"\$ORIGIN/../lib"
-fi
-'
-    done
+    # shellcheck disable=SC2016
+    stage_build --tests "$stage/new" "$stage/android-new" \
+        "$LLAMA_LIBS htp-v73 htp-v75 htp-v79 htp-v81 llama-bench test-backend-ops" '
+"$(ndk_cxx)" -O2 -std=c++17 -Wall -Wextra $FLAGS_EXTRA -static-libstdc++ -I"$TREE/ggml/include" tools/gemv/gemvcheck.cpp \
+    -o "$BDIR/bin/gemvcheck" -L"$BDIR/bin" -lggml -lggml-cpu -lggml-base -Wl,-rpath,"\$ORIGIN/../lib"'
+    stage_build --tests "$stage/base" "$stage/android-base" "htp-v73 htp-v75 htp-v79"
 ) 9> build/.container.lock > "$stage/build.log" 2>&1 || die "the build failed, refer to $stage/build.log"
 
 # 3. The stage files.

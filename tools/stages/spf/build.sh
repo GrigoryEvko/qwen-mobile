@@ -38,13 +38,11 @@ JOBS=${JOBS:-64}
 STAGE=${STAGE:-spf}
 VARIANTS=${VARIANTS:-new:*}
 cd "$REPO_ROOT"
+source tools/stages/common/buildlib.sh
 
 [[ $STAGE =~ ^spf[0-9]*$ ]] || die "STAGE must be spf or spf<N>, not $STAGE"
 readonly stage=build/$STAGE
 readonly out=$stage/phone
-readonly repro="-ffile-prefix-map=/workspace=. -fdebug-prefix-map=/workspace=. -Werror=date-time"
-readonly app_src=android/app/src/main/cpp
-readonly app_files="$app_src/state_cache.cpp $app_src/cache_io.cpp $app_src/spec_policy.cpp $app_src/chat_prompt.cpp $app_src/engine_tasks.cpp"
 
 shopt -s nullglob
 patches=(tools/stages/spf/patches/*.patch)
@@ -84,49 +82,16 @@ done
 (cd tools/stages/spf/patches && sha256sum ./*.patch) > "$stage/patches.sha256"
 
 # 2. The builds
-SOURCE_DATE_EPOCH=$(source_date_epoch)
-echo "spf: SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH JOBS=$JOBS"
+echo "spf: SOURCE_DATE_EPOCH=$(source_date_epoch) JOBS=$JOBS"
 (
     flock 9
-    container_run \
-        -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
-        -e LLAMA_BUILD_NUMBER="$LLAMA_BUILD_NUMBER" \
-        -e LLAMA_BUILD_COMMIT_SHORT="${LLAMA_COMMIT:0:7}" \
-        -e LIBS="$LLAMA_LIBS htp-v79 test-backend-ops" \
-        -e JOBS="$JOBS" \
-        -e REPRO="$repro" \
-        -e STAGE="$stage" \
-        -e NAMES="${names[*]}" \
-        -e APP_SRC="$app_src" -e APP_FILES="$app_files" \
-        "$SNAPDRAGON_IMAGE" bash -euo pipefail -c '
-source tools/stages/common/buildlib.sh
-for name in base $NAMES; do
-    tree=$STAGE/$name
-    bdir=$STAGE/android-$name
-    flags="$REPRO -ffile-prefix-map=/workspace/$tree=./third_party/llama.cpp -ffile-prefix-map=/workspace/$bdir=./build/native/llama"
-    targets="$LIBS"
-    [[ $name == base ]] && targets="$targets llama-bench llama-perplexity"
-    # The DSP library is an external project that the build step configures, thus it reads CFLAGS at that time
-    export CFLAGS="$flags" CXXFLAGS="$flags"
-    cmake -S "$tree" --preset arm64-android-snapdragon-release -B "$bdir" \
-        -DLLAMA_BUILD_NUMBER="$LLAMA_BUILD_NUMBER" \
-        -DLLAMA_BUILD_COMMIT="$LLAMA_BUILD_COMMIT_SHORT" \
-        -DLLAMA_BUILD_TESTS=ON \
-        -DCMAKE_C_FLAGS="$(preset_flag "$tree" CMAKE_C_FLAGS) $flags" \
-        -DCMAKE_CXX_FLAGS="$(preset_flag "$tree" CMAKE_CXX_FLAGS) $flags"
-    # shellcheck disable=SC2086
-    cmake --build "$bdir" -j"$JOBS" --target $targets
-done
-tree=$STAGE/base
-bdir=$STAGE/android-base
-flags="$REPRO -ffile-prefix-map=/workspace/$tree=./third_party/llama.cpp -ffile-prefix-map=/workspace/$bdir=./build/native/llama"
-cxx=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang++
-# shellcheck disable=SC2086
-$cxx -O2 -std=c++17 -Wall -Wextra -Wno-unused-parameter $flags -I"$tree/include" -I"$tree/common" -I"$tree/src" \
-    -I"$tree/ggml/include" -I"$tree/vendor" -I"$tree/tools/mtmd" -I"$APP_SRC" tools/memprobe/memprobe.cpp $APP_FILES \
-    -o "$bdir/bin/memprobe" -L"$bdir/bin" -lmtmd -lllama-common -lllama -lggml -lggml-cpu -lggml-base \
-    -Wl,-rpath,"\$ORIGIN/../lib"
-'
+    # The base build also compiles memprobe against its libraries
+    # shellcheck disable=SC2016
+    stage_build --tests "$stage/base" "$stage/android-base" "$LLAMA_LIBS htp-v79 test-backend-ops llama-bench llama-perplexity" '
+memprobe_build "$TREE" "$BDIR" "$BDIR/bin/memprobe" "-Wall -Wextra -Wno-unused-parameter $FLAGS_EXTRA"'
+    for name in "${names[@]}"; do
+        stage_build --tests "$stage/$name" "$stage/android-$name" "$LLAMA_LIBS htp-v79 test-backend-ops"
+    done
 ) 9> build/.container.lock > "$stage/build.log" 2>&1 || die "the build failed, refer to $stage/build.log"
 
 # 3. The stage files

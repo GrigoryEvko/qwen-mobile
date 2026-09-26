@@ -25,12 +25,11 @@ set -euo pipefail
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../../scripts/lib.sh"
 JOBS=${JOBS:-24}
 cd "$REPO_ROOT"
+source tools/stages/common/buildlib.sh
 
 readonly stage=build/fixed
 readonly tree=build/bench-kv/src
 readonly bdir=build/bench-kv/android
-readonly app_src=android/app/src/main/cpp
-readonly app_files="$app_src/state_cache.cpp $app_src/cache_io.cpp $app_src/spec_policy.cpp $app_src/chat_prompt.cpp $app_src/engine_tasks.cpp"
 readonly memprobe_src=tools/memprobe/memprobe.cpp
 readonly mode=${1:-phone}
 
@@ -45,15 +44,10 @@ build_phone() {
     mkdir -p "$stage/android"
     (
         flock 9
-        container_run -e TREE="$tree" -e BDIR="$bdir" -e APP_SRC="$app_src" -e APP_FILES="$app_files" \
-            -e SRC="$memprobe_src" -e OUT="$stage/android/memprobe" "$SNAPDRAGON_IMAGE" bash -euo pipefail -c '
-cxx=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang++
-flags="-ffile-prefix-map=/workspace=. -fdebug-prefix-map=/workspace=. -Werror=date-time"
-# shellcheck disable=SC2086
-$cxx -O2 -std=c++17 -Wall -Wextra -Wno-unused-parameter $flags -I"$TREE/include" -I"$TREE/common" -I"$TREE/src" \
-    -I"$TREE/ggml/include" -I"$TREE/vendor" -I"$TREE/tools/mtmd" -I"$APP_SRC" "$SRC" $APP_FILES \
-    -o "$OUT" -L"$BDIR/bin" -lmtmd -lllama-common -lllama -lggml -lggml-cpu -lggml-base -Wl,-rpath,"\$ORIGIN/../lib"
-'
+        # shellcheck disable=SC2016
+        snapdragon_run '
+memprobe_build "$TREE" "$BDIR" "$OUT" "-Wall -Wextra -Wno-unused-parameter $FLAGS_EXTRA"' \
+            -e FLAGS_EXTRA="$STAGE_REPRO" -e TREE="$tree" -e BDIR="$bdir" -e OUT="$stage/android/memprobe"
     ) 9> build/.container.lock > "$stage/build-phone.log" 2>&1 || die "the phone build failed, refer to $stage/build-phone.log"
 
     rm -rf "$stage/phone"
@@ -78,15 +72,15 @@ build_host() {
     cmake --build "$host/llama" -j"$JOBS" --target llama llama-common mtmd ggml-cpu > "$host/build.log" 2>&1 ||
         die "the host build failed, refer to $host/build.log"
     local -a inc=(-I"$tree/include" -I"$tree/common" -I"$tree/src" -I"$tree/ggml/include" -I"$tree/vendor"
-                  -I"$tree/tools/mtmd" -I"$app_src")
+                  -I"$tree/tools/mtmd" -I"$APP_SRC")
     local -a libs=(-L"$host/llama/bin" -lmtmd -lllama-common -lllama -lggml -lggml-cpu -lggml-base
                    -Wl,-rpath,"$REPO_ROOT/$host/llama/bin")
     # shellcheck disable=SC2086
-    g++ -O2 -std=c++17 -Wall -Wextra -Wno-unused-parameter "${inc[@]}" "$memprobe_src" $app_files \
+    g++ -O2 -std=c++17 -Wall -Wextra -Wno-unused-parameter "${inc[@]}" "$memprobe_src" $APP_FILES \
         -o "$host/memprobe" "${libs[@]}"
     # shellcheck disable=SC2086
     g++ -O1 -g -fno-omit-frame-pointer -fsanitize=address -std=c++17 "${inc[@]}" "$memprobe_src" \
-        $app_files -o "$host/memprobe-asan" "${libs[@]}"
+        $APP_FILES -o "$host/memprobe-asan" "${libs[@]}"
     echo "fixed: the host binaries are $host/memprobe and $host/memprobe-asan"
 }
 

@@ -16,6 +16,7 @@ set -euo pipefail
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../../scripts/lib.sh"
 JOBS=${JOBS:-16}
 cd "$REPO_ROOT"
+source tools/stages/common/buildlib.sh
 
 readonly name=${1:?usage: tools/stages/quick/build.sh base|new}
 case $name in
@@ -26,9 +27,6 @@ esac
 readonly stage=build/quick
 readonly bdir=$stage/android-$name
 readonly out=$stage/phone
-readonly repro="-ffile-prefix-map=/workspace=. -fdebug-prefix-map=/workspace=. -Werror=date-time"
-readonly remap="-ffile-prefix-map=/workspace/$tree=./third_party/llama.cpp -ffile-prefix-map=/workspace/$bdir=./build/native/llama"
-readonly app_src=android/app/src/main/cpp
 
 [[ -f $tree/.llama-copy-stamp ]] || die "$tree has no stamp of tests/sanitizers/llama-copy.sh"
 grep -q "patches $(git rev-parse HEAD:patches)" "$tree/.llama-copy-stamp" ||
@@ -36,39 +34,15 @@ grep -q "patches $(git rev-parse HEAD:patches)" "$tree/.llama-copy-stamp" ||
 
 cp -f android/snapdragon/CMakeUserPresets.json "$tree/CMakeUserPresets.json"
 mkdir -p "$bdir"
-SOURCE_DATE_EPOCH=$(source_date_epoch)
+# The base build also compiles memprobe against its libraries
+memprobe=""
+if [[ $name == base ]]; then
+    # shellcheck disable=SC2016
+    memprobe='memprobe_build "$TREE" "$BDIR" "$BDIR/bin/memprobe" "-Wall -Wextra -Wno-unused-parameter $FLAGS_EXTRA"'
+fi
 (
     flock 9
-    container_run \
-        -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
-        -e LLAMA_BUILD_NUMBER="$LLAMA_BUILD_NUMBER" \
-        -e LLAMA_BUILD_COMMIT_SHORT="${LLAMA_COMMIT:0:7}" \
-        -e TARGETS="$LLAMA_LIBS htp-v79 llama-bench test-backend-ops" \
-        -e JOBS="$JOBS" \
-        -e FLAGS_EXTRA="$repro $remap" \
-        -e TREE="$tree" -e BDIR="$bdir" -e NAME="$name" \
-        -e APP_SRC="$app_src" -e APP_FILES="$app_src/state_cache.cpp $app_src/cache_io.cpp $app_src/spec_policy.cpp $app_src/chat_prompt.cpp $app_src/engine_tasks.cpp" \
-        "$SNAPDRAGON_IMAGE" bash -euo pipefail -c '
-source tools/stages/common/buildlib.sh
-c_flags="$(preset_flag "$TREE" CMAKE_C_FLAGS) $FLAGS_EXTRA"
-cxx_flags="$(preset_flag "$TREE" CMAKE_CXX_FLAGS) $FLAGS_EXTRA"
-export CFLAGS="$FLAGS_EXTRA" CXXFLAGS="$FLAGS_EXTRA"
-cmake -S "$TREE" --preset arm64-android-snapdragon-release -B "$BDIR" \
-    -DLLAMA_BUILD_NUMBER="$LLAMA_BUILD_NUMBER" \
-    -DLLAMA_BUILD_COMMIT="$LLAMA_BUILD_COMMIT_SHORT" \
-    -DCMAKE_C_FLAGS="$c_flags" \
-    -DCMAKE_CXX_FLAGS="$cxx_flags"
-# shellcheck disable=SC2086
-cmake --build "$BDIR" -j"$JOBS" --target $TARGETS
-if [[ $NAME == base ]]; then
-    cxx=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang++
-    # shellcheck disable=SC2086
-    $cxx -O2 -std=c++17 -Wall -Wextra -Wno-unused-parameter $FLAGS_EXTRA -I"$TREE/include" -I"$TREE/common" \
-        -I"$TREE/src" -I"$TREE/ggml/include" -I"$TREE/vendor" -I"$TREE/tools/mtmd" -I"$APP_SRC" \
-        tools/memprobe/memprobe.cpp $APP_FILES -o "$BDIR/bin/memprobe" -L"$BDIR/bin" -lmtmd -lllama-common -lllama \
-        -lggml -lggml-cpu -lggml-base -Wl,-rpath,"\$ORIGIN/../lib"
-fi
-'
+    stage_build "$tree" "$bdir" "$LLAMA_LIBS htp-v79 llama-bench test-backend-ops" "$memprobe"
 ) 9> build/.container.lock > "$stage/build-$name.log" 2>&1 || die "the build failed, refer to $stage/build-$name.log"
 
 rm -rf "$out/lib-$name"

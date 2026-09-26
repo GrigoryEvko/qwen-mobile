@@ -29,15 +29,13 @@ set -euo pipefail
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../../scripts/lib.sh"
 JOBS=${JOBS:-24}
 cd "$REPO_ROOT"
+source tools/stages/common/buildlib.sh
 
 readonly stage=build/ttft
 readonly tree=$stage/src
 readonly bdir=$stage/android
 readonly out=$stage/phone
-readonly app_src=android/app/src/main/cpp
-readonly app_files="$app_src/state_cache.cpp $app_src/cache_io.cpp $app_src/spec_policy.cpp $app_src/chat_prompt.cpp $app_src/engine_tasks.cpp"
 readonly patch=${TTFT_PATCH:-}
-readonly repro="-ffile-prefix-map=/workspace=. -fdebug-prefix-map=/workspace=. -Werror=date-time"
 readonly mode=${1:-phone}
 
 # git apply in the tree. The tree is in the work tree of this repository, and inside a repository git apply
@@ -73,15 +71,10 @@ make_tree() {
 # Compile memprobe with the NDK clang++ of the Snapdragon container against the libraries in $bdir/bin. The caller
 # holds the lock build/.container.lock.
 compile_memprobe() {
-    container_run -e FLAGS_EXTRA="$repro" -e TREE="$tree" -e BDIR="$bdir" -e APP_SRC="$app_src" -e APP_FILES="$app_files" \
-        "$SNAPDRAGON_IMAGE" bash -euo pipefail -c '
-cxx=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang++
-# shellcheck disable=SC2086
-$cxx -O2 -std=c++17 $FLAGS_EXTRA -I"$TREE/include" -I"$TREE/common" -I"$TREE/src" -I"$TREE/ggml/include" \
-    -I"$TREE/vendor" -I"$TREE/tools/mtmd" -I"$APP_SRC" tools/memprobe/memprobe.cpp $APP_FILES \
-    -o "$BDIR/bin/memprobe" \
-    -L"$BDIR/bin" -lmtmd -lllama-common -lllama -lggml -lggml-cpu -lggml-base -Wl,-rpath,"\$ORIGIN/../lib"
-'
+    # shellcheck disable=SC2016
+    snapdragon_run '
+memprobe_build "$TREE" "$BDIR" "$BDIR/bin/memprobe" "$FLAGS_EXTRA"' \
+        -e FLAGS_EXTRA="$STAGE_REPRO" -e TREE="$tree" -e BDIR="$bdir"
 }
 
 # Copy the libraries of the app, the DSP library, memprobe and the gate into $out, and write SHA256SUMS.
@@ -118,28 +111,9 @@ build_memprobe() {
 build_phone() {
     make_tree
     mkdir -p "$bdir"
-    local epoch
-    epoch=$(source_date_epoch)
     (
         flock 9
-        container_run \
-            -e SOURCE_DATE_EPOCH="$epoch" \
-            -e LLAMA_BUILD_NUMBER="$LLAMA_BUILD_NUMBER" \
-            -e LLAMA_BUILD_COMMIT_SHORT="${LLAMA_COMMIT:0:7}" \
-            -e TARGETS="$LLAMA_LIBS htp-v79" \
-            -e JOBS="$JOBS" -e FLAGS_EXTRA="$repro" \
-            -e TREE="$tree" -e BDIR="$bdir" \
-            "$SNAPDRAGON_IMAGE" bash -euo pipefail -c '
-source tools/stages/common/buildlib.sh
-c_flags="$(preset_flag "$TREE" CMAKE_C_FLAGS) $FLAGS_EXTRA"
-cxx_flags="$(preset_flag "$TREE" CMAKE_CXX_FLAGS) $FLAGS_EXTRA"
-export CFLAGS="$FLAGS_EXTRA" CXXFLAGS="$FLAGS_EXTRA"
-cmake -S "$TREE" --preset arm64-android-snapdragon-release -B "$BDIR" \
-    -DLLAMA_BUILD_NUMBER="$LLAMA_BUILD_NUMBER" -DLLAMA_BUILD_COMMIT="$LLAMA_BUILD_COMMIT_SHORT" \
-    -DCMAKE_C_FLAGS="$c_flags" -DCMAKE_CXX_FLAGS="$cxx_flags"
-# shellcheck disable=SC2086
-cmake --build "$BDIR" -j"$JOBS" --target $TARGETS
-'
+        stage_build --no-remap "$tree" "$bdir" "$LLAMA_LIBS htp-v79"
         compile_memprobe
     ) 9> build/.container.lock > "$stage/build-phone.log" 2>&1 || die "the phone build failed, refer to $stage/build-phone.log"
     copy_phone_files
@@ -155,15 +129,15 @@ build_host() {
     cmake --build "$host/llama" -j"$JOBS" --target llama llama-common mtmd ggml-cpu > "$host/build.log" 2>&1 ||
         die "the host build failed, refer to $host/build.log"
     local -a inc=(-I"$tree/include" -I"$tree/common" -I"$tree/src" -I"$tree/ggml/include" -I"$tree/vendor"
-                  -I"$tree/tools/mtmd" -I"$app_src")
+                  -I"$tree/tools/mtmd" -I"$APP_SRC")
     local -a libs=(-L"$host/llama/bin" -lmtmd -lllama-common -lllama -lggml -lggml-cpu -lggml-base
                    -Wl,-rpath,"$REPO_ROOT/$host/llama/bin")
     # shellcheck disable=SC2086
     g++ -O2 -std=c++17 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function "${inc[@]}" tools/memprobe/memprobe.cpp \
-        $app_files -o "$host/memprobe" "${libs[@]}"
+        $APP_FILES -o "$host/memprobe" "${libs[@]}"
     # shellcheck disable=SC2086
     g++ -O1 -g -fno-omit-frame-pointer -fsanitize=address -std=c++17 "${inc[@]}" tools/memprobe/memprobe.cpp \
-        $app_files -o "$host/memprobe-asan" "${libs[@]}"
+        $APP_FILES -o "$host/memprobe-asan" "${libs[@]}"
     echo "ttft: the host binaries are $host/memprobe and $host/memprobe-asan"
 }
 

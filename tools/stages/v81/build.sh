@@ -34,6 +34,7 @@ source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../../scripts/lib.sh"
 JOBS=${JOBS:-24}
 KIT=${KIT:-1}
 cd "$REPO_ROOT"
+source tools/stages/common/buildlib.sh
 
 readonly stage=build/v81
 readonly tree=$stage/src
@@ -42,7 +43,6 @@ readonly bdir=$stage/android
 readonly bbase=$stage/android-base
 readonly out=$stage/phone
 readonly kit=$stage/kit
-readonly repro="-ffile-prefix-map=/workspace=. -fdebug-prefix-map=/workspace=. -Werror=date-time"
 
 patches=${PATCHES:-$(ls "$stage"/patches/*.patch 2> /dev/null || true)}
 
@@ -63,44 +63,14 @@ cp -f android/snapdragon/CMakeUserPresets.json "$base/CMakeUserPresets.json"
 
 # 2. The builds.
 mkdir -p "$bdir" "$bbase"
-SOURCE_DATE_EPOCH=$(source_date_epoch)
-echo "v81: SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH JOBS=$JOBS"
-build_tree() {
-    # build_tree TREE BDIR TARGETS: one container run for one tree
-    local t=$1 b=$2 targets=$3
-    local remap="-ffile-prefix-map=/workspace/$t=./third_party/llama.cpp -ffile-prefix-map=/workspace/$b=./build/native/llama"
-    container_run \
-        -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
-        -e LLAMA_BUILD_NUMBER="$LLAMA_BUILD_NUMBER" \
-        -e LLAMA_BUILD_COMMIT_SHORT="${LLAMA_COMMIT:0:7}" \
-        -e TARGETS="$targets" \
-        -e JOBS="$JOBS" \
-        -e FLAGS_EXTRA="$repro $remap" \
-        -e TREE="$t" -e BDIR="$b" \
-        "$SNAPDRAGON_IMAGE" bash -euo pipefail -c '
-source tools/stages/common/buildlib.sh
-c_flags="$(preset_flag "$TREE" CMAKE_C_FLAGS) $FLAGS_EXTRA"
-cxx_flags="$(preset_flag "$TREE" CMAKE_CXX_FLAGS) $FLAGS_EXTRA"
-export CFLAGS="$FLAGS_EXTRA" CXXFLAGS="$FLAGS_EXTRA"
-cmake -S "$TREE" --preset arm64-android-snapdragon-release -B "$BDIR" \
-    -DLLAMA_BUILD_NUMBER="$LLAMA_BUILD_NUMBER" \
-    -DLLAMA_BUILD_COMMIT="$LLAMA_BUILD_COMMIT_SHORT" \
-    -DLLAMA_BUILD_TESTS=ON \
-    -DCMAKE_C_FLAGS="$c_flags" \
-    -DCMAKE_CXX_FLAGS="$cxx_flags"
-# shellcheck disable=SC2086
-cmake --build "$BDIR" -j"$JOBS" --target $TARGETS
-if [ -f "$BDIR/bin/libggml.so" ]; then
-    cxx=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang++
-    $cxx -O2 -std=c++17 $FLAGS_EXTRA -I"$TREE/ggml/include" tools/stages/v81/canarytime.cpp -o "$BDIR/bin/canarytime" \
-        -L"$BDIR/bin" -lggml -lggml-base -Wl,-rpath,"\$ORIGIN/../lib"
-fi
-'
-}
+echo "v81: SOURCE_DATE_EPOCH=$(source_date_epoch) JOBS=$JOBS"
 (
     flock 9
-    build_tree "$tree" "$bdir" "$LLAMA_LIBS htp-v79 htp-v81 llama-bench llama-perplexity test-backend-ops"
-    build_tree "$base" "$bbase" "htp-v79 htp-v81"
+    # shellcheck disable=SC2016
+    stage_build --tests "$tree" "$bdir" "$LLAMA_LIBS htp-v79 htp-v81 llama-bench llama-perplexity test-backend-ops" '
+"$(ndk_cxx)" -O2 -std=c++17 $FLAGS_EXTRA -I"$TREE/ggml/include" tools/stages/v81/canarytime.cpp -o "$BDIR/bin/canarytime" \
+    -L"$BDIR/bin" -lggml -lggml-base -Wl,-rpath,"\$ORIGIN/../lib"'
+    stage_build --tests "$base" "$bbase" "htp-v79 htp-v81"
 ) 9> build/.container.lock > "$stage/build.log" 2>&1 || die "the build failed, refer to $stage/build.log"
 
 # 3. The DSP libraries of the two trees.

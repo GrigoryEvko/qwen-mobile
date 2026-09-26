@@ -27,12 +27,12 @@ source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../../scripts/lib.sh"
 JOBS=${JOBS:-24}
 STAGE=${STAGE:-fak}
 cd "$REPO_ROOT"
+source tools/stages/common/buildlib.sh
 
 readonly stage=build/$STAGE
 readonly tree=$stage/tree
 readonly bdir=$stage/android
 readonly out=$stage/phone
-readonly repro="-ffile-prefix-map=/workspace=. -fdebug-prefix-map=/workspace=. -Werror=date-time"
 
 # 1. The tree. The tree is below build/, which the repository ignores, and git apply inside the
 # repository skips the files of an ignored path with the exit code 0. Thus the tree is its own git
@@ -50,36 +50,14 @@ cp -f android/snapdragon/CMakeUserPresets.json "$tree/CMakeUserPresets.json"
 
 # 2. The build.
 mkdir -p "$bdir"
-SOURCE_DATE_EPOCH=$(source_date_epoch)
-echo "$STAGE: SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH JOBS=$JOBS"
+echo "$STAGE: SOURCE_DATE_EPOCH=$(source_date_epoch) JOBS=$JOBS"
 (
     flock 9
-    container_run \
-        -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
-        -e LLAMA_BUILD_NUMBER="$LLAMA_BUILD_NUMBER" \
-        -e LLAMA_BUILD_COMMIT_SHORT="${LLAMA_COMMIT:0:7}" \
-        -e TARGETS="$LLAMA_LIBS htp-v79 llama-bench llama-perplexity test-backend-ops" \
-        -e JOBS="$JOBS" \
-        -e FLAGS_EXTRA="$repro" \
-        -e TREE="$tree" -e BDIR="$bdir" \
-        "$SNAPDRAGON_IMAGE" bash -euo pipefail -c '
-source tools/stages/common/buildlib.sh
-c_flags="$(preset_flag "$TREE" CMAKE_C_FLAGS) $FLAGS_EXTRA"
-cxx_flags="$(preset_flag "$TREE" CMAKE_CXX_FLAGS) $FLAGS_EXTRA"
-export CFLAGS="$FLAGS_EXTRA" CXXFLAGS="$FLAGS_EXTRA"
-cmake -S "$TREE" --preset arm64-android-snapdragon-release -B "$BDIR" \
-    -DLLAMA_BUILD_NUMBER="$LLAMA_BUILD_NUMBER" \
-    -DLLAMA_BUILD_COMMIT="$LLAMA_BUILD_COMMIT_SHORT" \
-    -DLLAMA_BUILD_TESTS=ON \
-    -DCMAKE_C_FLAGS="$c_flags" \
-    -DCMAKE_CXX_FLAGS="$cxx_flags"
-# shellcheck disable=SC2086
-cmake --build "$BDIR" -j"$JOBS" --target $TARGETS
-cxx=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang++
-$cxx -O2 -std=c++17 $FLAGS_EXTRA -I"$TREE/include" -I"$TREE/common" -I"$TREE/ggml/include" -I"$TREE/vendor" \
+    # shellcheck disable=SC2016
+    stage_build --tests --no-remap "$tree" "$bdir" "$LLAMA_LIBS htp-v79 llama-bench llama-perplexity test-backend-ops" '
+"$(ndk_cxx)" -O2 -std=c++17 $FLAGS_EXTRA -I"$TREE/include" -I"$TREE/common" -I"$TREE/ggml/include" -I"$TREE/vendor" \
     tools/memprobe/kvkl.cpp -o "$BDIR/bin/kvkl" -L"$BDIR/bin" -lllama-common -lllama -lggml -lggml-base \
-    -Wl,-rpath,"\$ORIGIN/../lib"
-'
+    -Wl,-rpath,"\$ORIGIN/../lib"'
 ) 9> build/.container.lock > "$stage/build.log" 2>&1 || die "the build failed, refer to $stage/build.log"
 
 # 3. The stage files.
