@@ -10,7 +10,9 @@
 // the network has no conflict, thus this program measures which of the needed patterns work.
 //
 // Arguments: none
-// lab-run: mode=functional
+// The program is a probe with a recorded answer, not a check: it ends with the status 1 because
+// the patterns fail. Thus the registry skips it, and "run.sh run perm3" gives the answer again.
+// lab-run: skip=a probe with the answer: vrdelta cannot express the lane patterns (167 wrong lanes)
 #include "lab.h"
 
 #include <stdio.h>
