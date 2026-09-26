@@ -435,21 +435,22 @@ def nsp_tables(results: list[Result], include_all: bool) -> tuple[list[str], dic
                 windows.append((d["cfg"], d["votes"], freq_shares(fr, int(d["t_go"]), int(d["t_end"]))))
     votes = [v for v in VOTE_ORDER if any(k[1] == v for k in by)]
     out = ["NSP read (ddrbw nsp): GB/s of all threads = bytes / (last end - start); the median over the "
-           "repetitions and rounds, [lowest-highest], n; tmin = the median of the slowest thread",
-           f"  {'configuration':15s}" + "".join(f"| {v:24s}" for v in votes)]
+           "repetitions and rounds, [lowest-highest], n; tmin = the median of the GB/s of the slowest thread",
+           f"  {'configuration':15s}" + "".join(f"| {v:34s}" for v in votes)]
     for cfg in cfg_order:
         cells = []
         for v in votes:
             vals = by.get((cfg, v), [])
             f = fails.get((cfg, v), 0)
             if not vals and not f:
-                cells.append(f"| {'':24s}")
+                cells.append(f"| {'':34s}")
                 continue
             c = (f"{tables.fmt(tables.med(vals), 2)} [{tables.fmt(min(vals) if vals else None, 1)}-"
-                 f"{tables.fmt(max(vals) if vals else None, 1)}] n{len(vals)}")
+                 f"{tables.fmt(max(vals) if vals else None, 1)}] n{len(vals)} "
+                 f"tmin {tables.fmt(tables.med(tmins.get((cfg, v), [])), 2)}")
             c += f" F{f}" if f else ""
             c += mark((cfg, v) in flagged)
-            cells.append(f"| {c:24s}")
+            cells.append(f"| {c:34s}")
         out.append(f"  {cfg:15s}" + "".join(cells))
     ceil = {}
     for v in votes:
