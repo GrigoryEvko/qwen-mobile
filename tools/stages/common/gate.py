@@ -99,7 +99,7 @@ def read(gate: str, *, ok_codes: tuple[int, ...] = (0,), cap_min: int | None = N
 def nsp_range(items: list[Conditions], when: int) -> str:
     """One line with the lowest, the highest and the median NPU zone temperature of the runs that ran, or
     an empty text when the phone gave no temperature. `when` is 0 for before the runs and 1 for after."""
-    temps = [c.nsp[when] for c in items if c.ok and c.nsp[when] is not None]
+    temps = [t for c in items if c.ok and (t := c.nsp[when]) is not None]
     if not temps:
         return ""
     word = ("before", "after")[when]

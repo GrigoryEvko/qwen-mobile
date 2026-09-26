@@ -10,7 +10,7 @@ phone run must stay under two minutes.
 """
 
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from common.device import ADB, AFTER, BEFORE, MODEL_DIR, PHOTO_LOCAL, PHOTO_SHA1, THERMAL, StagePaths
 
@@ -88,7 +88,7 @@ def run_lines(title: str, cmd: str, pgrep_line: str, *, adb: str = ADB,
     return ["#", title, thermal, f"{adb} shell '{cmd}'", pgrep_line]
 
 
-def setup_lines(paths: StagePaths, pushes: dict[str, Iterable[str]], *, model_check: str = "",
+def setup_lines(paths: StagePaths, pushes: Mapping[str, Iterable[str]], *, model_check: str = "",
                 sub: str = "phone", adb: str = ADB, extra: Iterable[str] = (), sums: str = "SHA256SUMS",
                 count: int = 0, chmod: Iterable[str] = ("bin",)) -> list[str]:
     """The lines that copy the stage from the box to the laptop, check its files, and push them.

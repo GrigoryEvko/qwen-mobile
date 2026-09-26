@@ -633,7 +633,9 @@ def op_table(outs: dict[str, RunOut]) -> list[str]:
                  f"{'fresh new':>10s} {'d':>7s} {'sust old':>9s} {'sust new':>9s} {'d':>7s} {'loop old':>9s} "
                  f"{'loop new':>9s} {'d':>7s}")
     for c in op_cases():
-        vals = {}
+        # The fresh, the sustained and the loop time of each model, and apart from them its chunks
+        stats: dict[str, tuple[float | None, float | None, float | None]] = {}
+        chunks: dict[str, set] = {}
         for model in ("old", "new"):
             fr, su, lp, ch = [], [], [], set()
             for rnd in (1, 2):
@@ -647,18 +649,16 @@ def op_table(outs: dict[str, RunOut]) -> list[str]:
                 if c.name in o.us:
                     lp.append(o.us[c.name])
                 ch |= o.chunks.get(c.name, set())
-            vals[model] = (tables.med(fr), tables.med(su), tables.med(lp), ch)
-
-        def d(i: int) -> str:
-            """The change of the new model against the old one for one column."""
-            return f"{tables.change(vals['new'][i], vals['old'][i]):>7s}"
-
-        och, nch = vals["old"][3], vals["new"][3]
+            stats[model] = (tables.med(fr), tables.med(su), tables.med(lp))
+            chunks[model] = ch
+        old, new = stats["old"], stats["new"]
+        d = [f"{tables.change(new[i], old[i]):>7s}" for i in range(3)]
+        och, nch = chunks["old"], chunks["new"]
         lines.append(f"  {c.name:28s} {','.join(f'{a}x{b}' for a, b in sorted(och)) or '-':>11s} {passes(och, c.n):>2s} "
                      f"{','.join(f'{a}x{b}' for a, b in sorted(nch)) or '-':>11s} {passes(nch, c.n):>2s} "
-                     f"{tables.fmt(vals['old'][0]):>10s} {tables.fmt(vals['new'][0]):>10s} {d(0)} "
-                     f"{tables.fmt(vals['old'][1]):>9s} {tables.fmt(vals['new'][1]):>9s} {d(1)} "
-                     f"{tables.fmt(vals['old'][2]):>9s} {tables.fmt(vals['new'][2]):>9s} {d(2)}")
+                     f"{tables.fmt(old[0]):>10s} {tables.fmt(new[0]):>10s} {d[0]} "
+                     f"{tables.fmt(old[1]):>9s} {tables.fmt(new[1]):>9s} {d[1]} "
+                     f"{tables.fmt(old[2]):>9s} {tables.fmt(new[2]):>9s} {d[2]}")
     return lines
 
 

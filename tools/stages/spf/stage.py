@@ -42,6 +42,7 @@ import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from common import cli, commands, device, gate, logs, parse, tables  # noqa: E402
@@ -52,7 +53,8 @@ fixed = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(fixed)
 
 ADB = device.ADB
-# The stage of the run: select_stage sets PATHS, PHONE, LAPTOP_STAGE, BOX, STAGE_DIR, LIBS, RUNS, HEADER and TABLE
+# The stage of the run. The end of this file sets PATHS, PHONE, LAPTOP_STAGE, BOX, STAGE_DIR, LIBS, RUNS, HEADER
+# and TABLE for it, and select_stage sets them again for --stage.
 STAGE = "spf"
 MODEL_DIR = device.MODEL_DIR
 EVAL = device.EVAL_DIR
@@ -946,8 +948,8 @@ def bench_rounds_table3(root: Path, include_all: bool) -> list[str]:
         variant = "f" if r.var.startswith("f") else r.lib
         rnd = int(r.var.lstrip("f"))
         temps[variant][rnd] = _nsp_before(root, r.name)
-        for (p, g, _), v in parse.bench_values(logs.read_text(root / f"{r.name}.out")).items():
-            rates[(p, g)][variant][rnd] = v
+        for (p, g, _), ts in parse.bench_values(logs.read_text(root / f"{r.name}.out")).items():
+            rates[(p, g)][variant][rnd] = ts
     variants = ("b", "g", "n", "f")
     out = ["bn: llama-bench t/s of each variant in each round (the median of 5 repetitions): b = HEAD, g = HEAD plus 0001, "
            "n = HEAD plus the four candidates, f = n with the stream 2 on each matmul. change = the median of the "
@@ -1020,9 +1022,9 @@ def table_spf3(root: Path, include_all: bool) -> int:
 class Stage:
     """One phone stage of this file: its name, its runs, the header of its command file and its tables."""
     name: str
-    runs: list
+    runs: list[Run]
     header: str
-    table: object
+    table: Callable[[Path, bool], int]
 
 
 STAGES = {
@@ -1032,25 +1034,33 @@ STAGES = {
 }
 
 
+def stage_libs(phone: str) -> dict[str, Lib]:
+    """The library sets of a stage directory on the phone: HEAD, HEAD plus the candidates, and HEAD plus 0001."""
+    return {
+        "b": Lib("b", f"{phone}/lib-base", f"{phone}/lib-base", "HEAD"),
+        "n": Lib("n", f"{phone}/lib-new:{phone}/lib-base", f"{phone}/lib-new", "HEAD plus the candidates"),
+        "g": Lib("g", f"{phone}/lib-g:{phone}/lib-base", f"{phone}/lib-g", "HEAD plus 0001"),
+    }
+
+
 def select_stage(name: str) -> None:
     """Set the values of the stage name: the phone directory, the laptop and box directories, the library sets, the
     runs, the header and the tables."""
     global STAGE, PATHS, PHONE, LAPTOP_STAGE, BOX, STAGE_DIR, LIBS, RUNS, HEADER, TABLE
-    st = STAGES[name]
-    STAGE        = name
-    PATHS        = device.stage_paths(name, __file__)
+    STAGE = name
+    PATHS = device.stage_paths(name, __file__)
     PHONE, LAPTOP_STAGE, BOX, STAGE_DIR = PATHS
-    LIBS         = {
-        "b": Lib("b", f"{PHONE}/lib-base", f"{PHONE}/lib-base", "HEAD"),
-        "n": Lib("n", f"{PHONE}/lib-new:{PHONE}/lib-base", f"{PHONE}/lib-new", "HEAD plus the candidates"),
-        "g": Lib("g", f"{PHONE}/lib-g:{PHONE}/lib-base", f"{PHONE}/lib-g", "HEAD plus 0001"),
-    }
-    RUNS   = st.runs
-    HEADER = st.header
-    TABLE  = st.table
+    LIBS = stage_libs(PHONE)
+    RUNS, HEADER, TABLE = STAGES[name].runs, STAGES[name].header, STAGES[name].table
 
 
-select_stage(STAGE)
+# The values of the stage STAGE, which are the values that select_stage(STAGE) sets. They are written out here,
+# because a static check does not see a name that only a function sets with a global statement. main calls
+# select_stage for the stage of --stage.
+PATHS = device.stage_paths(STAGE, __file__)
+PHONE, LAPTOP_STAGE, BOX, STAGE_DIR = PATHS
+LIBS = stage_libs(PHONE)
+RUNS, HEADER, TABLE = STAGES[STAGE].runs, STAGES[STAGE].header, STAGES[STAGE].table
 
 
 def main() -> int:

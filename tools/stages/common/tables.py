@@ -9,9 +9,23 @@ from typing import Iterable
 
 
 def med(values: Iterable[float | None]) -> float | None:
-    """The median of the values that are not None, or None when there is no value."""
+    """The median of the values that are not None, or None when there is no value. Use it for a cell
+    that can be empty, and give the result to fmt, which prints a dash for None."""
     v = [x for x in values if x is not None]
     return statistics.median(v) if v else None
+
+
+def median(values: Iterable[float]) -> float:
+    """The median of the values, for a caller that has made sure that there is at least one value. The
+    result is never None, thus the caller can calculate with it.
+
+    Raises:
+        ValueError: If there is no value. This is an error of the caller, not a condition of the data
+    """
+    v = list(values)
+    if not v:
+        raise ValueError("tables.median: no value. Use tables.med for a cell that can be empty.")
+    return statistics.median(v)
 
 
 def fmt(x: float | None, digits: int = 1) -> str:

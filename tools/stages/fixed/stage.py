@@ -702,13 +702,14 @@ def prof_row(label: str, w: Window) -> str:
             f"{w.batches:4d} {mhz:>11} " + " ".join(f"{w.classes.get(c, 0) / 1000:9.1f}" for c in CLASSES))
 
 
-def prof_median(label: str, wins: list) -> str:
-    """The row of the medians of several windows."""
-    mw = Window(0.0, tables.med(w.wall_us for w in wins))
-    mw.dsp_us = tables.med(w.dsp_us for w in wins)
-    mw.batches = int(tables.med(w.batches for w in wins))
+def prof_median(label: str, wins: list[Window]) -> str:
+    """The row of the medians of several windows. Each caller gives at least one window, and
+    tables.median stops with an error when it gets none."""
+    mw = Window(0.0, tables.median(w.wall_us for w in wins))
+    mw.dsp_us = tables.median(w.dsp_us for w in wins)
+    mw.batches = int(tables.median(w.batches for w in wins))
     mw.mhz = [x for w in wins for x in w.mhz]
-    mw.classes = Counter({c: tables.med(w.classes.get(c, 0) for w in wins) for c in CLASSES})
+    mw.classes = Counter({c: tables.median(w.classes.get(c, 0) for w in wins) for c in CLASSES})
     return prof_row(label, mw)
 
 

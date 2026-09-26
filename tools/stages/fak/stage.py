@@ -75,6 +75,7 @@ import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypeGuard
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from common import cli, commands, device, gate, logs, parse, tables  # noqa: E402
@@ -640,8 +641,9 @@ def read_result(root: Path, run: Run) -> Result:
     return Result(run, c.ok, c.flags, c.caps, out, log, lc)
 
 
-def usable(res: Result | None, include_all: bool) -> bool:
-    """True when the run goes into the medians."""
+def usable(res: Result | None, include_all: bool) -> TypeGuard[Result]:
+    """True when the run goes into the medians. A True result also tells the type checker that res is not
+    None, thus the caller reads its fields with no second test."""
     return res is not None and res.ok and (include_all or not res.flags)
 
 

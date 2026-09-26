@@ -580,10 +580,12 @@ def prof_table(results: dict[str, Result]) -> list[str]:
         if not dec:
             out.append(f"  {v}: no decode graph in the log")
             continue
+        # Each decode graph adds one value to tok_us, mm_us and mm_bytes, thus the three are not empty here.
+        # gbs is empty when no graph has a weight MUL_MAT with a time, and its cell is then a dash.
         gbs = [b / u / 1e3 for b, u in zip(mm_bytes, mm_us) if u]
-        out.append(f"  {v}: {len(dec)} decode graphs, op time {tables.fmt(tables.med(tok_us) / 1e3, 2)} ms, "
-                   f"Q8_0 weight MUL_MATs {tables.fmt(tables.med(mm_us) / 1e3, 2)} ms at "
-                   f"{tables.fmt(tables.med(gbs), 2)} GB/s ({tables.fmt(tables.med(mm_bytes) / 1e9, 3)} GB); kernels "
+        out.append(f"  {v}: {len(dec)} decode graphs, op time {tables.fmt(tables.median(tok_us) / 1e3, 2)} ms, "
+                   f"Q8_0 weight MUL_MATs {tables.fmt(tables.median(mm_us) / 1e3, 2)} ms at "
+                   f"{tables.fmt(tables.med(gbs), 2)} GB/s ({tables.fmt(tables.median(mm_bytes) / 1e9, 3)} GB); kernels "
                    + ", ".join(f"{k} x{n}" for k, n in sorted(kern.items())))
     return out
 

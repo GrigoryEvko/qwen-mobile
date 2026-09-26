@@ -1363,10 +1363,17 @@ def consistency(store: Store) -> list[str]:
     return out
 
 
+def rel_cell(value: float | None, base: float | None) -> str:
+    """The change of a time against its reference time in percent, or a dash of the same width when one of
+    the two is missing or zero."""
+    return f"{100 * (value / base - 1):+6.1f}%" if value and base else f"{'-':>7s}"
+
+
 def timing(runs: dict[str, RunData]) -> list[str]:
     """The DSP time of each kind in each run against the median of the reference runs, thus a counter set
     that changes the time shows. O(runs)."""
     def kind_ms(r: RunData, kind: str) -> float | None:
+        """The DSP time of one kind of graph of one run in ms, or None when the run has not each graph."""
         if len(r.graphs) != r.run.n_graphs:
             return None
         idx = kind_graphs(r.run)[kind]
@@ -1385,7 +1392,7 @@ def timing(runs: dict[str, RunData]) -> list[str]:
         if r is None:
             continue
         vals = {kind: kind_ms(r, kind) for kind, _ in KINDS}
-        rel = {k: (f"{100 * (vals[k] / base[k] - 1):+6.1f}%" if vals[k] and base[k] else f"{'-':>7s}") for k in vals}
+        rel = {k: rel_cell(vals[k], base[k]) for k in vals}
         nsp = "/".join(f"{t:.0f}" if t is not None else "?" for t in r.nsp)
         out.append(f"  {run.key:12s} {num(vals['p0'], '9.1f')} {num(vals['p3'], '9.1f')} {num(vals['dec'], '8.2f')} "
                    f"{rel['p0']} {rel['p3']} {rel['dec']} {num(r.prefill_ms, '11.1f')} {num(r.steps_median, '8.1f')} "
