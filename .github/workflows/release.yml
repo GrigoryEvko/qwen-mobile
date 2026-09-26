@@ -13,6 +13,10 @@
 # and ANDROID_KEY_PASSWORD. Without them the release holds the unsigned APK and
 # the APK of a throwaway debug key, which Android installs but never upgrades.
 # The unsigned APK is the artifact that two machines compare.
+#
+# This workflow and the build workflow upload the same two hash tables,
+# hashes-native.txt and hashes-apk.txt. A download of each workflow thus decides
+# whether a branch build and the release build gave the same bytes.
 
 name: release
 
@@ -41,9 +45,9 @@ jobs:
       - name: Read the version
         id: version
         run: |
-          name=$(sed -n 's/^versionName=//p' android/version.properties | tr -d ' \r')
-          [ -n "$name" ] || { echo "no versionName in android/version.properties" >&2; exit 1; }
-          code=$(git rev-list --count HEAD)
+          source scripts/lib.sh
+          name=$(version_name)
+          code=$(version_code)
           tagged=false
           git rev-parse -q --verify "refs/tags/v$name" > /dev/null && tagged=true
           {
@@ -59,6 +63,17 @@ jobs:
 
       - name: Build the APK and run the unit tests
         run: scripts/build-apk.sh
+
+      # The same two artifact names as the build workflow, thus one download of
+      # each workflow decides whether the two builds gave the same bytes.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hashes-native
+          path: build/hashes-native.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hashes-apk
+          path: build/hashes-apk.txt
 
       - name: Sign the APK when the repository has a key
         env:

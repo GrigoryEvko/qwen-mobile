@@ -6,6 +6,17 @@
 # The signed APK on a runner has a new debug key on each run, because the
 # runner has no ~/.android/debug.keystore. The unsigned APK and the native
 # libraries are the comparable artifacts.
+#
+# This workflow and the release workflow produce the same two hash tables,
+# hashes-native.txt and hashes-apk.txt, thus one artifact of each workflow
+# decides whether the two builds gave the same bytes. Two conditions make the
+# tables comparable, and both are in the apk job:
+#   - The job reads the hash table of the native job. scripts/build-apk.sh
+#     compares that table against android/snapdragon/jniLibs and refuses a
+#     stale library, thus the table must travel with the libraries.
+#   - The checkout has the full history. versionCode is the number of commits
+#     of the branch, it goes into the manifest of the APK, and a checkout of
+#     depth 1 counts one commit.
 
 name: build
 
@@ -43,10 +54,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           name: jniLibs
           path: android/snapdragon/jniLibs
+      - uses: actions/download-artifact@v4
+        with:
+          name: hashes-native
+          path: build
       - name: Build the APK and run the unit tests in the pinned container
         run: scripts/build-apk.sh
       - uses: actions/upload-artifact@v4
