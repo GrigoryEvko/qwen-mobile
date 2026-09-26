@@ -53,6 +53,8 @@ BLOCKS = (
             "test-backend-ops of SIGMOID, SOFTPLUS and SCALE on HTP0 against the CPU"),
 )
 CHECK_CASES = ("sigmoid_beta_t1024", "sigmoid_beta_t1", "softplus_gate_t1024", "softplus_gate_t1")
+# The kernel keeps 15 characters of a process name, thus test-backend-ops goes in cut to 15 characters
+PGREP = device.pgrep("memprobe", "test-backend-op", "unarycheck")
 
 
 def run_lines(b: q.Block, rnd: int, v: q.Variant) -> list[str]:
@@ -75,7 +77,7 @@ def run_lines(b: q.Block, rnd: int, v: q.Variant) -> list[str]:
         tool = f"{PHONE}/bin/{b.tool} {b.args}"
         title = f"# KERNEL: {name}, {b.text}, {v.key.upper()}: {v.text}"
     cmd = commands.gated_run(stem, b.gate_kb, b.limit, env, tool, stage=PHONE, pre=pre)
-    return commands.run_lines(title, cmd, q.PGREP)
+    return commands.run_lines(title, cmd, PGREP)
 
 
 HEADER = """\
