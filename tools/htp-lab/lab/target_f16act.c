@@ -24,6 +24,7 @@
 #pragma clang diagnostic ignored "-Wunused-function"
 #pragma clang diagnostic ignored "-Wunused-variable"
 #pragma clang diagnostic ignored "-Wunused-but-set-variable"
+// lab-run: mode=functional
 
 #include "lab.h"
 
@@ -35,97 +36,10 @@
 // The MUL_MAT_ID path of matmul-ops.c calls memalign. The standalone runtime has no malloc.h.
 void * memalign(size_t alignment, size_t size);
 
-// --- the synchronous DMA shim (refer to target_fa.c) ---
-#define HTP_DMA_H
-
-typedef struct {
-    void *       dst;
-    const void * src;
-} dma_ptr;
-
-#define LAB_DMA_CAPACITY 256
-
-typedef struct dma_queue_s {
-    void *       dst[LAB_DMA_CAPACITY];
-    const void * src[LAB_DMA_CAPACITY];
-    uint32_t     push_idx;
-    uint32_t     pop_idx;
-} dma_queue;
-typedef dma_queue * dma_queue_t;
-
-static inline dma_ptr dma_make_ptr(void * dst, const void * src) {
-    dma_ptr p = { dst, src };
-    return p;
-}
-
-static inline bool dma_queue_push(dma_queue * q, dma_ptr p, size_t dst_stride, size_t src_stride, size_t row_size,
-                                  size_t nrows) {
-    for (size_t r = 0; r < nrows; r++) {
-        memcpy((uint8_t *) p.dst + r * dst_stride, (const uint8_t *) p.src + r * src_stride, row_size);
-    }
-    q->dst[q->push_idx & (LAB_DMA_CAPACITY - 1)] = p.dst;
-    q->src[q->push_idx & (LAB_DMA_CAPACITY - 1)] = p.src;
-    q->push_idx++;
-    return true;
-}
-
-static inline dma_ptr dma_queue_pop(dma_queue * q) {
-    dma_ptr p = { NULL, NULL };
-    if (q->pop_idx == q->push_idx) {
-        return p;
-    }
-    p.dst = q->dst[q->pop_idx & (LAB_DMA_CAPACITY - 1)];
-    p.src = q->src[q->pop_idx & (LAB_DMA_CAPACITY - 1)];
-    q->pop_idx++;
-    return p;
-}
-
-static inline bool dma_queue_push_vtcm_to_ddr(dma_queue * q, dma_ptr p, size_t dst_row_size, size_t src_row_size,
-                                              size_t nrows) {
-    return dma_queue_push(q, p, dst_row_size, src_row_size, dst_row_size, nrows);
-}
-
-static inline void dma_queue_flush(dma_queue * q) {
-    while (dma_queue_pop(q).dst != NULL) {
-    }
-}
-
-// --- the synchronous HMX queue shim ---
-#define HMX_QUEUE_H
+#include "lab-dma.h"
+#include "lab-hmx.h"
 
 #include "hex-profile.h"
-
-typedef void (*hmx_queue_func)(void *);
-
-struct hmx_queue_desc {
-    hmx_queue_func func;
-    void *         data;
-};
-
-struct hmx_queue_s {
-    int pending;
-};
-typedef struct hmx_queue_s * hmx_queue_t;
-
-static inline struct hmx_queue_desc hmx_queue_make_desc(hmx_queue_func func, void * data) {
-    struct hmx_queue_desc d = { func, data };
-    return d;
-}
-
-static inline bool hmx_queue_push(hmx_queue_t q, struct hmx_queue_desc d) {
-    d.func(d.data);
-    q->pending++;
-    return true;
-}
-
-static inline struct hmx_queue_desc hmx_queue_pop(hmx_queue_t q) {
-    struct hmx_queue_desc d = { NULL, NULL };
-    if (q->pending <= 0) {
-        printf("lab: error: hmx_queue_pop with no job\n");
-    }
-    q->pending--;
-    return d;
-}
 
 #include "matmul-ops.c"
 #include "act-ops.c"
@@ -487,6 +401,10 @@ int main(int argc, char ** argv) {
 
     lab_report(TARGET, "cases", (double) g_cases, "cases");
     lab_report(TARGET, "mismatches", (double) g_fail, "values");
+    // On the chip a push to a second DMA ring of one thread stops the op. A job that no pop took is
+    // an error of the kernel. Thus the two counts go into the failure count of the run.
+    g_fail += lab_dma_report(TARGET);
+    g_fail += lab_hmx_report(TARGET, &g_hmx);
     printf("lab: check %s %s\n", TARGET, g_fail == 0 ? "PASS" : "FAIL");
     return g_fail == 0 ? 0 : 1;
 }

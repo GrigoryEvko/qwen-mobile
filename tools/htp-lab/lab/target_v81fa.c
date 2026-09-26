@@ -4,12 +4,12 @@
 // The program includes flash-attn-ops.c verbatim and calls op_flash_attn_ext with the params that
 // ggml_hexagon_precompute_flash_attn_params gives for the HMX path (hmx_fa_find_chunk_size and the fields of
 // that function). Two shims replace the engines that the standalone runtime of the simulator does not give:
-//   - The DMA: a push copies at once, a pop returns the destinations in the order of the pushes, and the line
-//     cache of the mask keeps the replacement rule of dma-queue.h (the shims of target_fa.c).
-//   - The HMX queue: a push runs the job at once on the thread of the push (the shim of target_f16act.c).
+//   - The DMA (lab-dma.h): a push copies at once, a pop returns the destinations in the order of the pushes, and
+//     the line cache of the mask keeps the replacement rule of dma-queue.h.
+//   - The HMX queue (lab-hmx.h): a push runs the job at once on the thread of the push.
 // The ops get the first 1 MB of the VTCM: the HMX model of the simulator stops with the exception 0x26 when one
-// deep tile load crosses a multiple of 1 MB above the VTCM base (target_f16act.c). Thus the blocks (Br, Bc) are
-// those of a 1 MB budget, the same on each core. Run it in the functional mode (MODE=functional).
+// deep tile load crosses a multiple of 1 MB above the VTCM base. Thus the blocks (Br, Bc) are those of a 1 MB
+// budget, the same on each core. Run it in the functional mode (MODE=functional).
 //
 // The cases:
 //   dec256q8   decode: 1 token, 16 heads on 4 KV heads, head size 256, 512 KV rows of Q8_0, F32 Q, a mask
@@ -21,11 +21,14 @@
 // reference is not the naive CPU oracle (that one converts Q to F16 for an F16 K and to Q8_0 for a Q8_0 K), thus
 // the error of a correct kernel is the F16 rounding of Q and of the probabilities, about 1e-3.
 //
-// Arguments: --threads 4 --vtcm 1048576
+// Arguments: --threads 4 --vtcm 1048576 --cases all
+//   --cases  the names of the cases to run, separated by commas, or "all". The functional simulator runs the
+//            decode cases in minutes and the prefill case pre256q8 in hours, thus the registry runs the others.
 #pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
 #pragma clang diagnostic ignored "-Wunused-function"
 #pragma clang diagnostic ignored "-Wunused-variable"
 #pragma clang diagnostic ignored "-Wunused-but-set-variable"
+// lab-run: mode=functional args=--cases dec256q8,dec256f16,vis64
 
 #include "lab.h"
 
@@ -34,145 +37,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-// --- the synchronous DMA shim (refer to target_fa.c) ---
-#define HTP_DMA_H
-
-typedef struct {
-    void *       dst;
-    const void * src;
-} dma_ptr;
-
-#define LAB_DMA_CAPACITY 256
-
-typedef struct dma_queue_s {
-    void *   dst[LAB_DMA_CAPACITY];
-    uint32_t push_idx;
-    uint32_t pop_idx;
-} dma_queue;
-typedef dma_queue * dma_queue_t;
-
-static inline dma_ptr dma_make_ptr(void * dst, const void * src) {
-    dma_ptr p = { dst, src };
-    return p;
-}
-
-// Copies nrows rows of row_size bytes at once, then records the destination for the pop.
-// nrows == 0 is the dummy transfer that the line cache uses for a hit: it records only.
-static inline bool dma_queue_push(dma_queue * q, dma_ptr p, size_t dst_stride, size_t src_stride, size_t row_size,
-                                  size_t nrows) {
-    for (size_t r = 0; r < nrows; r++) {
-        memcpy((uint8_t *) p.dst + r * dst_stride, (const uint8_t *) p.src + r * src_stride, row_size);
-    }
-    q->dst[q->push_idx & (LAB_DMA_CAPACITY - 1)] = p.dst;
-    q->push_idx++;
-    return true;
-}
-
-static inline dma_ptr dma_queue_pop(dma_queue * q) {
-    dma_ptr p = { NULL, NULL };
-    if (q->pop_idx == q->push_idx) {
-        return p;
-    }
-    p.dst = q->dst[q->pop_idx & (LAB_DMA_CAPACITY - 1)];
-    q->pop_idx++;
-    return p;
-}
-
-static inline bool dma_queue_push_vtcm_to_ddr(dma_queue * q, dma_ptr p, size_t dst_row_size, size_t src_row_size,
-                                              size_t nrows) {
-    return dma_queue_push(q, p, dst_row_size, src_row_size, dst_row_size, nrows);
-}
-
-static inline void dma_queue_flush(dma_queue * q) {
-    while (dma_queue_pop(q).dst != NULL) {
-    }
-}
-
-#define DMA_CACHE_MAX_SIZE 128
-
-// The line cache of the mask, with the replacement rule of dma-queue.h: a hit refreshes the age and pushes a
-// dummy transfer, a miss takes the oldest line and pushes a real one.
-typedef struct {
-    uint8_t * base;
-    uint32_t  line_size;
-    uint32_t  capacity;
-    uint32_t  src[DMA_CACHE_MAX_SIZE];
-    uint16_t  age[DMA_CACHE_MAX_SIZE];
-} dma_cache;
-
-static inline void dma_cache_init(dma_cache * c, uint8_t * base, uint32_t line_size, uint32_t capacity) {
-    c->capacity  = (capacity > DMA_CACHE_MAX_SIZE) ? DMA_CACHE_MAX_SIZE : capacity;
-    c->base      = base;
-    c->line_size = line_size;
-    for (unsigned i = 0; i < c->capacity; i++) {
-        c->src[i] = 0;
-        c->age[i] = 0;
-    }
-}
-
-static inline bool dma_cache_push(dma_queue * q, dma_cache * c, const uint8_t * src, uint32_t dst_stride,
-                                  uint32_t src_stride, uint32_t row_size, uint32_t nrows) {
-    uint32_t  o_idx = 0;
-    uint16_t  o_age = 0;
-    uint8_t * dst   = 0;
-    for (unsigned i = 0; i < c->capacity; i++) {
-        if (c->src[i] == (uint32_t) (uintptr_t) src) {
-            c->age[i] = 0;
-            dst       = c->base + (i * c->line_size);
-            nrows     = 0;
-        } else {
-            c->age[i]++;
-            if (c->age[i] > o_age) {
-                o_age = c->age[i];
-                o_idx = i;
-            }
-        }
-    }
-    if (!dst) {
-        c->age[o_idx] = 0;
-        c->src[o_idx] = (uint32_t) (uintptr_t) src;
-        dst           = c->base + o_idx * c->line_size;
-    }
-    return dma_queue_push(q, dma_make_ptr(dst, src), dst_stride, src_stride, row_size, nrows);
-}
-
-// --- the synchronous HMX queue shim (refer to target_f16act.c) ---
-#define HMX_QUEUE_H
+#include "lab-dma.h"
+#include "lab-hmx.h"
 
 #include "hex-profile.h"
-
-typedef void (*hmx_queue_func)(void *);
-
-struct hmx_queue_desc {
-    hmx_queue_func func;
-    void *         data;
-};
-
-struct hmx_queue_s {
-    int pending;
-};
-typedef struct hmx_queue_s * hmx_queue_t;
-
-static inline struct hmx_queue_desc hmx_queue_make_desc(hmx_queue_func func, void * data) {
-    struct hmx_queue_desc d = { func, data };
-    return d;
-}
-
-static inline bool hmx_queue_push(hmx_queue_t q, struct hmx_queue_desc d) {
-    d.func(d.data);
-    q->pending++;
-    return true;
-}
-
-static inline struct hmx_queue_desc hmx_queue_pop(hmx_queue_t q) {
-    struct hmx_queue_desc d = { NULL, NULL };
-    q->pending--;
-    return d;
-}
-
-static inline void hmx_queue_flush(hmx_queue_t q) {
-    q->pending = 0;
-}
 
 #include "flash-attn-ops.c"
 
@@ -390,12 +258,32 @@ static void run_case(const char * name, uint32_t n_tokens, uint32_t n_heads, uin
     free(out);
 }
 
+// Returns true when the list of case names holds the name, or when the list is "all". The names in the list
+// are separated by commas. Complexity O(length of the list).
+static bool case_selected(const char * list, const char * name) {
+    if (strcmp(list, "all") == 0) {
+        return true;
+    }
+    const size_t n = strlen(name);
+    for (const char * p = list; *p != '\0';) {
+        const char * end = strchr(p, ',');
+        const size_t len = end ? (size_t) (end - p) : strlen(p);
+        if (len == n && strncmp(p, name, n) == 0) {
+            return true;
+        }
+        p += len + (end ? 1 : 0);
+    }
+    return false;
+}
+
 int main(int argc, char ** argv) {
     lab_init();
-    const uint32_t nt = (uint32_t) lab_arg_long(argc, argv, "--threads", 4);
+    const uint32_t     nt    = (uint32_t) lab_arg_long(argc, argv, "--threads", 4);
+    const char * const cases = lab_arg_str(argc, argv, "--cases", "all");
 
     g_ctx.vtcm_base     = lab_vtcm_base();
     g_ctx.vtcm_size     = (size_t) lab_arg_long(argc, argv, "--vtcm", 1 << 20);
+    lab_args_done(argc, argv);
     g_ctx.n_threads     = nt;
     g_ctx.n_threads_div = init_fastdiv_values(nt);
     g_ctx.work_queue    = (work_queue_t) &g_hmx;  // the lab stub does not read it
@@ -408,12 +296,27 @@ int main(int argc, char ** argv) {
     }
     printf("lab: %s threads %u vtcm %zu\n", TARGET, nt, g_ctx.vtcm_size);
 
-    run_case("dec256q8", 1, 16, 4, 256, 512, true, true, true);
-    run_case("dec256f16", 1, 16, 4, 256, 512, false, true, true);
-    run_case("pre256q8", 64, 16, 4, 256, 256, true, true, true);
-    run_case("vis64", 64, 4, 4, 64, 64, false, false, false);
+    if (case_selected(cases, "dec256q8")) {
+        run_case("dec256q8", 1, 16, 4, 256, 512, true, true, true);
+    }
+    if (case_selected(cases, "dec256f16")) {
+        run_case("dec256f16", 1, 16, 4, 256, 512, false, true, true);
+    }
+    if (case_selected(cases, "pre256q8")) {
+        run_case("pre256q8", 64, 16, 4, 256, 256, true, true, true);
+    }
+    if (case_selected(cases, "vis64")) {
+        run_case("vis64", 64, 4, 4, 64, 64, false, false, false);
+    }
+    if (strcmp(cases, "all") != 0) {
+        lab_limit("--cases selects a part of the cases of this target, thus the other cases did not run.");
+    }
 
     lab_report(TARGET, "failures", (double) g_fail, "cases");
+    // On the chip a push to a second DMA ring of one thread stops the op. A job that no pop took is
+    // an error of the kernel. Thus the two counts go into the failure count of the run.
+    g_fail += lab_dma_report(TARGET);
+    g_fail += lab_hmx_report(TARGET, &g_hmx);
     printf("lab: check %s %s\n", TARGET, g_fail == 0 ? "PASS" : "FAIL");
     return g_fail == 0 ? 0 : 1;
 }
