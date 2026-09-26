@@ -73,10 +73,12 @@
 #   ALL_PLIMIT The cycle limit of each timing run of "all". Default: 2000000000. The timing model
 #              does not retire an HMX instruction, thus a target that reads an HMX result waits
 #              without an end and the limit stops it.
-#   LAB_NO_LOCK Set it to 1 when the caller already holds build/.container.lock. This script takes
-#              that lock around each container, thus one container of the box runs at a time. A
-#              second exclusive lock of one file blocks without an end, thus a caller that holds the
-#              lock already must set this variable. The lock covers the life of the container only.
+#   LAB_NO_LOCK Set it to 1 when the caller holds build/.container.lock in a form that this script
+#              cannot see. This script takes that lock around each container, thus one container of
+#              the box runs at a time, and the lock covers the life of the container only. A caller
+#              of the form "flock build/.container.lock tools/htp-lab/run.sh ..." needs no variable:
+#              the script finds the descriptor of the lock that it inherited and takes no second
+#              lock, because a second exclusive lock of one file waits for the first without an end.
 #
 # Output (tools/htp-lab/out/, not in git):
 #   build/                       The CMake build directory (Ninja)
@@ -250,12 +252,28 @@ lab_target_decl() {
     echo "${mode} ${rest}"
 }
 
+# Returns 0 when this process holds an open descriptor of the container lock. "flock <file> <cmd>"
+# opens the file, locks it, and starts the command with the descriptor open, thus a caller of the
+# form "flock build/.container.lock tools/htp-lab/run.sh build" gives the lock to this script. A
+# second flock of the file opens a second descriptor, and that one waits for the first without an
+# end. Complexity O(open descriptors).
+lock_inherited() {
+    local fd lock
+    lock="$(readlink -f "${CONTAINER_LOCK}" 2> /dev/null || true)"
+    [ -n "${lock}" ] || return 1
+    for fd in /proc/$$/fd/*; do
+        [ "$(readlink -f "${fd}" 2> /dev/null)" = "${lock}" ] && return 0
+    done
+    return 1
+}
+
 # Runs a command under the container lock of the box. One container of this box runs at a time: two
 # container builds compete for the cores, thus a measurement beside a build is not valid. The lock
-# covers the life of the container and nothing else. A caller that already holds the lock sets
-# LAB_NO_LOCK=1, because a second exclusive lock of one file blocks without an end.
+# covers the life of the container and nothing else. When the caller holds the lock already (a
+# descriptor of the lock file that this process inherited, or LAB_NO_LOCK=1), the command runs
+# under the lock of the caller, thus the script cannot wait for itself.
 with_container_lock() {
-    if [ -n "${LAB_NO_LOCK:-}" ]; then
+    if [ -n "${LAB_NO_LOCK:-}" ] || lock_inherited; then
         "$@"
         return
     fi

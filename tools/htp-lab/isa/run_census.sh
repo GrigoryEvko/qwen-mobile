@@ -51,12 +51,25 @@ for a in ${VARIANT_ARCHS}; do
     done
 done
 
+# Returns 0 when this process holds an open descriptor of the container lock, which a caller of the
+# form "flock build/.container.lock <this script>" gives it. Complexity O(open descriptors).
+lock_inherited() {
+    local fd lock
+    lock="$(readlink -f "${REPO_DIR}/build/.container.lock" 2> /dev/null || true)"
+    [ -n "${lock}" ] || return 1
+    for fd in /proc/$$/fd/*; do
+        [ "$(readlink -f "${fd}" 2> /dev/null)" = "${lock}" ] && return 0
+    done
+    return 1
+}
+
 # Runs the given script text inside the container. The container lock of the box covers the life of
 # the container and nothing else: one container of this box runs at a time, because two of them
-# compete for the cores and a measurement beside a build is not valid. A caller that already holds
-# the lock sets LAB_NO_LOCK=1, because a second exclusive lock of one file blocks without an end.
+# compete for the cores and a measurement beside a build is not valid. When the caller holds the
+# lock already (an inherited descriptor, or LAB_NO_LOCK=1), the container runs under that lock,
+# because a second exclusive lock of one file waits for the first without an end.
 in_container() {
-    if [ -n "${LAB_NO_LOCK:-}" ]; then
+    if [ -n "${LAB_NO_LOCK:-}" ] || lock_inherited; then
         podman run --rm --userns=keep-id --security-opt label=disable -v "${REPO_DIR}:/repo" -w /repo "${IMAGE}" bash -c "$1"
         return
     fi
