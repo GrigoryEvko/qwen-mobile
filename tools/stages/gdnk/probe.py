@@ -42,7 +42,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import stage as S  # noqa: E402
+from common import device, parse  # noqa: E402
 
 PHONE = "/data/local/tmp/qwen/gdnk2"
 LAPTOP_STAGE = "build/gdnk2"
@@ -126,13 +128,13 @@ def run_lines(name: str, variant: str, probe: int, tool: str, args: str, logcat:
     pre = "logcat -c && " if logcat else ""
     post = f"logcat -d -t 20000 | grep gdn-probe > {stem}-logcat.txt; " if logcat else ""
     cmd = (f"sh {PHONE}/bin/gate.sh {S.MODEL_KB if model else S.TEST_KB} > {stem}-gate.txt && "
-           f"{S.BEFORE} >> {stem}-gate.txt && {pre}"
+           f"{device.BEFORE} >> {stem}-gate.txt && {pre}"
            f"timeout -s KILL {110 if '-ub 1' in args else LIMIT} env {env} {PHONE}/bin/{tool} {args} "
-           f"> {stem}.out 2> {stem}.log; echo \"rc=$?\" >> {stem}-gate.txt; {post}{S.AFTER} >> {stem}-gate.txt; "
+           f"> {stem}.out 2> {stem}.log; echo \"rc=$?\" >> {stem}-gate.txt; {post}{device.AFTER} >> {stem}-gate.txt; "
            f"cat {stem}-gate.txt")
     # The runner gates each line with "models/Qwen3.5" as a model run
     title = "REAL-MODEL Qwen3.5-4B-Q8_0" if model else "NO-MODEL"
-    return ["#", f"# {title}: {name}, {text}, variant {variant}", S.THERMAL, f"{S.ADB} shell '{cmd}'", S.PGREP]
+    return ["#", f"# {title}: {name}, {text}, variant {variant}", device.THERMAL, f"{S.ADB} shell '{cmd}'", S.PGREP]
 
 
 def setup_lines() -> list[str]:
@@ -205,7 +207,7 @@ def table(root: Path) -> int:
             p = root / f"{name}{suffix}"
             out += p.read_text(errors="replace") if p.exists() else ""
         passed = S.PASSED_RE.findall(out)
-        kl, top, mx = S.KLD_RE.search(out), S.TOP_RE.search(out), S.MAXKL_RE.search(out)
+        kl, top, mx = parse.KLD_RE.search(out), parse.TOP_RE.search(out), parse.MAXKL_RE.search(out)
         kl_text = (f", KL {kl.group(1)} ± {kl.group(2)}, max {mx.group(1) if mx else '?'}, "
                    f"top-1 {top.group(1) if top else '?'} %") if kl else ""
         print(f"{name} ({variant}, probe {probe}, {text}): exit {rc.group(1) if rc else '?'}, "

@@ -11,10 +11,10 @@ the phone command file (build/gdnk3/phone-commands.txt or phone-commands-p.txt).
 from the pulled logs (build/gdnk3/phone-out or phone-out-p). --reject takes the comma-separated names of the
 runs that the runner marked CAPS-CHANGED or SCREEN-OFF: the perf and rate tables do not use them.
 
-Patch 0005 (wip/gdnk/0005-*.patch) makes the paired qfloat forward substitution of version 2 skip each
-term with a zero coefficient, thus each chunk takes that solve, and the solve with the arithmetic of
-version 1 goes. It also flushes the input state one time in phase begin, not at each update. It changes
-only the DSP code (gdn-chunk-ops.c).
+Patch 0005 of the stage, which patches/hexagon-gdn/0013 holds, makes the paired qfloat forward
+substitution of version 2 skip each term with a zero coefficient, thus each chunk takes that solve, and
+the solve with the arithmetic of version 1 goes. It also flushes the input state one time in phase begin,
+not at each update. It changes only the DSP code (gdn-chunk-ops.c).
 
 The three library sets (build/gdnk3/build-stage.sh, which runs tools/stages/gdnk/build.sh):
     b  HEAD plus patch 0005, each library and program: bin/ and lib/ on the phone
@@ -53,7 +53,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import stage as S  # noqa: E402
+from common import device, parse  # noqa: E402
 
 LAPTOP_STAGE = "build/gdnk3"
 BOX = "grigory@10.10.20.200:airi/qwen-mobile/build/gdnk3"
@@ -226,13 +228,13 @@ def run_lines(st: Stage, run: Run) -> list[str]:
     pre = "logcat -c && " if run.logcat else ""
     post = f"logcat -d -t 20000 | grep gdn-probe > {stem}-logcat.txt; " if run.logcat else ""
     cmd = (f"sh {st.phone}/bin/gate.sh {S.MODEL_KB if model else S.TEST_KB} > {stem}-gate.txt && "
-           f"{S.BEFORE} >> {stem}-gate.txt && {pre}"
+           f"{device.BEFORE} >> {stem}-gate.txt && {pre}"
            f"timeout -s KILL {run.limit} env {env} {st.phone}/bin/{run.tool} {run.args} "
-           f"> {stem}.out 2> {stem}.log; echo \"rc=$?\" >> {stem}-gate.txt; {post}{S.AFTER} >> {stem}-gate.txt; "
+           f"> {stem}.out 2> {stem}.log; echo \"rc=$?\" >> {stem}-gate.txt; {post}{device.AFTER} >> {stem}-gate.txt; "
            f"cat {stem}-gate.txt")
     # The runner gates each line with "models/Qwen3.5" as a model run
     title = "REAL-MODEL Qwen3.5-4B-Q8_0" if model else "NO-MODEL"
-    return ["#", f"# {title}: {run.name}, {run.text}, variant {run.variant}", S.THERMAL,
+    return ["#", f"# {title}: {run.name}, {run.text}, variant {run.variant}", device.THERMAL,
             f"{S.ADB} shell '{cmd}'", S.PGREP]
 
 
@@ -244,7 +246,7 @@ def output_lines(st: Stage) -> list[str]:
         "#",
         "# ---- The outputs ----",
         "#",
-        S.THERMAL,
+        device.THERMAL,
         f"{S.ADB} shell 'ls {phone}/out | wc -l'",
         f"rm -rf {out}",
         f"{S.ADB} pull {phone}/out {out}",
@@ -285,7 +287,7 @@ def rate_rows(results: dict, rejected: set[str]) -> list[str]:
             m = P_RE.match(name)
             if m is None or not res.ok or name in rejected:
                 continue
-            val = S.bench_values(res).get(key)
+            val = parse.bench_values(res.out).get(key)
             if val is not None:
                 per[m.group(2)][int(m.group(1))] = val
         cells = []
@@ -321,7 +323,7 @@ def table(st: Stage, root: Path, rejected: set[str]) -> int:
         results[run.name] = res
         text = res.out + res.log
         passed = S.PASSED_RE.findall(text)
-        kl, top, mx = S.KLD_RE.search(text), S.TOP_RE.search(text), S.MAXKL_RE.search(text)
+        kl, top, mx = parse.KLD_RE.search(text), parse.TOP_RE.search(text), parse.MAXKL_RE.search(text)
         kl_text = (f", KL {kl.group(1)} ± {kl.group(2)}, max {mx.group(1) if mx else '?'}, "
                    f"top-1 {top.group(1) if top else '?'} %") if kl else ""
         mark = " [rejected]" if run.name in rejected else ""
