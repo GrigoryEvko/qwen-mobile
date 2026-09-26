@@ -1,16 +1,14 @@
-Hexagon HTP: read the fused ADD input from DDR in the two matvec kernels
+Hexagon HTP: the fused matvec reads src2 from DDR, and the host fuses only the whole product
 
-Base: llama.cpp commit c6824a9. File: ggml/src/ggml-hexagon/htp/matmul-ops.c.
+Base: llama.cpp commit c6824a9 plus the patches of patches/series before this one.
 
-How to apply, from the llama.cpp root:
+Files:
+    ggml/src/ggml-hexagon/htp/matmul-ops.c  the src2 read of the two matvec kernels
+    ggml/src/ggml-hexagon/ggml-hexagon.cpp  the conditions of try_fuse_mul_mat_add
 
-    git apply patches/hexagon-fusion/0001-hexagon-htp-fused-matvec-add-read-src2-from-ddr.patch
-    cmake --build build-snapdragon -j
+The DSP library and the host library both change.
 
-Only the DSP library changes. Push build-snapdragon/ggml/src/ggml-hexagon/libggml-htp-v79.so
-to /data/local/tmp/qwen/htp/lib/ on the phone. The host library libggml-hexagon.so stays as it is.
-
-Defect
+Defect 1: the aligned src2 load of the matvec kernels
 
 With op fusion on, the host fuses MUL_MAT and ADD when the activation has one row.
 The kernel for one row copies the ADD input (src2) with DMA into VTCM. The copy
@@ -39,6 +37,65 @@ hvx_tensor_add_f32_grid. The DMA copy of src2 is removed, and with it the
 dma_queue_pop_nowait that never waited for the copy. The VTCM layout does not
 change, thus the host and the DSP stay in sync.
 
+Defect 2: the host fused a product that the ADD does not read whole
+
+try_fuse_mul_mat_add fused a MUL_MAT and the ADD after it when one input of the ADD
+had the data address of the product. Two conditions give an incorrect fused op:
+
+- The ADD reads the product through a view with fewer rows or columns at the same
+  address. The fused kernel writes the full product into the smaller output of the
+  ADD, thus it writes past that output.
+- The other input of the ADD (src2 of the fused op) has a broadcast in dimension 0,
+  or a dimension that ggml_add repeats. The fused kernels read full rows of src2 and
+  broadcast only a dimension of size 1, thus they read past src2.
+
+The host fuses the two ops only when the ADD reads the whole product (the same
+address, type, shape and strides), the output of the ADD has the shape of the
+product, and src2 has full rows and, in each other dimension, a size of 1 or the
+size of the product. The matcher is upstream code.
+
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 3f14956..c281192 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -2614,14 +2614,35 @@ struct ggml_hexagon_opbatch {
+ 
+         if (!ggml_hexagon_tensor_is_fuseable(mm_out)) return false;
+ 
++        // The ADD must read the whole product: the product itself, or a view with the same bytes,
++        // type, shape and strides. A view with fewer rows or columns starts at the same address,
++        // but the fused kernel writes the full product into the smaller output of the ADD.
++        auto is_whole_product = [mm_out](const ggml_tensor * t) {
++            return t == mm_out || (t->data == mm_out->data && t->type == mm_out->type &&
++                                   ggml_are_same_shape(t, mm_out) && ggml_are_same_stride(t, mm_out));
++        };
+         const ggml_tensor * src2;
+-        if (add_src0 == mm_out || add_src0->data == mm_out->data) {
++        if (is_whole_product(add_src0)) {
+             src2 = add_src1;
+-        } else if (add_src1 == mm_out || add_src1->data == mm_out->data) {
++        } else if (is_whole_product(add_src1)) {
+             src2 = add_src0;
+         } else {
+             return false;
+         }
++        if (!ggml_are_same_shape(node.dst(), mm_out)) {
++            return false;
++        }
++        // The fused kernels read full rows of src2 (ne[0] of the product) and broadcast only a
++        // dimension of size 1 (htp/matmul-ops.c:359, 472 and 3664-3667). ggml_add also permits a
++        // broadcast in dimension 0 and a repeat of a larger size, which the kernels read outside src2.
++        if (src2->ne[0] != mm_out->ne[0]) {
++            return false;
++        }
++        for (int i = 1; i < GGML_MAX_DIMS; i++) {
++            if (src2->ne[i] != 1 && src2->ne[i] != mm_out->ne[i]) {
++                return false;
++            }
++        }
+ 
+         const ggml_tensor * src0 = last_node.src0();
+         const ggml_tensor * src1 = last_node.src1();
 diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
 index e16cfdc..1457a9a 100644
 --- a/ggml/src/ggml-hexagon/htp/matmul-ops.c

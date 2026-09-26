@@ -1,6 +1,6 @@
 Hexagon HTP: the slot index from the host, the error report of a batch, and --chunks in the KL mode
 
-Base: llama.cpp commit c6824a9, with patches 0001, 0002 and 0003 applied.
+Base: llama.cpp commit c6824a9 plus the patches of patches/series before this one.
 
 Files:
     ggml/src/ggml-hexagon/htp-gdn-match.h           the slot index check, with a named reason
@@ -12,11 +12,6 @@ Files:
     ggml/src/ggml-hexagon/htp/gdn-conv-ops.c        index from the kernel params, detail codes
     ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c index from the kernel params, detail codes
     tools/perplexity/perplexity.cpp                 --chunks limits a KL run
-
-How to apply, from the llama.cpp root:
-
-    git apply patches/hexagon-fusion/0004-hexagon-htp-gdn-slot-index-from-host-and-error-report.patch
-    cmake --build build-snapdragon -j
 
 Push to the phone: libggml-htp-v79.so (ggml/src/ggml-hexagon/), libggml-hexagon.so (bin/),
 test-backend-ops (bin/) and libllama-perplexity-impl.so (bin/, the llama-perplexity launcher
@@ -50,6 +45,7 @@ Problem 2: --chunks has no effect with --kl-divergence
 
 kl_divergence reads n_chunk from the header of the base file, and the loop runs over all of
 them. With --chunks N, the run now scores only the first N chunks of the file, and logs that.
+
 diff --git a/ggml/src/ggml-hexagon/htp-gdn-match.h b/ggml/src/ggml-hexagon/htp-gdn-match.h
 index be1dca2..eeca0c8 100644
 --- a/ggml/src/ggml-hexagon/htp-gdn-match.h

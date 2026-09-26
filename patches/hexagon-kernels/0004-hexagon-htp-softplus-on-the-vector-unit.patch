@@ -72,25 +72,52 @@ counts that passed, 128 and 256, are the multiples of four vectors.
 THIS PATCH STILL NEEDS ONE GENERATION ON THE DEVICE BEFORE IT GOES INTO patches/series. The
 simulator gives the result of the kernel and not the result of the model.
 
-diff -urN a/ggml/src/ggml-hexagon/htp/hvx-softplus.h b/ggml/src/ggml-hexagon/htp/hvx-softplus.h
---- a/ggml/src/ggml-hexagon/htp/hvx-softplus.h	1970-01-01 03:00:00.000000000 +0300
-+++ b/ggml/src/ggml-hexagon/htp/hvx-softplus.h	2026-09-20 07:14:37.744804901 +0300
-@@ -0,0 +1,265 @@
+The form of the softplus
+
+The HVX softplus computes relu(x) + log1p(e^-|x|) with an accurate log1p, and for a negative x it
+rounds 1 + e^x to an f32 first, as the CPU reference does. The reference (and the oracle) computes
+logf(1.0f + expf(x)) for x <= 20. That rounding moves the result by up to 2^-24 absolute, thus a
+form without it differs from the reference by about 256 ulp near x = -5 and by up to 16389 ulp near
+x = -9. Against the oracle form with correctly rounded expf and logf, the v79 simulator gives for
+x >= -10 a mean of 296 ulp without the rounding, and 73.8 % of the values are within 4 ulp.
+
+The rounding is t = (1 + t) - 1, with both steps in f32. The second step is exact, thus log1p(t)
+gives the log of the rounded sum. The simulator then gives a mean of 0.37 ulp, and 99.7 % of the
+values are within 4 ulp. Where the exp of the backend differs by one ulp from expf, the rounded sum
+can move by one ulp of 1, thus the largest difference stays 2^-23 absolute. The cycles of one call
+do not change (716 for 16 values, 706 for 32, 702 for 128).
+
+The app graphs reach this op: each gated delta net layer computes the softplus of its gate (16
+values for each token in the 2B, 32 in the 4B).
+
+diff --git a/ggml/src/ggml-hexagon/htp/hvx-softplus.h b/ggml/src/ggml-hexagon/htp/hvx-softplus.h
+new file mode 100644
+index 0000000..792a20e
+--- /dev/null
++++ b/ggml/src/ggml-hexagon/htp/hvx-softplus.h
+@@ -0,0 +1,281 @@
 +// The softplus in vector form for the HVX. tools/htp-lab/gen/softplus_i16.py of the qwen-mobile
 +// repository generates this file, do not edit it.
 +//
 +// softplus(x) = log(1 + e^x) = relu(x) + log(1 + e^-|x|). The identity holds for every x and it
 +// has no cancellation: relu(x) is exact in the float domain and the second term is a smooth bump
-+// in (0, log 2]. The op of the checkout evaluates logf(1.0f + expf(x)) one element at a time.
++// in (0, log 2]. The CPU reference (the oracle form) evaluates logf(1.0f + expf(x)) for x <= 20.
 +//
 +// Two paths, both of which write the same result the CPU reference writes for x > 20 (the result
 +// is x, because the bump is below the resolution of an f32 there).
 +//
-+//   hvx_softplus_f32_aa    t = e^-|x| with the exp of this backend, then log1p(t) = t * P(t) with
-+//                          P of degree 9 on [0, 1]. P(0) = 1 and the factor t is exact, thus
-+//                          this path keeps its relative accuracy where the result is e^x and no
-+//                          fixed-point number can hold it. Measured against a float64 reference:
-+//                          NMSE 7.1e-18, worst relative error 2.3e-7 over x in [-30, 30].
++//   hvx_softplus_f32_aa    the oracle form to a few ulp. t = e^-|x| with the exp of this backend.
++//                          For a negative x (t = e^x), t becomes (1 + t) - 1 with both steps in
++//                          f32, as the reference rounds 1 + e^x before its logf, and the second
++//                          step is exact. Then log1p(t) = t * P(t) with P of degree 9 on
++//                          [0, 1], thus the result is log of the rounded sum. The rounded sum has
++//                          an absolute error of up to 2^-24, thus against the exact function the
++//                          relative error grows for a large negative x (the result is 0 below
++//                          -16.6), the same as the reference. The model of this path in the
++//                          generator (--check) gives a mean of 0.45 ulp against the oracle
++//                          form for x >= -10, and 99.5 % of the values within 4 ulp. Where the
++//                          exp differs by one ulp from expf, the rounded sum can move by one
++//                          ulp of 1, thus the largest difference is 2^-23 absolute.
 +//
 +//   hvx_softplus_i16_f32_aa  D(u) = log(2) - log(1 + e^-u) from a piecewise int16 table, then
 +//                          softplus = relu(x) + log(2) - D(|x|). One polynomial of degree 4
@@ -178,6 +205,15 @@ diff -urN a/ggml/src/ggml-hexagon/htp/hvx-softplus.h b/ggml/src/ggml-hexagon/htp
 +    }
 +    for (int i = 0; i < 4; i++) {
 +        t[i] = hvx_vec_exp_f32(t[i]);
++    }
++
++    // For a negative x, the rounded sum of the reference: t = (1 + t) - 1, both steps in f32. A
++    // negative f32 is a negative int32, thus the word compare with 0 selects the negative lanes.
++    const HVX_Vector one = Q6_V_vsplat_R(0x3f800000);
++    for (int i = 0; i < 4; i++) {
++        const HVX_Vector s  = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(one, t[i]));
++        const HVX_Vector ts = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(s, one));
++        t[i] = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VwVw(zero, x[i]), ts, t[i]);
 +    }
 +
 +    // log1p(t) = t * P(t), by Horner over the four chains. The first step multiplies the top
@@ -341,9 +377,10 @@ diff -urN a/ggml/src/ggml-hexagon/htp/hvx-softplus.h b/ggml/src/ggml-hexagon/htp
 +}
 +
 +#endif /* HVX_SOFTPLUS_H */
-diff -urN a/ggml/src/ggml-hexagon/htp/unary-ops.c b/ggml/src/ggml-hexagon/htp/unary-ops.c
---- a/ggml/src/ggml-hexagon/htp/unary-ops.c	2026-09-20 07:14:37.584802623 +0300
-+++ b/ggml/src/ggml-hexagon/htp/unary-ops.c	2026-09-20 07:14:37.588802680 +0300
+diff --git a/ggml/src/ggml-hexagon/htp/unary-ops.c b/ggml/src/ggml-hexagon/htp/unary-ops.c
+index f705a32..e92fd53 100644
+--- a/ggml/src/ggml-hexagon/htp/unary-ops.c
++++ b/ggml/src/ggml-hexagon/htp/unary-ops.c
 @@ -13,6 +13,7 @@
  #include "hvx-exp.h"
  #include "hvx-sigmoid.h"
@@ -352,7 +389,7 @@ diff -urN a/ggml/src/ggml-hexagon/htp/unary-ops.c b/ggml/src/ggml-hexagon/htp/un
  #include "unary-ops.h"
  
  #define GGML_COMMON_DECL_C
-@@ -566,21 +567,30 @@
+@@ -566,21 +567,30 @@ static void tri_f32(const float * restrict src,
      }
  }
  
@@ -391,7 +428,7 @@ diff -urN a/ggml/src/ggml-hexagon/htp/unary-ops.c b/ggml/src/ggml-hexagon/htp/un
          }
      }
  }
-@@ -995,11 +1005,10 @@
+@@ -995,11 +1005,10 @@ static inline void tile_leaky_relu_f32(uint8_t * dst_vtcm, const uint8_t * src_v
  }
  
  static inline void tile_unary_softplus_f32(uint8_t * dst_vtcm, const uint8_t * src_vtcm, uint32_t tw) {

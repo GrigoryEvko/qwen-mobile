@@ -14,10 +14,35 @@ The gather is cheap only when its result is not read by the next instruction. On
 dependent load costs 45 cycles; 32 independent gathers cost 4.7 cycles each, because the unit
 pipelines them. concat-ops.c already uses that pattern.
 
-diff -urN a/ggml/src/ggml-hexagon/htp/cpy-ops.c b/ggml/src/ggml-hexagon/htp/cpy-ops.c
---- a/ggml/src/ggml-hexagon/htp/cpy-ops.c	2026-09-20 03:09:26.672091400 +0300
-+++ b/ggml/src/ggml-hexagon/htp/cpy-ops.c	2026-09-20 03:09:26.697617414 +0300
-@@ -201,6 +201,90 @@
+The stride of the source rows
+
+The source of this path is the transposed view: nb00 of the view is one row of x, and nb01 is one
+element (exec_cpy selects the path only for nb01 == 4). The kernel reads the 32 rows of each source
+tile at the stride nb00 / 4, one row of x. A read at the stride nb01 / 4 = 1 float gives each
+output row c the values x[c] thru x[c + 31] of one row of x, and not a column of x.
+
+The kernel lab (tools/htp-lab, target v81move, the release flags, v79na_1 and v81na_2): the CONT of
+a transposed 64 x 96 f32 matrix gives 0 of 6144 values that differ from the source with the stride
+nb00 / 4, and 6048 with the stride of one float. The other cases of the target (CPY to f16,
+SET_ROWS, GET_ROWS, ROPE, SOFT_MAX, GELU) give the same hashes with the two forms, and on the two
+cores.
+
+No graph of Qwen3.5 or of its vision encoder sends this shape: the delta net runs as the fused
+GATED_DELTA_NET op, and the vision encoder uses ggml_cont_3d. The CONT cases of test-backend-ops
+get four transposed matrices with two sides that are multiples of 32 (64 x 96, 256 x 256 x 2,
+32 x 32 x 3 x 2 and 1024 x 64).
+
+The phone stage v81 (the OnePlus 13, v79): test-backend-ops CPY, SET_ROWS, GET_ROWS and CONT on
+HTP0 pass 293 of 293, with the four cases. llama-bench of the 4B Q8_0, this kernel against the
+kernel with the stride of one float, 3 alternated rounds: pp512 1003.8 against 1012.0 t/s (the
+standard deviation of one run is 14 to 22 t/s), tg32 at d0 10.69 against 10.63 t/s, tg32 at d4096
+10.28 against 10.28 t/s.
+
+diff --git a/ggml/src/ggml-hexagon/htp/cpy-ops.c b/ggml/src/ggml-hexagon/htp/cpy-ops.c
+index 490efd6..5dc124c 100644
+--- a/ggml/src/ggml-hexagon/htp/cpy-ops.c
++++ b/ggml/src/ggml-hexagon/htp/cpy-ops.c
+@@ -201,6 +201,92 @@ static void cpy_thread_##NAME##_reshape(unsigned int nth, unsigned int ith, void
  DEFINE_CPY_RESHAPE(f32,  float, 4)
  DEFINE_CPY_RESHAPE(f16, __fp16, 2)
  
@@ -85,7 +110,9 @@ diff -urN a/ggml/src/ggml-hexagon/htp/cpy-ops.c b/ggml/src/ggml-hexagon/htp/cpy-
 +    const HVX_Vector voff = *(HVX_Vector *) offsets;
 +    const uint32_t   mu   = CPY_T_TILE * VLEN;
 +
-+    const uint32_t src_stride = nb01 / sizeof(float);  // one row of the original matrix
++    // One row of the original matrix. The source is its transposed view, thus that row is the element stride
++    // nb00 of the view. nb01 of the view is one element.
++    const uint32_t src_stride = nb00 / sizeof(float);
 +    const uint32_t dst_stride = nb1  / sizeof(float);
 +
 +    for (uint32_t i03 = 0; i03 < ne3; i03++) {
@@ -108,7 +135,7 @@ diff -urN a/ggml/src/ggml-hexagon/htp/cpy-ops.c b/ggml/src/ggml-hexagon/htp/cpy-
  static void cpy_thread_f16_f32_sameshape(unsigned int nth, unsigned int ith, void * data) {
      struct htp_copy_context * ct = (struct htp_copy_context *) data;
      struct htp_ops_context * octx = ct->octx;
-@@ -402,6 +486,16 @@
+@@ -402,6 +488,16 @@ static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
              }
              work_queue_run(octx->ctx->work_queue, copy_fun, &ct, n_threads);
          }
@@ -125,3 +152,20 @@ diff -urN a/ggml/src/ggml-hexagon/htp/cpy-ops.c b/ggml/src/ggml-hexagon/htp/cpy-
      } else if (sametype) {
          const uint32_t total_elems = ne0 * ne1 * ne2 * ne3;
          const uint32_t elems_per_line = (ct.dst_type_size == 4) ? 32 : 64;
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 0df2183..fef7afe 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9842,6 +9842,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // CONT of a transposed F32 matrix whose two sides are multiples of 32 (the tile path of the Hexagon copy)
++    for (std::array<int64_t, 4> ne : std::initializer_list<std::array<int64_t, 4>>{
++            {64, 96, 1, 1}, {256, 256, 2, 1}, {32, 32, 3, 2}, {1024, 64, 1, 1} }) {
++        test_cases.emplace_back(new test_cont(GGML_TYPE_F32, ne));
++    }
++
+     for (ggml_type type_dst : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+         for (std::array<int64_t, 4> ne : std::initializer_list<std::array<int64_t, 4>>{
+                 {10, 10, 10, 1}, {33, 5, 7, 1}, {64, 3, 65, 1}, {2, 3, 5, 7},

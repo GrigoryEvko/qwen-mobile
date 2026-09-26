@@ -1,8 +1,6 @@
 Hexagon HTP: the conv chain of a gated delta net layer over a batch of tokens
 
-Base: llama.cpp commit c6824a9 with patches/series applied in order, thru hexagon-fusion/0005.
-
-This patch is the last entry of patches/series, after hexagon-fusion/0005.
+Base: llama.cpp commit c6824a9 plus the patches of patches/series before this one.
 
 Files:
     ggml/src/ggml-hexagon/htp/gdn-conv-ops.c   the batch kernel, and the lane math as shared helpers
@@ -12,11 +10,6 @@ Files:
     ggml/src/ggml-hexagon/htp-gdn-match.h      the chain match, from one token to a batch
     ggml/src/ggml-hexagon/ggml-hexagon.cpp     the opcode of a batch, the name, the slot index
     tests/test-backend-ops.cpp                 the fusion test over a batch
-
-How to apply, from the llama.cpp root:
-
-    git apply patches/hexagon-fusion/0006-hexagon-htp-gdn-conv-chunk.patch
-    cmake --build build-snapdragon -j
 
 Push to the phone: libggml-htp-v79.so (ggml/src/ggml-hexagon/), libggml-hexagon.so (bin/) and
 test-backend-ops (bin/). The switch is the one of the state fusion, GGML_HEXAGON_OPFUSION_STATE,
@@ -53,10 +46,10 @@ its own block of each row, and the four rows that one token reads stay in L2 ove
 The DDR traffic is one read of the projection and one write of the output.
 
 The new state of the cache is the last three tokens of the batch in the layout of the cache. Three
-steps of the single token block of patch 0003, from an empty state, give exactly that, thus the lane
+steps of the single token block of patch 0002, from an empty state, give exactly that, thus the lane
 packing of the state has one implementation and one test.
 
-The lane math of patch 0003 is now four helpers (the deal of four vectors, the lanes of a block to
+The lane math of patch 0002 is now four helpers (the deal of four vectors, the lanes of a block to
 the four tap form, the four taps and the SiLU, and the four tap form back to the lanes of the state).
 The single token block is those four helpers in a row, thus the decode path keeps the instructions
 that the phone already runs.
@@ -81,8 +74,9 @@ The chain of a batch matches when: the conv width is 4, the batch holds at least
 channel count is a multiple of 32, the CONCAT holds the state columns in front of the batch, the
 projection is the transposed view with a stride of one float between channels, and the CPY takes the
 last three columns into one row of the cache. Each condition that fails names itself with
-GGML_HEXAGON_VERBOSE=1, and the unfused ops run. One token keeps HTP_OP_GDN_CONV_STEP of patch 0003,
+GGML_HEXAGON_VERBOSE=1, and the unfused ops run. One token keeps HTP_OP_GDN_CONV_STEP of patch 0002,
 thus decode does not change.
+
 diff --git a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
 index 73e8968..eb0c029 100644
 --- a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c

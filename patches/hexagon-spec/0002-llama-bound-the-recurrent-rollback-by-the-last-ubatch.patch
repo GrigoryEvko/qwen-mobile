@@ -3,8 +3,11 @@ llama: bound the recurrent rollback by the depth that the last ubatch wrote
 Base: llama.cpp commit c6824a9 plus the patches before this one in patches/series.
 
 Files:
-    src/llama-memory-recurrent.h    the per-seq depth of the snapshot groups
-    src/llama-memory-recurrent.cpp  the depth, and the limit that seq_rm applies
+    src/llama-memory-recurrent.h            the per-seq depth of the snapshot groups
+    src/llama-memory-recurrent.cpp          the depth, and the limit that seq_rm applies
+    src/llama-kv-cache-dsv4.h               the same depth of the DeepSeek V4 cache
+    src/llama-kv-cache-dsv4.cpp             the depth, and the limit that its seq_rm applies
+    tests/test-recurrent-state-rollback.cpp the rule, and the owners of the contexts
 
 The problem
 
@@ -67,6 +70,192 @@ State of the verification
 The host program above ran on the CPU backend with the 2B Q4_0 file, with n_rs_seq 3 and 8.
 The Android build of the pinned container compiles the change. The device did not run it: the
 patch changes no kernel and no graph, thus no speed number moves.
+
+The same bound in the DeepSeek V4 cache
+
+llama_kv_cache_dsv4 keeps n_rs_seq snapshot planes of the compressed state. The plan of a ubatch
+writes plane d from the first n - d tokens of the sequence (n is its token count in the ubatch),
+and a plane d > n from none of them: that plane holds the state at the start of the ubatch, which
+belongs to a different position. A check of the rollback against n_rs_seq alone lets a rollback of
+3 after three 1-token ubatches read a plane of a different position, with no error.
+
+The cache keeps rs_depth for each sequence. The memory context sets it in apply(), one time for
+each ubatch, to the token count of the sequence less one, at most n_rs_seq. seq_rm takes it as the
+limit. The limit is n - 1 and not n (plane n is also correct): the recurrent memory cannot roll
+back a full ubatch, and the two memories keep one rule for the callers. The value goes to zero when
+the compressed state of the sequence is cleared, after seq_cp (the copy moves the current state
+only) and after a state load. The app does not use this cache.
+
+The test: ctest test-recurrent-state-rollback-dsv4, and the qwen35, nemotron-h and kimi-k3 entries.
+
+The rule in test-recurrent-state-rollback
+
+The test asserts that seq_rm refuses a rollback that goes deeper than the tokens of the last ubatch
+of the sequence, at the two places where it rolls back past them: test_rollback after three decodes
+of one token each, and test_multi_seq_split_replay for a tail ubatch of 3 tokens. The slot groups
+that such a rollback reads hold the states of an earlier ubatch. Without the depth bound the test
+passes only because its replay decodes the same tokens as that earlier ubatch, thus the old groups
+hold the correct states by chance.
+
+Then test_rollback clears the sequence, decodes the prompt again as one ubatch and rolls back inside
+it, and test_multi_seq_split_replay decodes the sequence again with a last ubatch that starts one
+token before the rollback point. The partial checkpoint and the split replay then cover a pending
+rollback (rs_idx != 0), as the test intends. The reference context of the split replay keeps its one
+prefill ubatch.
+
+llama_context_ptr owners free the three contexts of test_rollback on each return path, and the init
+failure of the multi-sequence part calls its cleanup. Explicit frees at the end of a function leak
+the contexts on each failed check, thus LeakSanitizer reports them on top of the failure and the
+report hides the failure.
+
+diff --git a/src/llama-kv-cache-dsv4.cpp b/src/llama-kv-cache-dsv4.cpp
+index 948d081..c8cbd52 100644
+--- a/src/llama-kv-cache-dsv4.cpp
++++ b/src/llama-kv-cache-dsv4.cpp
+@@ -1228,7 +1228,8 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
+     hparams_lid(model.hparams),
+     n_seq_max(n_seq_max),
+     n_rs_seq(n_rs_seq),
+-    rs_idx(n_seq_max, 0) {
++    rs_idx(n_seq_max, 0),
++    rs_depth(n_seq_max, 0) {
+ 
+     const layer_filter_cb filter_raw = [&](int32_t il) {
+         if (filter && !filter(il)) {
+@@ -1482,8 +1483,14 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
+             return false;
+         }
+ 
++        // [TAG_RECURRENT_ROLLBACK_DEPTH]
++        // Plane d holds the state before the last d tokens only when the last ubatch of the
++        // sequence held d tokens or more. A deeper plane holds the state at the start of that
++        // ubatch, which belongs to a different position. Thus the depth of that ubatch
++        // (set_rs_depth) is the limit, and it is never more than n_rs_seq.
+         const llama_pos rollback = pos_max - (p0 - 1);
+-        if (rollback < 1 || rollback > (llama_pos) n_rs_seq) {
++        const llama_pos depth    = (llama_pos) std::min<uint32_t>(n_rs_seq, rs_depth[seq_id]);
++        if (rollback < 1 || rollback > depth) {
+             return false;
+         }
+ 
+@@ -1523,6 +1530,8 @@ void llama_kv_cache_dsv4::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
+ 
+     if (seq_id_src != seq_id_dst) {
+         rs_idx[seq_id_dst] = 0;
++        // the copy moves the current state only, not the snapshot planes
++        rs_depth[seq_id_dst] = 0;
+     }
+ }
+ 
+@@ -1664,11 +1673,14 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id,
+     hca_state->state_read(io, seq_id, flags);
+     lid_state->state_read(io, seq_id, flags);
+ 
++    // the load writes the current state only, thus no snapshot plane holds a rollback
+     if (seq_id >= 0) {
+         GGML_ASSERT((uint32_t) seq_id < n_seq_max);
+         rs_idx[seq_id] = 0;
++        rs_depth[seq_id] = 0;
+     } else {
+         std::fill(rs_idx.begin(), rs_idx.end(), 0);
++        std::fill(rs_depth.begin(), rs_depth.end(), 0);
+     }
+ }
+ 
+@@ -1725,6 +1737,29 @@ void llama_kv_cache_dsv4::reset_rs_idx_for_ubatches(const std::vector<llama_ubat
+     }
+ }
+ 
++void llama_kv_cache_dsv4::set_rs_depth(const llama_ubatch & ubatch) {
++    if (n_rs_seq == 0) {
++        return;
++    }
++
++    // The plan of the ubatch writes plane d from the first n - d tokens of the sequence (n is its
++    // token count in the ubatch), and plane d > n from none of them. Plane n is also correct, but
++    // the limit is n - 1: llama_memory_recurrent cannot roll back a full ubatch, and the two
++    // memories keep one rule for the callers. O(n_seqs_unq * n_tokens).
++    for (uint32_t u = 0; u < ubatch.n_seqs_unq; ++u) {
++        const llama_seq_id seq_id = ubatch.seq_id_unq[u];
++        if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
++            continue;
++        }
++
++        uint32_t n = 0;
++        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
++            n += dsv4_token_has_seq(ubatch, i, seq_id) ? 1 : 0;
++        }
++        rs_depth[seq_id] = std::min(n > 0 ? n - 1 : 0, n_rs_seq);
++    }
++}
++
+ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
+     if (seq_id < 0) {
+         kv_csa->clear(data);
+@@ -1755,8 +1790,10 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
+ 
+     if (seq_id >= 0) {
+         rs_idx[seq_id] = 0;
++        rs_depth[seq_id] = 0;
+     } else {
+         std::fill(rs_idx.begin(), rs_idx.end(), 0);
++        std::fill(rs_depth.begin(), rs_depth.end(), 0);
+     }
+ }
+ 
+@@ -2084,6 +2121,7 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
+     lid_state(kv->get_lid_state()),
+     status(ctx_raw->get_status()) {
+     kv->reset_rs_idx_for_ubatches(this->ubatches);
++    kv_dsv4 = kv;
+ }
+ 
+ llama_kv_cache_dsv4_context::~llama_kv_cache_dsv4_context() = default;
+@@ -2110,6 +2148,11 @@ bool llama_kv_cache_dsv4_context::apply() {
+ 
+     res = res & ctx_raw->apply();
+ 
++    // [TAG_RECURRENT_ROLLBACK_DEPTH] this ubatch writes the snapshot planes of its sequences
++    if (kv_dsv4 != nullptr && !ubatches.empty()) {
++        kv_dsv4->set_rs_depth(ubatches[i_next]);
++    }
++
+     if (ctx_csa_mem) {
+         res = res & ctx_csa_mem->apply();
+         res = res & ctx_hca_mem->apply();
+diff --git a/src/llama-kv-cache-dsv4.h b/src/llama-kv-cache-dsv4.h
+index ce39867..b9a2add 100644
+--- a/src/llama-kv-cache-dsv4.h
++++ b/src/llama-kv-cache-dsv4.h
+@@ -152,6 +152,10 @@ public:
+     const std::vector<uint32_t> & get_rs_idx() const;
+     void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
+ 
++    // [TAG_RECURRENT_ROLLBACK_DEPTH] record, for each sequence of the ubatch, the deepest rollback
++    // that seq_rm accepts after this ubatch: its token count in the ubatch less one, at most n_rs_seq
++    void set_rs_depth(const llama_ubatch & ubatch);
++
+ private:
+     llama_hparams hparams_raw;
+     llama_hparams hparams_csa;
+@@ -162,6 +166,7 @@ private:
+     const uint32_t n_rs_seq;
+ 
+     std::vector<uint32_t> rs_idx;
++    std::vector<uint32_t> rs_depth; // the limit of a rollback of each sequence (set_rs_depth)
+ 
+     std::unique_ptr<llama_kv_cache_iswa> kv_raw;
+     std::unique_ptr<llama_kv_cache>      kv_csa;
+@@ -397,6 +402,9 @@ private:
+     stream_copy_info sc_info_hca;
+     stream_copy_info sc_info_lid;
+ 
++    // the cache of the ubatches, which apply() gives the rollback depth of each ubatch
++    llama_kv_cache_dsv4 * kv_dsv4 = nullptr;
++
+     bool reserve_plans = false;
+     mutable comp_plan reserve_plan_csa;
+     mutable comp_plan reserve_plan_hca;
 diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
 index 57919ac..88c1418 100644
 --- a/src/llama-memory-recurrent.cpp
@@ -207,3 +396,156 @@ index 4abb3f5..3c4ffa1 100644
      // computed before each graph build
      uint32_t n = 0;
  
+diff --git a/tests/test-recurrent-state-rollback.cpp b/tests/test-recurrent-state-rollback.cpp
+index ef05de6..40e8718 100644
+--- a/tests/test-recurrent-state-rollback.cpp
++++ b/tests/test-recurrent-state-rollback.cpp
+@@ -116,16 +116,18 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
+ 
+     llama_context * ctx_roll = make_ctx_multi();
+     llama_context * ctx_ref  = make_ctx_multi();
+-    if (ctx_roll == nullptr || ctx_ref == nullptr) {
+-        fprintf(stderr, "%s : failed to init multi-seq contexts\n", __func__);
+-        return false;
+-    }
+ 
+     const auto cleanup = [&]() {
+         llama_free(ctx_roll);
+         llama_free(ctx_ref);
+     };
+ 
++    if (ctx_roll == nullptr || ctx_ref == nullptr) {
++        fprintf(stderr, "%s : failed to init multi-seq contexts\n", __func__);
++        cleanup();
++        return false;
++    }
++
+     if (llama_n_rs_seq(ctx_roll) < n_rollback) {
+         fprintf(stderr, "%s : skipping because n_rs_seq is too small\n", __func__);
+         cleanup();
+@@ -138,23 +140,34 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
+ 
+     bool ok = true;
+ 
+-    // both contexts decode the identical [0, p0) prefill; only ctx_roll decodes
+-    // the tail, which is then rolled back so its restore is pending at replay
+-    for (uint32_t s = 0; s < n_seqs && ok; ++s) {
++    // decode the tokens [from, to) of sequence s as one batch
++    const auto decode_range = [&](llama_context * ctx, uint32_t s, llama_pos from, llama_pos to) {
+         llama_batch batch = llama_batch_init(n_prompt, 0, 1);
+-        for (llama_pos pos = 0; pos < (llama_pos) p0; ++pos) {
+-            common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
+-        }
+-        ok = ok && llama_decode(ctx_roll, batch) == 0;
+-        ok = ok && llama_decode(ctx_ref,  batch) == 0;
+-
+-        common_batch_clear(batch);
+-        for (llama_pos pos = p0; pos < (llama_pos) n_prompt; ++pos) {
++        for (llama_pos pos = from; pos < to; ++pos) {
+             common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
+         }
+-        ok = ok && llama_decode(ctx_roll, batch) == 0;
++        const bool res = llama_decode(ctx, batch) == 0;
+         llama_batch_free(batch);
++        return res;
++    };
+ 
++    // both contexts decode the identical [0, p0) prefill; only ctx_roll decodes
++    // the tail, which is then rolled back so its restore is pending at replay
++    for (uint32_t s = 0; s < n_seqs && ok; ++s) {
++        ok = ok && decode_range(ctx_roll, s, 0, p0);
++        ok = ok && decode_range(ctx_ref,  s, 0, p0);
++        ok = ok && decode_range(ctx_roll, s, p0, n_prompt);
++
++        // A rollback may not go deeper than the tokens of the last ubatch of the sequence, because
++        // the older slot groups hold the states of an earlier ubatch. The tail is one ubatch of
++        // n_rollback tokens, thus a rollback of all of them must be refused.
++        ok = ok && !llama_memory_seq_rm(llama_get_memory(ctx_roll), (llama_seq_id) s, p0, -1);
++
++        // Decode the sequence again with a last ubatch that starts one token before p0: the
++        // rollback to p0 then stays inside that ubatch, and its restore is pending at replay.
++        ok = ok && llama_memory_seq_rm(llama_get_memory(ctx_roll), (llama_seq_id) s, -1, -1);
++        ok = ok && decode_range(ctx_roll, s, 0, p0 - 1);
++        ok = ok && decode_range(ctx_roll, s, p0 - 1, n_prompt);
+         ok = ok && llama_memory_seq_rm(llama_get_memory(ctx_roll), (llama_seq_id) s, p0, -1);
+ 
+         // a second partial removal while one is pending must be refused
+@@ -268,6 +281,9 @@ static int test_rollback(const common_params & params, llama_model * model, uint
+ 
+     llama_context * ctx_src = make_ctx(params, model, fill);
+     llama_context * ctx_dst = make_ctx(params, model, fill);
++    // the owners free the contexts on each return path, thus a failed check leaks no context
++    llama_context_ptr own_src(ctx_src);
++    llama_context_ptr own_dst(ctx_dst);
+     if (ctx_src == nullptr || ctx_dst == nullptr) {
+         fprintf(stderr, "%s : failed to init contexts\n", __func__);
+         return 1;
+@@ -275,8 +291,6 @@ static int test_rollback(const common_params & params, llama_model * model, uint
+ 
+     if (llama_n_rs_seq(ctx_src) == 0) {
+         fprintf(stderr, "%s : skipping because n_rs_seq is disabled\n", __func__);
+-        llama_free(ctx_src);
+-        llama_free(ctx_dst);
+         return 0;
+     }
+ 
+@@ -290,8 +304,6 @@ static int test_rollback(const common_params & params, llama_model * model, uint
+     constexpr uint32_t n_rollback = 3;
+     if (n_rs_seq < n_rollback) {
+         fprintf(stderr, "%s : skipping because n_rs_seq is too small\n", __func__);
+-        llama_free(ctx_src);
+-        llama_free(ctx_dst);
+         return 0;
+     }
+     if (tokens.empty()) {
+@@ -353,12 +365,26 @@ static int test_rollback(const common_params & params, llama_model * model, uint
+         return 1;
+     }
+ 
+-    if (!llama_memory_seq_rm(llama_get_memory(ctx_src), 0, rollback_pos, -1) ||
+-        !llama_memory_seq_rm(llama_get_memory(ctx_dst), 0, rollback_pos, -1)) {
+-        fprintf(stderr, "%s : partial rollback failed\n", __func__);
++    // A rollback may not go deeper than the tokens of the last ubatch of the sequence, because the
++    // older slot groups hold the states of an earlier ubatch. The replay above decoded one token
++    // at a time, thus a rollback of n_rollback tokens must be refused here.
++    if (llama_memory_seq_rm(llama_get_memory(ctx_src), 0, rollback_pos, -1) ||
++        llama_memory_seq_rm(llama_get_memory(ctx_dst), 0, rollback_pos, -1)) {
++        fprintf(stderr, "%s : a rollback deeper than the last ubatch was accepted\n", __func__);
+         return 1;
+     }
+ 
++    // Decode the prompt again as one ubatch on the two contexts, then roll back. The slot groups
++    // of that ubatch hold the state at rollback_pos, thus the partial checkpoint below covers a
++    // rolled-back state (rs_idx != 0).
++    for (llama_context * ctx : { ctx_src, ctx_dst }) {
++        llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1);
++        if (!decode_tokens(ctx, tokens, n_tokens) || !llama_memory_seq_rm(llama_get_memory(ctx), 0, rollback_pos, -1)) {
++            fprintf(stderr, "%s : partial rollback failed\n", __func__);
++            return 1;
++        }
++    }
++
+     constexpr llama_state_seq_flags partial_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+     common_prompt_checkpoint ckpt_partial;
+     ckpt_partial.update_tgt(ctx_src, 0, partial_flags);
+@@ -372,6 +398,7 @@ static int test_rollback(const common_params & params, llama_model * model, uint
+     // groups 1..n_rs_seq hold a different prompt's history, and rs_idx[0] is
+     // non-zero at load time. The restore must wipe that state and still match.
+     llama_context * ctx_dirty = make_ctx(params, model, fill);
++    llama_context_ptr own_dirty(ctx_dirty);
+     if (ctx_dirty == nullptr) {
+         fprintf(stderr, "%s : failed to init dirty ctx\n", __func__);
+         return 1;
+@@ -418,9 +445,9 @@ static int test_rollback(const common_params & params, llama_model * model, uint
+     }
+ 
+     fprintf(stderr, "%s : recurrent rollback checkpoint restored successfully\n", __func__);
+-    llama_free(ctx_src);
+-    llama_free(ctx_dst);
+-    llama_free(ctx_dirty);
++    own_src.reset();
++    own_dst.reset();
++    own_dirty.reset();
+ 
+     if (!test_multi_seq_split_replay(params, model, n_vocab, fill)) {
+         return 1;

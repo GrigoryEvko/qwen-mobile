@@ -51,12 +51,66 @@ The matchers, the slot mapping, the completeness of the member lists and the add
 were checked on the host against the real graph allocator and the CPU reference (2026-09-19): the
 slot stride of the 2B is 73728 bytes, the span covers 294912 bytes and no foreign byte, the attention
 row and the snapshot slot 0 of K = 4 equal those of K = 1 exactly, and no member runs twice or is
-skipped. The kernels themselves are not yet measured on the device.
+skipped.
+
+The nodes between the two positions of a moved access
+
+The fused GDN_CONV_STEP or GDN_CONV_CHUNK stands at the SILU or at the first CPY of the chain,
+at the one that comes first in the graph. Thus the op can write the output of the SILU at an
+earlier index than the graph does, and it reads the projection and the conv weights at a later
+index than the CONCAT and the SSM_CONV. The graph allocator can give the bytes of a tensor with
+no more readers to a different tensor. A node between the two positions can then read bytes that
+the fused op wrote too early, or write bytes that the fused op reads too late. For example, the
+allocator can give the output of the SILU the bytes of s_copy, while the GET_ROWS of the delta
+net state reads s_copy between the CPY and the SILU. That GET_ROWS then reads the conv output as
+the slot index.
+
+The matcher checks each node between the two positions of each moved access. Such a node must not
+read or write the bytes of the output, and it must not write the bytes of the projection or of the
+weights. The check compares byte ranges, and it ignores views, empty nodes and the members of the
+chain. It runs when a graph is new to the graph cache. A shared range of a projection and an
+output is one case of this condition.
+
+The stride of the snapshot slots
+
+With rollback snapshots, the GDN conv chain writes one row of the conv cache into each snapshot
+slot, and the fused op writes the slots from one base address and one stride. The matcher takes
+the distance between two adjacent slots as the stride, and it rejects the chain when that stride
+is less than the size of a slot. Slots with an overlap, for example two slots 144 bytes apart
+with a slot of 288 bytes, get the status 4 from the DSP, and the compute of the graph then fails.
+The chain stays with the unfused ops, and each CPY writes its own slot.
+
+On the model graphs of the app, the stride of the snapshot slots is equal to the size of a slot,
+on the 2B and on the 4B. Thus the decode path with 4 snapshots fuses the conv step. hexhost_graphs
+gives the same ops with and without this check on the decode, prefill, MTP and image paths.
+
+A reader of a replaced tensor in a different split
+
+The fused GDN_CONV_STEP does not write the GET_ROWS, the CONCAT and the SSM_CONV of its chain.
+The fused GDN_STATE_STEP does not write the GET_ROWS of its chain or the state tail of the
+GATED_DELTA_NET output. A search for another reader of these tensors in the nodes of the split
+that graph_compute gets is not sufficient: a reader in a later split then gets bytes that no op
+wrote. For example, a SCALE of the CONCAT in a later split reads the bytes of an earlier tensor.
+
+The split that graph_compute gets is a view of the full graph (ggml_graph_view), and the view
+shares the hash set and the use counts of the full graph. ggml_build_forward_expand counts the
+uses, and the splits of ggml_backend_sched are views of that graph. The matcher compares the use
+count of each such tensor, and of each member view of it, with its uses in the split. When the two
+counts are different, a node of a different split uses the tensor, and the matcher rejects the
+chain. A graph with no use counts gets no fused GDN op.
+
+The count of the uses in the split occurs in the loop that the matcher already has, and only for a
+source of an intermediate or of the output. Thus the time of the match does not change: the first
+packing of the decode graph takes the same time with and without this check (about 630 us for the
+2B and 1050 us for the 4B on x86). The model graphs of the app have no such reader. hexhost_graphs
+gives the same ops with and without this check on the decode, prefill, MTP and image paths of the
+2B and the 4B.
+
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-index 9155741..fc5609e 100644
+index 814f08e..7d3025c 100644
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-@@ -6404,9 +6404,31 @@ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, co
+@@ -6432,9 +6432,31 @@ static void ggml_hexagon_match_gdn_fusions(const ggml_hexagon_session * sess, co
              const bool batch = m.n_tokens > 1;
              htp_opnode node(batch ? HTP_OP_GDN_CONV_CHUNK : HTP_OP_GDN_CONV_STEP, m.S);
              node.name    = batch ? "GDN_CONV_CHUNK" : "GDN_CONV_STEP";
@@ -92,10 +146,27 @@ index 9155741..fc5609e 100644
              fu.at.emplace(m.emit, std::move(node));
              skip_members(m.emit, m.members);
 diff --git a/ggml/src/ggml-hexagon/htp-gdn-match.h b/ggml/src/ggml-hexagon/htp-gdn-match.h
-index fc840ad..1c16862 100644
+index 9d8f75b..9b3e0cf 100644
 --- a/ggml/src/ggml-hexagon/htp-gdn-match.h
 +++ b/ggml/src/ggml-hexagon/htp-gdn-match.h
-@@ -35,13 +35,16 @@ struct ggml_hexagon_gdn_conv_match {
+@@ -13,10 +13,12 @@
+ // other reader of the replaced tensors, and no other node that touches the cache inside the chain span.
+ // The state_zero SCALE of build_rs comes before the chain, thus it stays a separate op and runs first.
+ //
+-// The matcher sees only the nodes of the split that graph_compute gets. The fused state op does not
+-// write the state tail of the GATED_DELTA_NET output, thus the only permitted reader of that tail is
+-// the CPY into the cache in the same split. A reader in a later split gets bytes that no op wrote. The
+-// model graphs have no such reader: tests/fuzz/hexhost/run.sh graphs checks the paths of the app.
++// The matcher sees only the nodes of the split that graph_compute gets. The fused ops do not write the
++// replaced tensors (GET_ROWS, CONCAT, SSM_CONV) or the state tail of the GATED_DELTA_NET output. Thus a
++// reader of such a tensor in a different split gets bytes that no op wrote. The split is a view of the
++// full graph, and it has the use counts of the full graph. The match compares the use count of each
++// such tensor with its uses in the split, and it rejects the chain when a use is in a different split.
++// A graph with no use counts gets no fused op.
+ //
+ // This header depends on ggml only. A host program can run the same checks on a graph. Each check
+ // returns nullptr when the chain matches, or a short text for the first failed condition.
+@@ -40,13 +42,16 @@ struct ggml_hexagon_gdn_conv_match {
      ggml_tensor * states = nullptr; // the state table [row, n_slots]
      ggml_tensor * idx    = nullptr; // the s_copy view [1]
      ggml_tensor * xt     = nullptr; // the transposed projection [1, n_ch]
@@ -114,7 +185,132 @@ index fc840ad..1c16862 100644
  };
  
  struct ggml_hexagon_gdn_state_match {
-@@ -304,47 +307,117 @@ static inline const char * ggml_hexagon_gdn_conv_chain_check(const ggml_cgraph *
+@@ -120,8 +125,24 @@ static inline std::unordered_map<const ggml_tensor *, int> ggml_hexagon_gdn_inde
+     return index;
+ }
+ 
++// The use count of t in the full graph, or -1 when the graph has no use count for t. The split that
++// graph_compute gets is a view of the full graph (ggml_graph_view), and the view shares the hash set
++// and the use counts of the full graph. Thus the count includes the uses in the other splits.
++static inline int32_t ggml_hexagon_gdn_graph_uses(const ggml_cgraph * gf, const ggml_tensor * t) {
++    if (!gf->use_counts || !gf->visited_hash_set.used || gf->visited_hash_set.size == 0) {
++        return -1;
++    }
++    const size_t pos = ggml_hash_find(&gf->visited_hash_set, t);
++    if (pos == GGML_HASHSET_FULL || !ggml_bitset_get(gf->visited_hash_set.used, pos)) {
++        return -1;
++    }
++    return gf->use_counts[pos];
++}
++
+ // Every node that reads an intermediate (also through a view) must be a member of the chain. A view of
+-// `out` is permitted for any node when the view lies in the first `out_head_bytes` bytes of `out`.
++// `out` is permitted for any node when the view lies in the first `out_head_bytes` bytes of `out`. No
++// node of a different split can use an intermediate or `out`, or a member view of them.
++// O(nodes * GGML_MAX_SRC * members).
+ static inline const char * ggml_hexagon_gdn_chain_is_private(const ggml_cgraph * gf,
+                                                              const std::vector<ggml_tensor *> & intermediates,
+                                                              const std::vector<ggml_tensor *> & members,
+@@ -134,6 +155,21 @@ static inline const char * ggml_hexagon_gdn_chain_is_private(const ggml_cgraph *
+     if (out && (out->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+         return "the output is a graph output";
+     }
++    // The fused op does not write these tensors: the members with an intermediate or `out` as root.
++    // Each one gets the count of its uses in this split. Such a use has an intermediate or `out` as
++    // root, thus only the two branches of the loop below count.
++    std::vector<std::pair<const ggml_tensor *, int32_t>> unwritten;
++    for (ggml_tensor * m : members) {
++        ggml_tensor * root = ggml_hexagon_gdn_root(m);
++        if (ggml_hexagon_gdn_contains(intermediates, root) || (out && root == out)) {
++            unwritten.emplace_back(m, 0);
++        }
++    }
++    auto count_use = [&unwritten](const ggml_tensor * src) {
++        for (auto & u : unwritten) {
++            u.second += u.first == src ? 1 : 0;
++        }
++    };
+     for (int i = 0; i < gf->n_nodes; i++) {
+         ggml_tensor * n = gf->nodes[i];
+         for (int s = 0; s < GGML_MAX_SRC; s++) {
+@@ -143,6 +179,7 @@ static inline const char * ggml_hexagon_gdn_chain_is_private(const ggml_cgraph *
+             }
+             ggml_tensor * root = ggml_hexagon_gdn_root(src);
+             if (out && root == out) {
++                count_use(src);
+                 // The region that the reader touches: the view node itself when n is a view of out
+                 // (its src is the whole tensor), else the view that n reads.
+                 const ggml_tensor * region = (src == out && ggml_hexagon_gdn_is_view_op(n)) ? n : src;
+@@ -154,11 +191,24 @@ static inline const char * ggml_hexagon_gdn_chain_is_private(const ggml_cgraph *
+                 }
+                 return "the state part of the output has a reader outside the chain";
+             }
+-            if (ggml_hexagon_gdn_contains(intermediates, root) && !ggml_hexagon_gdn_contains(members, n)) {
+-                return "an intermediate has a reader outside the chain";
++            if (ggml_hexagon_gdn_contains(intermediates, root)) {
++                if (!ggml_hexagon_gdn_contains(members, n)) {
++                    return "an intermediate has a reader outside the chain";
++                }
++                count_use(src);
+             }
+         }
+     }
++    // A use that the full graph counts and this split does not have is a reader in a different split
++    for (const auto & u : unwritten) {
++        const int32_t uses = ggml_hexagon_gdn_graph_uses(gf, u.first);
++        if (uses < 0) {
++            return "the graph has no use count for a replaced tensor";
++        }
++        if (uses != u.second) {
++            return "a replaced tensor has a reader in a different split";
++        }
++    }
+     return nullptr;
+ }
+ 
+@@ -178,6 +228,41 @@ static inline bool ggml_hexagon_gdn_chain_span_is_clean(const ggml_cgraph * gf,
+     return true;
+ }
+ 
++// True when the bytes of the two tensors share a byte. A tensor with no data shares no byte.
++static inline bool ggml_hexagon_gdn_bytes_overlap(const ggml_tensor * a, const ggml_tensor * b) {
++    if (!a->data || !b->data) {
++        return false;
++    }
++    const char * ad = (const char *) a->data;
++    const char * bd = (const char *) b->data;
++    return ad < bd + ggml_nbytes(b) && bd < ad + ggml_nbytes(a);
++}
++
++// The fused op reads an input or writes an output at its emit index. The replaced node did that at the
++// index `at`. This change of position is safe when no node between the two indexes writes a byte of
++// the tensor. For an output, no node there can read a byte of it either. The allocator can give the
++// bytes of a tensor with no more readers to a different tensor, thus the check compares bytes and not
++// tensors. The check ignores views, empty nodes and the members of the chain.
++// O(|emit - at| * (GGML_MAX_SRC + members)).
++static inline bool ggml_hexagon_gdn_move_is_safe(const ggml_cgraph * gf, int emit, int at, const ggml_tensor * t,
++                                                 bool is_output, const std::vector<ggml_tensor *> & members) {
++    for (int i = std::min(emit, at) + 1; i < std::max(emit, at); i++) {
++        ggml_tensor * n = gf->nodes[i];
++        if (ggml_is_empty(n) || ggml_hexagon_gdn_is_view_op(n) || ggml_hexagon_gdn_contains(members, n)) {
++            continue;
++        }
++        if (ggml_hexagon_gdn_bytes_overlap(n, t)) {
++            return false;
++        }
++        for (int s = 0; is_output && s < GGML_MAX_SRC; s++) {
++            if (n->src[s] && ggml_hexagon_gdn_bytes_overlap(n->src[s], t)) {
++                return false;
++            }
++        }
++    }
++    return true;
++}
++
+ // The one CPY whose source is a view of `src_root`. Two of them (rollback snapshots) give nullptr and set `n_found`.
+ static inline ggml_tensor * ggml_hexagon_gdn_find_cpy(const ggml_cgraph * gf, const ggml_tensor * src_root, int & n_found) {
+     ggml_tensor * P = nullptr;
+@@ -309,47 +394,135 @@ static inline const char * ggml_hexagon_gdn_conv_chain_check(const ggml_cgraph *
          return "the second CONCAT input is not the transposed projection [n_tokens, n_ch]";
      }
  
@@ -196,6 +392,11 @@ index fc840ad..1c16862 100644
 +                return "the snapshot slots are not evenly strided";
 +            }
 +        }
++    }
++    // The fused op writes the slots from one base and one stride, and the DSP rejects a stride that
++    // is less than the size of a slot. Thus slots with an overlap stay with the unfused ops.
++    if (n_slots > 1 && stride < (size_t) row * sizeof(float)) {
++        return "the slot stride is less than a slot";
      }
  
 +    ggml_tensor * P    = cpys[0];
@@ -240,10 +441,23 @@ index fc840ad..1c16862 100644
      if (!ggml_hexagon_gdn_chain_span_is_clean(gf, ir->second, last_idx, cache, members)) {
          return "another node touches the conv cache inside the chain span";
      }
-+    // The op reads the projection of the tokens and writes its own output in
-+    // one pass over the channels. The fused op stands at the first CPY, long
-+    // before the SILU, thus the allocator can give the output the bytes of a
-+    // tensor that died earlier, and the projection is such a tensor.
++    // The fused op stands at the SILU or at the first CPY, at the one that comes first in the graph.
++    // Thus the op can write the output before the SILU, and it reads the projection and the weights
++    // at that index, not at the CONCAT and the SSM_CONV.
++    auto ici = index.find(CI);
++    auto ic  = index.find(C);
++    if (ici == index.end() || ic == index.end()) {
++        return "the CONCAT or the SSM_CONV is not a node of the graph";
++    }
++    if (!ggml_hexagon_gdn_move_is_safe(gf, emit, is, S, true, members)) {
++        return "a node between the CPY and the SILU touches the bytes of the output";
++    }
++    if (!ggml_hexagon_gdn_move_is_safe(gf, emit, ici->second, xt, false, members) ||
++        !ggml_hexagon_gdn_move_is_safe(gf, emit, ic->second, W, false, members)) {
++        return "a node between the CPY and the CONCAT or the SSM_CONV writes the bytes of an input";
++    }
++    // The op reads the projection of the tokens and writes its own output in one pass over the
++    // channels, thus the two must not share bytes.
 +    {
 +        const char * xd = (const char *) xt->data;
 +        const char * sd = (const char *) S->data;
@@ -254,7 +468,7 @@ index fc840ad..1c16862 100644
  
      m.S      = S;
      m.C      = C;
-@@ -357,10 +430,17 @@ static inline const char * ggml_hexagon_gdn_conv_chain_check(const ggml_cgraph *
+@@ -362,10 +535,17 @@ static inline const char * ggml_hexagon_gdn_conv_chain_check(const ggml_cgraph *
      m.P      = P;
      m.slot   = slot;
      m.members = members;
@@ -276,7 +490,7 @@ index fc840ad..1c16862 100644
      return nullptr;
  }
  
-@@ -374,8 +454,14 @@ static inline const char * ggml_hexagon_gdn_state_chain_check(const ggml_cgraph
+@@ -379,8 +559,14 @@ static inline const char * ggml_hexagon_gdn_state_chain_check(const ggml_cgraph
      if (G->type != GGML_TYPE_F32 || !ggml_is_contiguous(G)) {
          return "the output is not contiguous F32";
      }
@@ -293,7 +507,7 @@ index fc840ad..1c16862 100644
      }
      ggml_tensor * q    = G->src[0];
      ggml_tensor * k    = G->src[1];
-@@ -395,8 +481,8 @@ static inline const char * ggml_hexagon_gdn_state_chain_check(const ggml_cgraph
+@@ -400,8 +586,8 @@ static inline const char * ggml_hexagon_gdn_state_chain_check(const ggml_cgraph
          return "q or k is not one token of one sequence";
      }
      const int64_t D = S_v * S_v * H;

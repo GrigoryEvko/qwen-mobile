@@ -10,11 +10,6 @@ Files:
     common/sampling.cpp      the hook in common_sampler::set_logits, the verify mode in common_sampler_sample
     tests/test-sampling.cpp  the top set against all the logits, with ties at the cut
 
-How to apply, from the llama.cpp root:
-
-    git apply patches/hexagon-host/0003-llama-sampler-topset.patch
-    cmake --build build-snapdragon -j
-
 Only libllama.so and libllama-common.so change (the app links both).
 
 Switch (environment variable):
@@ -56,11 +51,30 @@ array is.
 LLAMA_SAMPLER_TOPSET=2 clones the chain (with its random state), runs the clone on all the logits, and
 compares the selected token with the one of the top set. A difference is a warn line. Every 64 tokens a
 line gives the counts. The stream of the run is the one of the top set.
+
+The counters of the verify mode
+
+The verify mode (LLAMA_SAMPLER_TOPSET=2) counts the equal and the different selections in four
+std::atomic<int64_t> counters, in llama_sampler_topset_verify and in common_sampler_sample.
+llama.cpp permits two contexts of one model in two threads, and each context has its own sampler.
+Thus two threads write the same counters, and function-static int64_t counters give a data race
+that TSan reports. The counts only go to a log line.
+
+The reproducer: tests/fuzz/core/regress/tsan_topset--tsan-topset-counters.
+
 diff --git a/common/sampling.cpp b/common/sampling.cpp
-index 06dea1e..a005e84 100644
+index 06dea1e..cae324e 100644
 --- a/common/sampling.cpp
 +++ b/common/sampling.cpp
-@@ -137,6 +137,10 @@ struct common_sampler {
+@@ -8,6 +8,7 @@
+ #include "ggml.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cctype>
+ #include <climits>
+ #include <cmath>
+@@ -137,6 +138,10 @@ struct common_sampler {
  
          const int n_vocab = llama_vocab_n_tokens(vocab);
  
@@ -71,7 +85,7 @@ index 06dea1e..a005e84 100644
          if (sampled_probs) {
              const uint32_t sampled_probs_count = llama_get_sampled_probs_count_ith(ctx, idx);
              cur.resize(sampled_probs_count);
-@@ -153,14 +157,34 @@ struct common_sampler {
+@@ -153,14 +158,34 @@ struct common_sampler {
              const auto * logits = llama_get_logits_ith(ctx, idx);
              GGML_ASSERT(logits != nullptr);
              cur.resize(n_vocab);
@@ -108,7 +122,7 @@ index 06dea1e..a005e84 100644
      common_time_meas tm() {
          return common_time_meas(t_total_us, params.no_perf);
      }
-@@ -635,10 +659,41 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+@@ -635,10 +660,42 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
          llama_sampler_apply(grmr, &cur_p);
      }
  
@@ -120,8 +134,9 @@ index 06dea1e..a005e84 100644
      id = cur_p.data[cur_p.selected].id;
  
 +    if (chain_verify) {
-+        static int64_t n_same = 0;
-+        static int64_t n_diff = 0;
++        // two contexts can sample in two threads, thus the counters are atomic
++        static std::atomic<int64_t> n_same{0};
++        static std::atomic<int64_t> n_diff{0};
 +
 +        const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
 +        const int n_vocab = llama_vocab_n_tokens(vocab);
@@ -170,10 +185,18 @@ index 3ab9359..7aebe56 100644
      //LLAMA_API void llama_decode_with_sampler(struct llama_context * ctx, struct llama_sampler * smpl, struct llama_batch batch, ...);
  
 diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
-index 61d28ad..d16c98d 100644
+index 61d28ad..79cd32e 100644
 --- a/src/llama-sampler.cpp
 +++ b/src/llama-sampler.cpp
-@@ -133,8 +133,9 @@ struct ring_buffer {
+@@ -8,6 +8,7 @@
+ 
+ #include <array>
+ #include <algorithm>
++#include <atomic>
+ #include <cassert>
+ #include <cfloat>
+ #include <chrono>
+@@ -133,8 +134,9 @@ struct ring_buffer {
  
  // writes result in res, does not mutate cur
  static void llama_token_data_array_partial_sort(const llama_token_data_array & cur, int npartial, std::vector<llama_token_data> & res) {
@@ -184,7 +207,7 @@ index 61d28ad..d16c98d 100644
      };
  
      constexpr int   nbuckets     = 128;
-@@ -191,8 +192,9 @@ static void llama_token_data_array_partial_sort(const llama_token_data_array & c
+@@ -191,8 +193,9 @@ static void llama_token_data_array_partial_sort(const llama_token_data_array & c
  
  // reduces the size of cur_p to npartial, keeping only the top npartial elements
  static void llama_token_data_array_partial_sort_inplace(llama_token_data_array * cur_p, int npartial) {
@@ -195,7 +218,7 @@ index 61d28ad..d16c98d 100644
      };
  
      if (npartial <= 128) {
-@@ -892,6 +894,18 @@ uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler) {
+@@ -892,6 +895,18 @@ uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler) {
      return chain->n_nodes;
  }
  
@@ -214,7 +237,7 @@ index 61d28ad..d16c98d 100644
  llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx) {
      const llama_token   sampled_token  = llama_get_sampled_token_ith     (ctx, idx);
      const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
-@@ -939,8 +953,17 @@ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_conte
+@@ -939,8 +954,17 @@ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_conte
          const auto * logits = llama_get_logits_ith(ctx, idx);
          GGML_ASSERT(logits != nullptr);
          cur.resize(n_vocab);
@@ -234,7 +257,7 @@ index 61d28ad..d16c98d 100644
          }
      }
  
-@@ -4050,12 +4073,27 @@ struct llama_sampler * llama_sampler_init_logit_bias(
+@@ -4050,12 +4074,27 @@ struct llama_sampler * llama_sampler_init_logit_bias(
          return llama_sampler_init_empty("?logit-bias");
      }
  
@@ -263,7 +286,7 @@ index 61d28ad..d16c98d 100644
              /* .to_search      = */ {},
              /* .inp_logit_bias = */ nullptr,
              /* .inp_logit_idxs = */ nullptr,
-@@ -4383,3 +4421,195 @@ void llama_perf_sampler_reset(struct llama_sampler * chain) {
+@@ -4383,3 +4422,196 @@ void llama_perf_sampler_reset(struct llama_sampler * chain) {
      ctx->t_sample_us = 0;
      ctx->n_sample    = 0;
  }
@@ -423,8 +446,9 @@ index 61d28ad..d16c98d 100644
 +// Runs a clone of the chain on all the logits and a clone on the top set, and compares the two selected
 +// tokens. The clones keep the random state of the chain, thus the chain itself is not changed.
 +static void llama_sampler_topset_verify(struct llama_sampler * smpl, const float * logits, int32_t n_vocab, const std::vector<llama_token_data> & top) {
-+    static int64_t n_same = 0;
-+    static int64_t n_diff = 0;
++    // two contexts can sample in two threads, thus the counters are atomic
++    static std::atomic<int64_t> n_same{0};
++    static std::atomic<int64_t> n_diff{0};
 +
 +    struct llama_sampler * chain_full = llama_sampler_clone(smpl);
 +    struct llama_sampler * chain_top  = llama_sampler_clone(smpl);

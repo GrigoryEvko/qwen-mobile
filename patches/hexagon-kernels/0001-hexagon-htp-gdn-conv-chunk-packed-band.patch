@@ -11,7 +11,7 @@ Modes 1 to 3 keep the chain and change the precision only. Mode 4 is the packed 
 rows in each iteration as independent chains, f16 taps with a 16-bit qfloat accumulator, and the
 int16 SiLU of hvx-silu-i16.h (2 int16 multiplies fit one packet, 1 qfloat multiply does).
 
-Revision of 2026-09-20: hvx_silu_h_i16 clamps its result to zero.
+The clamp of hvx_silu_h_i16
 
 The first form of this patch let the integer Horner of the last octave give -1 for 174 of the
 65536 f16 inputs, all with |x| in [14.4922, 15.7266]. The epilogue of gdn_conv_band_packed
@@ -29,9 +29,43 @@ The clamp is one integer ALU operation for each row. The same defect in the tabl
 to prevent as well: 2 more in the constant term of the octave 15 of tools/htp-lab/gen/silu_i16.py
 makes the integer Horner non-negative at every point, at 3.1e-05 more error in that octave.
 
-diff -urN a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
---- a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c	2026-09-20 01:19:34.138624337 +0300
-+++ b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c	2026-09-20 03:11:02.170390366 +0300
+The default of GDN_CONV_F16_MODE
+
+The default is 4, the packed band path. Measured in tools/htp-lab, target gdn_chunk, 512
+channels and 32 tokens on one thread, against a float64 reference:
+
+    mode 0, the f32 chain      115447 cycles   NMSE 2.7e-14
+    mode 4, the packed band     31993 cycles   NMSE 3.0e-07
+
+3.61 times faster. GDN_CONV_CHUNK is the largest single op of a 512-token prefill of the 4B, at
+27 % of the time on the digital signal processor, thus this is the largest prefill change of the
+series. The op runs when a batch has more than one token, thus it serves the prefill and the
+speculative verify, and not the single-token decode step. GDN_CONV_F16_MODE 0 takes the f32
+chain back.
+
+The error is 3.0e-07 of NMSE against a baseline of 2.7e-14. The consumer of this output, the
+chunked gated delta net, already measures 3.0e-07 of its own, and the bound that the backend
+tests apply is 2e-06, thus this value costs nothing downstream. It is a regression from an exact
+baseline and a reviewer must see it.
+
+Two measurements decide whether mode 4 is safe, and neither of them is in the lab of one kernel:
+
+1. The conv output of the real model reaches the band [14.4922, 15.7266]. A forward pass of
+   Qwen3.5-2B on the prompt "The capital of France is" gives 8 values in that band over 4 of the
+   18 gated delta net layers, and a 605-token prefill gives 699 over 13 layers.
+2. The lab reaches the band only with an input range of 6 or more. The target has a phase that
+   walks the f16 octaves, thus the default arguments cover it.
+
+A test of the model on the phone and a run of the parity harness (llama-perplexity
+--kl-divergence against the central processor) are necessary for a change of this path. The lab
+proves the shape of the SiLU and the absence of a value that is not finite. It does not prove the
+quality of the model, because an f16 accumulator over 4 taps cancels: at an input range of 4 the
+largest error of one value is 8.0e-03 at an output of 2.02.
+
+diff --git a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
+index 78c834b..3f58841 100644
+--- a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
++++ b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
 @@ -35,6 +35,7 @@
  #include <string.h>
  
@@ -40,7 +74,7 @@ diff -urN a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c b/ggml/src/ggml-hexagon/htp
  #include "hex-fastdiv.h"
  #include "hex-common.h"
  #include "hex-profile.h"
-@@ -171,12 +172,93 @@
+@@ -171,12 +172,93 @@ static inline void gdn_conv_lanes_to_c(const struct gdn_conv_masks * mk,
  // The convolution of one block of 32 channels from its four tap planes and its four weight planes,
  // and the SiLU. The sum keeps the order of the CPU reference, and the two functions are the
  // arithmetic of the ADD and MUL ops of this backend (hvx-base.h, per architecture).
@@ -55,7 +89,7 @@ diff -urN a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c b/ggml/src/ggml-hexagon/htp
 +//   3  f16 taps, f16 accumulate, f16 SiLU. Every product goes back to f16 before the sum.
 +//   4  the packed path: f16 taps, 32-bit accumulate, int16 SiLU, 4 token rows in each iteration.
 +#ifndef GDN_CONV_F16_MODE
-+#define GDN_CONV_F16_MODE 0
++#define GDN_CONV_F16_MODE 4
 +#endif
 +static int gdn_conv_f16_mode = GDN_CONV_F16_MODE;
 +
@@ -137,7 +171,7 @@ diff -urN a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c b/ggml/src/ggml-hexagon/htp
  
      // the SiLU of the SILU op: x * sigmoid(x)
      const HVX_Vector one     = hvx_vec_splat_f32(1.f);
-@@ -438,6 +520,133 @@
+@@ -438,6 +520,133 @@ int op_gdn_conv_step(struct htp_ops_context * octx) {
  // converts a lane layout again. The channels of one token are contiguous, thus each thread walks its
  // own block of each row, and the four rows that one token reads stay in L2 over the channel sweep.
  
@@ -271,7 +305,7 @@ diff -urN a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c b/ggml/src/ggml-hexagon/htp
  struct htp_gdn_conv_chunk_context {
      struct htp_ops_context * octx;
      const float * src_slot;   // source slot, DDR, three floats per channel
-@@ -473,6 +682,11 @@
+@@ -473,6 +682,11 @@ static void gdn_conv_chunk_thread(unsigned int nth, unsigned int ith, void * dat
      float * planes = (float *) (cctx->vtcm + cctx->vtcm_per_thread * ith);
      float * wt     = planes;             // [4][n] the weight planes
      float * st     = planes + 4 * n;     // [3][n] the state planes
@@ -283,7 +317,7 @@ diff -urN a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c b/ggml/src/ggml-hexagon/htp
  
      const float * w_ptr = cctx->w + (size_t) c0 * GDN_CONV_D_CONV;
      const float * s_ptr = cctx->src_slot + (size_t) c0 * (GDN_CONV_D_CONV - 1);
-@@ -501,6 +715,49 @@
+@@ -501,6 +715,49 @@ static void gdn_conv_chunk_thread(unsigned int nth, unsigned int ith, void * dat
          hvx_vmem(st + 2 * n + i * VLEN_FP32) = p2;
      }
  
@@ -333,7 +367,7 @@ diff -urN a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c b/ggml/src/ggml-hexagon/htp
      // the tokens. Tap j of token t reads the row t - 3 + j, or the state plane of that index when the
      // row is before the batch.
      for (uint32_t t = 0; t < T; t++) {
-@@ -513,7 +770,46 @@
+@@ -513,7 +770,46 @@ static void gdn_conv_chunk_thread(unsigned int nth, unsigned int ith, void * dat
  
          float * out = cctx->y + (size_t) t * cctx->y_stride + c0;
  
@@ -381,7 +415,7 @@ diff -urN a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c b/ggml/src/ggml-hexagon/htp
              const uint32_t o = i * VLEN_FP32;
              HVX_Vector r = gdn_conv_tap_silu(hvx_vmemu(tap[0] + o), hvx_vmemu(tap[1] + o),
                                               hvx_vmemu(tap[2] + o), hvx_vmemu(tap[3] + o),
-@@ -629,7 +925,7 @@
+@@ -629,7 +925,7 @@ int op_gdn_conv_chunk(struct htp_ops_context * octx) {
      const uint32_t chunk     = hex_round_up(fastdiv(n_ch + n_threads - 1, &octx->n_threads_div), VLEN_FP32);
  
      // the weight planes and the state planes of one thread
@@ -390,9 +424,11 @@ diff -urN a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c b/ggml/src/ggml-hexagon/htp
      if (octx->ctx->vtcm_size < vtcm_per_thread * n_threads) {
          FARF(ERROR, "gdn-conv-chunk: VTCM %zu is too small, needed %zu\n",
               octx->ctx->vtcm_size, vtcm_per_thread * n_threads);
-diff -urN a/ggml/src/ggml-hexagon/htp/hvx-silu-i16.h b/ggml/src/ggml-hexagon/htp/hvx-silu-i16.h
---- a/ggml/src/ggml-hexagon/htp/hvx-silu-i16.h	1970-01-01 03:00:00.000000000 +0300
-+++ b/ggml/src/ggml-hexagon/htp/hvx-silu-i16.h	2026-09-20 03:04:07.863095252 +0300
+diff --git a/ggml/src/ggml-hexagon/htp/hvx-silu-i16.h b/ggml/src/ggml-hexagon/htp/hvx-silu-i16.h
+new file mode 100644
+index 0000000..3bcc0b8
+--- /dev/null
++++ b/ggml/src/ggml-hexagon/htp/hvx-silu-i16.h
 @@ -0,0 +1,146 @@
 +// The SiLU in int16 for the HVX. tools/htp-lab/gen/silu_i16.py of the qwen-mobile repository
 +// generates this file, do not edit it.

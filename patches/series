@@ -1,59 +1,130 @@
+# The patch series on the pinned llama.cpp commit of scripts/lib.sh, grouped by
+# subsystem. scripts/apply-patches.sh applies the series in this order, and
+# scripts/check-patches.sh reconstructs it and compares the result with the
+# submodule file by file. A patch can change the files of an earlier patch, thus
+# the order is part of the series and a reader must take it from the top.
+#
+# scripts/regen-patch.sh rebuilds one patch from the live submodule. It gives a
+# correct result only for the last patch that touches the files of that patch.
+
+# ggml and the CPU backend
+fuzz-ops/0001-ggml-graph-size-with-integers.patch
+fuzz-ops/0002-ggml-thunks-for-the-type-trait-functions.patch
+fuzz-ops/0003-ggml-cpu-keep-the-sse2-exp-steps-under-fast-math.patch
+fuzz-ops/0004-ggml-cpu-quantize-a-strided-src1-of-the-repack-matmul.patch
+fuzz-ops/0005-ggml-cpu-run-the-value-asserts-only-with-an-opt-in-macro.patch
+fuzz-ops/0006-ggml-cpu-soft-max-of-a-fully-masked-row-gives-0.patch
+fuzz-ops/0013-ggml-the-f32-to-f16-conversion-gives-inf-past-the-f16-range-with-fast-math.patch
+fuzz-ops/0014-ggml-cpu-the-rope-cache-reads-no-freq-factor-past-src2.patch
+fuzz-matrix/0007-ggml-cpu-read-the-q1-0-bits-with-memcpy-in-the-x86-vec-dot.patch
+
+# The GGUF reader and the model loader
+fuzz-quant/0001-gguf-py-check-the-byte-ranges-and-the-shapes-of-the-reader.patch
+fuzz-core/0004-check-the-metadata-of-the-model-loader.patch
+fuzz-core/0007-check-the-input-of-the-gguf-reader.patch
+fuzz-core/0015-check-the-nonzero-dimensions-of-a-gguf-tensor.patch
+fuzz-core/0022-refuse-a-gguf-tensor-whose-size-the-alignment-cannot-pad.patch
+# The loader reads a duplicate of a lazy tensor (the tied output on a device) from the file and
+# not through the lazy mapping, thus the lazy mode does not slow the load.
+memory/0005-llama-copy-a-duplicate-of-a-lazy-tensor-from-the-file.patch
+
+# The vocabulary and the chat template
+fuzz-core/0005-refuse-a-defective-vocabulary.patch
+fuzz-core/0006-refuse-a-malformed-template.patch
+fuzz-core/0019-give-an-error-for-a-text-that-a-vocabulary-cannot-tokenize.patch
+fuzz-core/0023-refuse-a-dummy-vocabulary-size-above-2-24.patch
+fuzz-matrix/0002-server-give-the-chat-parameters-the-defaults-of-common-params.patch
+fuzz-matrix/0006-jinja-compute-the-integer-operators-in-int64.patch
+
+# The sampler
+hexagon-host/0003-llama-sampler-topset.patch
+fuzz-core/0008-give-the-samplers-a-defined-result-for-special-logits.patch
+fuzz-core/0016-give-the-softmax-a-defined-result-for-special-logits.patch
+fuzz-matrix/0004-sampler-give-each-padding-slot-of-the-penalties-its-own-token-id.patch
+
+# The context, the memory and the batch
+hexagon-host/0002-llama-host-timers-and-embd-lookup.patch
+# A rollback of a recurrent state must not go deeper than the tokens of the last ubatch of the
+# sequence. A prompt ubatch has nothing to roll back: a ubatch that holds more tokens of one
+# sequence than the rollback depth cannot be a verify step, thus it takes one snapshot group and
+# its graph equals the graph of speculation off.
+hexagon-spec/0002-llama-bound-the-recurrent-rollback-by-the-last-ubatch.patch
+hexagon-spec/0003-llama-one-recurrent-snapshot-group-for-a-prompt-ubatch.patch
+fuzz-core/0001-check-the-cell-count-of-a-state-blob.patch
+fuzz-core/0002-clear-the-rollback-index-of-a-removed-sequence.patch
+fuzz-core/0011-refuse-a-context-with-a-small-ubatch-for-the-rollback.patch
+fuzz-core/0012-clear-each-kv-stream-in-seq-keep-and-copy-the-rollback-index.patch
+fuzz-core/0017-refuse-the-rollback-of-a-shared-recurrent-cell.patch
+fuzz-core/0018-apply-the-pending-memory-update-before-a-state-write-or-read.patch
+fuzz-core/0020-check-the-strings-and-the-cell-sequences-of-a-state-blob.patch
+fuzz-core/0021-write-zeros-to-a-used-recurrent-row-before-a-new-sequence.patch
+fuzz-core/0024-replace-the-destination-of-a-sequence-copy-in-one-kv-stream.patch
+# llama_decode refuses a batch that asks for more logits rows than n_outputs_max with an error
+# code, not with an abort.
+memory/0001-llama-refuse-a-batch-with-more-outputs-than-n-outputs-max.patch
+# A quantized V cache with flash attention AUTO keeps the probe of the device of each attention
+# layer, and the context creation fails when a layer cannot run flash attention on its device.
+memory/0002-llama-probe-flash-attention-for-a-quantized-v-cache-in-auto-mode.patch
+fuzz-core/0025-reject-a-nan-or-an-inf-in-the-data-of-a-state-blob.patch
+
+# The Qwen3.5 model and the draft head
+llama-tied-head/0001-qwen35-tied-head-output-rot.patch
+llama-tied-head/0002-qwen35-mtp-rotation.patch
+# The drafter reads a frequency-ranked subset of the head. A model without the three tensors
+# takes the full head, thus the patch is inert for a plain GGUF.
+draft-head/0001-llama-qwen35-reduced-mtp-draft-head.patch
+# qwen35 marks its token embedding for the lazy read, thus with LLAMA_LAZY_MODE_ON the embedding
+# stays in a file mapping and takes no anonymous memory.
+memory/0004-llama-qwen35-reads-the-token-embedding-lazily.patch
+
+# The vision encoder outside the DSP
 opencl-vision/0001-mtmd-qwen-patch-embedding-as-gemm.patch
 opencl-vision/0002-mtmd-clip-compute-warmup.patch
 opencl-vision/0003-mtmd-qwen3vl-zero-mask-test-aid.patch
-hexagon-fusion/0001-hexagon-htp-fused-matvec-add-read-src2-from-ddr.patch
-hexagon-fusion/0002-hexagon-htp-fused-gdn-state-step.patch
-hexagon-fusion/0003-hexagon-htp-gdn-state-step-hvx-conv-and-match-fix.patch
-hexagon-vit/0001-hexagon-gelu-tanh-form.patch
-llama-tied-head/0001-qwen35-tied-head-output-rot.patch
-hexagon-fusion/0004-hexagon-htp-gdn-slot-index-from-host-and-error-report.patch
-llama-tied-head/0002-qwen35-mtp-rotation.patch
 mtmd/0001-mtmd-qwen3vl-position-embedding-on-cpu.patch
 mtmd/0002-mtmd-qwen3vl-one-rope-for-q-and-k.patch
+fuzz-ops/0010-opencl-soft-max-of-a-fully-masked-row-gives-0.patch
+fuzz-ops/0011-opencl-row-broadcast-of-a-src1-row-that-repeats-along-dim-0.patch
+
+# The switches of the app and the tools
+spec-draft-4/0001-common-default-the-draft-depth-to-4.patch
+fuzz-quant/0002-perplexity-write-the-queued-log-lines-before-the-exit.patch
+spec-mtp/0001-common-the-mtp-drafter-stops-at-the-draft-length-of-the-call.patch
+
+# The tests of llama.cpp
+fuzz-matrix/0001-tests-free-the-compute-context-of-test-opt.patch
+fuzz-matrix/0003-tests-give-the-tensors-of-test-barrier-defined-data.patch
+fuzz-matrix/0005-tests-give-the-keys-with-no-array-type-a-valid-gguf-type.patch
+
+# The Hexagon backend. Each patch of this group changes ggml-hexagon.cpp, the op table of the DSP
+# library, or a kernel source that a later patch changes again. Thus the order inside this group
+# is a dependency chain, and the patches of one area are not adjacent.
+#
+# Every kernel patch needs one generation of text on the device before it enters this file. The
+# kernel lab gives the result of one kernel and not the result of the model: it builds without
+# -flto, and a sweep of element counts that are multiples of 32 never runs the tail block that
+# the model always runs.
+hexagon-fusion/0001-hexagon-htp-fused-matvec-add-read-src2-from-ddr.patch
+hexagon-fusion/0002-hexagon-htp-fused-gdn-state-step.patch
+hexagon-vit/0001-hexagon-gelu-tanh-form.patch
+hexagon-fusion/0004-hexagon-htp-gdn-slot-index-from-host-and-error-report.patch
 hexagon-host/0001-hexagon-host-timers-and-batch-cache.patch
-hexagon-host/0002-llama-host-timers-and-embd-lookup.patch
-hexagon-host/0003-llama-sampler-topset.patch
 hexagon-fusion/0005-hexagon-htp-gdn-chunked-hmx.patch
 hexagon-multirow/0001-hexagon-htp-multirow-decode-step.patch
+# The chunked delta rule of hexagon-fusion/0005 lands at an error of 1.24e-7 against the usual
+# limit of 1.0e-7 in test-backend-ops: the rounding of the fp16 inputs of the HMX.
+# hexagon-fusion/0006 sets the limit to 1e-5 for the HTP backend on the chunkable shapes only,
+# and the other backends and shapes keep 1e-7. The model does not move: the 2B Q8_0 file on the
+# phone gives maximum KL 0.00986 and top-1 99.35 % with the kernel and 0.00983 and 99.22 %
+# without it, and the prefill goes from 981 to 1675 t/s.
 hexagon-fusion/0006-hexagon-htp-gdn-conv-chunk.patch
-# The chunked delta rule above lands at an error of 1.24e-7 against the usual
-# limit of 1.0e-7 in test-backend-ops: the rounding of the fp16 inputs of the
-# HMX. Patch 0006 sets the limit to 1e-5 for the HTP backend on the chunkable
-# shapes only, and the other backends and shapes keep 1e-7. The model does not
-# move: the 2B Q8_0 file on the phone gives maximum KL 0.00986 and top-1
-# 99.35 % with the kernel and 0.00983 and 99.22 % without it, and the prefill
-# goes from 981 to 1675 t/s.
-
 hexagon-fusion/0007-hexagon-htp-gdn-fusions-with-rollback-slots.patch
-
 # The f16 math helpers, before any kernel moves to f16. hvx_vec_exp2_f16 held a raw qf16 constant
 # that hexagon-clang 19.0.07 reads as an IEEE half when it inlines the function into a larger loop
-# (2 % to 56 % error in exp2), and hvx_vec_fast_sigmoid_f16 cancelled for a negative input (29 % rms
-# over [-12, 12]). tools/htp-lab target f16math measures the two. The library of the app did not
-# hold the wrong multiply, thus no shipped result changes.
+# (2 % to 56 % error in exp2), and hvx_vec_fast_sigmoid_f16 cancelled for a negative input (29 %
+# rms over [-12, 12]). tools/htp-lab target f16math measures the two. The library of the app holds
+# neither defect, thus no shipped result changes.
 hexagon-f16/0001-hexagon-f16-exp2-coefficient-and-sigmoid-branch.patch
-
-# The kernel work of 2026-09-20. Each patch is measured in tools/htp-lab against a
-# float64 reference, in the cycle-accurate simulator, and its header carries the
-# cycles and the error before and after.
-#
-# THREE OF THEM GAVE A WRONG MODEL ON THE DEVICE AND THE LAB DID NOT SEE IT.
-# On 2026-09-20 the NPU answered every prompt with one repeated token, while the
-# CPU and the GPU were correct. A bisect on the phone, one library for each
-# prefix, isolated 0004 and 0011, and an audit then found a third defect in 0010.
-# Each one is now repaired and each patch header holds its mechanism:
-#   0004  the Horner seed was an IEEE single that the next step read as a qf32
-#   0010  the int16 rows dropped the tail, and the SIGMOID row is 1 element
-#   0001  the int16 SiLU returned a negative h, and an unsigned exponent
-#         subtract then turned it into +Inf. 0011 only selects that path.
-#
-# Why the lab passed them: it measures one kernel that it compiles on its own,
-# with a token count that is a multiple of 4 vectors, against a float64
-# reference. The library compiles the same source with -flto into a translation
-# unit of a different shape, and the model calls it with ne0 = the head count.
-# A lab result is thus necessary and not sufficient: every kernel patch needs
-# one generation on the device before it goes into this file.
-
 hexagon-kernels/0001-hexagon-htp-gdn-conv-chunk-packed-band.patch
 hexagon-kernels/0002-hexagon-htp-gdn-chunk-rank1-decay-and-transpose.patch
 hexagon-kernels/0003-hexagon-htp-activation-int16-tables.patch
@@ -63,189 +134,70 @@ hexagon-kernels/0006-hexagon-htp-arith-fused-chains.patch
 hexagon-kernels/0007-hexagon-htp-softmax-and-norm-packed.patch
 hexagon-kernels/0008-hexagon-htp-flash-attn-code-size.patch
 hexagon-kernels/0009-hexagon-htp-cpy-transpose-tiles.patch
-
 hexagon-kernels/0010-hexagon-htp-wire-activation-tables.patch
-
-# The int16 activation kernels of 0003 compute nvec = n / 32 and drop the rest of
-# the row. Qwen3.5 gives the SIGMOID a row of 1 element, thus the kernel wrote
-# nothing and the gate held the previous contents of the scratch pad. This patch
-# adds the tail store. It comes after 0010, which is the tree it was made against.
-hexagon-kernels/0003b-hexagon-htp-act-i16-tail-store.patch
-
-hexagon-kernels/0011-hexagon-htp-gdn-conv-chunk-band-by-default.patch
-
-# The HMX 2D path pipelines below 33 rows. The threshold was an untested guess:
-# the VTCM budget allows the pipelined layout at every row count from 5 to 32.
+# The HMX 2D path pipelines below 33 rows. The VTCM budget allows the pipelined layout at every
+# row count from 5 to 32.
 hexagon-mm/0001-hexagon-mm-pipeline-below-33-rows.patch
-
-# Speculative decoding gives the context K rollback slots. The chunked gated
-# delta net kernel refused K > 1, thus prefill with speculation on ran the
-# sequential kernel and lost a factor of 2.1.
+# Speculative decoding gives the context K rollback slots. The chunked gated delta net kernel
+# refuses K > 1, thus prefill with speculation on runs the sequential kernel and loses a factor
+# of 2.1.
 hexagon-spec/0001-hexagon-htp-gdn-chunked-and-conv-rollback-slots.patch
-
-# A prompt ubatch has nothing to roll back. A ubatch that holds more tokens of
-# one sequence than the rollback depth cannot be a verify step, thus it takes
-# one snapshot group and its graph equals the graph of speculation off.
-hexagon-spec/0002-llama-bound-the-recurrent-rollback-by-the-last-ubatch.patch
-hexagon-spec/0003-llama-one-recurrent-snapshot-group-for-a-prompt-ubatch.patch
-
-# The drafter reads a frequency-ranked subset of the head. A model without the
-# three tensors takes the full head, thus the patch is inert for a plain GGUF.
-draft-head/0001-llama-qwen35-reduced-mtp-draft-head.patch
-
-# The int8 HMX macros. No kernel uses them yet, thus the patch is inert.
+# The int8 HMX macros. No kernel uses them, thus the patch changes no result.
 hexagon-hmx-i8/0001-hexagon-hmx-int8-macros.patch
 hexagon-repeat-splat/0001-hexagon-htp-splat-the-scalar-broadcast-of-repeat.patch
-spec-draft-4/0001-common-default-the-draft-depth-to-4.patch
-
-# The DSP library of the cores before v79: the one IEEE intrinsic of our kernels takes the qf path there.
+# The DSP library of the cores before v79: the one IEEE intrinsic of our kernels takes the qf
+# path there.
 hexagon-pre79/0001-hexagon-htp-build-the-dsp-library-for-v73-and-v75.patch
-
-# No HTP device below v73, or when the library of the DSP is missing: a library
-# for a newer DSP than the chip gives incorrect values with no error.
+# No HTP device below v73, or when the library of the DSP is missing: a library for a newer DSP
+# than the chip gives incorrect values with no error.
 hexagon-arch/0001-hexagon-no-device-for-an-unsupported-dsp.patch
-
-# The Q8_0 activations of the HVX matmul get the bits of quantize_row_q8_0_ref
-# on every Hexagon version: one scale for each 32 values, integer arithmetic.
+# The Q8_0 activations of the HVX matmul get the bits of quantize_row_q8_0_ref on every Hexagon
+# version: one scale for each 32 values, integer arithmetic.
 hexagon-q8-ref/0001-hexagon-quantize-the-activations-as-the-cpu-reference.patch
-
-# fuzz-ops: the fixes of the op fuzzer. The header of each patch gives its task.
-fuzz-ops/0001-ggml-graph-size-with-integers.patch
-
-# fuzz-quant: the fixes of the quant fuzzer. The header of each patch gives its task.
-fuzz-quant/0001-gguf-py-check-the-byte-ranges-and-the-shapes-of-the-reader.patch
-fuzz-ops/0002-ggml-thunks-for-the-type-trait-functions.patch
-fuzz-quant/0002-perplexity-write-the-queued-log-lines-before-the-exit.patch
-fuzz-ops/0003-ggml-cpu-keep-the-sse2-exp-steps-under-fast-math.patch
-
-# fuzz-hexhost: the fixes of the Hexagon host fuzzer. The header of each patch gives its task.
 fuzz-hexhost/0001-hexagon-gdn-slot-index-before-the-first-batch.patch
-fuzz-hexhost/0002-hexagon-mul-mat-add-only-for-the-whole-product.patch
 fuzz-hexhost/0003-hexagon-model-the-dsp-limits-in-supports-op.patch
 fuzz-hexhost/0004-hexagon-no-fastdiv-of-zero-in-the-matmul-params.patch
 fuzz-hexhost/0005-hexagon-tiled-matmul-rows-from-dst.patch
-fuzz-ops/0004-ggml-cpu-quantize-a-strided-src1-of-the-repack-matmul.patch
-
-# The fixes of the defects that the fuzz harness of tests/fuzz/core finds in the core of llama.cpp.
-# The header of each patch describes its defects and the change.
-fuzz-core/0001-check-the-cell-count-of-a-state-blob.patch
-fuzz-core/0002-clear-the-rollback-index-of-a-removed-sequence.patch
-fuzz-core/0003-tests-state-the-rollback-depth-rule-in-the-recurrent-state-test.patch
-fuzz-core/0004-check-the-metadata-of-the-model-loader.patch
-fuzz-core/0005-refuse-a-defective-vocabulary.patch
-fuzz-core/0006-refuse-a-malformed-template.patch
-fuzz-core/0007-check-the-input-of-the-gguf-reader.patch
-fuzz-core/0008-give-the-samplers-a-defined-result-for-special-logits.patch
-fuzz-core/0009-make-the-counters-of-the-top-set-verify-atomic.patch
-fuzz-core/0010-give-the-host-embedding-lookup-the-positions-of-m-rope.patch
-fuzz-core/0011-refuse-a-context-with-a-small-ubatch-for-the-rollback.patch
-fuzz-core/0012-clear-each-kv-stream-in-seq-keep-and-copy-the-rollback-index.patch
-fuzz-core/0013-bound-the-rollback-of-the-dsv4-cache-by-the-last-ubatch.patch
-fuzz-core/0014-tests-free-the-contexts-of-the-rollback-test-on-each-return.patch
-fuzz-core/0015-check-the-nonzero-dimensions-of-a-gguf-tensor.patch
-fuzz-core/0016-give-the-softmax-a-defined-result-for-special-logits.patch
-fuzz-core/0017-refuse-the-rollback-of-a-shared-recurrent-cell.patch
-fuzz-core/0018-apply-the-pending-memory-update-before-a-state-write-or-read.patch
-fuzz-core/0019-give-an-error-for-a-text-that-a-vocabulary-cannot-tokenize.patch
-fuzz-core/0020-check-the-strings-and-the-cell-sequences-of-a-state-blob.patch
-fuzz-core/0021-write-zeros-to-a-used-recurrent-row-before-a-new-sequence.patch
-fuzz-core/0022-refuse-a-gguf-tensor-whose-size-the-alignment-cannot-pad.patch
-fuzz-core/0023-refuse-a-dummy-vocabulary-size-above-2-24.patch
-fuzz-core/0024-replace-the-destination-of-a-sequence-copy-in-one-kv-stream.patch
-
-# The fixes of the defects that the sanitizer matrix of tests/run-suite.sh finds in the tests of llama.cpp.
-# The header of each patch describes its defect and the change.
-fuzz-matrix/0001-tests-free-the-compute-context-of-test-opt.patch
-
-# fuzz-ops: the value asserts of ggml-cpu behind an opt-in macro, and the fully masked soft_max row.
-fuzz-ops/0005-ggml-cpu-run-the-value-asserts-only-with-an-opt-in-macro.patch
-fuzz-ops/0006-ggml-cpu-soft-max-of-a-fully-masked-row-gives-0.patch
 fuzz-hexhost/0006-hexagon-parse-the-init-environment-safely.patch
 fuzz-hexhost/0007-hexagon-saturate-the-k-quant-repack-scales.patch
-fuzz-matrix/0002-server-give-the-chat-parameters-the-defaults-of-common-params.patch
-fuzz-matrix/0003-tests-give-the-tensors-of-test-barrier-defined-data.patch
-
-# memory: the output limit of a context. llama_decode refuses a batch that asks for more
-# logits rows than n_outputs_max with an error code, not with an abort.
-memory/0001-llama-refuse-a-batch-with-more-outputs-than-n-outputs-max.patch
-# memory: a quantized V cache with flash attention AUTO keeps the probe of the device of each attention
-# layer, and the context creation fails when a layer cannot run flash attention on its device.
-memory/0002-llama-probe-flash-attention-for-a-quantized-v-cache-in-auto-mode.patch
-
-# fuzz-ops: the kernel fixes of the review of the HTP0 and OpenCL results of the op fuzzer.
-fuzz-ops/0007-hexagon-htp-silu-and-swiglu-of-small-inputs-in-the-int16-path.patch
 fuzz-ops/0008-hexagon-htp-get-rows-of-an-f16-row-with-a-tail.patch
 fuzz-ops/0009-hexagon-htp-soft-max-of-a-fully-masked-row-gives-0.patch
-fuzz-ops/0010-opencl-soft-max-of-a-fully-masked-row-gives-0.patch
-fuzz-ops/0011-opencl-row-broadcast-of-a-src1-row-that-repeats-along-dim-0.patch
 fuzz-ops/0012-hexagon-htp-the-src1-rows-of-the-scalar-and-same-shape-binary-paths.patch
-fuzz-ops/0013-ggml-the-f32-to-f16-conversion-gives-inf-past-the-f16-range-with-fast-math.patch
-
-# hexagon-hmx-i8: the comment of the int32 read gives the format of the conversion word.
-hexagon-hmx-i8/0002-hexagon-describe-the-conversion-word-of-the-int32-read.patch
-
-# memory: the HMX flash attention converts the rows of a Q8_0 K and V cache into its tiles two blocks at a
-# time, thus a Q8_0 cache decodes faster than an F16 cache.
+# The HMX flash attention converts the rows of a Q8_0 K and V cache into its tiles two blocks at
+# a time, thus a Q8_0 cache decodes faster than an F16 cache.
 memory/0003-hexagon-convert-q8_0-kv-rows-into-the-hmx-tiles-two-blocks-at-a-time.patch
-fuzz-ops/0014-ggml-cpu-the-rope-cache-reads-no-freq-factor-past-src2.patch
 fuzz-hexhost/0008-hexagon-fuse-mul-mat-and-add-only-for-the-one-reader-of-the-product.patch
-fuzz-hexhost/0009-hexagon-keep-the-fd-map-of-an-op-batch-after-the-buffer-sort.patch
-fuzz-hexhost/0010-hexagon-reject-a-gdn-conv-chain-when-a-node-touches-its-moved-bytes.patch
-fuzz-hexhost/0011-hexagon-state-the-split-limit-of-the-fused-gdn-state-chain.patch
 fuzz-hexhost/0012-hexagon-write-the-final-gdn-state-through-the-cache-when-it-shares-a-line.patch
-
-# memory: qwen35 marks its token embedding for the lazy read, thus with LLAMA_LAZY_MODE_ON the embedding
-# stays in a file mapping and takes no anonymous memory.
-memory/0004-llama-qwen35-reads-the-token-embedding-lazily.patch
-fuzz-matrix/0004-sampler-give-each-padding-slot-of-the-penalties-its-own-token-id.patch
-
-# memory: the loader reads a duplicate of a lazy tensor (the tied output on a device) from the file and not
-# through the lazy mapping, thus the lazy mode does not slow the load.
-memory/0005-llama-copy-a-duplicate-of-a-lazy-tensor-from-the-file.patch
 fuzz-hexhost/0013-hexagon-state-the-l2-limit-of-the-dirty-range-tracker.patch
 fuzz-hexhost/0014-hexagon-compute-the-matmul-vtcm-layout-in-64-bits.patch
 fuzz-ops/0015-hexagon-htp-reduce-the-rope-angle-with-a-split-pi.patch
-fuzz-matrix/0005-tests-give-the-keys-with-no-array-type-a-valid-gguf-type.patch
-fuzz-ops/0016-hexagon-htp-softplus-in-the-oracle-form.patch
-fuzz-matrix/0006-jinja-compute-the-integer-operators-in-int64.patch
-fuzz-matrix/0007-ggml-cpu-read-the-q1-0-bits-with-memcpy-in-the-x86-vec-dot.patch
 fuzz-ops/0017-hexagon-htp-the-32x2-dot-adds-the-k-tiles-in-the-order-of-the-32x1-dot.patch
-fuzz-hexhost/0015-hexagon-reject-a-gdn-conv-chain-when-its-slot-stride-is-less-than-a-slot.patch
-fuzz-hexhost/0016-hexagon-reject-a-gdn-chain-when-a-replaced-tensor-has-a-reader-in-a-different-split.patch
-fuzz-hexhost/0017-hexagon-give-a-replayed-batch-the-node-of-its-last-op.patch
-fuzz-core/0025-reject-a-nan-or-an-inf-in-the-data-of-a-state-blob.patch
 fuzz-hexhost/0018-hexagon-retry-a-dspqueue-read-or-write-that-a-signal-interrupts.patch
-fuzz-core/0026-check-the-data-of-a-state-blob-in-the-copy-of-the-host-reader.patch
 fuzz-ops/0018-hexagon-htp-keep-the-sign-of-zero-in-the-f16-conversion-of-v79-copy-to-f16-without-unroll.patch
-
-# memory: the host sends the Hadamard rotation of a quantized KV cache (a hinted MUL_MAT) as the DSP op FWHT, a fast
-# Walsh-Hadamard transform, for the decode shapes and for rows of 64 values.
+# The host sends the Hadamard rotation of a quantized KV cache (a hinted MUL_MAT) as the DSP op
+# FWHT, a fast Walsh-Hadamard transform, for the decode shapes and for rows of 64 values.
 memory/0006-hexagon-run-the-kv-cache-rotation-as-a-fast-walsh-hadamard-transform.patch
 fuzz-ops/0019-hexagon-htp-store-only-the-columns-of-dst-in-the-hmx-mul-mat-id-output.patch
-memory/0007-hexagon-an-environment-switch-for-the-fwht-form-of-the-kv-cache-rotation.patch
 hexagon-fusion/0008-hexagon-fuse-the-gate-chains-of-the-qwen35-layers.patch
-spec-mtp/0001-common-the-mtp-drafter-stops-at-the-draft-length-of-the-call.patch
-
-# The DSP removes only the mappings that a batch needs to free. The batch cache replays a graph of more than one
-# DSP batch. The host makes the text of each profile line when it packs the batch.
+# The DSP removes only the mappings that a batch needs to free. The batch cache replays a graph
+# of more than one DSP batch. The host makes the text of each profile line when it packs the
+# batch.
 hexagon-host/0004-hexagon-htp-remove-only-the-mappings-that-a-batch-needs-to-free.patch
 hexagon-host/0005-hexagon-replay-the-packed-batches-of-a-graph-of-more-than-one-batch.patch
 hexagon-host/0006-hexagon-format-the-profile-line-of-an-op-when-the-host-packs-the-batch.patch
 hexagon-mm/0002-hexagon-select-the-hmx-2d-chunks-with-the-cost-of-the-kernel.patch
 hexagon-host/0007-hexagon-refuse-a-mul-mat-weight-of-a-tiled-type-in-the-plain-layout.patch
 hexagon-fusion/0009-hexagon-an-f16-swiglu-output-for-its-only-reader-an-hmx-mul-mat.patch
-
-# The host gives a pointwise unary op on contiguous tensors rows of up to 16 KiB (GGML_HEXAGON_UNARY_FLAT).
+# The host gives a pointwise unary op on contiguous tensors rows of up to 16 KiB
+# (GGML_HEXAGON_UNARY_FLAT).
 hexagon-host/0008-hexagon-send-a-pointwise-unary-op-on-contiguous-tensors-with-long-rows.patch
 hexagon-v81/0001-hexagon-htp-v81-uses-the-f32-to-f16-conversion-of-v79.patch
 hexagon-gemv/0001-hexagon-htp-move-each-q8-0-column-tile-with-one-dma-row.patch
 hexagon-v81/0002-hexagon-a-start-up-self-test-of-the-dsp-before-the-backend-registers-a-device.patch
-hexagon-v81/0003-hexagon-htp-the-transpose-tile-copy-reads-the-source-rows-at-the-stride-of-a-row.patch
 gdnk/0001-hexagon-stream-the-rows-of-gdn-conv-chunk-through-vtcm-with-the-dma.patch
 gdnk/0002-hexagon-version-2-of-the-chunked-gated-delta-net-kernel.patch
 gdnk/0003-hexagon-run-the-l2-norm-of-q-and-k-inside-the-gated-delta-net-ops.patch
 gdnk/0004-hexagon-fuse-the-conv-chain-of-the-verify-batch-of-a-draft-into-gdn-conv-chunk.patch
 hexagon-fa/0001-hexagon-a-flash-attention-kernel-whose-softmax-reads-the-hmx-tiles.patch
 hexagon-fa/0002-hexagon-the-tile-flash-attention-for-the-decode-shapes-in-spans-of-kv-rows.patch
-gdnk/0005-hexagon-skip-the-zero-terms-of-the-forward-substitution-of-version-2.patch
 hexagon-vit/0002-hexagon-fuse-the-layernorm-and-the-attention-input-of-the-vision-encoder.patch
