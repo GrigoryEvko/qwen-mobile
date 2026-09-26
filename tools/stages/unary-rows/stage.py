@@ -38,9 +38,9 @@ STAGE_DIR = q.STAGE_DIR
 q.BINS = ("gate.sh", "memprobe", "test-backend-ops", "unarycheck")
 q.LIBS = ("libggml-base.so", "libggml-cpu.so", "libggml-hexagon.so", "libggml-htp-v79.so", "libggml-opencl.so",
           "libggml.so", "libllama-common.so", "libllama.so", "libmtmd.so")
-# build.sh keeps in lib-new only the libraries that differ from lib-base, thus the push takes the list of the box
-_lib_new = STAGE_DIR / "phone" / "lib-new"
-q.NEW_LIBS = tuple(sorted(p.name for p in _lib_new.glob("*.so"))) if _lib_new.is_dir() else ("libggml-hexagon.so",)
+# build.sh keeps in lib-new only the libraries that differ from lib-base. The shell of the runner expands the glob on
+# the laptop, and the checksum check on the phone finds a library that the push did not move.
+q.NEW_LIBS = ("*.so",)
 
 q.VARIANTS = {v.key: v for v in (
     q.Variant("a", "lib-base", "", "HEAD"),
