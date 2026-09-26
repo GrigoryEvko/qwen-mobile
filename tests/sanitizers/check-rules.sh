@@ -92,8 +92,9 @@
 #        scripts/ or tools/ has no task number and no finding ID (a comment
 #        names the defect in words). NOID_ALLOW below lists the lines of
 #        real code that match the pattern. NOID_PATTERN gives the forms.
-#   NOID-STAGED Each line that the staged diff adds, in each directory, has
-#        no task number and no finding ID.
+#   NOID-STAGED Each line of new text in the staged diff, in each directory,
+#        has no task number and no finding ID. A rename and a line that the
+#        diff moves from another place are not new text.
 #   NOID-MSG (only with --commit-msg) The commit message has no task number
 #        and no finding ID.
 #   L9   Each libFuzzer command of the scripts of an area has -artifact_prefix,
@@ -173,12 +174,13 @@ families_of_list() {
 }
 
 # Print the area of a path: tests/fuzz/<area>/..., build/fuzz/<area>-...,
-# or "sanitizers" and "matrix" for the files of this agent.
+# "patches" for the patch series, or "sanitizers" and "matrix" for the shared
+# files of the sanitizer matrix.
 area_of() {
     local rel="${1#"$REPO/"}"
     case "$rel" in
         tests/fuzz/*) rel="${rel#tests/fuzz/}"; echo "${rel%%/*}" ;;
-        patches/fuzz-*) rel="${rel#patches/fuzz-}"; echo "${rel%%/*}" ;;
+        patches/*) echo patches ;;
         quant/*) echo quant ;;
         android/*) echo app ;;
         tests/sanitizers/*|tests/suite/*|tests/run-suite.sh) echo sanitizers ;;
@@ -787,12 +789,6 @@ readonly NOID_HISTORY_LINES=112
 readonly NOID_ALLOW=(
     # An assembly immediate of Hexagon ("r7 = #64").
     'tools/htp-lab/lab/target_hvxcost.c:#64'
-    # A log line of the patch: "op #17 of 96".
-    'patches/hexagon-fusion/0004-hexagon-htp-gdn-slot-index-from-host-and-error-report.patch:op #'
-    # An assembly immediate of Hexagon: "pause(#255)".
-    'patches/hexagon-fusion/0005-hexagon-htp-gdn-chunked-hmx.patch:pause(#255)'
-    # A log line of the patch: "decode #12 tokens".
-    'patches/hexagon-host/0002:decode #'
 )
 readonly NOID_DIRS="tests patches android/app/src quant scripts tools"
 
@@ -822,35 +818,51 @@ check_noid() {
                 | xargs -0 -r rg -n --no-heading -e "$NOID_PATTERN" -- 2> /dev/null || true)
 }
 
-# NOID-STAGED: each line that the staged diff (the index against HEAD) adds
-# has no task number and no finding ID, in each directory. In a hook of
+# NOID-STAGED: each line of new text in the staged diff (the index against
+# HEAD) has no task number and no finding ID, in each directory. In a hook of
 # "git commit", the index is the content of the commit, also for
-# "git commit -- <paths>". The added lines go to one rg call as
-# "<text> US <path> US <line>" (US is the byte 0x1f), thus the text keeps its
-# start of line for the pattern.
-# Complexity: one pass over the staged diff.
+# "git commit -- <paths>".
+# Only new text counts, because the rule is about what a writer adds:
+#   - The diff finds renames. A file that moves to a new path adds only the
+#     lines that its move changes, not its full text.
+#   - A line that the same diff removes in another place is text that the
+#     repository held before: a fold of two files into one, or a block that
+#     moves to another file. Thus it is not new text.
+# Text that the repository held before can hold a "#" and digits that are not
+# a task number: a Hexagon operand (pause(#255)) or a counter in an example
+# log line (decode #12, op #17 of 96). A new line with a task number still
+# fails. --noid-self-test runs the two directions on a scratch repository.
+# The added lines go to one rg call as "<text> US <path> US <line>" (US is the
+# byte 0x1f), thus the text keeps its start of line for the pattern.
+# Argument: the repository (the preset value is this repository).
+# Complexity: one pass over the staged diff, and one hash lookup for each
+# added line that matches the pattern.
 check_noid_staged() {
-    command -v git > /dev/null && git -C "$REPO" rev-parse --verify -q HEAD > /dev/null 2>&1 || return 0
+    local repo="${1:-$REPO}"
+    command -v git > /dev/null && git -C "$repo" rev-parse --verify -q HEAD > /dev/null 2>&1 || return 0
     local us=$'\x1f' line file="" num=0 added="" text path header=0
+    local -A removed=()
     while IFS= read -r line; do
-        # A "+++" line is a file header only between "diff --git" and the
-        # first hunk, not an added line that starts with "++".
+        # A "+++" or "---" line is a file header only between "diff --git"
+        # and the first hunk, not a changed line that starts with "++" or "--".
         case "$header:$line" in
             *:'diff --git '*) header=1; file="" ;;
             '1:+++ b/'*) file="${line#+++ b/}" ;;
             '1:+++ '*) file="" ;;
             *:'@@ '*) header=0; num="${line#*+}"; num="${num%%[, ]*}" ;;
+            '0:-'*) [[ -n "${line#-}" ]] && removed["${line#-}"]=1 ;;
             '0:+'*)
                 # This file holds the pattern and its examples.
                 [[ -n "$file" && "$file" != tests/sanitizers/check-rules.sh ]] \
                     && added+="${line#+}$us$file$us$num"$'\n'
                 num=$((num + 1)) ;;
         esac
-    done < <(git -C "$REPO" diff --cached --no-color --no-ext-diff --no-renames -U0 2> /dev/null || true)
+    done < <(git -C "$repo" diff --cached --no-color --no-ext-diff --find-renames -U0 2> /dev/null || true)
     [[ -n "$added" ]] || return 0
     while IFS="$us" read -r text path num; do
+        [[ -n "${removed["$text"]:-}" ]] && continue
         noid_allowed "$path" "$text" && continue
-        violation NOID-STAGED "$(area_of "$REPO/$path")" "$path:$num" "the staged diff adds a task number or a finding ID: describe the defect in words ('${text:0:90}')"
+        violation NOID-STAGED "$(area_of "$repo/$path")" "$path:$num" "the staged diff adds a task number or a finding ID: describe the defect in words ('${text:0:90}')"
     done < <(rg --no-heading -e "$NOID_PATTERN" <<< "$added" || true)
 }
 
@@ -901,10 +913,65 @@ noid_self_test() {
     else
         echo "NOID self-test: the clone has no commit ${NOID_HISTORY_REF:0:12}, thus the history case does not run"
     fi
+    noid_staged_self_test || failed=1
     VIOLATIONS=()
     check_noid
     [[ ${#VIOLATIONS[@]} -eq 0 ]] || { echo "NOID self-test: the tree has ${#VIOLATIONS[@]} NOID violation(s)"; printf '  %s\n' "${VIOLATIONS[@]}"; failed=1; }
-    [[ $failed -eq 0 ]] && echo "NOID self-test: ${#positive[@]} positive and ${#negative[@]} negative cases pass, the history has $NOID_HISTORY_LINES ID lines, the tree has none."
+    [[ $failed -eq 0 ]] && echo "NOID self-test: ${#positive[@]} positive and ${#negative[@]} negative cases pass, the staged cases pass, the history has $NOID_HISTORY_LINES ID lines, the tree has none."
+    return $failed
+}
+
+# Make a scratch repository with one base commit in a new directory, and print
+# the directory. The base holds text that matches the pattern and is not a task
+# number: a Hexagon operand and two counters of example log lines. The scratch
+# repository has no hook, and its commit takes the identity of the git
+# configuration. Return status: 1 if the commit is not possible.
+noid_scratch_repo() {
+    local dir
+    dir="$(mktemp -d)"
+    git -C "$dir" init -q 2> /dev/null || { rm -rf "$dir"; return 1; }
+    printf '%s\n' 'static void wait_dma(void) {' '    asm volatile ("pause(#255)");' '}' > "$dir/kernel.c"
+    printf '%s\n' 'The log of one run:' '  decode #12 tokens' '  op #17 of 96 is MUL_MAT' > "$dir/log.txt"
+    printf '%s\n' 'A second file.' > "$dir/other.txt"
+    git -C "$dir" add -A > /dev/null
+    git -C "$dir" commit -q -m "the base" > /dev/null 2>&1 || { rm -rf "$dir"; return 1; }
+    echo "$dir"
+}
+
+# The staged cases of NOID-STAGED. Each case makes a new scratch repository
+# (noid_scratch_repo), stages one change and runs check_noid_staged on it:
+#   rename  git mv of the file with the operand: no violation
+#   fold    the log lines move into the other file: no violation
+#   new     a new line with a task reference: one violation
+#   edit    the operand of a line changes: one violation (new text)
+# Without a git identity the cases do not run.
+# Output: one line for each case that fails. Return status: 0 if all cases
+# pass or cannot run.
+noid_staged_self_test() {
+    local scratch failed=0 n case_name want
+    for case_name in rename fold new edit; do
+        if ! scratch="$(noid_scratch_repo)"; then
+            echo "NOID self-test: no scratch repository (git init, or a git identity for its commit), thus the staged cases do not run"
+            return 0
+        fi
+        case $case_name in
+            rename) git -C "$scratch" mv kernel.c htp-kernel.c; want=0 ;;
+            fold)   cat "$scratch/log.txt" >> "$scratch/other.txt"; git -C "$scratch" rm -q log.txt; want=0 ;;
+            new)    printf '%s\n' 'This is the fix of task #173.' >> "$scratch/other.txt"; want=1 ;;
+            edit)   printf '%s\n' 'static void wait_dma(void) {' '    asm volatile ("pause(#254)");' '}' > "$scratch/kernel.c"; want=1 ;;
+        esac
+        git -C "$scratch" add -A > /dev/null
+        VIOLATIONS=()
+        check_noid_staged "$scratch"
+        n=${#VIOLATIONS[@]}
+        if [[ $n -ne $want ]]; then
+            echo "NOID self-test: the staged case '$case_name' gives $n violation(s), not $want"
+            [[ $n -gt 0 ]] && printf '  %s\n' "${VIOLATIONS[@]}"
+            failed=1
+        fi
+        rm -rf "$scratch"
+    done
+    VIOLATIONS=()
     return $failed
 }
 
