@@ -7,6 +7,8 @@
 # The image, the container engine and the repository root come from scripts/lib.sh, thus the
 # toolchain is the same image that builds the libraries of the app, pinned by its digest.
 
+# shellcheck shell=bash
+
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../scripts/lib.sh"
 
 # The Hexagon core of the programs. The phone has v79.

@@ -43,7 +43,10 @@ cd "$REPO_ROOT"
 [[ -f third_party/llama.cpp/ggml/src/ggml-hexagon/htp/dma-queue.c ]] ||
     die "third_party/llama.cpp has no Hexagon backend: run 'git submodule update --init'"
 
-rm -rf "$OUT_REL/cmake" "$OUT_REL/bin" "$OUT_REL"/v73 "$OUT_REL"/v75 "$OUT_REL"/v79 "$OUT_REL"/v81 "$OUT_REL/hashes.txt"
+# The ${OUT_REL:?} form stops the command when the constant is empty, thus no path of the removal
+# can become an absolute path of the machine.
+rm -rf "${OUT_REL:?}/cmake" "${OUT_REL:?}/bin" "${OUT_REL:?}"/v73 "${OUT_REL:?}"/v75 \
+    "${OUT_REL:?}"/v79 "${OUT_REL:?}"/v81 "${OUT_REL:?}/hashes.txt"
 mkdir -p "$OUT_REL"
 
 (

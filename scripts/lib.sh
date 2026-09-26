@@ -10,6 +10,11 @@
 # The Snapdragon image is pinned by the digest of its amd64 manifest. The
 # multi-arch index of the tag v0.7 has the digest 91714433... and contains it.
 
+# shellcheck shell=bash
+# The constants below are read by the scripts that source this file, thus shellcheck cannot see
+# their readers.
+# shellcheck disable=SC2034
+
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
