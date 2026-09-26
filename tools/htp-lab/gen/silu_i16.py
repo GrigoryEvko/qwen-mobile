@@ -17,10 +17,12 @@ Usage:
 
 from __future__ import annotations
 
-import argparse
 import sys
 
 import numpy as np
+
+import i16_fit
+from i16_fit import Piecewise
 
 DEGREE = 4
 E_LO = -12          # the first octave is [2^-12, 2^-11)
@@ -34,6 +36,11 @@ def h(u: np.ndarray) -> np.ndarray:
     return u / (1.0 + np.exp(u))
 
 
+# h is 0 at u = 0, thus a u below the first octave needs no clamp: the lookup misses and the
+# evaluator gives 0, which is the limit. No coefficient of h reaches the int16 bound.
+SPEC = Piecewise(f=h, e_lo=E_LO, e_hi=E_HI, degree=DEGREE, scale=SCALE, clip_coeffs=False)
+
+
 def table() -> np.ndarray:
     """Fit one polynomial for each octave at Chebyshev nodes. O(PIECES).
 
@@ -43,13 +50,7 @@ def table() -> np.ndarray:
     Raises:
         ValueError: If a coefficient does not fit an int16
     """
-    nodes = (np.cos(np.pi * (np.arange(96) + 0.5) / 96) + 1) / 2
-    rows = [np.polynomial.polynomial.polyfit(nodes, h(2.0 ** e * (1 + nodes)), DEGREE)
-            for e in range(E_LO, E_HI)]
-    c = np.round(np.array(rows) * 2.0 ** SCALE).astype(np.int64)
-    if np.max(np.abs(c)) > 32767:
-        raise ValueError(f"a coefficient is {np.max(np.abs(c))}, more than an int16 holds")
-    return c
+    return i16_fit.fit_table(SPEC)
 
 
 def evaluate(u16: np.ndarray, q: np.ndarray) -> np.ndarray:
@@ -62,20 +63,14 @@ def evaluate(u16: np.ndarray, q: np.ndarray) -> np.ndarray:
     Returns:
         h as float64
     """
-    bits = u16.view(np.uint16).astype(np.int64)
-    bits = np.minimum(bits, 0x4BFF)                      # the largest f16 below 16
-    idx = (bits >> 10) - (E_LO + 15)
-    v = (bits & 0x3FF) << 5                              # the mantissa as Q15
-    ok = idx >= 0
-    idx = np.clip(idx, 0, PIECES - 1)
-    acc = q[idx, DEGREE]
-    for d in range(DEGREE - 1, -1, -1):
-        acc = np.clip(((acc * v * 2 + 0x8000) >> 16) + q[idx, d], -32768, 32767)
-    return np.where(ok, acc, 0) / 2.0 ** SCALE
+    return i16_fit.evaluate(SPEC, u16, q) / 2.0 ** SCALE
 
 
 def integer_h(q: np.ndarray) -> np.ndarray:
     """h * 2^SCALE for every f16 input, before the clamp. O(65536).
+
+    The HVX multiply and the HVX add each saturate, thus the model saturates the product before the
+    add of the constant term.
 
     Args:
         q: The coefficient table of table()
@@ -84,16 +79,7 @@ def integer_h(q: np.ndarray) -> np.ndarray:
         The integer results, one for each of the 65536 f16 bit patterns
     """
     bits = np.arange(0x10000, dtype=np.uint16).astype(np.int64) & 0x7FFF
-    u = np.minimum(bits, 0x4BFF)
-    idx = (u >> 10) - (E_LO + 15)
-    v = ((u << 6) & 0xFFFF) >> 1
-    ok = idx >= 0
-    k = np.clip(idx, 0, PIECES - 1)
-    acc = q[k, DEGREE]
-    for d in range(DEGREE - 1, -1, -1):
-        acc = np.clip((acc * v * 2 + 0x8000) >> 16, -32768, 32767)
-        acc = np.clip(acc + q[k, d], -32768, 32767)
-    return np.where(ok, acc, 0)
+    return i16_fit.evaluate(SPEC, bits, q, split_clip=True)
 
 
 def h_bound(q: np.ndarray) -> int:
@@ -116,9 +102,7 @@ def check() -> int:
     Returns:
         The exit status
     """
-    rng = np.random.default_rng(1)
-    x = np.concatenate([rng.uniform(-18, 18, 400000), rng.normal(0, 1.5, 400000),
-                        rng.normal(0, 0.05, 100000)]).astype(np.float32)
+    x = i16_fit.sweep_inputs(-18, 18)
     x64 = x.astype(np.float64)
     ref = x64 / (1 + np.exp(-x64))
     q = table()
@@ -271,6 +255,14 @@ static inline __attribute__((always_inline)) HVX_VectorPair hvx_silu_neg_h_qf32(
 '''
 
 
+def emit() -> str:
+    """The text of the header file."""
+    q = table()
+    return HEADER.format(degree=DEGREE, scale=SCALE, e_lo=E_LO, e_hi_m1=E_HI - 1,
+                         e_base=E_LO + 15, rows=i16_fit.emit_rows(q, DEGREE, PIECES),
+                         h_max=h_bound(q), n_neg=n_negative(q))
+
+
 def main(argv: list[str] | None = None) -> int:
     """Write the header to stdout, or print the error with --check.
 
@@ -280,23 +272,7 @@ def main(argv: list[str] | None = None) -> int:
     Returns:
         The exit status
     """
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--check", action="store_true", help="print the error of the integer path")
-    a = ap.parse_args(argv)
-    if a.check:
-        return check()
-
-    q = table()
-    rows = []
-    for d in range(DEGREE + 1):
-        cells = ["0"] * 64
-        for k in range(PIECES):
-            cells[2 * k] = str(int(q[k, d]))
-        rows.append(f"    // the coefficient of v^{d}\n    {{ " + ", ".join(cells) + " },")
-    sys.stdout.write(HEADER.format(degree=DEGREE, scale=SCALE, e_lo=E_LO, e_hi_m1=E_HI - 1,
-                                   e_base=E_LO + 15, rows="\n".join(rows),
-                                   h_max=h_bound(q), n_neg=n_negative(q)))
-    return 0
+    return i16_fit.cli(__doc__, emit, check, argv=argv)
 
 
 if __name__ == "__main__":

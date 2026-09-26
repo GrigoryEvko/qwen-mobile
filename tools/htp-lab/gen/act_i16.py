@@ -33,11 +33,13 @@ Usage:
 
 from __future__ import annotations
 
-import argparse
 import sys
 from typing import Callable
 
 import numpy as np
+
+import i16_fit
+from i16_fit import Piecewise
 
 DEGREE = 4
 E_LO = -12              # the first octave is [2^-12, 2^-11)
@@ -68,6 +70,22 @@ FUNCS: dict[str, tuple[Callable[[np.ndarray], np.ndarray], str, bool]] = {
 }
 
 
+def spec_of(fn: Callable[[np.ndarray], np.ndarray]) -> Piecewise:
+    """The table parameters of one function of the family.
+
+    The clip of a coefficient to the int16 range is necessary: g reaches 32768 at u = 0, because its
+    value is exactly 0.5. A clip to 32767 costs 7.6e-6 of the value, and the saturating add of the
+    HVX would do the same.
+
+    Args:
+        fn: The function of u, evaluated on an array
+
+    Returns:
+        The specification of the piecewise table of fn
+    """
+    return Piecewise(f=fn, e_lo=E_LO, e_hi=E_HI, degree=DEGREE, scale=SCALE, clip_coeffs=True)
+
+
 def table(fn: Callable[[np.ndarray], np.ndarray]) -> np.ndarray:
     """Fit one polynomial for each octave at Chebyshev nodes. O(PIECES).
 
@@ -75,15 +93,9 @@ def table(fn: Callable[[np.ndarray], np.ndarray]) -> np.ndarray:
         fn: The function of u, evaluated on an array
 
     Returns:
-        The integer coefficients [PIECES][DEGREE + 1], the constant term first. A coefficient of
-        32768, which g reaches at u = 0 because its value is exactly 0.5, becomes 32767. That
-        costs 7.6e-6 of the value and the saturating add of the HVX would do the same.
+        The integer coefficients [PIECES][DEGREE + 1], the constant term first
     """
-    nodes = (np.cos(np.pi * (np.arange(96) + 0.5) / 96) + 1) / 2
-    rows = [np.polynomial.polynomial.polyfit(nodes, fn(2.0 ** e * (1 + nodes)), DEGREE)
-            for e in range(E_LO, E_HI)]
-    c = np.round(np.array(rows) * 2.0 ** SCALE)
-    return np.clip(c, -32767, 32767).astype(np.int64)
+    return i16_fit.fit_table(spec_of(fn))
 
 
 def evaluate(u16: np.ndarray, q: np.ndarray, low_clamp: bool = False) -> np.ndarray:
@@ -99,18 +111,7 @@ def evaluate(u16: np.ndarray, q: np.ndarray, low_clamp: bool = False) -> np.ndar
     Returns:
         The value times 2^SCALE, as int64
     """
-    bits = u16.view(np.uint16).astype(np.int64)
-    bits = np.minimum(bits, 0x4BFF)                      # the largest f16 below 16
-    if low_clamp:
-        bits = np.maximum(bits, (E_LO + 15) << 10)       # the smallest u of the first octave
-    idx = (bits >> 10) - (E_LO + 15)
-    v = (bits & 0x3FF) << 5                              # the mantissa as Q15
-    ok = idx >= 0
-    idx = np.clip(idx, 0, PIECES - 1)
-    acc = q[idx, DEGREE]
-    for d in range(DEGREE - 1, -1, -1):
-        acc = np.clip(((acc * v * 2 + 0x8000) >> 16) + q[idx, d], -32768, 32767)
-    return np.where(ok, acc, 0)
+    return i16_fit.evaluate(spec_of(f_h), u16, q, low_clamp=low_clamp)
 
 
 def check() -> int:
@@ -119,9 +120,10 @@ def check() -> int:
     Returns:
         The exit status
     """
+    # The corpus and the second operand of the SwiGLU come from one stream, thus the check of the
+    # SwiGLU always sees the same pair of rows.
     rng = np.random.default_rng(1)
-    x = np.concatenate([rng.uniform(-18, 18, 400000), rng.normal(0, 1.5, 400000),
-                        rng.normal(0, 0.05, 100000)]).astype(np.float32)
+    x = i16_fit.sweep_inputs(-18, 18, rng=rng)
     x64 = x.astype(np.float64)
     u16 = np.abs(x).astype(np.float16)
     q_h = table(f_h)
@@ -484,15 +486,21 @@ def emit_table(name: str, doc: str, q: np.ndarray) -> str:
     Returns:
         The C text of the table
     """
-    rows = []
-    for d in range(DEGREE + 1):
-        cells = ["0"] * 64
-        for k in range(PIECES):
-            cells[2 * k] = str(int(q[k, d]))
-        rows.append(f"    // the coefficient of v^{d}\n    {{ " + ", ".join(cells) + " },")
+    rows = i16_fit.emit_rows(q, DEGREE, PIECES)
     return (f"// {name}(u) = {doc}\n"
             f"static const int16_t hvx_act_i16_tab_{name}[HVX_ACT_I16_DEGREE + 1][64]"
-            f" __attribute__((aligned(128))) = {{\n" + "\n".join(rows) + "\n};\n")
+            f" __attribute__((aligned(128))) = {{\n" + rows + "\n};\n")
+
+
+def emit() -> str:
+    """The text of the header file: the preamble, one table for each function, and the evaluator."""
+    out = [HEADER_TOP.format(degree=DEGREE, scale=SCALE, e_lo=E_LO, e_hi_m1=E_HI - 1,
+                             e_base=E_LO + 15)]
+    for name, (fn, doc, _) in FUNCS.items():
+        out.append(emit_table(name, doc, table(fn)))
+        out.append("\n")
+    out.append(HEADER_BODY)
+    return "".join(out)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -504,21 +512,7 @@ def main(argv: list[str] | None = None) -> int:
     Returns:
         The exit status
     """
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--check", action="store_true", help="print the error of the integer path")
-    a = ap.parse_args(argv)
-    if a.check:
-        return check()
-
-    out = [HEADER_TOP.format(degree=DEGREE, scale=SCALE, e_lo=E_LO, e_hi_m1=E_HI - 1,
-                             e_base=E_LO + 15)]
-    for name, (fn, doc, _) in FUNCS.items():
-        out.append(emit_table(name, doc, table(fn)))
-        out.append("\n")
-    out.append(HEADER_BODY)
-    sys.stdout.write("".join(out))
-    return 0
+    return i16_fit.cli(__doc__, emit, check, argv=argv)
 
 
 if __name__ == "__main__":

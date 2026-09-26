@@ -40,6 +40,9 @@ import sys
 
 import numpy as np
 
+import i16_fit
+from i16_fit import Piecewise
+
 DEGREE = 4
 E_LO = -12          # the first octave is [2^-12, 2^-11)
 E_HI = 4            # the input is limited to values below 2^4
@@ -59,6 +62,11 @@ def deficit(u: np.ndarray) -> np.ndarray:
     return LOG2 - bump(u)
 
 
+# D is 0 at u = 0, thus a u below the first octave needs no clamp: the lookup misses and the
+# evaluator gives 0, which is the limit. No coefficient of D reaches the int16 bound.
+SPEC = Piecewise(f=deficit, e_lo=E_LO, e_hi=E_HI, degree=DEGREE, scale=SCALE, clip_coeffs=False)
+
+
 def table() -> np.ndarray:
     """Fit one polynomial of D for each octave at Chebyshev nodes. O(PIECES).
 
@@ -68,13 +76,7 @@ def table() -> np.ndarray:
     Raises:
         ValueError: If a coefficient does not fit an int16
     """
-    nodes = (np.cos(np.pi * (np.arange(96) + 0.5) / 96) + 1) / 2
-    rows = [np.polynomial.polynomial.polyfit(nodes, deficit(2.0 ** e * (1 + nodes)), DEGREE)
-            for e in range(E_LO, E_HI)]
-    c = np.round(np.array(rows) * 2.0 ** SCALE).astype(np.int64)
-    if np.max(np.abs(c)) > 32767:
-        raise ValueError(f"a coefficient is {np.max(np.abs(c))}, more than an int16 holds")
-    return c
+    return i16_fit.fit_table(SPEC)
 
 
 def log1p_coeffs() -> np.ndarray:
@@ -100,16 +102,7 @@ def eval_i16(x: np.ndarray, q: np.ndarray) -> np.ndarray:
         softplus as float64
     """
     u16 = np.abs(x).astype(np.float16)
-    bits = u16.view(np.uint16).astype(np.int64)
-    bits = np.minimum(bits, 0x4BFF)                      # the largest f16 below 16
-    idx = (bits >> 10) - (E_LO + 15)
-    v = (bits & 0x3FF) << 5                              # the mantissa as Q15
-    ok = idx >= 0
-    idx = np.clip(idx, 0, PIECES - 1)
-    acc = q[idx, DEGREE]
-    for d in range(DEGREE - 1, -1, -1):
-        acc = np.clip(((acc * v * 2 + 0x8000) >> 16) + q[idx, d], -32768, 32767)
-    d_u = np.where(ok, acc, 0) / 2.0 ** SCALE
+    d_u = i16_fit.evaluate(SPEC, u16, q) / 2.0 ** SCALE
     return np.maximum(x.astype(np.float64), 0.0) + (LOG2 - d_u)
 
 
@@ -154,9 +147,7 @@ def ulp32(v: np.ndarray) -> np.ndarray:
 
 def check_inputs() -> np.ndarray:
     """The inputs of the check: the range [-30, 30], a normal spread, and values near 0. O(1)."""
-    rng = np.random.default_rng(1)
-    return np.concatenate([rng.uniform(-30, 30, 400000), rng.normal(0, 1.5, 400000),
-                           rng.normal(0, 0.05, 100000), rng.uniform(-1e-3, 1e-3, 50000)]).astype(np.float32)
+    return i16_fit.sweep_inputs(-30, 30, near_zero=True)
 
 
 def f32_oracle_ulp(x: np.ndarray, p: np.ndarray) -> np.ndarray:
@@ -462,6 +453,19 @@ static inline void hvx_softplus_i16_f32_aa(uint8_t * restrict dst, const uint8_t
 '''
 
 
+def emit() -> str:
+    """The text of the header file: the int16 table, the log1p coefficients and the two paths."""
+    q = table()
+    p = log1p_coeffs()
+    bits = [int(np.float32(c).view(np.uint32)) for c in p]
+    log1p_rows = "\n".join(f"    0x{b:08x},   // {c:+.9g} * t^{i}" for i, (b, c) in enumerate(zip(bits, p)))
+    d = f32_oracle_ulp(check_inputs(), p)
+    return HEADER.format(degree=DEGREE, scale=SCALE, log1p_degree=LOG1P_DEGREE,
+                         e_base=E_LO + 15, rows=i16_fit.emit_rows(q, DEGREE, PIECES),
+                         log1p_rows=log1p_rows,
+                         orc_mean_ulp=f"{np.mean(d):.2f}", orc_within=f"{np.mean(d <= 4) * 100:.1f}")
+
+
 def main(argv: list[str] | None = None) -> int:
     """Write the header to stdout, or print the error of each path with --check.
 
@@ -471,27 +475,7 @@ def main(argv: list[str] | None = None) -> int:
     Returns:
         The exit status
     """
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--check", action="store_true", help="print the error of each path")
-    a = ap.parse_args(argv)
-    if a.check:
-        return check()
-
-    q = table()
-    rows = []
-    for d in range(DEGREE + 1):
-        cells = ["0"] * 64
-        for k in range(PIECES):
-            cells[2 * k] = str(int(q[k, d]))
-        rows.append(f"    // the coefficient of v^{d}\n    {{ " + ", ".join(cells) + " },")
-    p = log1p_coeffs()
-    bits = [int(np.float32(c).view(np.uint32)) for c in p]
-    log1p_rows = "\n".join(f"    0x{b:08x},   // {c:+.9g} * t^{i}" for i, (b, c) in enumerate(zip(bits, p)))
-    d = f32_oracle_ulp(check_inputs(), p)
-    sys.stdout.write(HEADER.format(degree=DEGREE, scale=SCALE, log1p_degree=LOG1P_DEGREE,
-                                   e_base=E_LO + 15, rows="\n".join(rows), log1p_rows=log1p_rows,
-                                   orc_mean_ulp=f"{np.mean(d):.2f}", orc_within=f"{np.mean(d <= 4) * 100:.1f}"))
-    return 0
+    return i16_fit.cli(__doc__, emit, check, check_help="print the error of each path", argv=argv)
 
 
 if __name__ == "__main__":
