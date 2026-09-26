@@ -147,8 +147,6 @@ hexagon-mm/0003-hexagon-mm-pipeline-below-33-rows.patch
 # refuses K > 1, thus prefill with speculation on runs the sequential kernel and loses a factor
 # of 2.1.
 hexagon-gdn/0009-hexagon-htp-gdn-chunked-and-conv-rollback-slots.patch
-# The int8 HMX macros. No kernel uses them, thus the patch changes no result.
-hexagon-hmx-i8/0001-hexagon-hmx-int8-macros.patch
 hexagon-kernels/0008-hexagon-htp-splat-the-scalar-broadcast-of-repeat.patch
 # The DSP library of the cores before v79: the one IEEE intrinsic of our kernels takes the qf
 # path there.
