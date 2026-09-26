@@ -98,8 +98,8 @@ mostly engine time, the true ratio falls toward 1.04. Do not plan on 2.05 until
 a device run settles it. `tools/hmx-bench/src/i8read.c` times the read on its own.
 
 **The instruction set is reachable without HexKL, and that matters because the
-HexKL archive cannot ship.** The macros are in the tree at
-`ggml/src/ggml-hexagon/htp/hmx-utils.h`, behind patch `hexagon-hmx-i8/0001`.
+HexKL archive cannot ship.** The macros are in the kernel lab at
+`tools/htp-lab/lab/hmx-i8.h`, and the backend holds none of them.
 They compile with the Hexagon compiler and emit the same encodings as the vendor
 library. The multiply packet is
 `{ activation.ub = mxmem(act, 0x1f):cm ; weight.b = mxmem(wt, 0x380) }`, and the
