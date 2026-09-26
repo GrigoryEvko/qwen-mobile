@@ -150,9 +150,5 @@ sha256_table "$out"/*.so > build/hashes-native.txt
 echo "native: build/hashes-native.txt"
 cat build/hashes-native.txt
 
-# A library must not contain the container path. The prefix map removes it
-# from the objects, and this line shows a leak if one occurs.
-for lib in "$out"/*.so; do
-    count=$(grep -a -c '/workspace' "$lib" || true)
-    [[ "$count" == 0 ]] || echo "native: note: $(basename "$lib") contains /workspace on $count lines"
-done
+# A library must not contain the container path.
+report_workspace_leak native "$out"

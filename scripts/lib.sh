@@ -83,22 +83,34 @@ ensure_apk_image() {
     echo "$image"
 }
 
+# Print the value of one "<key>=<value>" line of android/version.properties.
+# The first argument is the key. The file has one line for each key, thus the
+# function takes the first match and removes the spaces and the carriage return.
+version_property() {
+    local key=$1 line
+    line=$(grep -m 1 "^$key=" "$REPO_ROOT/android/version.properties") \
+        || die "no $key in android/version.properties"
+    printf '%s\n' "${line#"$key"=}" | tr -d ' \r'
+}
+
 # Print the number of commits of the branch, the versionCode of the APK. A tree
-# without a git directory gives the fallback of android/version.properties.
+# without a git directory gives the fallback of android/version.properties. The
+# number goes into the manifest of the APK, thus a shallow clone, which counts
+# one commit, gives an APK that no other build matches.
 version_code() {
     local count
     if count=$(git -C "$REPO_ROOT" rev-list --count HEAD 2> /dev/null) && [[ -n $count ]]; then
         echo "$count"
     else
-        sed -n 's/^versionCodeFallback=//p' "$REPO_ROOT/android/version.properties" | tr -d ' \r'
+        version_property versionCodeFallback
     fi
 }
 
 # Print the versionName of android/version.properties.
 version_name() {
     local name
-    name=$(sed -n 's/^versionName=//p' "$REPO_ROOT/android/version.properties" | tr -d ' \r')
-    [[ -n $name ]] || die "no versionName in android/version.properties"
+    name=$(version_property versionName)
+    [[ -n $name ]] || die "the versionName of android/version.properties is empty"
     echo "$name"
 }
 
@@ -114,4 +126,18 @@ sha256_table() {
     for file in "$@"; do
         printf '%s  %s\n' "$(sha256sum "$file" | cut -d' ' -f1)" "$(basename "$file")"
     done | sort -k2
+}
+
+# Write a note for each file below one directory that holds the container path
+# /workspace. The prefix map of a build removes that path from the objects, thus
+# a file that still holds it carries the absolute path of the container into the
+# artifact, and two machines with different paths give different bytes. The
+# first argument is the tag of the message, the second the directory. The note
+# names the path inside that directory. Complexity: O(bytes below the directory).
+report_workspace_leak() {
+    local tag=$1 root=$2 file count
+    while IFS= read -r file; do
+        count=$(grep -a -c -- /workspace "$file" || true)
+        echo "$tag: note: ${file#"$root"/} contains /workspace on $count lines"
+    done < <(grep -r -a -l -- /workspace "$root" 2> /dev/null || true)
 }

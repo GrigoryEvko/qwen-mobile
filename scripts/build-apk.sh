@@ -134,5 +134,4 @@ cat build/hashes-apk.txt
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/build-apk.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 unzip -q -o build/apk/app-release-unsigned.apk -d "$scratch"
-leaks=$(grep -r -a -l '/workspace' "$scratch" || true)
-[[ -z "$leaks" ]] || echo "apk: note: these entries contain /workspace:" "$leaks"
+report_workspace_leak apk "$scratch"
