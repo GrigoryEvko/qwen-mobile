@@ -27,7 +27,11 @@ set(LAB_EXTRA_C_FLAGS "" CACHE STRING "More compile flags, after the flags of LA
 set(LAB_WARNING_FLAGS
     -Wall -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-variable
     -Wno-gnu-zero-variadic-macro-arguments -Wno-format)
-set(LAB_LINK_FLAGS -m${HEXAGON_ARCH} -mhvx=${HEXAGON_ARCH} -mhmx -G0)
+# --wrap=exit sends each call of exit(), also the call of the runtime after main returns, to
+# __wrap_exit of lab/lab.c. That function prints the exit status, because hexagon-sim gives the exit
+# code 0 for each program and run.sh reads the status from the output. After the wrap no object
+# refers to exit by its name, thus -u exit makes the linker take the exit of libc.a for __real_exit.
+set(LAB_LINK_FLAGS -m${HEXAGON_ARCH} -mhvx=${HEXAGON_ARCH} -mhmx -G0 -Wl,--wrap=exit -Wl,-u,exit)
 if (LAB_PROFILE STREQUAL "")
     set(LAB_C_FLAGS
         -m${HEXAGON_ARCH} -mhvx=${HEXAGON_ARCH} -mhvx-length=128B -mhmx

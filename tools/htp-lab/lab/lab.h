@@ -6,7 +6,12 @@
 // sets the HMX enable bit of the thread itself.
 //
 // A green lab result is necessary and not sufficient. lab_init records the limits of the build and
-// of the simulator, and it prints them at the exit of the program. Refer to lab_limit.
+// of the simulator, and the exit of the program prints them. Refer to lab_limit.
+//
+// The exit of each program goes through the lab runtime (the link option --wrap=exit), which prints
+// "lab: exit status = <status>" as the last result line. hexagon-sim gives the exit code 0 for each
+// program, thus run.sh reads the status from that line. Return a status other than 0 from main when
+// a check fails.
 #ifndef LAB_H
 #define LAB_H
 
@@ -27,8 +32,8 @@ static inline uint64_t lab_cycles(void) {
 }
 
 // Maps the VTCM, enables the HMX for the main thread, seeds the random generator, and records the
-// limits of the build and of the simulator. At the exit of the program it does the check of the
-// options (refer to lab_args_done) and prints the limits.
+// limits of the build and of the simulator. The exit of the program does the check of the options
+// (refer to lab_args_done), prints the limits and prints the exit status.
 void lab_init(void);
 
 // Returns the VTCM base and size that the core configuration reports
@@ -175,7 +180,7 @@ void lab_report(const char * target, const char * key, double value, const char 
 // life of the program, thus give a string literal.
 void lab_limit(const char * text);
 
-// Prints the limits block. The exit handler of lab_init calls this function, thus a program prints
+// Prints the limits block. The exit of the program calls this function, thus a program prints
 // its limits without a call of its own.
 void lab_limits_report(void);
 
@@ -204,7 +209,7 @@ bool lab_arg_flag(int argc, char ** argv, const char * name);
 // error: without the check a misspelled option name takes the preset value in silence, and the run
 // then measures a case that the reader did not ask for.
 //
-// The exit handler of lab_init does this check for every program that read an option with lab_arg_*.
+// The exit of the program does this check for every program that read an option with lab_arg_*.
 // It prints the unknown options and the limits block, and the program ends with the status 2. Thus an
 // option that a mode of the program does not read also fails, because the run did not use it.
 //

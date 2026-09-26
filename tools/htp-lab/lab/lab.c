@@ -42,8 +42,8 @@ static size_t       g_arg_name_count;
 
 static const char * g_limits[LAB_MAX_LIMITS];
 static size_t       g_limit_count;
+static bool         g_initialized;  // lab_init ran, thus the limits block holds the limits of the run
 
-static void lab_at_exit(void);
 
 // The standalone runtime maps a page on the first access with the default attributes. The lab
 // maps the VTCM pages explicitly with the cacheable attribute (L1 write-back, L2), which is the
@@ -101,7 +101,7 @@ void lab_init(void) {
     printf("lab: build profile = %s\n", LAB_PROFILE_NAME);
 #endif
     lab_record_build_limits();
-    atexit(lab_at_exit);
+    g_initialized = true;
 }
 
 uint8_t * lab_vtcm_base(void) {
@@ -543,16 +543,31 @@ void lab_args_done(int argc, char ** argv) {
     }
 }
 
-// The exit handler of every lab program: the check of the options, then the limits block. A program
-// that read its options with lab_arg_* and got one that it did not read ends with the status 2, thus
-// a misspelled option name cannot take the preset value in silence.
-static void lab_at_exit(void) {
-    const size_t bad = (g_argv != NULL && !g_args_checked) ? lab_args_unknown(g_argc, g_argv) : 0;
-    lab_limits_report();
-    if (bad != 0) {
-        fflush(stdout);
-        _Exit(2);
+void __real_exit(int status) __attribute__((noreturn));
+
+// The exit of every lab program. The link option --wrap=exit of CMakeLists.txt sends each call of
+// exit() here, also the call of the runtime after main returns. The function does the check of the
+// options, prints the limits block, and prints the status as the last result line:
+//
+//   lab: exit status = <status>
+//
+// hexagon-sim gives the exit code 0 for each program, thus that line is the only record of the
+// status. run.sh fails a run whose output has no such line or a status other than 0. A program that
+// read its options with lab_arg_* and got one that it did not read ends with the status 2, thus a
+// misspelled option name cannot take the preset value in silence.
+void __wrap_exit(int status) {
+    if (g_argv != NULL && !g_args_checked) {
+        g_args_checked = true;
+        if (lab_args_unknown(g_argc, g_argv) != 0 && status == 0) {
+            status = 2;
+        }
     }
+    if (g_initialized) {
+        lab_limits_report();
+    }
+    printf("lab: exit status = %d\n", status);
+    fflush(stdout);
+    __real_exit(status);
 }
 
 float lab_hf_to_f32(uint16_t h) {

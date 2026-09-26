@@ -9,7 +9,7 @@
 # Usage:
 #   tools/htp-lab/run.sh build                    Build all lab programs
 #   tools/htp-lab/run.sh run <target> [-- args]   Build, then run and profile one target
-#   tools/htp-lab/run.sh all                      Run every target of the registry
+#   tools/htp-lab/run.sh all                      Run every target of the registry, exit 1 on a failure
 #   tools/htp-lab/run.sh list                     Print the registry
 #   tools/htp-lab/run.sh shell                    Open a shell in the container
 #
@@ -27,6 +27,13 @@
 #
 # "all" is the regression gate of the lab: it runs every target of the registry and writes the
 # result of each to out/<target>-all/. Compare two trees with a diff of the "lab:" lines.
+#
+# The verdict. Each run ends with a line "lab: verdict <target> PASS" or "... FAIL: <reasons>".
+# hexagon-sim gives the exit code 0 for each program, thus the verdict comes from the output: an
+# exception, an abort or the cycle limit of the simulator, a missing or non-zero "lab: exit status"
+# line, a check line with values outside the tolerance, the word FAIL, a "lab: error" line, or no
+# result line. "run" exits with 1 for a failed run. "all" runs every target, then prints one line
+# for each failed target and exits with 1. test-verdict.sh does a check of each condition.
 #
 # A target name with the suffix "_after" runs the same program against the kernel directory with
 # the proposal patches (tools/htp-lab/proposals/*.patch) applied to a copy in the output directory.
@@ -62,6 +69,8 @@
 #              lab at the same time: a build failure of a target that you do not name cannot
 #              stop yours. The build also passes -k 0, thus one broken target never stops the
 #              others, and "run" reports a missing program rather than a build error.
+#   ALL_TARGETS The targets that "all" runs, space separated. The default is every target of the
+#              registry. Give LAB_TARGETS the same names, thus the build makes those programs only.
 #   PROPOSALS  The proposal patches to apply, as space-separated names of tools/htp-lab/proposals.
 #              Default: every patch of that directory. "none" applies no patch, thus the "_after"
 #              programs measure the kernels of the checkout.
@@ -70,9 +79,9 @@
 #              "debug": the release flags with live asserts (no -DNDEBUG=1). A profile builds in
 #              out/build-<ARCH>-<PROFILE>, thus the lab flags and the two profiles do not mix.
 #   EXTRA_CFLAGS More compile flags, after the flags of the profile.
-#   ALL_PLIMIT The cycle limit of each timing run of "all". Default: 2000000000. The timing model
-#              does not retire an HMX instruction, thus a target that reads an HMX result waits
-#              without an end and the limit stops it.
+#   ALL_PLIMIT The cycle limit of each run of "all". Default: 100000000000. The timing model does
+#              not retire an HMX instruction, and a program with a defect can loop without an end,
+#              thus the limit stops such a run and the verdict fails it.
 #   LAB_NO_LOCK Set it to 1 when the caller holds build/.container.lock in a form that this script
 #              cannot see. This script takes that lock around each container, thus one container of
 #              the box runs at a time, and the lock covers the life of the container only. A caller
@@ -336,33 +345,81 @@ cmake -G Ninja -S /repo/tools/htp-lab -B "$BUILD_DIR" \
 ninja -k 0 -C "$BUILD_DIR" || echo "lab: NOTE: at least one target did not build. The others did."
 EOF
 
-# Runs one program under the simulator and writes the profile files.
+# Runs one program under the simulator, writes the profile files, and gives the verdict of the run.
 # run_target <target> <tag> [args...]: the output goes to out/<target>-<tag>.
 # MODE=functional runs without the timing model (no profile files), the default is the timing mode.
+#
+# hexagon-sim gives the exit code 0 for each program, thus the verdict comes from the output. A run
+# fails when one of these conditions occurs:
+#   - the simulator reports an exception, an abort, or the cycle limit (--plimit)
+#   - the program wrote no line "lab: exit status = N" (lab.c prints it at each exit), thus it
+#     stopped before its end, or the status is not 0
+#   - a line "lab: check <what>: N of M outside tolerance" or "lab: check guard" reports N above 0
+#   - a result line holds the word FAIL, or the lab runtime wrote a line "lab: error"
+#   - the program wrote no result line
+# run_target prints "lab: verdict <target> PASS" or "lab: verdict <target> FAIL: <the reasons>",
+# writes the line to verdict.txt, and returns 1 for a failed run.
 read -r -d '' RUNFN <<'EOF' || true
+lab_verdict() {
+    local target="$1" out="$2" sim_rc="$3" why="" n st
+    grep -q "I think the exception was" "$out" && why="${why}; the simulator stopped the program at an exception"
+    grep -q "^abort -- terminating" "$out" && why="${why}; the program called abort"
+    grep -q "^Unexpected Run Result" "$out" && why="${why}; the simulator stopped the program at the cycle limit"
+    [ "${sim_rc}" = 0 ] || why="${why}; hexagon-sim gave the exit code ${sim_rc}"
+    st=$(grep -m1 -o "^lab: exit status = -\?[0-9]*" "$out" || true)
+    st="${st##*= }"
+    if [ -z "${st}" ]; then
+        why="${why}; the program wrote no exit status line, thus it stopped before its end"
+    elif [ "${st}" != 0 ]; then
+        why="${why}; the program ended with the status ${st}"
+    fi
+    n=$(grep -cE "^lab: check .*: [1-9][0-9]* of [0-9]+ outside tolerance|^lab: check guard .*: [1-9][0-9]* guard bytes changed" "$out" || true)
+    [ "${n}" = 0 ] || why="${why}; ${n} check lines report values outside the tolerance"
+    n=$(grep -cE "^lab: .*\bFAIL\b" "$out" || true)
+    [ "${n}" = 0 ] || why="${why}; ${n} result lines hold FAIL"
+    n=$(grep -c "^lab: error" "$out" || true)
+    [ "${n}" = 0 ] || why="${why}; ${n} lines of the lab runtime report an error"
+    n=$(grep "^lab:" "$out" | grep -cvE "^lab: (tree|core|build profile|limits|limit [0-9]+:|exit status|NOTICE|proposals)" || true)
+    [ "${n}" != 0 ] || why="${why}; the program wrote no result line"
+    if [ -z "${why}" ]; then
+        echo "lab: verdict ${target} PASS" | tee verdict.txt
+        return 0
+    fi
+    echo "lab: verdict ${target} FAIL: ${why#; }" | tee verdict.txt
+    return 1
+}
+
 run_target() {
     local target="$1"; local tag="$2"; shift 2
     local dir="$OUT/$target-$tag"
     [ "${ARCH}" = "v79" ] || dir="$OUT/$target-${ARCH}-$tag"
     local elf="$BUILD_DIR/lab_$target"
-    [ -x "$elf" ] || { echo "no program $elf"; return 1; }
+    local sim_rc=0
+    if [ ! -x "$elf" ]; then
+        echo "lab: verdict ${target} FAIL: no program ${elf}, thus the target did not build"
+        return 1
+    fi
     rm -rf "$dir"; mkdir -p "$dir"; cd "$dir"
     echo "== run $target-$tag: $*"
     # the source of the numbers, as the first lines of the output and thus of the report
     echo "lab: tree ${LAB_TREE} arch ${ARCH} core ${SIM_CORE}" > tree.txt
     case "$target" in *_after) echo "lab: proposals ${LAB_PROPOSALS}" >> tree.txt ;; esac
     if [ "${MODE:-timing}" = "functional" ]; then
-        { cat tree.txt; hexagon-sim --m${SIM_CORE} $SIM_ARGS "$elf" -- "$@"; } 2>&1 | tee stdout.txt
+        { cat tree.txt; hexagon-sim --m${SIM_CORE} $SIM_ARGS "$elf" -- "$@"; } 2>&1 | tee stdout.txt || sim_rc=$?
         grep "^lab:" stdout.txt > report.txt || true
-        return 0
+    else
+        { cat tree.txt; hexagon-sim --m${SIM_CORE} --timing --profile --packet_analyze pa.json --pmu_statsfile pmu.txt $SIM_ARGS \
+            "$elf" -- "$@"; } 2>&1 | tee stdout.txt || sim_rc=$?
+        hexagon-profiler --packet_analyze --json=pa.json --elf="$elf" -o pa.html > /dev/null 2>&1 || true
+        hexagon-nm -S -n "$elf" > symbols.txt
+        hexagon-llvm-objdump -d --no-show-raw-insn "$elf" > disasm.txt
+        python3 /repo/tools/htp-lab/lab/report.py --pa pa.json --symbols symbols.txt --disasm disasm.txt \
+            --stdout stdout.txt --target "$target-$tag" | tee report.txt || true
     fi
-    { cat tree.txt; hexagon-sim --m${SIM_CORE} --timing --profile --packet_analyze pa.json --pmu_statsfile pmu.txt $SIM_ARGS \
-        "$elf" -- "$@"; } 2>&1 | tee stdout.txt
-    hexagon-profiler --packet_analyze --json=pa.json --elf="$elf" -o pa.html > /dev/null 2>&1 || true
-    hexagon-nm -S -n "$elf" > symbols.txt
-    hexagon-llvm-objdump -d --no-show-raw-insn "$elf" > disasm.txt
-    python3 /repo/tools/htp-lab/lab/report.py --pa pa.json --symbols symbols.txt --disasm disasm.txt \
-        --stdout stdout.txt --target "$target-$tag" | tee report.txt
+    local rc=0
+    lab_verdict "$target" stdout.txt "$sim_rc" || rc=1
+    cat verdict.txt >> report.txt
+    return "$rc"
 }
 EOF
 
@@ -394,9 +451,13 @@ run_target ${target} ${TAG:-run} $*"
     all)
         # The registry lives in the sources, thus the host reads it and the container gets the
         # commands. A target that declares skip gives a notice and no run.
-        ALL_PLIMIT="${ALL_PLIMIT:-2000000000}"
+        ALL_PLIMIT="${ALL_PLIMIT:-100000000000}"
         ALL_CMDS=""
+        ALL_COUNT=0
         while IFS= read -r name; do
+            if [ -n "${ALL_TARGETS:-}" ] && [[ " ${ALL_TARGETS} " != *" ${name} "* ]]; then
+                continue
+            fi
             read -r mode rest <<< "$(lab_target_decl "$name")"
             case "${mode}" in
                 skip)
@@ -409,22 +470,33 @@ run_target ${target} ${TAG:-run} $*"
                     exit 1
                     ;;
             esac
-            # A timing run gets a cycle limit: the timing model does not retire an HMX instruction,
-            # thus a target that reads an HMX result waits without an end.
-            # "|| true" keeps the sweep going: a target that does not build reports a missing
-            # program, and the other targets still run.
-            if [ "${mode}" = timing ]; then
-                ALL_CMDS="${ALL_CMDS}SIM_ARGS=\"\$SIM_ARGS --plimit ${ALL_PLIMIT}\" MODE=timing run_target ${name} all ${rest} || true
+            # Each run gets a cycle limit: the timing model does not retire an HMX instruction, and a
+            # program with a defect can loop without an end. The limit stops it, and the verdict
+            # fails the run. The sweep continues after a failed run, thus the summary names each
+            # failed target.
+            ALL_CMDS="${ALL_CMDS}SIM_ARGS=\"\$SIM_ARGS --plimit ${ALL_PLIMIT}\" MODE=${mode} run_target ${name} all ${rest} || ALL_FAILED=\"\${ALL_FAILED} ${name}\"
 "
-            else
-                ALL_CMDS="${ALL_CMDS}MODE=functional run_target ${name} all ${rest} || true
-"
-            fi
+            ALL_COUNT=$((ALL_COUNT + 1))
         done < <(lab_target_names)
         in_container "${PROLOGUE}
 ${BUILD}
 ${RUNFN}
-${ALL_CMDS}"
+ALL_FAILED=''
+${ALL_CMDS}
+echo
+if [ -z \"\${ALL_FAILED}\" ]; then
+    echo 'lab: all: ${ALL_COUNT} of ${ALL_COUNT} targets pass'
+    exit 0
+fi
+set -- \${ALL_FAILED}
+echo \"lab: all: \$# of ${ALL_COUNT} targets fail\"
+for t in \${ALL_FAILED}; do
+    d=\"\$OUT/\$t-all\"
+    [ \"\${ARCH}\" = v79 ] || d=\"\$OUT/\$t-\${ARCH}-all\"
+    v=\$(cat \"\$d/verdict.txt\" 2> /dev/null || echo \"lab: verdict \$t FAIL: the target did not build\")
+    echo \"lab: all fail \$t: \${v#*FAIL: }\"
+done
+exit 1"
         ;;
     shell)
         # An interactive shell holds the container lock until it exits.
