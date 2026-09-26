@@ -46,5 +46,7 @@ url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.pytest.ini_options]
-testpaths = ["quant/tests"]
+# The tests that need no phone, no weights and no container. tests/fuzz and tests/suite have their
+# own drivers, thus they are not here.
+testpaths = ["quant/tests", "tools/trace/tests"]
 pythonpath = ["."]

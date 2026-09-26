@@ -80,7 +80,7 @@ jobs:
   pipeline:
     # The lock holds torch with CUDA 13 wheels. The download is several GB,
     # and the runner has approximately 14 GB of free disk space.
-    name: Quantization pipeline tests
+    name: Python tests of the pipeline and the trace tool
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -93,5 +93,7 @@ jobs:
         run: scripts/apply-patches.sh
       - name: Install the locked environment
         run: uv sync --frozen
+      # tools/trace holds the one tested tool of the profiling kit, and
+      # htp_trace.py needs the standard library only.
       - name: Run the tests
-        run: uv run --frozen pytest quant/tests
+        run: uv run --frozen pytest quant/tests tools/trace/tests
