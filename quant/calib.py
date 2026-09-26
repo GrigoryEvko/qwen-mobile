@@ -35,10 +35,36 @@ def load_text_ids(tokenizer, path: Path, n_seq: int, seq_len: int) -> torch.Tens
 
 
 def build_calibration(tokenizer, n_seq: int, seq_len: int, seed: int, out: Path) -> torch.Tensor:
-    """Token ids [n_seq, seq_len] from C4 English, saved to ``out``."""
+    """Token ids [n_seq, seq_len] from C4 English, saved to ``out``.
+
+    A cached file gives its ids and reads no corpus. Without the cache the function streams the
+    corpus, and that path needs the package datasets, which the locked environment does not hold.
+
+    Args:
+        tokenizer: A tokenizer with a call that gives input_ids
+        n_seq: The number of sequences
+        seq_len: The number of tokens in one sequence
+        seed: The seed of the shuffle of the stream
+        out: The cache file
+
+    Returns:
+        The token ids [n_seq, seq_len]
+
+    Raises:
+        SystemExit: If the cache is absent and the package datasets is absent
+
+    Complexity: O(n_seq x seq_len) tokens of the stream.
+    """
     if out.exists():
         return torch.load(out)
-    from datasets import load_dataset
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise SystemExit(
+            f"{out} does not exist, thus this run must read the corpus, and that path needs the "
+            "package datasets, which the locked environment does not hold. Install it beside that "
+            "environment with: uv pip install datasets==4.5.0. The group \"corpus\" of "
+            "pyproject.toml records the version and the reason that uv.lock does not hold it.") from exc
 
     ds = load_dataset("allenai/c4", "en", split="train", streaming=True).shuffle(seed=seed, buffer_size=10_000)
     rows: list[torch.Tensor] = []

@@ -9,6 +9,17 @@
 # gguf is the gguf-py package of the llama.cpp submodule, with the patch
 # series applied (scripts/apply-patches.sh). sentencepiece and protobuf are
 # imports of convert_hf_to_gguf.py, which quant/run.py starts as a subprocess.
+#
+# The group "corpus" records the one package that reads a corpus from the
+# network. It is not a dependency of the pipeline, because the calibration file
+# data/calib-128x2048.pt is the input of every measured run.
+#
+# uv.lock does not hold that group. A resolution with datasets moves fsspec from
+# 2026.7.0 to 2025.10.0, and fsspec is a dependency of the default set, thus a
+# relock would change the environment that produced the results in analysis/.
+# Install the package beside the locked environment instead:
+#
+#   uv pip install datasets==4.5.0
 
 [project]
 name = "qwen-mobile-quant"
@@ -30,6 +41,10 @@ dev = [
     "atheris==3.1.0",
     "hypothesis==6.168.0",
     "pytest==9.0.3",
+]
+# quant/calib.py reads the C4 corpus with this package when the cache file is absent.
+corpus = [
+    "datasets==4.5.0",
 ]
 
 [tool.uv]
