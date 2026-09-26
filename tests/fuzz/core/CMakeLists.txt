@@ -41,6 +41,9 @@
 cmake_minimum_required(VERSION 3.22)
 project(qwen_mobile_fuzz_core C CXX)
 
+# The shared flag functions of the areas (the tables of the sanitizers and of the profiles).
+include("${CMAKE_CURRENT_LIST_DIR}/../../sanitizers/fuzz-common.cmake")
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -77,68 +80,20 @@ if (DEFINED SANMATRIX_PROFILE)
         message(FATAL_ERROR "FUZZ_PROFILE=${FUZZ_PROFILE} differs from the profile file (${SANMATRIX_PROFILE}).")
     endif()
 else()
-    # An Android build, or a host build without the shared files: the same rules here.
-    set(fuzz_prof "-g -fvectorize -ffp-model=fast -fno-finite-math-only -D_GNU_SOURCE")
-    set(fuzz_link "")
-    if (FUZZ_PROFILE STREQUAL "release")
-        # the flags of the preset arm64-android-snapdragon with CMAKE_BUILD_TYPE=Release
-        set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
-        set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "" FORCE)
-        set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "" FORCE)
-        string(APPEND fuzz_prof " -flto")
-        set(fuzz_link "-flto")
-        if (NOT ANDROID)
-            string(APPEND fuzz_link " -fuse-ld=lld")  # the x86 substitution for the NDK linker, necessary for -flto
-        endif()
-    else()
-        set(CMAKE_BUILD_TYPE Debug CACHE STRING "" FORCE)
-        set(CMAKE_C_FLAGS_DEBUG "-O1 -g" CACHE STRING "" FORCE)
-        set(CMAKE_CXX_FLAGS_DEBUG "-O1 -g" CACHE STRING "" FORCE)
-        string(APPEND fuzz_prof " -fno-omit-frame-pointer")
-    endif()
-
-    set(fuzz_san "")
-    set(fuzz_san_link "")
-    if (FUZZ_SANITIZER STREQUAL "none")
-    elseif (FUZZ_SANITIZER STREQUAL "asan")
-        set(fuzz_san "-fsanitize=address -fno-optimize-sibling-calls")
-        set(fuzz_san_link "-fsanitize=address")
-    elseif (FUZZ_SANITIZER STREQUAL "ubsan")
-        # Rule R5: the first report stops the run (the flags of tests/sanitizers/ubsan.cmake).
-        set(fuzz_san "-fsanitize=undefined -fno-sanitize-recover=undefined")
-        set(fuzz_san_link "-fsanitize=undefined")
-    elseif (FUZZ_SANITIZER STREQUAL "tsan")
-        set(fuzz_san "-fsanitize=thread")
-        set(fuzz_san_link "-fsanitize=thread")
-    elseif (FUZZ_SANITIZER STREQUAL "hwasan" AND ANDROID)
-        set(fuzz_san "-fsanitize=hwaddress")
-        set(fuzz_san_link "-fsanitize=hwaddress")
-    else()
+    # An Android build, or a host build without the shared files: the shared functions of
+    # tests/sanitizers/fuzz-common.cmake give the same flags. MSan needs the MSan libc++ of the
+    # initial cache files, thus it is not a configuration of this branch.
+    if (NOT FUZZ_SANITIZER MATCHES "^(none|asan|ubsan|tsan|hwasan)$")
         message(FATAL_ERROR "FUZZ_SANITIZER=${FUZZ_SANITIZER} is not known for this build. Android: none, asan, hwasan, "
                             "ubsan, tsan. Host: give -C tests/sanitizers/profile-<profile>.cmake -C tests/sanitizers/<sanitizer>.cmake "
                             "(msan needs the MSan libc++ of those files).")
     endif()
-    if (ANDROID AND (FUZZ_SANITIZER STREQUAL "ubsan" OR FUZZ_SANITIZER STREQUAL "none"))
-        # The UBSan runtime links statically (the libFuzzer of the NDK links the UBSan runtime also
-        # with no sanitizer). The shared UBSan runtime of the NDK holds a private copy of the
-        # libc++abi type-info classes, and each executable holds the copy of the static NDK libc++.
-        # The vptr check walks the class hierarchy with a dynamic_cast to the copy of the runtime,
-        # which fails for the type_info objects of the executable. Thus, with the shared runtime,
-        # each check of a derived class gives a false report (dynamic-type-mismatch in the libc++
-        # sstream at the start). The static runtime uses the one copy of the executable, and vptr
-        # stays on without a recovery.
-        string(APPEND fuzz_san_link " -static-libsan")
-    endif()
+    fuzz_profile_build_type("${FUZZ_PROFILE}")
+    fuzz_profile_flags("${FUZZ_PROFILE}" fuzz_prof fuzz_link)
+    fuzz_profile_cxx_flags("${FUZZ_PROFILE}" "${FUZZ_SANITIZER}" fuzz_prof_cxx)
+    fuzz_sanitizer_flags("${FUZZ_SANITIZER}" fuzz_san fuzz_san_link fuzz_san_cxx)
     string(APPEND CMAKE_C_FLAGS   " ${fuzz_prof} ${fuzz_san}")
-    string(APPEND CMAKE_CXX_FLAGS " ${fuzz_prof} ${fuzz_san}")
-    if (FUZZ_PROFILE STREQUAL "debug")
-        # the library asserts of the debug profile: libc++ (NDK) or libstdc++ (host)
-        if (ANDROID)
-            string(APPEND CMAKE_CXX_FLAGS " -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE")
-        else()
-            string(APPEND CMAKE_CXX_FLAGS " -D_GLIBCXX_ASSERTIONS")
-        endif()
-    endif()
+    string(APPEND CMAKE_CXX_FLAGS " ${fuzz_prof} ${fuzz_san} ${fuzz_san_cxx} ${fuzz_prof_cxx}")
     string(APPEND CMAKE_EXE_LINKER_FLAGS " ${fuzz_link} ${fuzz_san_link}")
     set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
 endif()
@@ -199,7 +154,7 @@ function(fuzz_add name)
     add_executable(${name} ${name}.cpp fuzz_common.h)
     target_include_directories(${name} PRIVATE
         "${CMAKE_CURRENT_LIST_DIR}"
-        "${CMAKE_CURRENT_LIST_DIR}/../../sanitizers"
+        "${FUZZ_SHARED_DIR}"
         "${FUZZ_LLAMA_DIR}/include"
         "${FUZZ_LLAMA_DIR}/src"
         "${FUZZ_LLAMA_DIR}/common"

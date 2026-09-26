@@ -42,6 +42,9 @@
 cmake_minimum_required(VERSION 3.20)
 project(fuzz_ops C CXX)
 
+# The shared flag functions of the areas (the tables of the sanitizers and of the profiles).
+include("${CMAKE_CURRENT_LIST_DIR}/../../sanitizers/fuzz-common.cmake")
+
 set(FUZZ_OPS_GGML_SRC "" CACHE PATH "The ggml source tree (a snapshot of third_party/llama.cpp/ggml)")
 set(FUZZ_OPS_VARIANT "fuzz" CACHE STRING "fuzz, oracle or android")
 set(FUZZ_SANITIZER "none" CACHE STRING "none, asan, ubsan, tsan, msan (host) or hwasan (Android)")
@@ -103,16 +106,9 @@ else()
     set(FUZZ_OPS_HARNESS_FP -ffp-contract=off -fno-fast-math)
 endif()
 
-# Turn the x86 SIMD options of ggml off (the oracle and MSan).
-macro(fuzz_ops_scalar_x86)
-    foreach (opt GGML_NATIVE GGML_AVX GGML_AVX2 GGML_AVX512 GGML_AVX512_VBMI GGML_AVX512_VNNI GGML_AVX512_BF16
-                 GGML_AVX_VNNI GGML_FMA GGML_F16C GGML_SSE42 GGML_BMI2 GGML_AMX_TILE GGML_AMX_INT8 GGML_AMX_BF16)
-        set(${opt} OFF CACHE BOOL "" FORCE)
-    endforeach()
-endmacro()
-
 if (FUZZ_OPS_VARIANT STREQUAL "oracle")
-    fuzz_ops_scalar_x86()
+    # The scalar CPU backend: each x86 SIMD option of ggml off (fuzz-common.cmake).
+    fuzz_scalar_x86()
     set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS} -ffp-contract=off -fno-fast-math")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ffp-contract=off -fno-fast-math")
 elseif (FUZZ_OPS_VARIANT STREQUAL "fuzz")
@@ -140,47 +136,19 @@ elseif (FUZZ_OPS_VARIANT STREQUAL "fuzz")
     set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS} -fsanitize=fuzzer-no-link -fno-sanitize-coverage=trace-cmp")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=fuzzer-no-link -fno-sanitize-coverage=trace-cmp")
 else()
-    # The sanitizer of the Android builds. No UBSan check recovers: each report stops the run.
-    # The ubsan build links the UBSan runtime statically (-static-libsan). With the shared runtime,
-    # two modules hold a copy of the libc++abi type-info classes: ops_replay (the static NDK libc++)
-    # and libclang_rt.ubsan_standalone-aarch64-android.so (a private copy). The vptr check walks the
-    # class hierarchy with a dynamic_cast to the copy of the runtime, which fails for the type_info
-    # objects of ops_replay, thus each check of a derived class gives a false report (for example
-    # 'ggml::cpu::repack::extra_buffer_type' for 'ggml::cpu::extra_buffer_type'). With the static
-    # runtime, the references resolve to one copy, and vptr stays on without a recovery.
-    set(android_san "")
-    set(android_link "")
-    if (FUZZ_SANITIZER STREQUAL "asan")
-        set(android_san "-fsanitize=address")
-    elseif (FUZZ_SANITIZER STREQUAL "ubsan")
-        # No check recovers: refer to the text above and to tests/sanitizers/ubsan.cmake.
-        set(android_san "-fsanitize=undefined -fno-sanitize-recover=undefined")
-        set(android_link "-static-libsan")
-    elseif (FUZZ_SANITIZER STREQUAL "hwasan")
-        set(android_san "-fsanitize=hwaddress")
-    endif()
-    # The shipped flags of the preset arm64-android-snapdragon. Keep them equal.
-    set(shipped "-march=armv8.7a+fp16+dotprod+i8mm -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE")
-    if (FUZZ_PROFILE STREQUAL "release")
-        set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
-        set(CMAKE_C_FLAGS_RELEASE   "-O3 -DNDEBUG" CACHE STRING "" FORCE)
-        set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "" FORCE)
-        set(pflags "${shipped} -g")
-        set(plink "-flto")
-    else()
-        # the release flags less -flto, with -O1 and without -DNDEBUG
-        string(REPLACE " -flto" "" pflags "${shipped}")
-        set(CMAKE_BUILD_TYPE Debug CACHE STRING "" FORCE)
-        set(CMAKE_C_FLAGS_DEBUG   "-O1 -g" CACHE STRING "" FORCE)
-        set(CMAKE_CXX_FLAGS_DEBUG "-O1 -g" CACHE STRING "" FORCE)
-        set(plink "")
-    endif()
+    # The Android build: the shared functions of tests/sanitizers/fuzz-common.cmake give the flags of
+    # the profile and of the sanitizer, and the -march of the shipped build goes with them.
+    fuzz_profile_build_type("${FUZZ_PROFILE}")
+    fuzz_profile_flags("${FUZZ_PROFILE}" pflags plink)
+    fuzz_profile_cxx_flags("${FUZZ_PROFILE}" "${FUZZ_SANITIZER}" pflags_cxx)
+    fuzz_sanitizer_flags("${FUZZ_SANITIZER}" android_san android_san_link android_san_cxx)
+    string(APPEND pflags " -march=armv8.7a+fp16+dotprod+i8mm")
     set(GGML_NATIVE  OFF CACHE BOOL "" FORCE)
     set(GGML_HEXAGON ON  CACHE BOOL "" FORCE)
     set(GGML_OPENCL  OFF CACHE BOOL "" FORCE)
     set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS} ${pflags} ${android_san}")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${pflags} ${android_san}")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${plink} ${android_san} ${android_link}")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${pflags} ${android_san} ${android_san_cxx} ${pflags_cxx}")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${plink} ${android_san_link}")
 endif()
 
 if (FUZZ_OPS_GGML_PREBUILT)

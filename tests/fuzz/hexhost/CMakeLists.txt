@@ -33,6 +33,9 @@
 cmake_minimum_required(VERSION 3.20)
 project(hexhost_fuzz C CXX)
 
+# The shared flag functions of the areas (the tables of the sanitizers and of the profiles).
+include("${CMAKE_CURRENT_LIST_DIR}/../../sanitizers/fuzz-common.cmake")
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -44,8 +47,6 @@ set_property(CACHE FUZZ_SANITIZER PROPERTY STRINGS none asan ubsan tsan msan)
 set(FUZZ_PROFILE "debug" CACHE STRING "debug or release")
 set_property(CACHE FUZZ_PROFILE PROPERTY STRINGS debug release)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-set(FUZZ_MSAN_PREFIX "${CMAKE_CURRENT_SOURCE_DIR}/../../../build/fuzz/msan-libcxx/install" CACHE PATH
-    "The install prefix of the MSan-instrumented libc++")
 
 # HEXHOST_SANITIZER is the old name of FUZZ_SANITIZER
 if (DEFINED HEXHOST_SANITIZER)
@@ -67,80 +68,70 @@ endif()
 
 # This project builds no ggml-cpu and no target uses OpenMP (GGML_OPENMP=OFF in effect, rule
 # R7). GGML_NATIVE has its effect through -march=native of the release profile.
-set(SAN_LINK_FLAGS "")
-set(SAN_CXX_FLAGS -D_GLIBCXX_ASSERTIONS)
-if (FUZZ_SANITIZER STREQUAL "asan")
-    set(SAN_FLAGS -fsanitize=address -fno-optimize-sibling-calls)
+#
+# The flags of the sanitizer come from tests/sanitizers/fuzz-common.cmake, which holds the table of
+# each area. The thread of the fake DSP runs only in the tsan configuration (HEXHOST_ASYNC_DSP): the
+# other configurations answer each queue call in the thread of the caller.
+if (NOT FUZZ_SANITIZER MATCHES "^(none|asan|ubsan|tsan|msan)$")
+    message(FATAL_ERROR "hexhost: FUZZ_SANITIZER must be none, asan, ubsan, tsan or msan, it is ${FUZZ_SANITIZER}")
+endif()
+fuzz_sanitizer_flags("${FUZZ_SANITIZER}" san_flags san_link san_cxx)
+separate_arguments(SAN_FLAGS UNIX_COMMAND "${san_flags}")
+separate_arguments(SAN_LINK_FLAGS UNIX_COMMAND "${san_link}")
+separate_arguments(SAN_CXX_FLAGS UNIX_COMMAND "${san_cxx}")
+if (FUZZ_SANITIZER STREQUAL "tsan")
+    add_compile_definitions(HEXHOST_ASYNC_DSP=1)
+else()
     add_compile_definitions(HEXHOST_ASYNC_DSP=0)
-elseif (FUZZ_SANITIZER STREQUAL "ubsan")
-    # No check recovers, thus each UBSan report stops the run. harness.cpp gives the shared file
-    # tests/sanitizers/ubsan.supp to the runtime: an entry there has an effect only for a check
-    # that tests/sanitizers/ubsan.cmake makes recover.
-    set(SAN_FLAGS -fsanitize=undefined -fno-sanitize-recover=undefined)
-    set(HEXHOST_UBSAN_SUPP "${CMAKE_CURRENT_SOURCE_DIR}/../../sanitizers/ubsan.supp")
-    get_filename_component(HEXHOST_UBSAN_SUPP "${HEXHOST_UBSAN_SUPP}" ABSOLUTE)
-    add_compile_definitions(HEXHOST_ASYNC_DSP=0 HEXHOST_UBSAN_SUPP="${HEXHOST_UBSAN_SUPP}")
+endif()
+if (FUZZ_SANITIZER STREQUAL "ubsan")
+    # harness.cpp gives the shared file tests/sanitizers/ubsan.supp to the runtime: an entry there
+    # has an effect only for a check that tests/sanitizers/ubsan.cmake makes recover, and no check
+    # recovers.
+    set(HEXHOST_UBSAN_SUPP "${FUZZ_SHARED_DIR}/ubsan.supp")
+    add_compile_definitions(HEXHOST_UBSAN_SUPP="${HEXHOST_UBSAN_SUPP}")
     if (NOT EXISTS "${HEXHOST_UBSAN_SUPP}")
         message(WARNING "hexhost: ${HEXHOST_UBSAN_SUPP} does not exist. The UBSan runtime then gets no "
                         "suppression file.")
     endif()
-elseif (FUZZ_SANITIZER STREQUAL "tsan")
-    set(SAN_FLAGS -fsanitize=thread)
-    add_compile_definitions(HEXHOST_ASYNC_DSP=1)
-elseif (FUZZ_SANITIZER STREQUAL "msan")
-    if (NOT EXISTS "${FUZZ_MSAN_PREFIX}/include/c++/v1/vector" OR NOT EXISTS "${FUZZ_MSAN_PREFIX}/lib/libc++.so")
-        message(FATAL_ERROR "hexhost: msan needs an MSan-instrumented libc++ in FUZZ_MSAN_PREFIX "
-                            "(${FUZZ_MSAN_PREFIX}). tests/sanitizers/build-msan-libcxx.sh builds it into "
-                            "build/fuzz/msan-libcxx/install. Build it first, or set FUZZ_MSAN_PREFIX.")
-    endif()
-    set(SAN_FLAGS -fsanitize=memory -fsanitize-memory-track-origins=2)
-    set(SAN_CXX_FLAGS -stdlib=libc++ -nostdinc++ "SHELL:-isystem ${FUZZ_MSAN_PREFIX}/include/c++/v1"
-                      -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE)
-    add_compile_definitions(HEXHOST_ASYNC_DSP=0)
-    set(SAN_LINK_FLAGS -stdlib=libc++ -L${FUZZ_MSAN_PREFIX}/lib -Wl,-rpath,${FUZZ_MSAN_PREFIX}/lib -lc++ -lc++abi)
-elseif (FUZZ_SANITIZER STREQUAL "none")
-    set(SAN_FLAGS "")
-    add_compile_definitions(HEXHOST_ASYNC_DSP=0)
-else()
-    message(FATAL_ERROR "hexhost: FUZZ_SANITIZER must be none, asan, ubsan, tsan or msan, it is ${FUZZ_SANITIZER}")
 endif()
 
-# The fp flags of the app (preset arm64-android-snapdragon) in the two profiles. The two profiles
-# build shared libraries (hexhost_ggml, hexhost_core), as the app ships the libraries and as
-# tests/sanitizers/profile-<profile>.cmake does. Thus the LTO of the release profile runs one time
-# for each library, not again for each fuzz target.
-set(APP_FP_FLAGS -fvectorize -ffp-model=fast -fno-finite-math-only -D_GNU_SOURCE)
+# The flags of the two profiles come from tests/sanitizers/fuzz-common.cmake, which holds the table
+# of each area: the optimizer flags, the floating-point flags of the app, the frame pointer and the
+# library asserts of the debug profile. The build type of this project is None, thus the optimizer
+# flags go into the compile options.
+# The two profiles build shared libraries (hexhost_ggml, hexhost_core), as the app ships the
+# libraries and as tests/sanitizers/profile-<profile>.cmake does. Thus the LTO of the release profile
+# runs one time for each library, not again for each fuzz target.
 set(BUILD_SHARED_LIBS ON)
-if (FUZZ_PROFILE STREQUAL "debug")
-    set(PROFILE_FLAGS -O1 -g -fno-omit-frame-pointer ${APP_FP_FLAGS})
-    set(PROFILE_LINK_FLAGS -fuse-ld=lld)
-elseif (FUZZ_PROFILE STREQUAL "release")
-    # -fno-omit-frame-pointer: the x86 substitution of the arm64 frame pointer (profile-release.cmake)
-    set(PROFILE_FLAGS -O3 -DNDEBUG -flto ${APP_FP_FLAGS} -g -fno-omit-frame-pointer)
+fuzz_profile_opt_flags("${FUZZ_PROFILE}" opt_flags)
+fuzz_profile_flags("${FUZZ_PROFILE}" prof_flags prof_link)
+fuzz_profile_cxx_flags("${FUZZ_PROFILE}" "${FUZZ_SANITIZER}" prof_cxx)
+separate_arguments(PROFILE_FLAGS UNIX_COMMAND "${opt_flags} ${prof_flags}")
+# The optimizer flags and the profile flags both hold -g. Each flag of the list is a switch that one
+# occurrence sets, thus one occurrence is enough.
+list(REMOVE_DUPLICATES PROFILE_FLAGS)
+separate_arguments(PROFILE_LINK_FLAGS UNIX_COMMAND "${prof_link}")
+separate_arguments(PROFILE_CXX_FLAGS UNIX_COMMAND "${prof_cxx}")
+set(CXX_ONLY_FLAGS ${SAN_CXX_FLAGS} ${PROFILE_CXX_FLAGS})
+if (FUZZ_PROFILE STREQUAL "release")
     if (NOT FUZZ_SANITIZER STREQUAL "msan")
+        # the x86 substitution of the -march of the shipped build. MemorySanitizer does not follow
+        # the SIMD intrinsics, thus its build stays scalar (rule R7).
         list(APPEND PROFILE_FLAGS -march=native)
     endif()
-    # The LTO objects need the LLVM archiver and linker
-    set(PROFILE_LINK_FLAGS -flto -fuse-ld=lld)
+    # The LTO objects need the LLVM archiver
     find_program(LLVM_AR NAMES llvm-ar REQUIRED)
     find_program(LLVM_RANLIB NAMES llvm-ranlib REQUIRED)
     set(CMAKE_AR "${LLVM_AR}")
     set(CMAKE_RANLIB "${LLVM_RANLIB}")
-    # the release profile has no libstdc++ assertions, as the shipped library
-    if (NOT FUZZ_SANITIZER STREQUAL "msan")
-        set(SAN_CXX_FLAGS "")
-    else()
-        list(REMOVE_ITEM SAN_CXX_FLAGS -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE)
-    endif()
-else()
-    message(FATAL_ERROR "hexhost: FUZZ_PROFILE must be debug or release, it is ${FUZZ_PROFILE}")
 endif()
 
 add_compile_options(${PROFILE_FLAGS} ${SAN_FLAGS} -fsanitize=fuzzer-no-link
-                    "$<$<COMPILE_LANGUAGE:CXX>:${SAN_CXX_FLAGS}>")
-add_link_options(${PROFILE_LINK_FLAGS} ${SAN_FLAGS} ${SAN_LINK_FLAGS})
+                    "$<$<COMPILE_LANGUAGE:CXX>:${CXX_ONLY_FLAGS}>")
+add_link_options(${PROFILE_LINK_FLAGS} ${SAN_LINK_FLAGS})
 message(STATUS "hexhost: profile ${FUZZ_PROFILE}, sanitizer ${FUZZ_SANITIZER}: "
-               "${PROFILE_FLAGS} ${SAN_FLAGS} | C++ ${SAN_CXX_FLAGS} | link ${PROFILE_LINK_FLAGS} ${SAN_FLAGS} ${SAN_LINK_FLAGS}")
+               "${PROFILE_FLAGS} ${SAN_FLAGS} | C++ ${CXX_ONLY_FLAGS} | link ${PROFILE_LINK_FLAGS} ${SAN_LINK_FLAGS}")
 
 # The version header of ggml.c
 set(GGML_VERSION "0.0.0")
@@ -185,7 +176,7 @@ target_compile_options(hexhost_core PRIVATE -Wall -Wno-unused-function -Wno-unus
 foreach(name kparams graph repack envparse dirty mmap)
     add_executable(fuzz_${name} fuzz_${name}.cpp)
     target_link_libraries(fuzz_${name} PRIVATE hexhost_core)
-    target_include_directories(fuzz_${name} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../sanitizers")
+    target_include_directories(fuzz_${name} PRIVATE "${FUZZ_SHARED_DIR}")
     target_link_options(fuzz_${name} PRIVATE -fsanitize=fuzzer)
 endforeach()
 
@@ -195,10 +186,9 @@ endforeach()
 # coverage callbacks of libFuzzer without the main of libFuzzer. The none config has no sanitizer
 # runtime that gives these callbacks. The shared libraries find the callbacks in the tool, thus the
 # tool exports its symbols.
-execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-runtime-dir OUTPUT_VARIABLE FUZZ_RT_DIR
-                OUTPUT_STRIP_TRAILING_WHITESPACE)
+fuzz_fuzzer_no_main(FUZZER_NO_MAIN)
 add_executable(hexhost_repack_bytes tools/repack_bytes.cpp)
-target_link_libraries(hexhost_repack_bytes PRIVATE hexhost_core "${FUZZ_RT_DIR}/libclang_rt.fuzzer_no_main.a")
+target_link_libraries(hexhost_repack_bytes PRIVATE hexhost_core "${FUZZER_NO_MAIN}")
 set_target_properties(hexhost_repack_bytes PROPERTIES ENABLE_EXPORTS ON)
 
 # The dirty range tracker of the DSP (htp/htp-tensor.c) runs on x86 with the

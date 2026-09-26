@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.22)
 project(qwenmobile-app-fuzz LANGUAGES C CXX)
 
+# The shared flag functions of the areas (the tables of the sanitizers and of the profiles).
+include("${CMAKE_CURRENT_LIST_DIR}/../../sanitizers/fuzz-common.cmake")
+
 # The fuzzers of the native layer of the app: the JNI entry points of
 # android/app/src/main/cpp/llama_jni.cpp with a fake Java VM, the two engine
 # caches, and the draft length policy. tests/fuzz/app/run.sh configures this
@@ -27,8 +30,6 @@ set(FUZZ_SANITIZER "asan" CACHE STRING "none, asan, ubsan, tsan, msan, or hwasan
 if(NOT FUZZ_PROFILE MATCHES "^(debug|release)$")
     message(FATAL_ERROR "FUZZ_PROFILE must be debug or release, not '${FUZZ_PROFILE}'")
 endif()
-set(FUZZ_MSAN_PREFIX "${CMAKE_CURRENT_SOURCE_DIR}/../../../build/fuzz/msan-libcxx/install" CACHE PATH
-    "The install directory of an MSan-instrumented libc++")
 option(FUZZ_LIBFUZZER "Link the fuzzers with libFuzzer" ON)
 set(LLAMA_CPP_DIR "" CACHE PATH "The llama.cpp tree")
 set(FUZZ_APP_MODEL_DIR "" CACHE PATH "The default directory of the tiny models")
@@ -47,45 +48,21 @@ get_filename_component(APP_CPP_DIR "${FUZZ_APP_CPP_DIR}" ABSOLUTE)
 # allocation, and MemorySanitizer each store.
 set(SAN_COMPILE "")
 set(SAN_LINK "")
+set(SAN_CXX "")
 if(CMAKE_CXX_FLAGS MATCHES "-fsanitize=")
     # The shared initial cache (cmake -C tests/sanitizers/<value>.cmake,
     # which run.sh gives on the host) holds the flags of the configuration.
     message(STATUS "app fuzz: the sanitizer flags come from the initial cache: ${CMAKE_CXX_FLAGS}")
-elseif(FUZZ_SANITIZER STREQUAL "asan")
-    set(SAN_COMPILE -fsanitize=address)
-elseif(FUZZ_SANITIZER STREQUAL "ubsan")
-    # The flags of tests/sanitizers/ubsan.cmake, for the builds without that
-    # initial cache (the phone): every report stops the run.
-    set(SAN_COMPILE -fsanitize=undefined -fno-sanitize-recover=undefined)
-    if(ANDROID)
-        # The shared UBSan runtime of the NDK holds a private copy of the
-        # libc++abi type-info classes, and each executable holds the copy of
-        # the static NDK libc++. The vptr check walks the class hierarchy with
-        # a dynamic_cast to the copy of the runtime, which fails for the
-        # type_info objects of the executable. Thus each check of a derived
-        # class gave a false report (for example the __func of a std::function
-        # for its __base). The static runtime uses the one copy of the
-        # executable, and vptr stays on without a recovery.
-        set(SAN_LINK -static-libsan)
-    endif()
-elseif(FUZZ_SANITIZER STREQUAL "tsan")
-    set(SAN_COMPILE -fsanitize=thread)
-elseif(FUZZ_SANITIZER STREQUAL "msan")
-    if(NOT EXISTS "${FUZZ_MSAN_PREFIX}/include/c++/v1/vector")
-        message(FATAL_ERROR "msan needs an MSan-instrumented libc++ in FUZZ_MSAN_PREFIX='${FUZZ_MSAN_PREFIX}' "
-                            "(include/c++/v1 and lib). tests/sanitizers/build-msan-libcxx.sh builds it into "
-                            "build/fuzz/msan-libcxx/install, and that directory does not exist.")
-    endif()
-    set(SAN_COMPILE -fsanitize=memory -fsanitize-memory-track-origins=2 -stdlib=libc++ -nostdinc++
-                    -isystem ${FUZZ_MSAN_PREFIX}/include/c++/v1)
-    set(SAN_LINK -stdlib=libc++ -L${FUZZ_MSAN_PREFIX}/lib -Wl,-rpath,${FUZZ_MSAN_PREFIX}/lib -lc++ -lc++abi)
-elseif(FUZZ_SANITIZER STREQUAL "hwasan")
-    if(NOT ANDROID)
+else()
+    # The builds of the phone get no initial cache: the shared function of
+    # tests/sanitizers/fuzz-common.cmake gives the flags of the configuration.
+    if(NOT ANDROID AND FUZZ_SANITIZER STREQUAL "hwasan")
         message(FATAL_ERROR "hwasan is for the Android builds only")
     endif()
-    set(SAN_COMPILE -fsanitize=hwaddress)
-elseif(NOT FUZZ_SANITIZER STREQUAL "none")
-    message(FATAL_ERROR "FUZZ_SANITIZER must be none, asan, ubsan, tsan, msan or hwasan, not '${FUZZ_SANITIZER}'")
+    fuzz_sanitizer_flags("${FUZZ_SANITIZER}" san_compile san_link san_cxx)
+    separate_arguments(SAN_COMPILE UNIX_COMMAND "${san_compile}")
+    separate_arguments(SAN_LINK UNIX_COMMAND "${san_link}")
+    separate_arguments(SAN_CXX UNIX_COMMAND "${san_cxx}")
 endif()
 # The coverage of libFuzzer goes to the app, llama, common and mtmd. The
 # kernels of ggml get none: their loops add cost and no useful coverage.
@@ -98,8 +75,8 @@ if(FUZZ_LIBFUZZER)
         list(APPEND COV_FLAGS -fno-sanitize-coverage=stack-depth)
     endif()
 endif()
-add_compile_options(${SAN_COMPILE})
-add_link_options(${SAN_COMPILE} ${SAN_LINK})
+add_compile_options(${SAN_COMPILE} "$<$<COMPILE_LANGUAGE:CXX>:${SAN_CXX}>")
+add_link_options(${SAN_LINK})
 
 # The flags of the llama.cpp libraries that the app ships
 # (android/snapdragon/CMakeUserPresets.json, preset arm64-android-snapdragon):
@@ -111,10 +88,6 @@ add_link_options(${SAN_COMPILE} ${SAN_LINK})
 # NDK gives: -O3 -DNDEBUG, no -flto, no floating-point flags. The fuzz builds
 # apply the flags of the profile to every target, as the shared initial caches
 # on x86 do, thus the app sources here get them too.
-set(LLAMA_FP_FLAGS -fvectorize -ffp-model=fast -fno-finite-math-only -D_GNU_SOURCE)
-if(ANDROID)
-    list(APPEND LLAMA_FP_FLAGS -march=armv8.7a+fp16+dotprod+i8mm)
-endif()
 if(DEFINED SANMATRIX_PROFILE)
     # The x86 builds of run.sh take the shared initial caches
     # (tests/sanitizers/profile-<profile>.cmake, then <sanitizer>.cmake). They
@@ -124,22 +97,22 @@ if(DEFINED SANMATRIX_PROFILE)
     if(NOT SANMATRIX_PROFILE STREQUAL FUZZ_PROFILE)
         message(FATAL_ERROR "the initial cache is for the profile ${SANMATRIX_PROFILE}, FUZZ_PROFILE is ${FUZZ_PROFILE}")
     endif()
-    set(LLAMA_FP_FLAGS "")
     message(STATUS "app fuzz: profile ${FUZZ_PROFILE} from the initial cache: ${CMAKE_CXX_FLAGS}")
-elseif(FUZZ_PROFILE STREQUAL "release")
-    set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
-    set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "" FORCE)
-    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "" FORCE)
-    add_compile_options(-g)
-    list(APPEND LLAMA_FP_FLAGS -flto)
-    add_compile_options(${LLAMA_FP_FLAGS})
-    # clang LTO needs a linker that reads its bitcode.
-    add_link_options(-flto -fuse-ld=lld)
 else()
-    set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "" FORCE)
-    set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O1 -g" CACHE STRING "" FORCE)
-    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O1 -g" CACHE STRING "" FORCE)
-    add_compile_options(-g -O1 -fno-omit-frame-pointer ${LLAMA_FP_FLAGS})
+    # The builds of the phone get no initial cache: the shared functions of
+    # tests/sanitizers/fuzz-common.cmake give the flags of the profile, and the
+    # -march of the shipped build goes with them.
+    fuzz_profile_build_type("${FUZZ_PROFILE}")
+    fuzz_profile_flags("${FUZZ_PROFILE}" profile_flags profile_link)
+    fuzz_profile_cxx_flags("${FUZZ_PROFILE}" "${FUZZ_SANITIZER}" profile_cxx)
+    separate_arguments(PROFILE_FLAGS UNIX_COMMAND "${profile_flags}")
+    separate_arguments(PROFILE_LINK UNIX_COMMAND "${profile_link}")
+    separate_arguments(PROFILE_CXX UNIX_COMMAND "${profile_cxx}")
+    if(ANDROID)
+        list(APPEND PROFILE_FLAGS -march=armv8.7a+fp16+dotprod+i8mm)
+    endif()
+    add_compile_options(${PROFILE_FLAGS} "$<$<COMPILE_LANGUAGE:CXX>:${PROFILE_CXX}>")
+    add_link_options(${PROFILE_LINK})
 endif()
 
 # llama.cpp with the CPU backend always, and the Hexagon backend on Android.
@@ -173,10 +146,7 @@ if(ANDROID)
 endif()
 if(FUZZ_SANITIZER STREQUAL "msan")
     # MemorySanitizer does not know the x86 intrinsics of the kernels: the scalar paths only.
-    set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
-    foreach(opt SSE42 AVX AVX_VNNI AVX2 BMI2 AVX512 AVX512_VBMI AVX512_VNNI AVX512_BF16 FMA F16C AMX_TILE AMX_INT8 AMX_BF16)
-        set(GGML_${opt} OFF CACHE BOOL "" FORCE)
-    endforeach()
+    fuzz_scalar_x86()
 endif()
 set(FUZZ_LLAMA_PREBUILT_DIR "" CACHE PATH
     "The llama.cpp libraries that ship (android/snapdragon/jniLibs/arm64-v8a), for the release none build of the phone")
@@ -246,8 +216,8 @@ add_library(app_harness STATIC
     "${APP_CPP_DIR}/spec_policy.cpp"
     "${APP_CPP_DIR}/token_rows.cpp"
     "${APP_CPP_DIR}/trace.cpp")
-# tests/sanitizers holds fuzz_death.h, the shared TSan death callback of each libFuzzer target.
-set(FUZZ_SHARED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../sanitizers")
+# FUZZ_SHARED_DIR (tests/sanitizers) holds fuzz_death.h, the shared TSan death callback of each
+# libFuzzer target.
 target_include_directories(app_harness PUBLIC
     harness
     "${FUZZ_SHARED_DIR}"
@@ -289,28 +259,8 @@ target_link_libraries(app_fuzz_driver PRIVATE app_harness)
 if(FUZZ_LIBFUZZER)
     # The driver has its own main, but its objects call the coverage callbacks.
     # A sanitizer runtime defines them, and in the "none" configuration only the
-    # libFuzzer runtime without main does. The name of the file depends on the
-    # layout of the runtime directory of clang.
-    if(ANDROID)
-        set(_rt_arch aarch64-android)
-    else()
-        set(_rt_arch ${CMAKE_SYSTEM_PROCESSOR})
-    endif()
-    set(FUZZER_NO_MAIN "")
-    set(_target_flag "")
-    if(CMAKE_CXX_COMPILER_TARGET)
-        set(_target_flag --target=${CMAKE_CXX_COMPILER_TARGET})
-    endif()
-    foreach(name libclang_rt.fuzzer_no_main.a libclang_rt.fuzzer_no_main-${_rt_arch}.a)
-        execute_process(COMMAND ${CMAKE_CXX_COMPILER} ${_target_flag} --print-file-name=${name}
-                        OUTPUT_VARIABLE path OUTPUT_STRIP_TRAILING_WHITESPACE)
-        if(NOT FUZZER_NO_MAIN AND IS_ABSOLUTE "${path}" AND EXISTS "${path}")
-            set(FUZZER_NO_MAIN "${path}")
-        endif()
-    endforeach()
-    if(NOT FUZZER_NO_MAIN)
-        message(FATAL_ERROR "no libclang_rt.fuzzer_no_main of ${CMAKE_CXX_COMPILER}: the driver cannot link")
-    endif()
+    # libFuzzer runtime without main does.
+    fuzz_fuzzer_no_main(FUZZER_NO_MAIN)
     target_link_libraries(app_fuzz_driver PRIVATE "${FUZZER_NO_MAIN}")
 endif()
 
