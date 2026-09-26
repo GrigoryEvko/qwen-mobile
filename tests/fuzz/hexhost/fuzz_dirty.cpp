@@ -127,7 +127,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
     const uint32_t ARENA = 0x40000000u;
     const uint32_t SPAN  = 24u << 20;
 
-    std::vector<htp_tensor> pool(32);
+    // More tensors than the tracker has ranges: a new output with each range in use makes the tracker
+    // evict ranges (htp_tensor_dirty_all). With as many tensors as ranges that path cannot occur.
+    // tools/make_dirty_seeds.py writes the seeds of this input format.
+    std::vector<htp_tensor> pool(HTP_MAX_DIRTY_RANGES + 8);
     for (auto & t : pool) {
         memset(&t, 0, sizeof(t));
         const bool big = fdp.ConsumeIntegralInRange<int>(0, 7) == 0;
