@@ -1,8 +1,6 @@
 Hexagon HTP: the chunked gated delta rule on the HMX for a batch of tokens
 
-Base: llama.cpp commit c6824a9 with patches/series applied in order, thru sampler/0001.
-
-This patch is the last entry of patches/series, after sampler/0001.
+Base: llama.cpp commit c6824a9 with the entries of patches/series before this one applied in order.
 
 Files:
     ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c         new: the chunked kernel
@@ -14,13 +12,13 @@ Files:
 The host half of the switch GGML_HEXAGON_GDN_CHUNK is already in the series: patch
 hexagon-host/0001 carries the option, the environment variable, and the line of graph_compute that
 gives the value to the DSP in kernel_params[0] of each GATED_DELTA_NET op. Thus this patch changes
-no host file. On a DSP library without this patch that kernel param is unread, which is why the
-series works today.
+no host file. On a DSP library without this patch that kernel param is unread, thus the host half
+alone changes nothing.
 
 Push to the phone: libggml-htp-v79.so (ggml/src/ggml-hexagon/) and test-backend-ops (bin/). The
 host library does not change.
 
-This patch does not depend on the op fusion of patches 0002 thru 0004, and the switch
+This patch does not depend on the op fusion of patches hexagon-gdn/0001 and 0002, and the switch
 GGML_HEXAGON_OPFUSION_STATE does not reach it. The kernel is inside the plain GATED_DELTA_NET op,
 which the backend runs for every batch of tokens. Its own switch is GGML_HEXAGON_GDN_CHUNK.
 
@@ -60,7 +58,7 @@ comes from qurt_hvx_get_units and the thread count of the core), and hex_pause i
 which holds the hardware thread. When every worker waits for the HMX queue thread, every hardware
 taken, the queue thread never runs, and the jobs never finish. The matmul kernel and the flash
 attention kernel of this backend never do that: the op thread alone pushes and pops the HMX queue,
-and it gives the HVX work between two jobs to the workers. This kernel now follows that pattern.
+and it gives the HVX work between two jobs to the workers. This kernel follows that pattern.
 
 A group of rows runs together, and the group is as large as VTCM holds (24 rows at most, 16 rows of
 the 2B in one group at 440 KB a row). Each row of the group keeps its buffers over the whole chunk
@@ -78,8 +76,8 @@ descriptor up to it, the signal included. The queue thread works in order, thus 
 hmx_queue_pop of the library does the same thing with a loop, and without a bound on the wait.
 
 Every wait of the op thread has a bound of 2000000000 cycles, about two seconds. When it fires, the
-op returns INTERNAL-ERROR with a detail code, and the host prints the op and the code (patch 0004
-carries that report):
+op returns INTERNAL-ERROR with a detail code, and the host prints the op and the code (patch
+hexagon-gdn/0002 carries that report):
 
     21  the HMX queue took no job
     22  an HMX job did not finish inside the bound
@@ -156,7 +154,8 @@ The HMX work is 1.5 GFLOP per layer of the 2B at 512 tokens, about 0.25 ms at th
 matmuls of this backend reach. The HVX work is about 0.3 ms per layer over the worker threads, and
 the DMA of q, k and v is 12 MB per layer, which is the same traffic that the sequential kernel reads.
 The phases serialize the HVX work and the HMX work of a group, thus the expectation is 0.5 to 1.5 ms
-per op against 6.5 ms, and 30 to 60 ms of the 235 ms that the 36 ops of one pp512 batch take today.
+per op against 6.5 ms, and 30 to 60 ms of the 235 ms that the 36 ops of one pp512 batch take with
+the sequential kernel.
 
 diff --git a/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c b/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c
 new file mode 100644
