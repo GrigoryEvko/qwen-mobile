@@ -77,7 +77,24 @@ def pgrep(*tools: str) -> str:
     return f"{ADB} shell '" + "; ".join(f"pgrep -x {t}" for t in tools) + "; echo pgrep-done'"
 
 
-def lib_env(stage: str, sub: str = "lib") -> str:
-    """The library search path of the host and of the DSP for one directory of the phone stage."""
-    return f"LD_LIBRARY_PATH={stage}/{sub} ADSP_LIBRARY_PATH={stage}/{sub}"
+def lib_env(stage: str, host: str = "lib", dsp: str | None = None) -> str:
+    """The library search paths of one run: LD_LIBRARY_PATH for the host and ADSP_LIBRARY_PATH for the DSP.
+
+    Args:
+        stage: The phone directory of the stage
+        host: The directories of the host libraries below the stage, in the order of the search and with ":"
+            between them. An empty text gives no LD_LIBRARY_PATH, for a program that loads no library of the
+            stage on the host
+        dsp: The directory of the DSP libraries below the stage. None gives the first directory of host
+
+    Raises:
+        ValueError: If host is empty and dsp is None
+    """
+    dirs = host.split(":") if host else []
+    if dsp is None:
+        if not dirs:
+            raise ValueError("lib_env: give the DSP directory, because host gives no directory")
+        dsp = dirs[0]
+    ld = [f"LD_LIBRARY_PATH={':'.join(f'{stage}/{d}' for d in dirs)}"] if dirs else []
+    return " ".join(ld + [f"ADSP_LIBRARY_PATH={stage}/{dsp}"])
 

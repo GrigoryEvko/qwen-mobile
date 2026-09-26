@@ -287,7 +287,7 @@ def run_lines(stage: Stage, set_key: str, vk: str, rnd: int) -> list[str]:
     name = run_name(set_key, vk, rnd)
     stem = f"{PHONE}/out/{name}"
     sdir = f"{PHONE}/{stage.sets[set_key]}"
-    libs = f"{sdir}/lib"
+    host = f"{stage.sets[set_key]}/lib"
     gate_kb = GATE_KB
     prefix = ""
     if v.tool == "vit":
@@ -306,10 +306,10 @@ def run_lines(stage: Stage, set_key: str, vk: str, rnd: int) -> list[str]:
     else:
         # llama-bench of the tools set, with the libraries of this set first in the search path
         tdir = f"{PHONE}/{stage.sets[stage.tools_set]}"
-        libs = f"{sdir}/lib:{tdir}/lib"
+        host += f":{stage.sets[stage.tools_set]}/lib"
         gate_kb = BENCH_GATE_KB
         tool = f"{tdir}/bin/llama-bench -m {MODEL_DIR}/{MODEL} {BENCH_ARGS}"
-    env = " ".join(x for x in (f"LD_LIBRARY_PATH={libs} ADSP_LIBRARY_PATH={sdir}/lib", APP_ENV, v.env) if x)
+    env = " ".join(x for x in (device.lib_env(PHONE, host), APP_ENV, v.env) if x)
     # The projector is in the model directory of the stages, or in the model directory of the app
     find_mmproj = (f"P={MODEL_DIR}/{MMPROJ}; [ -f $P ] || P=/sdcard/qwen/models/{MMPROJ}; "
                    f"echo \"mmproj: $P\" >> {stem}-gate.txt; ")

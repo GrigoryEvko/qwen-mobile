@@ -105,12 +105,6 @@ CHECK = Layout("/data/local/tmp/qwen/gemvchk", "build/gemv-check", ("gate.sh", "
 HERE = FULL.here
 
 
-def host_lib_env(lay: Layout) -> str:
-    """The host library path of the stage and the environment of the app (init_impl in llama_jni.cpp).
-    ADSP_LIBRARY_PATH comes from the variant."""
-    return f"LD_LIBRARY_PATH={lay.phone}/lib {device.APP_ENV}"
-
-
 # The flags of the variant b of bench-kv (the app): flash attention on HTP0, a Q8_0 K and V cache.
 BENCH_ARGS = f"-m {MODEL_DIR}/{MODEL} -dev HTP0 -ngl 99 -t 4 -fa on -b 1024 -ub 1024 -o jsonl -ctk q8_0 -ctv q8_0"
 TOOLS = ("llama-bench", "gemvcheck", "test-backend-op")
@@ -244,7 +238,9 @@ def run_lines(run: Run, lay: Layout) -> list[str]:
     the screen wake, the memory gate and the CAPS line of a model run."""
     p = lay.phone
     stem = f"{p}/out/{run.name}"
-    env = " ".join(x for x in (host_lib_env(lay), f"ADSP_LIBRARY_PATH={p}/dsp/{run.variant}", run.env) if x)
+    # The host libraries of lib, the DSP library of the variant, and the environment of the app (init_impl in
+    # llama_jni.cpp)
+    env = " ".join(x for x in (device.lib_env(p, "lib", f"dsp/{run.variant}"), device.APP_ENV, run.env) if x)
     cmd = commands.gated_run(stem, run.gate_kb, run.limit, env, f"{p}/bin/{run.tool} {run.args}", stage=p, model=MODEL)
     return commands.run_lines(f"# {run.name}: {run.text}, DSP {run.variant} (limit {run.limit} s)", cmd, PGREP)
 

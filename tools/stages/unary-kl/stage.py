@@ -126,10 +126,9 @@ def runs() -> list[tuple[Block, int, Variant]]:
 def run_lines(b: Block, rnd: int, v: Variant) -> list[str]:
     """The lines of one run: a title, the thermal line, the run and the pgrep line."""
     name = f"{b.key}-{rnd}-{v.key}"
-    lib = f"{PHONE}/{v.lib}"
-    ld = lib if v.lib == "lib-base" else f"{lib}:{PHONE}/lib-base"
+    host = v.lib if v.lib == "lib-base" else f"{v.lib}:lib-base"
     # The row change does not change the DSP code, thus each run loads the DSP library of lib-base
-    env = " ".join(x for x in (f"LD_LIBRARY_PATH={ld} ADSP_LIBRARY_PATH={PHONE}/lib-base", APP_ENV, v.env) if x)
+    env = " ".join(x for x in (device.lib_env(PHONE, host, "lib-base"), APP_ENV, v.env) if x)
     cmd = commands.gated_run(f"{PHONE}/out/{name}", MODEL_KB, b.limit, env,
                              f"{PHONE}/bin/{b.tool} {b.args}", stage=PHONE)
     model = "Qwen3.5-2B-Q8_0" if MODEL_2B in b.args else "Qwen3.5-4B-Q8_0"

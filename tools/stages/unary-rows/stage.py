@@ -66,10 +66,9 @@ def run_lines(b: q.Block, rnd: int, v: q.Variant) -> list[str]:
     name = f"{b.key}-{rnd}-{v.key}"
     stem = f"{q.PHONE}/out/{name}"
     # lib-new holds only the libraries that differ (the Hexagon backend)
-    lib = f"{q.PHONE}/{v.lib}"
-    ld = lib if v.lib == "lib-base" else f"{lib}:{q.PHONE}/lib-base"
+    host = v.lib if v.lib == "lib-base" else f"{v.lib}:lib-base"
     # The row change does not change the DSP code, thus each run loads the DSP library of lib-base
-    env = " ".join(x for x in (f"LD_LIBRARY_PATH={ld} ADSP_LIBRARY_PATH={q.PHONE}/lib-base", q.APP_ENV, v.env, b.env) if x)
+    env = " ".join(x for x in (device.lib_env(q.PHONE, host, "lib-base"), q.APP_ENV, v.env, b.env) if x)
     pre = ""
     if b.tool == "memprobe":
         tool = f"{q.PHONE}/bin/memprobe -m {q.MODEL} {q.PROBE_ARGS} {b.args}"

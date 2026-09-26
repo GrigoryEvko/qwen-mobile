@@ -53,8 +53,8 @@ fixed = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(fixed)
 
 ADB = device.ADB
-# The stage of the run. The end of this file sets PATHS, PHONE, LAPTOP_STAGE, BOX, STAGE_DIR, LIBS, RUNS, HEADER
-# and TABLE for it, and select_stage sets them again for --stage.
+# The stage of the run. The end of this file sets PATHS, PHONE, LAPTOP_STAGE, BOX, STAGE_DIR, RUNS, HEADER and
+# TABLE for it, and select_stage sets them again for --stage.
 STAGE = "spf"
 MODEL_DIR = device.MODEL_DIR
 EVAL = device.EVAL_DIR
@@ -94,10 +94,11 @@ def cool_line(limit: int) -> str:
 
 @dataclass(frozen=True)
 class Lib:
-    """One library set: its key, its directories, and its text."""
+    """One library set: its key, the directories of its host libraries and of its DSP library below the stage
+    (the arguments of device.lib_env), and its text."""
     key: str
-    ld: str
-    adsp: str
+    host: str
+    dsp: str
     text: str
 
 
@@ -283,7 +284,7 @@ def run_lines(run: Run) -> list[str]:
     """The lines of one run: a title, the thermal line, the run and the pgrep line."""
     lib = LIBS[run.lib]
     stem = f"{PHONE}/out/{run.name}"
-    env = " ".join(x for x in (f"LD_LIBRARY_PATH={lib.ld} ADSP_LIBRARY_PATH={lib.adsp}", RUN_ENV, run.env) if x)
+    env = " ".join(x for x in (device.lib_env(PHONE, lib.host, lib.dsp), RUN_ENV, run.env) if x)
     # The phone waits for the NPU temperature after the gate and before the line of the conditions
     before = f"{cool_line(run.cool)} >> {stem}-gate.txt && {device.BEFORE}" if run.cool else device.BEFORE
     cmd = commands.gated_run(stem, run.gate_kb, run.limit, env, f"{PHONE}/bin/{run.tool} {run.args}",
@@ -1034,23 +1035,21 @@ STAGES = {
 }
 
 
-def stage_libs(phone: str) -> dict[str, Lib]:
-    """The library sets of a stage directory on the phone: HEAD, HEAD plus the candidates, and HEAD plus 0001."""
-    return {
-        "b": Lib("b", f"{phone}/lib-base", f"{phone}/lib-base", "HEAD"),
-        "n": Lib("n", f"{phone}/lib-new:{phone}/lib-base", f"{phone}/lib-new", "HEAD plus the candidates"),
-        "g": Lib("g", f"{phone}/lib-g:{phone}/lib-base", f"{phone}/lib-g", "HEAD plus 0001"),
-    }
+# The library sets of each stage: HEAD, HEAD plus the candidates, and HEAD plus 0001
+LIBS = {
+    "b": Lib("b", "lib-base", "lib-base", "HEAD"),
+    "n": Lib("n", "lib-new:lib-base", "lib-new", "HEAD plus the candidates"),
+    "g": Lib("g", "lib-g:lib-base", "lib-g", "HEAD plus 0001"),
+}
 
 
 def select_stage(name: str) -> None:
-    """Set the values of the stage name: the phone directory, the laptop and box directories, the library sets, the
-    runs, the header and the tables."""
-    global STAGE, PATHS, PHONE, LAPTOP_STAGE, BOX, STAGE_DIR, LIBS, RUNS, HEADER, TABLE
+    """Set the values of the stage name: the phone directory, the laptop and box directories, the runs, the header
+    and the tables."""
+    global STAGE, PATHS, PHONE, LAPTOP_STAGE, BOX, STAGE_DIR, RUNS, HEADER, TABLE
     STAGE = name
     PATHS = device.stage_paths(name, __file__)
     PHONE, LAPTOP_STAGE, BOX, STAGE_DIR = PATHS
-    LIBS = stage_libs(PHONE)
     RUNS, HEADER, TABLE = STAGES[name].runs, STAGES[name].header, STAGES[name].table
 
 
@@ -1059,7 +1058,6 @@ def select_stage(name: str) -> None:
 # select_stage for the stage of --stage.
 PATHS = device.stage_paths(STAGE, __file__)
 PHONE, LAPTOP_STAGE, BOX, STAGE_DIR = PATHS
-LIBS = stage_libs(PHONE)
 RUNS, HEADER, TABLE = STAGES[STAGE].runs, STAGES[STAGE].header, STAGES[STAGE].table
 
 

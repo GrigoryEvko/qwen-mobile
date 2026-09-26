@@ -94,9 +94,9 @@ class Run:
 
 
 def lib_env(t: Target, dsp: str = "lib") -> str:
-    """The environment of the app (init_impl in llama_jni.cpp) and the stage libraries. The host loads the
-    libraries of lib, and the DSP loads those of `dsp`, thus device.lib_env does not give this text."""
-    return f"LD_LIBRARY_PATH={t.phone}/lib ADSP_LIBRARY_PATH={t.phone}/{dsp} {device.APP_ENV}"
+    """The stage libraries and the environment of the app (init_impl in llama_jni.cpp). The host loads the
+    libraries of lib, and the DSP loads those of `dsp`."""
+    return f"{device.lib_env(t.phone, 'lib', dsp)} {device.APP_ENV}"
 
 
 def mini_runs() -> list[Run]:
@@ -209,7 +209,7 @@ def setup_lines(t: Target, kit: bool) -> list[str]:
 
 def kit_probe_lines(t: Target) -> list[str]:
     """The ISA probe on the v81 phone: the chip facts, then the census of each HVX op with the ARM CPU oracle."""
-    env = f"ADSP_LIBRARY_PATH={t.phone}/isaprobe/v81 LD_LIBRARY_PATH={t.phone}/isaprobe/v81"
+    env = device.lib_env(t.phone, "isaprobe/v81")
     return [
         "#",
         "# ---- The chip: the SoC, the build, then the ISA probe (the DSP version, the HVX and HMX units, the VTCM) ----",

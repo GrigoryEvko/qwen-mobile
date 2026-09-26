@@ -64,7 +64,7 @@ MODEL_DIR = device.MODEL_DIR
 MODEL = device.MODEL_4B
 # The environment of the app (init_impl in llama_jni.cpp) and the stage libraries.
 LIB_ENV = f"{device.lib_env(PHONE)} {device.APP_ENV}"
-DDRBW_ENV = f"ADSP_LIBRARY_PATH={PHONE}/lib"
+DDRBW_ENV = device.lib_env(PHONE, "", "lib")
 LIBS = ("libddrbw_skel.so", "libggml-base.so", "libggml-cpu.so", "libggml-hexagon.so", "libggml-htp-v79.so",
         "libggml-opencl.so", "libggml.so", "libllama-bench-impl.so", "libllama-common.so", "libllama.so",
         "libmtmd.so")

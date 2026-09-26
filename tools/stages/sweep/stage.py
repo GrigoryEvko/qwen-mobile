@@ -672,7 +672,7 @@ def run_lines(r: Run) -> list[str]:
     # Each tool part is one group: a gate that fails skips all of it, and $? after it is the exit code of
     # the tool (or of the gate).
     if r.program:
-        cmd = commands.timeout_cmd(limit_s(r), f"ADSP_LIBRARY_PATH={PHONE}/hmx",
+        cmd = commands.timeout_cmd(limit_s(r), device.lib_env(PHONE, "", "hmx"),
                                    f"./run_main_on_hexagon 3 {r.program} --out {stem}.txt")
         tool = f"{{ cd {PHONE}/hmx && {commands.redirect(stem, cmd)}; }}; "
         # The lines of a DSP program also go to the log of the DSP daemon: they are the fallback when the

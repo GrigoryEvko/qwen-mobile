@@ -122,9 +122,8 @@ def run_lines(b: Block, rnd: int, v: Variant) -> list[str]:
     """The lines of one run: a title, the thermal line, the run and the pgrep line."""
     name = f"{b.key}-{rnd}-{v.key}"
     # lib-new holds only the two libraries that differ (the Hexagon backend and the DSP library)
-    lib = f"{PHONE}/{v.lib}"
-    ld = lib if v.lib == "lib-base" else f"{lib}:{PHONE}/lib-base"
-    env = " ".join(x for x in (f"LD_LIBRARY_PATH={ld} ADSP_LIBRARY_PATH={lib}", APP_ENV, v.env, b.env) if x)
+    host = v.lib if v.lib == "lib-base" else f"{v.lib}:lib-base"
+    env = " ".join(x for x in (device.lib_env(PHONE, host), APP_ENV, v.env, b.env) if x)
     if b.tool == "test-backend-ops":
         tool = f"{PHONE}/bin/test-backend-ops {b.args}"
         title = f"# KERNEL: {name}, {b.text}, {v.key.upper()}: {v.text}"

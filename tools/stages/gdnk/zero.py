@@ -157,10 +157,10 @@ class Stage:
         """The environment of one variant."""
         p = self.phone
         return {
-            "A": f"LD_LIBRARY_PATH={p}/a/lib:{p}/lib ADSP_LIBRARY_PATH={p}/a/lib {FUSION}",
-            "B": f"LD_LIBRARY_PATH={p}/lib ADSP_LIBRARY_PATH={p}/lib {FUSION}",
-            "C": f"LD_LIBRARY_PATH={p}/lib ADSP_LIBRARY_PATH={p}/lib {FUSION} GGML_HEXAGON_GDN_QKNORM=0",
-            "P": f"LD_LIBRARY_PATH={p}/p/lib:{p}/lib ADSP_LIBRARY_PATH={p}/p/lib {FUSION}",
+            "A": f"{device.lib_env(p, 'a/lib:lib')} {FUSION}",
+            "B": f"{device.lib_env(p)} {FUSION}",
+            "C": f"{device.lib_env(p)} {FUSION} GGML_HEXAGON_GDN_QKNORM=0",
+            "P": f"{device.lib_env(p, 'p/lib:lib')} {FUSION}",
         }[variant]
 
 
