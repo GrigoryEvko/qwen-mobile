@@ -1,0 +1,115 @@
+hexagon: htp: keep the range of each output when the dirty tracker evicts
+
+Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
+Upstream: a candidate. The defect is in the code of the llama.cpp commit.
+
+The defect
+
+htp_tensor_dirty_all (htp/htp-tensor.c) puts the outputs of an op into the
+dirty range tracker before the op writes them. An output that touches a
+range joins that range. An output that touches no range needs a free
+range. When each range is in use, the call evicts ranges: it flushes them
+and gives them to the new outputs.
+
+The eviction takes the first ranges in use, and one of them can be the
+range that a different output of the same op joined. The flush of the
+whole data cache (evicted bytes above HEX_L2_FLUSH_ALL_THRESHOLD) clears
+each range. Then it gives a range only to the outputs that touched no
+range. In the two conditions, the op writes bytes that no range holds.
+
+No flush before the end of the batch writes these bytes to DDR. Thus the
+DMA of a later op of the batch can read stale DDR, and a fence can signal
+a peer before the bytes are in DDR. The defect needs an op with two
+outputs, one that touches a range and one that touches no range, while
+each of the 32 ranges is in use.
+
+The change
+
+The eviction does not take a range that holds an output of the op. An op
+has a maximum of 4 outputs and the tracker has 32 ranges, thus sufficient
+victims stay. The flush of the whole cache gives a range to each output of
+the op. The paths without an eviction do not change.
+
+The tests
+
+The hexhost fuzz target fuzz_dirty (tests/fuzz/hexhost) runs htp-tensor.c
+on x86 with a model of the true dirty bytes. Its check dirty-lost found the
+defect, and each of the 26 crash inputs of the fuzz runs had a lost range.
+Two regression inputs give the two conditions:
+
+  tests/fuzz/hexhost/regress/dirty/evict-range-of-own-output.bin
+  tests/fuzz/hexhost/regress/dirty/flush-all-drops-own-output.bin
+
+With the change, the two inputs and the 17 seeds of fuzz_dirty pass. A
+fuzz run of 301 s with the check dirty-lost on (5336302 executions) gives
+no crash input.
+
+The replay of the tracker on the graphs of the app (hexhost_graphs: the
+decode of one token, prefill 512, the MTP draft step of 4 tokens and the
+image turn, on the 2B and the 4B Q8_0) counts no eviction. A batch of these
+graphs has 7 ranges in use at most. Thus the flushes of these graphs do not
+change, and the change costs no decode or prefill time.
+
+diff --git a/ggml/src/ggml-hexagon/htp/htp-tensor.c b/ggml/src/ggml-hexagon/htp/htp-tensor.c
+index 7a90a2b..4c96a18 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-tensor.c
++++ b/ggml/src/ggml-hexagon/htp/htp-tensor.c
+@@ -101,6 +101,18 @@ static void merge_dirty_ranges(struct htp_context * ctx) {
+     }
+ }
+ 
++// Gives true when the range holds bytes of an output of the op (not a weight and not a fence).
++static bool range_holds_output(const struct htp_dirty_range * r, const struct htp_tensor * const * tensors, uint32_t n) {
++    for (uint32_t i = 0; i < n; i++) {
++        const struct htp_tensor * t = tensors[i];
++        if (t && !(t->flags & (HTP_TENSOR_WEIGHT | HTP_TENSOR_FENCE)) && r->start < t->data + t->size &&
++            t->data < r->end) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ void htp_tensor_dirty_all(struct htp_context * ctx, const struct htp_tensor * const * tensors, uint32_t n) {
+     const struct htp_tensor * pending[HTP_OP_MAX_OUTPUTS];
+     uint32_t n_pending = 0;
+@@ -162,6 +174,16 @@ void htp_tensor_dirty_all(struct htp_context * ctx, const struct htp_tensor * co
+         return;
+     }
+ 
++    // A range that holds an output of this op is not a victim: the op writes the output after this
++    // call, thus the range must stay. An op has a maximum of HTP_OP_MAX_OUTPUTS outputs and the
++    // tracker has HTP_MAX_DIRTY_RANGES ranges, thus n_evict victims or more stay.
++    uint32_t n_victims = 0;
++    for (uint32_t j = 0; j < n_active; j++) {
++        if (!range_holds_output(&ctx->dirty_ranges[active_indices[j]], tensors, n)) {
++            active_indices[n_victims++] = active_indices[j];
++        }
++    }
++
+     uint32_t n_evict = n_pending - n_empty;
+     uint32_t total_evict_size = 0;
+     for (uint32_t i = 0; i < n_evict; i++) {
+@@ -171,11 +193,18 @@ void htp_tensor_dirty_all(struct htp_context * ctx, const struct htp_tensor * co
+     }
+ 
+     if (total_evict_size > HEX_L2_FLUSH_ALL_THRESHOLD) {
++        // The flush clears each range, thus each output of the op gets a range again: also an output
++        // that the first loop joined to a range.
+         flush_all_dcache(ctx);
+-        for (uint32_t i = 0; i < n_pending; i++) {
+-            struct htp_dirty_range * r = &ctx->dirty_ranges[i];
+-            r->start = pending[i]->data;
+-            r->end   = pending[i]->data + pending[i]->size;
++        uint32_t k = 0;
++        for (uint32_t i = 0; i < n; i++) {
++            const struct htp_tensor * t = tensors[i];
++            if (!t || (t->flags & (HTP_TENSOR_WEIGHT | HTP_TENSOR_FENCE))) {
++                continue;
++            }
++            ctx->dirty_ranges[k].start = t->data;
++            ctx->dirty_ranges[k].end   = t->data + t->size;
++            k++;
+         }
+         merge_dirty_ranges(ctx);
+         return;

@@ -204,3 +204,4 @@ hexagon-gdn/0015-hexagon-fuse-the-conv-chain-of-the-verify-batch-of-a-draft-into
 hexagon-fa/0003-hexagon-a-flash-attention-kernel-whose-softmax-reads-the-hmx-tiles.patch
 hexagon-fa/0004-hexagon-the-tile-flash-attention-for-the-decode-shapes-in-spans-of-kv-rows.patch
 hexagon-vit/0002-hexagon-fuse-the-layernorm-and-the-attention-input-of-the-vision-encoder.patch
+hexagon-host/0014-hexagon-htp-keep-the-range-of-each-output-when-the-dirty-tracker-evicts.patch

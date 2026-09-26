@@ -43,15 +43,9 @@ SHIPPED_HASHES="$REPO/build/hashes-native.txt"
 # The names of the checks (fake_dsp.cpp: violation) that detect a defect of the backend with no
 # fix in the patch series. In the fuzz mode the harness keeps these conditions off (HEXHOST_IGNORE),
 # thus the fuzzers look for other defects. The test mode does not set them, thus each regression
-# input of such a defect fails. The list is comma-separated, as HEXHOST_IGNORE reads it.
-#   dirty-lost  htp_tensor_dirty_all (htp/htp-tensor.c) drops the range of an output of the op when
-#               the same call evicts ranges for another output: the eviction can pick the range that
-#               the first output touches, and the flush of the whole data cache keeps only the ranges
-#               of the outputs that touched no range. The op then writes bytes that no range holds,
-#               and no flush before the end of the batch writes them to DDR. An op needs two outputs,
-#               one that touches a range and one that does not, with each range of the tracker in use.
-#               regress/dirty holds the two inputs (tools/make_dirty_seeds.py). Found 2026-09-26.
-KNOWN_IDS="dirty-lost"
+# input of such a defect fails. The list is comma-separated, as HEXHOST_IGNORE reads it. The list is
+# empty: the patch series has a fix for each defect that a check of the harness found.
+KNOWN_IDS=""
 
 # The known properties of the NPU in the phone runs. The phone driver compares HTP0 with the CPU
 # backend of the phone, thus each property shows as a difference:
