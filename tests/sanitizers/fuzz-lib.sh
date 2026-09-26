@@ -257,13 +257,48 @@ fuzz_sanitizer_assignments() {
     )
 }
 
+# Print the number of regular files in the directories. A directory that does
+# not exist has none.
+# Arguments: the directories. Complexity: O(the files of the directories).
+fuzz_count_inputs() {
+    local n=0 d
+    for d in "$@"; do
+        [[ -d $d ]] && n=$(( n + $(find "$d" -type f | wc -l) ))
+    done
+    echo "$n"
+}
+
+# The rule of the test mode: a target that runs no input cannot fail, thus it
+# is a finding. Write the message that names the target and each directory
+# that the test mode read to stderr, and print the text of the finding (for the
+# crash files of the result line and for the summary).
+# Arguments: the area, the target, then the directories of its seeds and of its
+# regression inputs.
+fuzz_no_input() {
+    local area=$1 target=$2
+    shift 2
+    echo "run.sh: $area $target: the test mode ran no input, thus it cannot fail. It read: $*. Add a seed or a regression input." >&2
+    echo "no input in $*"
+}
+
 # Append one result line to a results file (rules R3 and R11).
+# A line of the test mode with 0 executions and no finding gets the finding
+# "no input" and the status 1: a target that runs no input cannot fail. The
+# area names its directories with fuzz_no_input, and this rule is the last
+# guard for a caller that did not.
 # Arguments: the results file, the area, the target, the profile, the
 # configuration, the mode, the seconds, the executions, the findings, then the
 # crash files.
+# Return status: 1 for a test line with no input, 0 otherwise.
 fuzz_result_line() {
-    local file=$1 area=$2 target=$3 profile=$4 config=$5 mode=$6 seconds=$7 executions=$8 findings=$9
+    local file=$1 area=$2 target=$3 profile=$4 config=$5 mode=$6 seconds=$7 executions=$8 findings=$9 status=0
     shift 9
+    if [[ $mode == test && $executions == 0 && $findings == 0 ]]; then
+        echo "run.sh: $area $target: the test mode ran no input, thus it cannot fail." >&2
+        findings=1
+        set -- "no input: the test mode ran 0 inputs"
+        status=1
+    fi
     mkdir -p "$(dirname "$file")"
     jq -nc --arg area "$area" --arg target "$target" --arg profile "$profile" --arg sanitizer "$config" \
         --arg mode "$mode" --argjson seconds "$seconds" --argjson executions "$executions" \
@@ -271,6 +306,7 @@ fuzz_result_line() {
         '{area: $area, target: $target, profile: $profile, sanitizer: $sanitizer, mode: $mode,
           seconds: $seconds, executions: $executions, findings: $findings,
           crash_files: $ARGS.positional}' "$@" >> "$file"
+    return $status
 }
 
 # Print the executions of a libFuzzer log: the sum of the last progress count

@@ -348,6 +348,15 @@ test_group() {
             echo "fuzz-ops: test $profile-$config $g: FINDING on $f (log $w/log.txt)" >&2
         fi
     done
+    # A group that runs no input cannot fail, thus it is a finding (fuzz-lib.sh).
+    if (( n == 0 )); then
+        local -a places=("$HERE/corpus/$g")
+        for k in $(group_kinds_of "$g"); do
+            places+=("$HERE/regress/$k")
+        done
+        bad=1
+        fuzz_no_input "$AREA" "$g" "${places[@]}" >> "$failed_list"
+    fi
     echo "$n $bad"
 }
 

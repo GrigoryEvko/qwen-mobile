@@ -107,6 +107,32 @@ PYTHON_TARGETS = [
 NATIVE_TARGETS = [Target("loader-check", "loader"), Target("llama-toy", "llama")]
 
 
+def input_places(t: Target) -> str:
+    """Give the places that the test mode of a target reads, for the message of a target that runs no input."""
+    if t.kind == "atheris":
+        return f"{SEED_DIR / t.seeds} {REGRESS_DIR / t.seeds}"
+    if t.kind == "loader":
+        return " ".join(str(p) for p in (SEED_DIR / "reader", REGRESS_DIR / "reader", REGRESS_DIR / "ggml",
+                                         REGRESS_DIR / "ggml-full", PHONE))
+    if t.kind == "llama":
+        return f"the toy models of qfz_toy.py and {PHONE}"
+    return str(HERE / t.file)
+
+
+def require_input(t: Target, r: Result) -> None:
+    """Make a test result with 0 executions a finding: a target that runs no input cannot fail.
+
+    A skipped target (its build is missing) keeps its note, because run.sh reports it with the code 3.
+    """
+    if r.mode != "test" or r.executions or r.findings or r.note.startswith("skipped"):
+        return
+    places = input_places(t)
+    LOG.error("%s: the test mode ran no input, thus it cannot fail. It read: %s. Add a seed or a test.", t.name, places)
+    r.findings = 1
+    r.crash_files.append(f"no input in {places}")
+    r.note = "the test mode ran no input"
+
+
 @dataclasses.dataclass
 class Result:
     """The result line of one target."""
@@ -255,6 +281,11 @@ class Runner:
                 "-print_final_stats=1"]
         status, text = 0, ""
         if self.mode == "test":
+            # With no input file, libFuzzer runs the empty input, thus its count of executions is not 0.
+            # A test with no seed file ran no input of the target: its result keeps 0 executions.
+            if not any(p.is_file() for d in seeds for p in Path(d).rglob("*")):
+                r.seconds = time.monotonic() - start
+                return r
             status, text, r.executions = self._atheris_process(t, [*args, "-runs=0", *seeds], self.budget + 600)
         else:
             while status == 0:
@@ -434,6 +465,7 @@ class Runner:
             result.findings = 1
             result.crash_files = [self._keep_log(t.name, traceback.format_exc())]
             result.note = f"the target raised {type(exc).__name__}"
+        require_input(t, result)
         with _WRITE_LOCK:
             for path in (self.out / "results.jsonl", self.copy / "results.jsonl"):
                 with path.open("a") as f:

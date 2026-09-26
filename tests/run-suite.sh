@@ -28,8 +28,10 @@
 # Rule R1: each build and each run has one sanitizer, or none.
 #
 # The steps, in this sequence (--list-steps gives the requirements):
-#   rules        tests/sanitizers/check-rules.sh --no-builds. A violation stops
-#                the driver before each other step. After the other steps,
+#   rules        tests/sanitizers/check-rules.sh --no-builds, its self-test
+#                (--noid-self-test) and tests/sanitizers/fuzz-lib-selftest.sh.
+#                A violation or a failed case stops the driver before each
+#                other step. After the other steps,
 #                check-rules.sh runs again with the build directories
 #                (rules-after), thus a stray file in the root of the
 #                repository or a build with the wrong flags fails the run.
@@ -381,8 +383,13 @@ main() {
 
     if want_step rules; then
         local rc=0
-        "$SUITE_REPO_ROOT/tests/sanitizers/check-rules.sh" --no-builds --areas "$AREAS" \
-            > "$MATRIX/logs/$RUN_ID/rules.log" 2>&1 || rc=$?
+        # The rules, then the self-tests of the rule check (the patterns of NOID and the staged
+        # cases of the commit hook) and of the shared shell library of the areas.
+        {
+            "$SUITE_REPO_ROOT/tests/sanitizers/check-rules.sh" --no-builds --areas "$AREAS" || rc=1
+            "$SUITE_REPO_ROOT/tests/sanitizers/check-rules.sh" --noid-self-test || rc=1
+            "$SUITE_REPO_ROOT/tests/sanitizers/fuzz-lib-selftest.sh" || rc=1
+        } > "$MATRIX/logs/$RUN_ID/rules.log" 2>&1
         jq -nc --argjson rc "$rc" --arg log "$MATRIX/logs/$RUN_ID/rules.log" \
             '{kind: "step", suite: "test", step: "rules", profile: "-", sanitizer: "-",
               status: (if $rc == 0 then "pass" else "fail" end), exit_code: $rc, seconds: 0, log: $log}' \

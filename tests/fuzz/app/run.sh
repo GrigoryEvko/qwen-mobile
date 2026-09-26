@@ -336,6 +336,10 @@ test_one() {
         fi
     done
     t1=$(date +%s)
+    # A target that runs no input cannot fail, thus it is a finding (fuzz-lib.sh).
+    if ((n == 0)); then
+        crashes+=("$(fuzz_no_input "$AREA" "$target" "$(seeds_of "$target")" "$HERE/regress/$(binary_of "$target")")")
+    fi
     result "$target" "$san" test $((t1 - t0)) "$n" "${crashes[@]}"
     echo "run.sh: test $PROFILE-$san $target: $n inputs, ${#crashes[@]} findings"
     ((${#crashes[@]} == 0))

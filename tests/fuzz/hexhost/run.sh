@@ -252,6 +252,10 @@ test_one() {
         echo "run.sh: $f gives the code $rc" >> "$log"
         [[ $rc != 0 ]] && failed+=("$f")
     done
+    # A target that runs no input cannot fail, thus it is a finding (fuzz-lib.sh).
+    if (( ${#files[@]} == 0 )); then
+        failed+=("$(fuzz_no_input "$AREA" "$t" "$HERE/corpus/$t" "$HERE/regress/$t")")
+    fi
     fuzz_result_line "$dir/results.jsonl" "$AREA" "$t" "$prof" "$cfg" test "$(( SECONDS - start ))" \
         "${#files[@]}" "${#failed[@]}" "${failed[@]}"
     local names=""

@@ -255,7 +255,7 @@ test_one() {
     rc=0
     env "${all[@]}" GGML_NO_BACKTRACE=1 FUZZ_DATA_DIR="$DATA" FUZZ_ARTIFACT_DIR="$art" timeout -s KILL 600 "$dir/$fz" -runs=0 -rss_limit_mb=4096 \
         -timeout="$tmo" -artifact_prefix="$art/" -max_len="$(max_len "$fz")" "$HERE/seeds/$fz" >> "$log" 2>&1 || rc=$?
-    execs=$(( execs + $(find "$HERE/seeds/$fz" -type f | wc -l) ))
+    execs=$(( execs + $(fuzz_count_inputs "$HERE/seeds/$fz") ))
     if [[ $rc != 0 ]]; then
         findings=$(( findings + 1 ))
         failed+=("$HERE/seeds/$fz")
@@ -328,6 +328,12 @@ test_one() {
         fi
     done
     rm -rf "$tmp" "$art"
+    # A target that runs no input cannot fail, thus it is a finding (fuzz-lib.sh).
+    if (( execs == 0 )); then
+        findings=$(( findings + 1 ))
+        failed+=("$(fuzz_no_input "$AREA" "$fz" "$HERE/seeds/$fz" "$HERE/regress/$fz--*")")
+        notes+=" no-input"
+    fi
     fuzz_result_line "$dir/results.jsonl" "$AREA" "$fz" "$profile" "$san" test "$(( SECONDS - start ))" \
         "$execs" "$findings" "${failed[@]}"
     echo "core-$profile-$san${TREE_TAG:+-$TREE_TAG} $fz: $execs runs, $findings findings |$notes"
