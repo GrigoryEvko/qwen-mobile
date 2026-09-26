@@ -10,7 +10,7 @@ decode steps), skips the first N of them, and prints the median, the 90th percen
 maximum of each time field of the two lines, in microseconds. It only reads the files.
 O(lines) time and memory.
 
-The two lines come from patches/hexagon-host/0001 (the Hexagon session) and patches/hexagon-host/0002
+The two lines come from patches/hexagon-host/0001 (the Hexagon session) and patches/context/0001
 (llama_decode). tools/prof/stallprof.py pairs the same session line with the DSP batches.
 """
 

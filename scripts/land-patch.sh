@@ -5,8 +5,8 @@
 #
 #   PATCH          The patch file to land.
 #   DEST           The name of the patch below patches/, for example
-#                  memory/0007-hexagon-a-switch-for-the-fwht-form-of-the-kv-cache-rotation.patch.
-#                  The directory of DEST is the group of the patch.
+#                  hexagon-fwht/0002-hexagon-SUBJECT-OF-THE-PATCH.patch for the next patch
+#                  of the group hexagon-fwht. The directory of DEST is the group of the patch.
 #   MSG_FILE       The commit message.
 #   PATH           More paths for the same commit, relative to the root of the
 #                  repository, for example a regression input of a fuzz area.

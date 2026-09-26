@@ -112,8 +112,9 @@ reports import it. Read a rate against the roofline of 51 to 56 GB/s: a rate far
 above it means the byte count is wrong, not that the op is fast. `stalls.py` is
 the report half of the `stalls` event set, thus the log needs that set.
 
-Two more readers take the host timers of `patches/hexagon-host/0001` and `0002`,
-which `LLAMA_HOSTPROF=1` turns on:
+Two more readers take the host timers of `patches/hexagon-host/0001` (the Hexagon
+session) and `patches/context/0001` (`llama_decode`), which `LLAMA_HOSTPROF=1`
+turns on:
 
 ```
 tools/prof/hostprof.py LOG            # the median, the 90th percentile and the maximum of each phase

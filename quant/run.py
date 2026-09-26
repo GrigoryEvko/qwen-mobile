@@ -248,11 +248,11 @@ def cmd_eval(args: argparse.Namespace) -> None:
         if any(k in line for k in ("Mean    KLD", "Maximum KLD", "99.9%   KLD", "99.0%   KLD", "Median  KLD",
                                    "RMS Δp", "Same top", "Mean PPL(Q)  ", "error", "failed")):
             print(line.split(" I ", 1)[-1])
-    # A build without patches/fuzz-quant/0002 can lose the last lines at the exit with the status 0.
+    # A build without patches/tools/0001 can lose the last lines at the exit with the status 0.
     if res.returncode != 0 or "Mean    KLD" not in output or "Same top" not in output:
         raise SystemExit(f"llama-perplexity gave the exit status {res.returncode}, and its output has no complete "
                          "final KL statistics block, thus the run has no result. With the status 0, the build does "
-                         "not have patches/fuzz-quant/0002: rebuild it.")
+                         "not have patches/tools/0001: rebuild it.")
 
 
 def _plan(args: argparse.Namespace, n_layers: int, tied: bool = False) -> Plan:

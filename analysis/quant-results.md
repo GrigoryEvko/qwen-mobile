@@ -31,7 +31,7 @@ Hadamard R1 on the residual stream, head untied.
 | 13 | Row 12 with the eight matrices of the MTP block in round-to-nearest Q8_0 | 1.09 GiB file | as row 12 | | | | |
 
 Rows 7c, 10 and 11 ran on the laptop against the F16 base of the box, with llama.cpp c6824a9 plus
-`patches/llama-tied-head`. The control reproduces row 7 (0.0296 / 91.40 % against 0.0295 / 91.35 %).
+`patches/qwen35/0001`. The control reproduces row 7 (0.0296 / 91.40 % against 0.0295 / 91.35 %).
 The motivation of the tie is RAM and file size, not the bytes of a decode token: the logits still
 read the full Q4_0 head (0.286 GB) tied or not. The tie removes the separate Q8_0 `token_embd`
 tensor (540 MB) from the file and from the RAM of the phone, and adds the dense map M in F16
@@ -93,7 +93,7 @@ Phone speed on the NPU with op fusion on (llama-bench -p 512 -n 32, 2026-09-17 2
 00:45): row 7 pp512 1017 t/s, tg32 32.05 t/s; row 11 (tied head, 0.53 GB less) pp512 1017 t/s, tg32
 32.2 t/s; the 2B Q8_0 pp512 1004 t/s, tg32 21.5 t/s (2.1 GB per token, 45 GB/s); the 4B Q8_0 pp512
 377 t/s, tg32 7.0 t/s (4.7 GB per token, the gate and up pairs stream at 56 GB/s, thus the floor). The
-fused matvec add of the Hexagon backend (patches/hexagon-fusion/0001) makes the fusion correct: the
+fused matvec add of the Hexagon backend (patches/hexagon-mm/0001) makes the fusion correct: the
 32-token greedy streams with fusion on and off are identical for the Q4_0 and the F16 file.
 
 Grid test on Gaussian weights (256 x 512, block-32 F16 scales with the scale search, 4.5 bits per
@@ -130,7 +130,7 @@ The embedding half of `fc` folds `enorm` and Q, `fc` writes into the rotated str
 the block takes the transform of a main layer. The head map is the same for the tied and the untied
 file. The calibration of row 11 moved the output norm by 0.6 %. Thus the export scales the columns
 of `hnorm_rot` and the rows of `shared_head_rot` by the exported norm. The patch
-`patches/llama-tied-head/0002-qwen35-mtp-rotation.patch` (on top of 0001) maps the two tensors in the
+`patches/qwen35/0002-qwen35-mtp-rotation.patch` (on top of 0001) maps the two tensors in the
 converter, loads them as optional, and applies them in the MTP graph. The main graph does not load
 the block, thus rows 12 and 13 have the KL of row 11. The 321 trunk tensors of row 12 are byte for
 byte those of row 11. The KL run gives 0.031126 / 0.4989 / 6.82 / 90.417 % (row 11: 0.0311 / 0.499 /
@@ -235,7 +235,7 @@ from the project root:
     llama.cpp/build-host/bin/llama-completion -m weights/gguf/Qwen3.5-2B-Q8_0.gguf -p "The three laws of thermodynamics are" -n 48 -no-cnv --temp 0 --simple-io
     llama.cpp/build-host/bin/llama-mtmd-cli -m weights/gguf/Qwen3.5-2B-Q8_0.gguf --mmproj weights/gguf/Qwen3.5-2B-Q8_0.mmproj.gguf --image <file.jpg> -p "Describe this image in one sentence." -n 64 --temp 0
 
-Decode path on the NPU with the fused recurrent state step (patches/hexagon-fusion/0002 to 0004, 2026-09-18):
+Decode path on the NPU with the fused recurrent state step (patches/hexagon-gdn/0001 and 0002, 2026-09-18):
 the one-token decode of the Q4_0 file (llama-perplexity -b 1 -ub 1, 2 chunks, against the CUDA F16
 base) gives mean ln(PPL(Q)/PPL(base)) 0.0380 ± 0.0216 with the fusion on and 0.0405 ± 0.0217 with it
 off, same top-1 (90.98 % against 90.78 %), maximum KLD 7.35 against 7.49: the fused path is at the

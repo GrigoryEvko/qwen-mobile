@@ -59,11 +59,11 @@ The F32 activations cost 11 GB of traffic, approximately 0.3 s. They are not the
 
 ## 4. Patches
 
-The patches are unified diffs against commit c6824a9, in `patches/opencl-vision/`. On the host CPU, the patched build gives bit-identical embeddings for the test image (maximum difference 0.0 over 672 x 2048 values).
+The patches are unified diffs against commit c6824a9, in `patches/vision/`. On the host CPU, the patched build gives bit-identical embeddings for the test image (maximum difference 0.0 over 672 x 2048 values).
 
 - `0001-mtmd-qwen-patch-embedding-as-gemm.patch` (`tools/mtmd/models/qwen2vl.cpp`, `qwen3vl.cpp`). The patch embedding becomes `ggml_im2col` to F32 plus `ggml_mul_mat(weight, columns)`. The weight is `src0` and the columns are `src1`, thus the xmem GEMM does it, not the F16 x F16 GEMV. The result is already in the `[c, w, h]` order, thus the patch removes the transposed copy and two plain copies. The two temporal kernels use one im2col. The node count changes from 736 to 728. The estimate of the gain is 0.25 to 0.4 s.
 - `0002-mtmd-clip-compute-warmup.patch` (`tools/mtmd/clip.cpp`). With `CLIP_WARMUP_COMPUTE=1`, `clip_init` encodes one 96 x 96 image after the load. The OpenCL backend then builds the FA programs at the load, not during the first image of the user. The app can do the same without a patch: encode a small bitmap after `mtmd_init_from_file`.
-- `0003-mtmd-qwen3vl-zero-mask-test-aid.patch` (`qwen3vl.cpp`, `clip.cpp`). With `MTMD_VIT_ZERO_MASK=1`, the attention gets an all-zero mask. This is a test aid for section 6. The result does not change.
+- `0003-mtmd-qwen3vl-zero-mask-test-aid.patch` is gone. It gave the attention an all-zero mask behind `MTMD_VIT_ZERO_MASK`. The series deleted it, because nothing sets the switch and the mask does not change the result.
 
 Options that need no patch, for a test on the phone:
 
@@ -95,7 +95,7 @@ Test sequence on the phone, one step at a time:
 
 1. `GGML_HEXAGON_OPFILTER='FLASH_ATTN_EXT'`. If the features become correct, the op is the flash attention.
 2. `GGML_HEXAGON_FA_SELECT=1` selects the HVX FA kernel instead of the HMX kernel (`opt_fa_select`, line 3991).
-3. Patch 0003 with `MTMD_VIT_ZERO_MASK=1` gives the FA a mask. If this makes the features correct, the HTP FA kernel does not accept a NULL mask for these shapes.
+3. Patch 0003 with `MTMD_VIT_ZERO_MASK=1` gives the FA a mask. If this makes the features correct, the HTP FA kernel does not accept a NULL mask for these shapes. The series does not hold that patch. Get it with `git show 5bda71c^:patches/opencl-vision/0003-mtmd-qwen3vl-zero-mask-test-aid.patch`.
 4. `GGML_HEXAGON_OPFILTER='MUL_MAT'` moves all matmuls to the CPU. Patch 0001 already removes the only F16 x F16 matmul, which the HVX kernel `HTP_MM_KERNEL_HVX_F16_F16` did (`ggml_hexagon_matmul_is_hmx_eligible` accepts only src1 F32, line 4247).
 
 The other ops are safe by inspection. UPSCALE has no Hexagon kernel and goes to the CPU. The CPY and CONT kernels read the strides (`htp/cpy-ops.c:220`, `:156`). The binary kernels have a row broadcast (`htp/binary-ops.c:384`). The rope kernel reads nb02 (`htp/rope-ops.c:598`).
