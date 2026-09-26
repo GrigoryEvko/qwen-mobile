@@ -299,7 +299,7 @@ static inline __attribute__((always_inline)) void hvx_softplus_f32_x4(const HVX_
     // with -flto, gave that value at each element count. The lab, which builds without -flto,
     // gave it in the tail block only, because hexagon-clang 19.0.07 put an sf to qf32 conversion
     // before the read in the other copy. Refer to the header of
-    // patches/hexagon-kernels/0004 of the qwen-mobile repository.
+    // the patch hexagon-htp-softplus-on-the-vector-unit of the qwen-mobile repository.
     const HVX_Vector c_top = Q6_V_vsplat_R(hvx_softplus_log1p_p[HVX_SOFTPLUS_LOG1P_DEGREE]);
     for (int i = 0; i < 4; i++) {{
         acc[i] = Q6_Vqf32_vmpy_VsfVsf(c_top, t[i]);
