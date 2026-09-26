@@ -557,15 +557,26 @@ check_repro() {
     done < <(rg -v -e '^\s*#' -e '^\s*$' "$SAN_DIR/ubsan.supp" || true)
 }
 
-# Write the violations of each area to its request file.
+# Write the violations of each area to its request file. The areas are the
+# checked fuzz areas and each area that a violation names (area_of), thus a
+# violation outside the fuzz areas (a patch file, a tool) also gets a file.
+# A file with no violation goes away.
 write_requests() {
-    local dir="$BUILD_FUZZ/matrix/requests" area v file
-    mkdir -p "$dir"
+    local dir="$BUILD_FUZZ/matrix/requests" area v file r a p m
+    local -A areas=()
     for area in $AREAS; do
+        areas["$area"]=1
+    done
+    for v in "${VIOLATIONS[@]}"; do
+        IFS=$'\t' read -r r a p m <<< "$v"
+        areas["$a"]=1
+    done
+    mkdir -p "$dir"
+    for area in "${!areas[@]}"; do
         file="$dir/$area-rules.txt"
         {
-            echo "$(date -u +%Y-%m-%d), from sanitizer-matrix: tests/sanitizers/check-rules.sh found these violations in the area $area."
-            echo "Format: <rule> <place>: <message>. The rules are in the message of the coordinator (R1 to R13)."
+            echo "$(date -u +%Y-%m-%d), tests/sanitizers/check-rules.sh found these violations in the area $area."
+            echo "Format: <rule> <place>: <message>. The header of check-rules.sh gives the rules."
             echo
             for v in "${VIOLATIONS[@]}"; do
                 IFS=$'\t' read -r r a p m <<< "$v"
