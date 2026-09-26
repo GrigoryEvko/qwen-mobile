@@ -1,5 +1,4 @@
 hexagon: give init_fastdiv_values no divisor of zero in the matmul params
-Fold-into: upstream/hexagon-host
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 

@@ -1,5 +1,4 @@
 llama: probe flash attention for a quantized V cache in AUTO mode
-Fold-into: upstream/llama-context
 
 The defect
 
@@ -31,6 +30,7 @@ Files:
     src/llama-context.cpp
     tests/CMakeLists.txt
     tests/test-kv-quant-auto-fa.cpp
+
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
 index 76f1fe0..b93c119 100644
 --- a/src/llama-context.cpp

@@ -1,5 +1,4 @@
 Refuse a malformed template and convert numbers outside int64_t without undefined behavior
-Fold-into: upstream/jinja
 
 The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
 
@@ -28,6 +27,7 @@ Base: llama.cpp commit c6824a9 with the patches of patches/series above this one
 Files:
     common/jinja/runtime.h
     common/jinja/value.h
+
 --- a/common/jinja/runtime.h
 +++ b/common/jinja/runtime.h
 @@ -7,6 +7,7 @@

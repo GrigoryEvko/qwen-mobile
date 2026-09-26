@@ -26,10 +26,6 @@ SET_ROWS scatter at 1.5 ms.
 Files:
     ggml/src/ggml-hexagon/htp/repeat-ops.c
 
-How to apply, from the llama.cpp root:
-
-    git apply patches/hexagon-repeat-splat/0001-hexagon-htp-splat-the-scalar-broadcast-of-repeat.patch
-
 diff --git a/ggml/src/ggml-hexagon/htp/repeat-ops.c b/ggml/src/ggml-hexagon/htp/repeat-ops.c
 index 530279d..cc5bf56 100644
 --- a/ggml/src/ggml-hexagon/htp/repeat-ops.c

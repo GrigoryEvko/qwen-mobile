@@ -1,5 +1,4 @@
 hexagon: htp: the src1 rows of the scalar and same-shape binary paths
-Fold-into: upstream/hexagon-htp
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 

@@ -1,5 +1,4 @@
 hexagon: fuse MUL_MAT and ADD only when the ADD is the one reader of the product
-Fold-into: upstream/hexagon-host
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 

@@ -1,5 +1,4 @@
 hexagon: a start-up self-test of the DSP before the backend registers a device
-Fold-into: hexagon-arch/0001
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 
@@ -65,6 +64,7 @@ The phone stage v81 (tools/stages/v81, the OnePlus 13, v79, 2026-09-25):
     opens is the session of the model.
   - GGML_HEXAGON_CANARY=2 gives no HTP device and the error line.
 No v81 silicon verified this patch.
+
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 index 4a17422..6c3a867 100644
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp

@@ -1,5 +1,4 @@
 hexagon: retry a dspqueue read or write that a signal interrupts
-Fold-into: upstream/hexagon-host
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 

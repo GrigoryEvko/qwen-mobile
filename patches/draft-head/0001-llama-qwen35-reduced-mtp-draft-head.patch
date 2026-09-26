@@ -35,12 +35,9 @@ Files:
 The loader skips a tensor whose info says GGML_OP_NONE, thus the index and the fill tensors declare
 the op that reads them. weight_buft_supported had no case for either op and its default aborts.
 
-How to apply, from the llama.cpp root:
-
-    git apply patches/draft-head/0001-llama-qwen35-reduced-mtp-draft-head.patch
-
 A model without the three tensors takes the full head, thus the patch changes nothing for a GGUF
 that quant/draftset.py has not processed.
+
 diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
 index c135a4d..68e84f9 100644
 --- a/src/llama-arch.cpp

@@ -36,10 +36,6 @@ Files:
     ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
     ggml/src/ggml-hexagon/htp/hvx-silu-i16.h
 
-How to apply, from the llama.cpp root:
-
-    git apply patches/hexagon-pre79/0001-hexagon-htp-build-the-dsp-library-for-v73-and-v75.patch
-
 diff --git a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c b/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c
 index 13b2e86..d2c2a0c 100644
 --- a/ggml/src/ggml-hexagon/htp/gdn-conv-ops.c

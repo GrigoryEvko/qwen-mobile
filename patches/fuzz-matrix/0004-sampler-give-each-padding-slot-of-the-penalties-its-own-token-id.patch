@@ -1,5 +1,4 @@
 sampler: give each padding slot of the backend penalties its own token id
-Fold-into: upstream/sampler
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 

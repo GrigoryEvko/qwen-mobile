@@ -1,5 +1,4 @@
 opencl: row broadcast of a src1 row that repeats along dim 0
-Fold-into: upstream/ggml-opencl
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 

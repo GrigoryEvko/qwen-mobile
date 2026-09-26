@@ -1,5 +1,4 @@
 ggml-cpu: soft_max of a fully masked row gives 0
-Fold-into: upstream/ggml-cpu
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 

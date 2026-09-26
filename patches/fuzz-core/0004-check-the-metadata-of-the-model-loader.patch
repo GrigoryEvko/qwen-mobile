@@ -1,5 +1,4 @@
 Check the metadata of the model loader before its conversions
-Fold-into: upstream/loader
 
 The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
 
@@ -24,6 +23,7 @@ Base: llama.cpp commit c6824a9 with the patches of patches/series above this one
 
 Files:
     src/llama-model-loader.cpp
+
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -572,12 +572,14 @@

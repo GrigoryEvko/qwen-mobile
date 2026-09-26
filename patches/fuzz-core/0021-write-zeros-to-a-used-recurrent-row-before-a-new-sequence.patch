@@ -1,5 +1,4 @@
 Write zeros to a used recurrent state row before a new sequence starts in it
-Fold-into: upstream/memory
 
 The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
 
@@ -27,6 +26,7 @@ Base: llama.cpp commit c6824a9 with the patches of patches/series above this one
 Files:
     src/llama-memory-recurrent.cpp
     src/llama-memory-recurrent.h
+
 --- a/src/llama-memory-recurrent.cpp
 +++ b/src/llama-memory-recurrent.cpp
 @@ -39,6 +39,7 @@ llama_memory_recurrent::llama_memory_recurrent(

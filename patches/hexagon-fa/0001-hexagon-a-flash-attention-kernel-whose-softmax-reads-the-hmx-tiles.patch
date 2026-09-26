@@ -1,5 +1,4 @@
 hexagon: a flash attention kernel whose softmax reads the HMX tiles as they are
-Fold-into: upstream/hexagon-htp
 
 Base: llama.cpp commit c6824a9 plus the patches before this one in patches/series.
 

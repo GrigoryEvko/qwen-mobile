@@ -1,5 +1,4 @@
 Check the cell count of a state blob before it sizes an allocation
-Fold-into: upstream/memory
 
 The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
 
@@ -20,6 +19,7 @@ Base: llama.cpp commit c6824a9 with the patches of patches/series above this one
 Files:
     src/llama-kv-cache.cpp
     src/llama-memory-recurrent.cpp
+
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -2340,6 +2340,13 @@

@@ -1,5 +1,4 @@
 Replace the destination of a sequence copy in one KV cache stream
-Fold-into: upstream/memory
 
 The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
 
@@ -34,6 +33,7 @@ Base: llama.cpp commit c6824a9 with the patches of patches/series above this one
 
 Files:
     src/llama-kv-cache.cpp
+
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -470,6 +470,15 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll

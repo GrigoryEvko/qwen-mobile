@@ -1,5 +1,4 @@
 Refuse a GGUF tensor whose size the alignment cannot pad
-Fold-into: upstream/gguf
 
 The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
 
@@ -20,6 +19,7 @@ Base: llama.cpp commit c6824a9 with the patches of patches/series above this one
 
 Files:
     ggml/src/gguf.cpp
+
 --- a/ggml/src/gguf.cpp
 +++ b/ggml/src/gguf.cpp
 @@ -834,7 +834,17 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr

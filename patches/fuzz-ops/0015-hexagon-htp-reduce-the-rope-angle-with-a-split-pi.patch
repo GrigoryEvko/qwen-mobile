@@ -1,5 +1,4 @@
 hexagon: htp: reduce the rope angle with a split pi
-Fold-into: upstream/hexagon-htp
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 

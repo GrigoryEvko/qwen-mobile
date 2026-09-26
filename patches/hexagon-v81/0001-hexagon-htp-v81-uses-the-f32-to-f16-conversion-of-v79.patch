@@ -1,5 +1,4 @@
 hexagon: htp: v81 uses the f32 to f16 conversion of v79
-Fold-into: upstream/hexagon-htp
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 
@@ -38,6 +37,7 @@ The v79 library keeps its bytes: libggml-htp-v79.so has the SHA-256
 without this patch (tools/stages/v81/build.sh, the flags of the app build).
 
 No v81 silicon verified this patch.
+
 diff --git a/ggml/src/ggml-hexagon/htp/hvx-base.h b/ggml/src/ggml-hexagon/htp/hvx-base.h
 index 99c8e0e..3624dc7 100644
 --- a/ggml/src/ggml-hexagon/htp/hvx-base.h

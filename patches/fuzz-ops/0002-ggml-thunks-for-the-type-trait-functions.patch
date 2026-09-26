@@ -1,5 +1,4 @@
 ggml: call the type trait functions through thunks of the generic types
-Fold-into: upstream/ggml-cpu
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 

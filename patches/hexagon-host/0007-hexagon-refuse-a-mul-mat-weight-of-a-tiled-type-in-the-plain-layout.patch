@@ -1,5 +1,4 @@
 hexagon: refuse a MUL_MAT weight of a tiled type in the plain layout
-Fold-into: upstream/hexagon-host
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 
@@ -29,7 +28,7 @@ of has the REPACK flag.
     caller that computes a graph with no supports_op call. The error
     message tells the caller to set the WEIGHTS usage before the first
     ggml_backend_tensor_set.
-A weight with no data has no layout yet, and the function is false for it.
+A weight with no data has no layout, and the function is false for it.
 The model loader asks supports_op with a buffer of size 0 on the weight
 (weight_buft_supported), and the memory-fit pass gives the weights a
 buffer of size 0. A first form of this patch did not have this condition:

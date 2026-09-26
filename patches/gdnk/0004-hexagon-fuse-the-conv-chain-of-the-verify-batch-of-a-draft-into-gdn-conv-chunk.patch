@@ -29,9 +29,6 @@ The change
   place, 8224 channels with a draft of 4, 64 tokens with 4 slots, slots
   past the start of the batch, and a batch shorter than the conv kernel.
 
-patches/hexagon-spec/0005 holds the same change of the matcher without the
-allocation dependency, and it is not in patches/series.
-
 The results on the host
 
 The hexhost graphs harness (the host code with a fake DSP, the real graphs
@@ -56,6 +53,7 @@ Files:
     ggml/src/ggml-hexagon/ggml-hexagon.cpp
     ggml/src/ggml-hexagon/htp-gdn-match.h
     tests/test-backend-ops.cpp
+
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 index 1c35fe3..b9b4cff 100644
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp

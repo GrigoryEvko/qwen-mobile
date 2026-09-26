@@ -1,5 +1,4 @@
 hexagon: the tile flash attention for the decode shapes, in spans of KV rows
-Fold-into: upstream/hexagon-htp
 
 Base: llama.cpp commit c6824a9 plus the patches before this one in patches/series.
 

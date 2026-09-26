@@ -1,5 +1,4 @@
 Give the softmax of the samplers a defined result for an infinite or a NaN logit
-Fold-into: upstream/sampling
 
 The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
 
@@ -23,6 +22,7 @@ Base: llama.cpp commit c6824a9 with the patches of patches/series above this one
 
 Files:
     src/llama-sampler.cpp
+
 --- a/src/llama-sampler.cpp
 +++ b/src/llama-sampler.cpp
 @@ -304,21 +304,43 @@ static void llama_sampler_softmax_impl(llama_token_data_array * cur_p, bool do_s

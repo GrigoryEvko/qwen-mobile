@@ -1,5 +1,4 @@
 llama: qwen35 reads the token embedding lazily with LLAMA_LAZY_MODE_ON
-Fold-into: upstream/loader
 
 The defect
 
@@ -30,6 +29,7 @@ Files:
     src/models/qwen35.cpp
     tests/CMakeLists.txt
     tests/test-lazy-embd.cpp
+
 diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
 index 8b239ea..6a047fe 100644
 --- a/src/models/qwen35.cpp

@@ -1,5 +1,4 @@
 llama: the loader copies a duplicate of a lazy tensor from the file and not through the mapping
-Fold-into: upstream/loader
 
 The defect
 
@@ -13,7 +12,7 @@ page cache the load took 14.3 s against 6.6 s.
 
 The change
 
-A tensor reads through the mapping only when it is lazy and has no data yet, that is the lazy
+A tensor reads through the mapping only when it is lazy and has no data, that is the lazy
 tensor itself. A duplicate with a buffer of its own reads from the file as in a load without the
 lazy mode. With --drop-cache on the host the 2B loads in 1.1 to 3.0 s with the lazy mode and in
 2.2 to 6.3 s without it (the box has a high load), and the logits hashes are the same.
@@ -23,6 +22,7 @@ Base: llama.cpp commit c6824a9 with the patches of patches/series above this one
 
 Files:
     src/llama-model-loader.cpp
+
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
 index 685d991..fed52a7 100644
 --- a/src/llama-model-loader.cpp

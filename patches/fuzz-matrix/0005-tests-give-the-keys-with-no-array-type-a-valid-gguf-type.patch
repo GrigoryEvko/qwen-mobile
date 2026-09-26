@@ -1,5 +1,4 @@
 tests: give the keys with no array type a valid gguf_type in test-gguf
-Fold-into: upstream/ggml
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 

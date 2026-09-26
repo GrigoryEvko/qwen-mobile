@@ -1,5 +1,4 @@
 Check the product of the nonzero dimensions of a GGUF tensor and write a tensor of 0 bytes
-Fold-into: upstream/gguf
 
 The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
 
@@ -32,6 +31,7 @@ Base: llama.cpp commit c6824a9 with the patches of patches/series above this one
 
 Files:
     ggml/src/gguf.cpp
+
 --- a/ggml/src/gguf.cpp
 +++ b/ggml/src/gguf.cpp
 @@ -693,6 +693,9 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr

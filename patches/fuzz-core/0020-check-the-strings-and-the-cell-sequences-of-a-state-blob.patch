@@ -1,5 +1,4 @@
 Check the strings and the cell sequences of a state blob before their use
-Fold-into: upstream/llama-context
 
 The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
 
@@ -31,6 +30,7 @@ Base: llama.cpp commit c6824a9 with the patches of patches/series above this one
 Files:
     src/llama-io.cpp
     src/llama-kv-cache.cpp
+
 --- a/src/llama-io.cpp
 +++ b/src/llama-io.cpp
 @@ -13,8 +13,14 @@ void llama_io_read_i::read_string(std::string & str) {

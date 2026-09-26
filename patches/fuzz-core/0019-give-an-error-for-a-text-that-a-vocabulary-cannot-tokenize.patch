@@ -1,5 +1,4 @@
 Give an error for a text that a defective vocabulary cannot tokenize
-Fold-into: upstream/vocab
 
 The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
 
@@ -42,6 +41,7 @@ Base: llama.cpp commit c6824a9 with the patches of patches/series above this one
 
 Files:
     src/llama-vocab.cpp
+
 --- a/src/llama-vocab.cpp
 +++ b/src/llama-vocab.cpp
 @@ -1334,6 +1334,7 @@ struct llm_tokenizer_rwkv_session {

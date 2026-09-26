@@ -1,5 +1,4 @@
 hexagon: replay the packed batches of a graph of more than one batch
-Fold-into: patches/hexagon-host/0001-hexagon-host-timers-and-batch-cache.patch
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 

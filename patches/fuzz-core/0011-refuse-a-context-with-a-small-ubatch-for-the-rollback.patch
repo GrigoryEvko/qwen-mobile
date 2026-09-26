@@ -1,5 +1,4 @@
 Refuse a context with an n_ubatch that is not larger than n_rs_seq + 1
-Fold-into: upstream/llama-context
 
 The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
 
@@ -19,6 +18,7 @@ Base: llama.cpp commit c6824a9 with the patches of patches/series above this one
 
 Files:
     src/llama-context.cpp
+
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -246,6 +246,15 @@ llama_context::llama_context(

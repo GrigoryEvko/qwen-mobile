@@ -1,5 +1,4 @@
 hexagon: write the final GATED_DELTA_NET state through the cache when it shares a line
-Fold-into: upstream/hexagon-host
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 

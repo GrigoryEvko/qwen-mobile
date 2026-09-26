@@ -1,5 +1,4 @@
 common: the MTP drafter stops at the draft length of the call
-Fold-into: upstream/speculative
 
 The defect
 
@@ -32,10 +31,6 @@ Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 
 Files:
     common/speculative.cpp
-
-How to apply, from the llama.cpp root:
-
-    git apply patches/spec-mtp/0001-common-the-mtp-drafter-stops-at-the-draft-length-of-the-call.patch
 
 diff --git a/common/speculative.cpp b/common/speculative.cpp
 index 77dfe95..cd756d3 100644

@@ -1,5 +1,4 @@
 llama: refuse a batch with more outputs than n_outputs_max
-Fold-into: upstream/llama-context
 
 The defect
 
@@ -24,6 +23,7 @@ Files:
     src/llama-context.cpp
     tests/CMakeLists.txt
     tests/test-output-limit.cpp
+
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
 index 9f5eecc..76f1fe0 100644
 --- a/src/llama-context.cpp

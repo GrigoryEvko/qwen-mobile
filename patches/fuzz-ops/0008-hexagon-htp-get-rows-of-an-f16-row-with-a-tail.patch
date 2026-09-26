@@ -1,5 +1,4 @@
 hexagon: htp: get_rows of an f16 row with a tail
-Fold-into: upstream/hexagon-htp
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 

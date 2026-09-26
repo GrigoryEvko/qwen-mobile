@@ -1,5 +1,4 @@
 perplexity: write the queued log lines before the exit
-Fold-into: upstream/tools
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 

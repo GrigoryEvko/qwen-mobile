@@ -1,5 +1,4 @@
 gguf-py: check the byte ranges and the shapes of the reader
-Fold-into: upstream/gguf-py
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 

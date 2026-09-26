@@ -19,10 +19,6 @@ the acceptance falls, which the application does with SpecPolicy.
 Files:
     common/common.h
 
-How to apply, from the llama.cpp root:
-
-    git apply patches/spec-draft-4/0001-common-default-the-draft-depth-to-4.patch
-
 diff --git a/common/common.h b/common/common.h
 index 63d0bad..b835494 100644
 --- a/common/common.h

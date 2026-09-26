@@ -1,5 +1,4 @@
 Refuse a defective vocabulary with an error and keep the C API free of aborts
-Fold-into: upstream/vocab
 
 The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
 
@@ -56,6 +55,7 @@ Base: llama.cpp commit c6824a9 with the patches of patches/series above this one
 Files:
     src/llama-vocab.cpp
     src/unicode.cpp
+
 --- a/src/llama-vocab.cpp
 +++ b/src/llama-vocab.cpp
 @@ -2516,7 +2516,12 @@

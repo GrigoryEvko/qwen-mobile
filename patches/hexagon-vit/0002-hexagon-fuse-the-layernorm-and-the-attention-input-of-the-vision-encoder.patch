@@ -1,5 +1,4 @@
 hexagon: fuse the LayerNorm and the attention input of the vision encoder
-Fold-into: upstream/hexagon-htp
 
 Base: llama.cpp commit c6824a9 plus the patches before this one in patches/series.
 

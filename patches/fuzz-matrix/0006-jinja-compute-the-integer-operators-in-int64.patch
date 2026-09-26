@@ -1,5 +1,4 @@
 jinja: compute the integer +, -, * and % in int64_t, with errors for a zero divisor and an overflow
-Fold-into: upstream/common
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 

@@ -1,5 +1,4 @@
 hexagon: htp: the 32x2 dot adds the k-tiles in the order of the 32x1 dot
-Fold-into: upstream/hexagon-htp
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 

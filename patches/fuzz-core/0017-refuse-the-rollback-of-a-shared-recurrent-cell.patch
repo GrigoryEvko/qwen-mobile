@@ -1,5 +1,4 @@
 Refuse the rollback of a sequence whose recurrent cell other sequences share
-Fold-into: upstream/memory
 
 The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
 
@@ -22,6 +21,7 @@ Base: llama.cpp commit c6824a9 with the patches of patches/series above this one
 
 Files:
     src/llama-memory-recurrent.cpp
+
 --- a/src/llama-memory-recurrent.cpp
 +++ b/src/llama-memory-recurrent.cpp
 @@ -209,7 +209,12 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos

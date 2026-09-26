@@ -1,5 +1,4 @@
 hexagon: htp: keep the sign of zero in the f16 conversion of v79, copy to f16 without unroll
-Fold-into: upstream/hexagon-htp
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 

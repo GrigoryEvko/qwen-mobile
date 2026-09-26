@@ -1,5 +1,4 @@
 server: give the chat parameters the defaults of common_params
-Fold-into: upstream/jinja
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 

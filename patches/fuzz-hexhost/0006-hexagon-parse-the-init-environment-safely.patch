@@ -1,5 +1,4 @@
 hexagon: parse the environment of the backend init without a crash or a hang
-Fold-into: upstream/hexagon-host
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 

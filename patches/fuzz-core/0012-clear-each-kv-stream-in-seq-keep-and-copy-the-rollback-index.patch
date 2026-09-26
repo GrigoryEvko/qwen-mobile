@@ -1,5 +1,4 @@
 Clear each KV stream in seq_keep and copy the rollback index with a sequence
-Fold-into: upstream/memory
 
 The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
 
@@ -29,6 +28,7 @@ Base: llama.cpp commit c6824a9 with the patches of patches/series above this one
 Files:
     src/llama-kv-cache.cpp
     src/llama-memory-recurrent.cpp
+
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -548,22 +548,26 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {

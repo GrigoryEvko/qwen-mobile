@@ -1,5 +1,4 @@
 Give the samplers a defined result for an infinite, a NaN or a very large logit
-Fold-into: upstream/sampling
 
 The defects. tests/fuzz/core/run.sh test replays the reproducer of each one.
 
@@ -32,6 +31,7 @@ Base: llama.cpp commit c6824a9 with the patches of patches/series above this one
 
 Files:
     src/llama-sampler.cpp
+
 --- a/src/llama-sampler.cpp
 +++ b/src/llama-sampler.cpp
 @@ -153,8 +153,11 @@

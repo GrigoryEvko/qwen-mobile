@@ -1,5 +1,4 @@
 hexagon: fuse the gate chains of the Qwen3.5 layers into two DSP ops
-Fold-into: upstream/hexagon-htp
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 

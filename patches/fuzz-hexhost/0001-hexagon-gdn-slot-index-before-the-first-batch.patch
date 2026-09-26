@@ -1,5 +1,4 @@
 hexagon: read the slot index of a fused recurrent op before the graph goes to the DSP
-Fold-into: patches/hexagon-fusion/0004-hexagon-htp-gdn-slot-index-from-host-and-error-report.patch
 
 Base: llama.cpp commit c6824a9 plus every patch of the series before this one.
 

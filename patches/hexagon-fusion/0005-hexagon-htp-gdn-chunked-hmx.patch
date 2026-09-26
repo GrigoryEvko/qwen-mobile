@@ -17,11 +17,6 @@ gives the value to the DSP in kernel_params[0] of each GATED_DELTA_NET op. Thus 
 no host file. On a DSP library without this patch that kernel param is unread, which is why the
 series works today.
 
-How to apply, from the llama.cpp root:
-
-    git apply patches/hexagon-fusion/0005-hexagon-htp-gdn-chunked-hmx.patch
-    cmake --build build-snapdragon -j
-
 Push to the phone: libggml-htp-v79.so (ggml/src/ggml-hexagon/) and test-backend-ops (bin/). The
 host library does not change.
 
@@ -162,6 +157,7 @@ matmuls of this backend reach. The HVX work is about 0.3 ms per layer over the w
 the DMA of q, k and v is 12 MB per layer, which is the same traffic that the sequential kernel reads.
 The phases serialize the HVX work and the HMX work of a group, thus the expectation is 0.5 to 1.5 ms
 per op against 6.5 ms, and 30 to 60 ms of the 235 ms that the 36 ops of one pp512 batch take today.
+
 diff --git a/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c b/ggml/src/ggml-hexagon/htp/gdn-chunk-ops.c
 new file mode 100644
 index 0000000..9215df3
