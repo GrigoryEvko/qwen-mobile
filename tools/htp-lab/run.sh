@@ -9,16 +9,27 @@
 # Usage:
 #   tools/htp-lab/run.sh build                    Build all lab programs
 #   tools/htp-lab/run.sh run <target> [-- args]   Build, then run and profile one target
-#   tools/htp-lab/run.sh all                      Run every target with its default arguments
+#   tools/htp-lab/run.sh all                      Run every target of the registry
+#   tools/htp-lab/run.sh list                     Print the registry
 #   tools/htp-lab/run.sh shell                    Open a shell in the container
 #
-# Targets:
-#   gdn_conv   The fused GDN conv step (gdn-conv-ops.c). Args: --n_ch 6144 --threads 1 --iters 20
-#   q4         The Q4_0 tiled dot kernels with the Q8 activation (hvx-mm-kernels-tiled.h) for
-#              1 to 4 activation rows. Args: --k 2048 --rows 4 --ct 8 --iters 10
-#   hmx        The HMX tile MAC microbenchmark, F16 against int8. Args: --dot_tiles 64 --iters 8
-#   A target name with the suffix "_after" runs the same program against the kernel directory with
-#   the proposal patches (tools/htp-lab/proposals/*.patch) applied to a copy in the output directory.
+# The registry. Each file lab/target_<name>.c declares the mode and the arguments of its canonical
+# run in one line of its header comment:
+#
+#   // lab-run: mode=functional args=--rows 256 --iters 5
+#   // lab-run: skip=<the reason in one phrase>
+#
+# The mode is "functional" or "timing". "timing" adds the cycle-accurate model and the profile
+# files. A target that needs a file that the sweep cannot make declares skip, thus "all" reports it
+# and runs it not. A target with no declaration runs in the functional mode with no argument, and
+# "all" gives a notice with its name. The declaration is in the source of the target, thus a new
+# target needs no edit of this file and two agents never write the same line.
+#
+# "all" is the regression gate of the lab: it runs every target of the registry and writes the
+# result of each to out/<target>-all/. Compare two trees with a diff of the "lab:" lines.
+#
+# A target name with the suffix "_after" runs the same program against the kernel directory with
+# the proposal patches (tools/htp-lab/proposals/*.patch) applied to a copy in the output directory.
 #
 # Environment:
 #   LLAMA_DIR  The llama.cpp checkout, read only. Default: the submodule third_party/llama.cpp with the
@@ -59,6 +70,13 @@
 #              "debug": the release flags with live asserts (no -DNDEBUG=1). A profile builds in
 #              out/build-<ARCH>-<PROFILE>, thus the lab flags and the two profiles do not mix.
 #   EXTRA_CFLAGS More compile flags, after the flags of the profile.
+#   ALL_PLIMIT The cycle limit of each timing run of "all". Default: 2000000000. The timing model
+#              does not retire an HMX instruction, thus a target that reads an HMX result waits
+#              without an end and the limit stops it.
+#   LAB_NO_LOCK Set it to 1 when the caller already holds build/.container.lock. This script takes
+#              that lock around each container, thus one container of the box runs at a time. A
+#              second exclusive lock of one file blocks without an end, thus a caller that holds the
+#              lock already must set this variable. The lock covers the life of the container only.
 #
 # Output (tools/htp-lab/out/, not in git):
 #   build/                       The CMake build directory (Ninja)
@@ -96,6 +114,7 @@ set -euo pipefail
 
 LAB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${LAB_DIR}/../.." && pwd)"
+CONTAINER_LOCK="${REPO_DIR}/build/.container.lock"
 LLAMA_DIR="${LLAMA_DIR:-${REPO_DIR}/third_party/llama.cpp}"
 IMAGE="${IMAGE:-ghcr.io/snapdragon-toolchain/arm64-android:v0.7}"
 SIM_ARGS="${SIM_ARGS:-}"
@@ -168,13 +187,85 @@ fi
 LAB_TREE="$(tree_id)"
 LAB_PROPOSALS="$(proposal_ids)"
 
+# Prints the header comment of this script, from line 2 until the first line that is not a comment.
+# The block thus never goes stale when a line joins the documentation.
 usage() {
-    sed -n '2,89p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    local line
+    local n=0
+    while IFS= read -r line; do
+        n=$((n + 1))
+        [ "$n" -eq 1 ] && continue
+        case "$line" in
+            '#!'*) continue ;;
+            '#') echo "" ;;
+            '# '*) echo "${line#\# }" ;;
+            '#'*) echo "${line#\#}" ;;
+            *) return 0 ;;
+        esac
+    done < "${BASH_SOURCE[0]}"
+}
+
+# ---- the registry ----
+
+# Prints the names of every target of lab/target_*.c, one for each line, in alphabetical order.
+lab_target_names() {
+    local f base
+    for f in "${LAB_DIR}"/lab/target_*.c; do
+        [ -e "$f" ] || continue
+        base="${f##*/target_}"
+        echo "${base%.c}"
+    done
+}
+
+# Prints the run declaration of one target as one line: the mode, one space, and the rest. The mode
+# is "functional", "timing" or "skip". For "skip" the rest is the reason, and for the other two it
+# is the arguments of the run, which can be empty. A target with no declaration gives "functional"
+# and no argument. Arguments: the name of the target.
+lab_target_decl() {
+    local name="$1"
+    local src="${LAB_DIR}/lab/target_${name}.c"
+    local line mode="functional" rest=""
+    line=$(grep -m1 '^// lab-run:' "$src" 2> /dev/null || true)
+    if [ -n "$line" ]; then
+        line="${line#// lab-run:}"
+        case "$line" in
+            *skip=*)
+                mode="skip"
+                rest="${line#*skip=}"
+                ;;
+            *)
+                case "$line" in
+                    *mode=*)
+                        mode="${line#*mode=}"
+                        mode="${mode%% *}"
+                        ;;
+                esac
+                # The arguments hold spaces, thus they are the last field of the declaration.
+                case "$line" in
+                    *args=*) rest="${line#*args=}" ;;
+                esac
+                ;;
+        esac
+    fi
+    echo "${mode} ${rest}"
+}
+
+# Runs a command under the container lock of the box. One container of this box runs at a time: two
+# container builds compete for the cores, thus a measurement beside a build is not valid. The lock
+# covers the life of the container and nothing else. A caller that already holds the lock sets
+# LAB_NO_LOCK=1, because a second exclusive lock of one file blocks without an end.
+with_container_lock() {
+    if [ -n "${LAB_NO_LOCK:-}" ]; then
+        "$@"
+        return
+    fi
+    mkdir -p "$(dirname "${CONTAINER_LOCK}")"
+    flock "${CONTAINER_LOCK}" "$@"
 }
 
 in_container() {
     # Runs the given script text inside the container with the repository and llama.cpp mounted
-    podman run --rm --userns=keep-id --security-opt label=disable \
+    with_container_lock podman run --rm --userns=keep-id --security-opt label=disable \
         -v "${REPO_DIR}:/repo" -v "${LLAMA_DIR}:/llama" -w /repo \
         -e "SIM_ARGS=${SIM_ARGS}" -e "SIM_CORE=${SIM_CORE}" -e "LAB_TREE=${LAB_TREE}" -e "LAB_PROPOSALS=${LAB_PROPOSALS}" \
         -e "OUT_REL=${OUT_REL}" -e "PROPOSALS=${PROPOSALS}" -e "LAB_TARGETS=${LAB_TARGETS}" -e "ARCH=${ARCH}" \
@@ -275,23 +366,51 @@ ${RUNFN}
 export MODE=${MODE:-timing}
 run_target ${target} ${TAG:-run} $*"
         ;;
+    list)
+        printf '%-14s %-10s %s\n' TARGET MODE "ARGUMENTS OR THE REASON TO SKIP"
+        while IFS= read -r name; do
+            read -r mode rest <<< "$(lab_target_decl "$name")"
+            printf '%-14s %-10s %s\n' "$name" "$mode" "${rest:-(none)}"
+        done < <(lab_target_names)
+        ;;
     all)
+        # The registry lives in the sources, thus the host reads it and the container gets the
+        # commands. A target that declares skip gives a notice and no run.
+        ALL_PLIMIT="${ALL_PLIMIT:-2000000000}"
+        ALL_CMDS=""
+        while IFS= read -r name; do
+            read -r mode rest <<< "$(lab_target_decl "$name")"
+            case "${mode}" in
+                skip)
+                    echo "lab: all skips ${name}: ${rest}" >&2
+                    continue
+                    ;;
+                functional|timing) ;;
+                *)
+                    echo "lab: all: target ${name} declares the mode '${mode}', which is not functional, timing or skip" >&2
+                    exit 1
+                    ;;
+            esac
+            # A timing run gets a cycle limit: the timing model does not retire an HMX instruction,
+            # thus a target that reads an HMX result waits without an end.
+            # "|| true" keeps the sweep going: a target that does not build reports a missing
+            # program, and the other targets still run.
+            if [ "${mode}" = timing ]; then
+                ALL_CMDS="${ALL_CMDS}SIM_ARGS=\"\$SIM_ARGS --plimit ${ALL_PLIMIT}\" MODE=timing run_target ${name} all ${rest} || true
+"
+            else
+                ALL_CMDS="${ALL_CMDS}MODE=functional run_target ${name} all ${rest} || true
+"
+            fi
+        done < <(lab_target_names)
         in_container "${PROLOGUE}
 ${BUILD}
 ${RUNFN}
-run_target q4 k2048 --k 2048 --rows 4 --ct 8 --iters 10
-run_target q4 k6144 --k 6144 --rows 4 --ct 4 --iters 10
-run_target q4_after k2048 --k 2048 --rows 4 --ct 8 --iters 10
-run_target q4_after k6144 --k 6144 --rows 4 --ct 4 --iters 10
-run_target gdn_conv t1 --n_ch 6144 --threads 1 --iters 20
-run_target gdn_conv t6 --n_ch 6144 --threads 6 --iters 20
-run_target gdn_conv_after t1 --n_ch 6144 --threads 1 --iters 20
-run_target gdn_conv_after t6 --n_ch 6144 --threads 6 --iters 20
-MODE=functional run_target hmx functional --dot_tiles 64 --col_tiles 4 --iters 2
-SIM_ARGS=\"\$SIM_ARGS --plimit 60000000\" run_target hmx timing --dot_tiles 64 --col_tiles 4 --iters 8"
+${ALL_CMDS}"
         ;;
     shell)
-        podman run --rm -it --userns=keep-id --security-opt label=disable \
+        # An interactive shell holds the container lock until it exits.
+        with_container_lock podman run --rm -it --userns=keep-id --security-opt label=disable \
             -v "${REPO_DIR}:/repo" -v "${LLAMA_DIR}:/llama" -w /repo "${IMAGE}" bash
         ;;
     *)

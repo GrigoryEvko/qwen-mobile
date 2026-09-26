@@ -51,8 +51,18 @@ for a in ${VARIANT_ARCHS}; do
     done
 done
 
+# Runs the given script text inside the container. The container lock of the box covers the life of
+# the container and nothing else: one container of this box runs at a time, because two of them
+# compete for the cores and a measurement beside a build is not valid. A caller that already holds
+# the lock sets LAB_NO_LOCK=1, because a second exclusive lock of one file blocks without an end.
 in_container() {
-    podman run --rm --userns=keep-id --security-opt label=disable -v "${REPO_DIR}:/repo" -w /repo "${IMAGE}" bash -c "$1"
+    if [ -n "${LAB_NO_LOCK:-}" ]; then
+        podman run --rm --userns=keep-id --security-opt label=disable -v "${REPO_DIR}:/repo" -w /repo "${IMAGE}" bash -c "$1"
+        return
+    fi
+    mkdir -p "${REPO_DIR}/build"
+    flock "${REPO_DIR}/build/.container.lock" \
+        podman run --rm --userns=keep-id --security-opt label=disable -v "${REPO_DIR}:/repo" -w /repo "${IMAGE}" bash -c "$1"
 }
 
 # The shell prologue of the container commands: the tools and the ncurses shim of hexagon-sim
@@ -83,7 +93,10 @@ hexagon-clang -m$a -mhvx=$a ${LAB_FLAGS} $(variant_flags ${l:3}) -Wno-format -I 
             > "${OUT}/build-var-${l}.log" 2>&1
     done
 
-    # The functional census and the timing bench of each version, all in parallel
+    # The functional census and the timing bench of each version. run.sh takes the container lock of
+    # the box for the life of each container, thus the runs start together and the box runs one of
+    # them at a time. One container at a time is the rule of the box: two of them compete for the
+    # cores and a measurement beside a build is not valid.
     pids=""
     for a in ${ARCHS}; do
         ARCH=$a MODE=functional LAB_TARGETS=isa LAB_OUT=${OUT_REL} TAG=${TAG} PROPOSALS=none NO_BUILD=1 \
