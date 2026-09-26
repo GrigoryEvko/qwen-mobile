@@ -6,7 +6,7 @@
 // bytes after dst must not change.
 //
 // The program includes matmul-ops.c verbatim and calls the op entry points op_matmul and op_matmul_nx with the
-// kernel params that the host computes. The shims of target_mmswiglu_op.c replace the engines that the standalone
+// kernel params that the host computes. The shims of lab-dma.h and lab-hmx.h replace the engines that the standalone
 // runtime of the simulator does not give:
 //   - The DMA: a push copies at once and a pop returns the destinations in the order of the pushes.
 //   - The HMX queue: a push runs the job at once on the calling thread, and a pop returns.

@@ -4,7 +4,7 @@
 // The program includes matmul-ops.c verbatim and calls the op entry points op_matmul, op_matmul_nx and
 // op_matmul_id with the kernel params that the host computes for the HVX path
 // (ggml_hexagon_precompute_hvx_mm_params). Two shims replace the engines that the standalone runtime of
-// the simulator does not give (refer to target_mmswiglu_op.c):
+// the simulator does not give (lab-dma.h and lab-hmx.h):
 //   - The DMA: a push copies the rows of the descriptor at once (dst stride, src stride, row size, row
 //     count), and a pop returns the destinations in the order of the pushes. Thus a descriptor with a
 //     wrong geometry puts wrong bytes into VTCM, and the output changes.
