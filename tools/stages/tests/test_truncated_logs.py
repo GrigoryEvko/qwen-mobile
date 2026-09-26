@@ -27,7 +27,7 @@ class SweepEngineTable(unittest.TestCase):
             (root / "i8a-gate.txt").write_text(GATE_OK)
             (root / "i8a.txt").write_text(text)
             out = sweep.read_run(root, run)
-        lines, _ = sweep.i8_tables({"i8a": out}, 1000.0, False)
+        lines, _ = sweep.i8_tables({"i8a": out}, 1000.0)
         return "\n".join(lines)
 
     def test_one_point_of_the_fit_does_not_crash(self) -> None:
