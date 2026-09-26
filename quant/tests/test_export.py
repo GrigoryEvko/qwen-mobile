@@ -366,9 +366,9 @@ def solved_pack(path: Path, w: np.ndarray) -> None:
 def test_export_refuses_a_plan_change_on_an_unfolded_source(tmp_path: Path) -> None:
     """A solved class that the plan moves to Q8_0 needs the folded reference, or --promote.
 
-    An old folds.npz holds no plan, thus the plan guard does not see the
-    change. Without this check the export would take the unfolded weight
-    of the F16 GGUF and the file would be wrong.
+    A folds.npz that holds no plan gives the plan guard nothing to compare,
+    thus the guard does not see the change. Without this check the export
+    would take the unfolded weight of the F16 GGUF and the file would be wrong.
     """
     gguf = gguf_module()
     gen = np.random.default_rng(11)

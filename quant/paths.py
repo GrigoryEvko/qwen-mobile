@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-# The llama.cpp tree: the submodule of this repository, then the plain clone that the GPU box keeps in
-# ~/qwen-mobile/llama.cpp. The first tree that holds a path gives it.
+# The llama.cpp tree: the submodule of this repository, then a plain clone beside it for a machine
+# that has no submodule. The first tree that holds a path gives it.
 LLAMA_DIRS = (ROOT / "third_party" / "llama.cpp", ROOT / "llama.cpp")
 
 

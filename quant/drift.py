@@ -17,7 +17,9 @@ the two sub-block updates (mixer and MLP):
 The logits give the KL, the top-1 agreement, the KL quantiles, and the KL
 by position bin. The weights give the relative error and kurtosis by class.
 
-    python -m quant.drift --model Qwen3.5-2B --source t --packs quant-out/Qwen3.5-2B --out analysis/x.drift.md
+This module has no command line. ``quant.run drift`` calls ``drift_report``:
+
+    python -m quant.run drift --model Qwen3.5-2B --source t --packs quant-out/Qwen3.5-2B --out analysis/x.drift.md
 """
 
 from __future__ import annotations

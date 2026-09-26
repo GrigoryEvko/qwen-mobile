@@ -37,7 +37,7 @@ def test_the_guarded_classes_take_their_own_type() -> None:
 
 
 def test_a_guarded_class_follows_the_bulk_by_default() -> None:
-    """None means that the class takes the type of the bulk, thus an old plan keeps its meaning."""
+    """None means that the class takes the type of the bulk, thus a plan without the key keeps its meaning."""
     plan = Plan(n_layers=24, bulk="IQ4_NL")
     assert plan.type_of("blk.3.ssm_out.weight") == "IQ4_NL"
     assert plan.type_of("blk.3.ffn_down.weight") == "IQ4_NL"
@@ -61,20 +61,20 @@ def test_the_mtp_block_and_the_tensors_outside_the_layers() -> None:
     assert plan.type_of("rope_freqs.weight") == "keep"
 
 
-def test_an_old_saved_plan_loads_and_keeps_its_meaning() -> None:
-    """A plan of folds.npz without the two new keys passes the guard of the export against the default.
+def test_a_saved_plan_without_the_guard_keys_loads_and_keeps_its_meaning() -> None:
+    """A plan of folds.npz without the keys embedding and mtp passes the guard of the export.
 
     The export compares ``Plan(**saved).calibrated()`` with the JSON round
-    trip of the calibrated fields of the new plan. Thus the test uses the
-    same two sides.
+    trip of the calibrated fields of the plan of the run. Thus the test uses
+    the same two sides.
     """
     saved = {"bulk": "Q4_0", "head": "Q4_0", "embedding": "Q4_0", "kv_proj": "Q8_0", "gdn_gate": "Q4_0",
              "edge_layers": [], "edge_type": "Q8_0", "n_layers": 24}
-    old = Plan(**json.loads(json.dumps(saved)))
+    loaded = Plan(**json.loads(json.dumps(saved)))
     wanted = json.loads(json.dumps(Plan(embedding="Q4_0", n_layers=24).calibrated()))
-    assert old.calibrated() == wanted
-    assert "embedding" not in old.calibrated() and "mtp" not in old.calibrated()
-    assert old.calibrated()["ssm_out"] is None
-    # A plan that moves a guarded class must not pass the guard of an old calibration.
+    assert loaded.calibrated() == wanted
+    assert "embedding" not in loaded.calibrated() and "mtp" not in loaded.calibrated()
+    assert loaded.calibrated()["ssm_out"] is None
+    # A plan that moves a guarded class must not pass the guard of that calibration.
     moved = json.loads(json.dumps(Plan(embedding="Q4_0", n_layers=24, ssm_out="Q8_0").calibrated()))
-    assert old.calibrated() != moved
+    assert loaded.calibrated() != moved

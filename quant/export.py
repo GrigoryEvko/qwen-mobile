@@ -167,7 +167,7 @@ class LinearAttentionLayout:
 
 
 def plan_of(folds) -> dict | None:
-    """The plan that the calibration used, from folds.npz, or None for an old file."""
+    """The plan that the calibration used, from folds.npz, or None for a file that holds no plan."""
     if folds is None or "plan" not in folds.files:
         return None
     return json.loads(str(folds["plan"]))
@@ -361,7 +361,7 @@ def export(f16_gguf: Path, out_gguf: Path, packs: Path, plan: Plan, llama_dir: P
         if (not promote_this and kind not in GGUF_4BIT and pack.exists()
                 and folds is not None and not source_folded):
             # The calibration solved this tensor, thus the F16 GGUF holds it in the coordinates
-            # before the folds. A plan of an old folds.npz passes the guard above, thus this
+            # before the folds. A folds.npz that holds no plan passes the guard above, thus this
             # tensor would take the unfolded weight and the file would be wrong.
             raise ValueError(f"{name}: the plan gives {kind} to a class that the calibration solved, and the "
                              f"source is not folded. Export from the folded reference (--source tf), or move "

@@ -1,6 +1,6 @@
 """Attribute the KL of a quantized file to its tensor classes.
 
-    python -m quant.attribute --model Qwen3.5-2B --packs-tag gptq
+    python -m quant.attribute --model Qwen3.5-2B --packs quant-out/Qwen3.5-2B --packs-tag gptq
 
 For each class, two files come from the same solved blocks: one with only
 that class quantized (the rest F16) and one with everything except that
