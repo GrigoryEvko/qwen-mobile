@@ -13,13 +13,12 @@ metadata copy as they are.
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from .paths import llama_path
+from .paths import gguf_module
 from .transform import rotation_matrix
 
 MERGER_OUT = "mm.2"
@@ -33,9 +32,7 @@ def main() -> None:
     p.add_argument("--block", type=int, default=None, help="the block of the rotation, as in the transform")
     args = p.parse_args()
 
-    sys.path.insert(0, str(llama_path("gguf-py")))
-    import gguf  # noqa: E402
-
+    gguf = gguf_module()
     reader = gguf.GGUFReader(str(args.src))
     arch = bytes(reader.fields["general.architecture"].parts[-1]).decode()
     writer = gguf.GGUFWriter(str(args.dst), arch)

@@ -14,7 +14,8 @@ import argparse
 import time
 from pathlib import Path
 
-from .sweep import ROOT, parse_eval, run
+from .paths import ROOT
+from .sweep import parse_eval, run
 
 CLASSES: dict[str, str] = {
     "head": r"^output\.weight$",

@@ -61,15 +61,13 @@ import math
 import os
 import re
 import subprocess
-import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parent.parent
-LLAMA_DIR = ROOT / "third_party" / "llama.cpp"
+from .paths import gguf_module
 
 # The head that the drafter shares with the main graph. A tied checkpoint has
 # no output.weight and llama.cpp reads the head from the embedding table.
@@ -79,18 +77,6 @@ HEAD_NAMES = ("output.weight", "token_embd.weight")
 # drafter that cannot propose the end of a turn ends every draft one token
 # early, thus these carry far more weight than their frequency shows.
 FORCED_TOKEN_TYPES = (2, 3, 4, 5, 6)  # CONTROL, USER_DEFINED, UNUSED, BYTE, UNKNOWN
-
-
-def _import_gguf() -> Any:
-    """Import the gguf package of the pinned llama.cpp.
-
-    Returns:
-        The gguf module
-    """
-    sys.path.insert(0, str(LLAMA_DIR / "gguf-py"))
-    import gguf  # noqa: PLC0415
-
-    return gguf
 
 
 def forced_ids(reader: Any, n_vocab: int) -> set[int]:
@@ -285,7 +271,7 @@ def inject(src: Path, dst: Path, ids: list[int], fill: float) -> dict[str, int]:
     Raises:
         ValueError: If the head is missing or its rows do not divide its bytes
     """
-    gguf = _import_gguf()
+    gguf = gguf_module()
     reader = gguf.GGUFReader(str(src))
     arch = bytes(reader.fields["general.architecture"].parts[-1]).decode()
     il = mtp_layer(reader)
@@ -560,7 +546,7 @@ def cmd_select(a: argparse.Namespace) -> int:
     Returns:
         The exit status
     """
-    gguf = _import_gguf()
+    gguf = gguf_module()
     reader = gguf.GGUFReader(str(a.model))
     head = next((t for name in HEAD_NAMES for t in reader.tensors if t.name == name), None)
     if head is None:

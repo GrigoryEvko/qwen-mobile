@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import re
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -16,16 +15,9 @@ import torch
 from quant import grid as grid_module
 from quant.grid import BLOCK, block_error, dequantize, dequantize_pack, pack_nibbles, pack_q8_0, q8_0_quantize, quantize
 from quant.grids import IQ4_NL_TABLE, Grid, IQ4NLGrid, Q4_0Grid
-from quant.paths import llama_path
+from quant.paths import gguf_module, llama_path
 
 LLAMA = llama_path("gguf-py").parent
-
-
-def gguf_module():
-    sys.path.insert(0, str(LLAMA / "gguf-py"))
-    import gguf
-
-    return gguf
 
 
 def test_iq4_nl_table_is_the_ggml_table() -> None:

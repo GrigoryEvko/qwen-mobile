@@ -27,15 +27,16 @@ from __future__ import annotations
 
 import json
 import re
-import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 
 import numpy as np
 import torch
 
 from .grid import block_permutation, dequantize_pack, pack_nibbles, pack_q8_0, q8_0_quantize, quantize
 from .grids import make_grid
+from .paths import gguf_module
 from .plan import MTP_MAPS, Plan
 from .refold import Geometry, Refold
 
@@ -66,14 +67,19 @@ def _f16(name: str, a: np.ndarray) -> np.ndarray:
     return out
 
 
-def _load_gguf_module(llama_dir: Path):
-    path = str(llama_dir / "gguf-py")
-    # One entry for each process: an insertion for each call would grow sys.path with each export.
-    if path not in sys.path:
-        sys.path.insert(0, path)
-    import gguf  # noqa: E402
+def _load_gguf_module(llama_dir: Path) -> ModuleType:
+    """The gguf package of one llama.cpp tree.
 
-    return gguf
+    ``export`` takes the tree as a parameter, thus a caller can name a checkout that is not the
+    submodule. Refer to ``quant.paths.gguf_module`` for the one implementation.
+
+    Args:
+        llama_dir: The root of the llama.cpp tree
+
+    Returns:
+        The gguf module
+    """
+    return gguf_module(llama_dir)
 
 
 def _f32_of(reader_tensor) -> np.ndarray:

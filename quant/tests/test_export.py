@@ -13,7 +13,7 @@ from quant.blockopt import weighted_low_rank
 from quant.export import LinearAttentionLayout, _f32_of, block_permutation, export, write_adapter
 from quant.grid import dequantize, pack_nibbles, q8_0_dequantize, q8_0_quantize, quantize
 from quant.grids import Q4_0Grid
-from quant.paths import llama_path
+from quant.paths import gguf_module, llama_path
 from quant.plan import Plan
 
 LLAMA = llama_path("gguf-py").parent
@@ -27,13 +27,6 @@ def converter_reorder():
     from conversion.qwen import _LinearAttentionVReorderBase
 
     return _LinearAttentionVReorderBase._reorder_v_heads
-
-
-def gguf_module():
-    sys.path.insert(0, str(LLAMA / "gguf-py"))
-    import gguf
-
-    return gguf
 
 
 LAYOUT = LinearAttentionLayout(num_k_heads=2, num_v_heads=6, head_k_dim=32, head_v_dim=32)

@@ -1,10 +1,14 @@
-"""Run named configurations end to end and append their rows to the results file.
+"""Run named configurations end to end and print the results row of each one.
 
     python -m quant.sweep --model Qwen3.5-2B --configs gptq head-q8 gate-q8 edges-q8
 
 A configuration names its transform flags, its plan flags, and if it needs a
-new calibration. Configurations that only change the export reuse the solved
-blocks of the last calibration.
+calibration of its own. Configurations that only change the export reuse the
+solved blocks of the last calibration.
+
+The tool prints the row of each configuration and writes it to its log. A person
+puts the row in the table of analysis/quant-results.md that the row belongs to,
+because that file holds several tables and a heading for each group of rows.
 """
 
 from __future__ import annotations
@@ -15,10 +19,8 @@ import re
 import subprocess
 import sys
 import time
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-RESULTS = ROOT / "analysis" / "quant-results.md"
+from .paths import ROOT
 
 CONFIGS: dict[str, dict] = {
     "gptq": {"desc": "Targeted plan, GPTQ Q4_0 (128 x 2048 C4 tokens, damp 0.01)", "quantize": True},
@@ -57,22 +59,30 @@ def parse_eval(text: str) -> dict[str, str]:
     return out
 
 
-def append_row(name: str, desc: str, size_gib: float, ev: dict[str, str]) -> None:
-    """Append one row to the results table."""
-    rows = RESULTS.read_text().rstrip("\n").splitlines()
-    numbered = [r for r in rows if re.match(r"^\| \d+ \|", r)]
-    n = len(numbered) + 1
-    rows.append(f"| {n} | {desc} ({name}) | {size_gib:.2f} GiB file | {ev['mean']} | {ev['p999']} | {ev['max']} | {ev['top1']} % | {ev['ppl']} |")
-    RESULTS.write_text("\n".join(rows) + "\n")
+def results_row(name: str, desc: str, size_gib: float, ev: dict[str, str]) -> str:
+    """One row of the results table, without a row number.
+
+    Args:
+        name: The name of the configuration
+        desc: The description of the configuration
+        size_gib: The size of the GGUF in GiB
+        ev: The KL numbers of parse_eval
+
+    Returns:
+        The Markdown row
+    """
+    return (f"| | {desc} ({name}) | {size_gib:.2f} GiB file | {ev['mean']} | {ev['p999']} | "
+            f"{ev['max']} | {ev['top1']} % | {ev['ppl']} |")
 
 
 def main() -> None:
+    """Run each named configuration and print its row."""
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="Qwen3.5-2B")
     p.add_argument("--configs", nargs="+", required=True)
     args = p.parse_args()
-    log = ROOT / "logs" / f"sweep-{args.model}.log"
-    log.parent.mkdir(exist_ok=True)
+    log = ROOT / "build" / "quant" / f"sweep-{args.model}.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
     for name in args.configs:
         cfg = CONFIGS[name]
         t0 = time.time()
@@ -92,8 +102,8 @@ def main() -> None:
         run(["export", "--model", args.model, "--source", "tf", "--tag", tag, *export_args])
         gguf = ROOT / "weights" / "gguf" / f"{args.model}-{tag}.gguf"
         ev = parse_eval(run(["eval", "--model", args.model, "--gguf", str(gguf)]))
-        append_row(name, cfg["desc"], gguf.stat().st_size / 2**30, ev)
-        line = f"{name}: {json.dumps(ev)} in {(time.time() - t0) / 60:.1f} min"
+        row = results_row(name, cfg["desc"], gguf.stat().st_size / 2**30, ev)
+        line = f"{name}: {json.dumps(ev)} in {(time.time() - t0) / 60:.1f} min\n{row}"
         print(line, flush=True)
         with log.open("a") as f:
             f.write(line + "\n")
