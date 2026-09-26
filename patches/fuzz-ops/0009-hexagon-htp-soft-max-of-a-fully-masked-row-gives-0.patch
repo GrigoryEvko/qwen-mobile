@@ -13,6 +13,13 @@ path. The v79 simulator gives 0 for fully masked rows of 32, 64 and 1024
 elements, and the rows with some or no masked columns do not change.
 test_soft_max_masked_row of test-backend-ops tests the change.
 
+This patch is the Hexagon DSP part of one idea that covers three backends. The CPU
+backend and OpenCL get the same result in
+patches/fuzz-ops/0006-soft-max-of-a-fully-masked-row-gives-0.patch, which the
+series applies earlier. This part comes after
+patches/hexagon-kernels/0007-hexagon-htp-softmax-and-norm-packed.patch, because it
+changes hvx_fast_softmax_f32, which that kernel creates.
+
 diff --git a/ggml/src/ggml-hexagon/htp/softmax-ops.c b/ggml/src/ggml-hexagon/htp/softmax-ops.c
 index 53cd5fe..45fce84 100644
 --- a/ggml/src/ggml-hexagon/htp/softmax-ops.c

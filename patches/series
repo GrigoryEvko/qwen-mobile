@@ -18,7 +18,9 @@ fuzz-ops/0002-ggml-thunks-for-the-type-trait-functions.patch
 fuzz-ops/0003-ggml-cpu-keep-the-sse2-exp-steps-under-fast-math.patch
 fuzz-ops/0004-ggml-cpu-quantize-a-strided-src1-of-the-repack-matmul.patch
 fuzz-ops/0005-ggml-cpu-run-the-value-asserts-only-with-an-opt-in-macro.patch
-fuzz-ops/0006-ggml-cpu-soft-max-of-a-fully-masked-row-gives-0.patch
+# One idea, three backends: the CPU backend and OpenCL here, and the Hexagon DSP in
+# fuzz-ops/0009, which must come after the packed softmax kernel of hexagon-kernels/0007.
+fuzz-ops/0006-soft-max-of-a-fully-masked-row-gives-0.patch
 fuzz-ops/0013-ggml-the-f32-to-f16-conversion-gives-inf-past-the-f16-range-with-fast-math.patch
 fuzz-ops/0014-ggml-cpu-the-rope-cache-reads-no-freq-factor-past-src2.patch
 fuzz-matrix/0007-ggml-cpu-read-the-q1-0-bits-with-memcpy-in-the-x86-vec-dot.patch
@@ -88,7 +90,6 @@ opencl-vision/0002-mtmd-clip-compute-warmup.patch
 opencl-vision/0003-mtmd-qwen3vl-zero-mask-test-aid.patch
 mtmd/0001-mtmd-qwen3vl-position-embedding-on-cpu.patch
 mtmd/0002-mtmd-qwen3vl-one-rope-for-q-and-k.patch
-fuzz-ops/0010-opencl-soft-max-of-a-fully-masked-row-gives-0.patch
 fuzz-ops/0011-opencl-row-broadcast-of-a-src1-row-that-repeats-along-dim-0.patch
 
 # The switches of the app and the tools
