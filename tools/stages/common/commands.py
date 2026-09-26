@@ -158,6 +158,40 @@ def output_lines(paths: StagePaths, *, tools: Iterable[str] = (), out_dir: str =
     ] + list(extra)
 
 
+def pull_check(local: str, stage: str, names: Iterable[str], *, adb: str = ADB, expected: Iterable[str] = (),
+               suffixes: tuple[str, ...] = (".out", ".log")) -> str:
+    """The line that removes the stage from the phone only when the pull has each file, and else names each
+    file that the laptop does not have.
+
+    The laptop must have these files:
+    - the gate file of each run, because each run line writes it first;
+    - the files of `suffixes` of each run whose gate file holds "gate: OK", because a run that the gate
+      stopped writes only its gate file;
+    - each file of `expected`, a path relative to the out directory;
+    - each file that the out directory of the phone holds.
+    A count of the files cannot see a lost file when another directory of the pull holds more files. The
+    names of the runs and of the files must hold no space. O(files).
+
+    Args:
+        local: The directory of the pulled outputs on the laptop
+        stage: The stage directory on the phone, whose out directory the pull copied
+        names: The name of each run
+        adb: The adb command
+        expected: More files that the pull must have
+        suffixes: The files of a run whose gate passed, after its name
+    """
+    runs = " ".join(names)
+    extra = " ".join(expected)
+    return (f"miss=\"\"; for n in {runs}; do g={local}/$n-gate.txt; if [ ! -e \"$g\" ]; then "
+            f"miss=\"$miss $n-gate.txt\"; elif grep -q \"gate: OK\" \"$g\"; then for s in {' '.join(suffixes)}; do "
+            f"[ -e \"{local}/$n$s\" ] || miss=\"$miss $n$s\"; done; fi; done; "
+            + (f"for f in {extra}; do [ -e \"{local}/$f\" ] || miss=\"$miss $f\"; done; " if extra else "")
+            + f"for f in $({adb} shell 'cd {stage}/out && find . -type f' | tr -d '\\r'); do f=${{f#./}}; "
+            f"[ -e \"{local}/$f\" ] || case \" $miss \" in *\" $f \"*) ;; *) miss=\"$miss $f\" ;; esac; done; "
+            f"if [ -z \"$miss\" ]; then {adb} shell 'rm -rf {stage}' && echo removed {stage}; "
+            f"else echo \"PULL FAULT: the laptop has no copy of:$miss. The phone keeps {stage}.\"; fi")
+
+
 def photo_lines(box: str, photo: str, *, adb: str = ADB) -> list[str]:
     """The lines that copy the photo of the image stages from the box, check its sha1, and push it to the
     phone. `box` is the box build directory and `photo` is the path of the photo on the phone."""

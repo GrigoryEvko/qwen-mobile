@@ -224,23 +224,25 @@ def kit_probe_lines(t: Target) -> list[str]:
     ]
 
 
-def output_lines(t: Target, kit: bool, n_runs: int) -> list[str]:
+def output_lines(t: Target, kit: bool, rs: list[Run]) -> list[str]:
     """The lines that pull the outputs, copy them to the box and remove the phone directory.
 
-    This block has no thermal line, and its file count test counts 3 files for each run. Thus
-    commands.output_lines does not give the same text."""
+    This block has no thermal line, thus commands.output_lines does not give the same text. The phone
+    directory goes only when the laptop has each file of the pull and each file of each run of rs, and the
+    check names each missing file (commands.pull_check)."""
+    local = f"{LAPTOP_STAGE}/{t.out_dir}"
+    names = [r.name for r in rs]
+    probe = ("probe-info/stdout.txt", "probe-census/stdout.txt") if kit else ()
     lines = [
         "#",
         "# ---- The outputs ----",
         "#",
         f"{t.adb} shell '" + "; ".join(f"pgrep -x {x}" for x in TOOLS) + f"; ls {t.phone}/out | wc -l; "
         f"du -sh {t.phone}/out'",
-        f"rm -rf {LAPTOP_STAGE}/{t.out_dir}",
-        f"{t.adb} pull {t.phone}/out {LAPTOP_STAGE}/{t.out_dir}",
-        f"rsync -a --delete {LAPTOP_STAGE}/{t.out_dir}/ {BOX}/{t.out_dir}/",
-        # Each run writes 3 files: the phone directory goes only when the pull has the files of each run
-        f"test $(ls {LAPTOP_STAGE}/{t.out_dir} | wc -l) -ge {3 * n_runs} && {t.adb} shell 'rm -rf {t.phone}' && "
-        "echo removed",
+        f"rm -rf {local}",
+        f"{t.adb} pull {t.phone}/out {local}",
+        f"rsync -a --delete {local}/ {BOX}/{t.out_dir}/",
+        commands.pull_check(local, t.phone, names, adb=t.adb, expected=probe),
         "# Then, on the box:",
         f"#   tools/stages/v81/stage.py table --root build/v81/{t.out_dir}",
     ]
@@ -340,7 +342,7 @@ def write_commands(set_name: str, path: Path) -> None:
     lines += ["#", "# ---- The runs ----"]
     for r in rs:
         lines += run_lines(t, r)
-    lines += output_lines(t, kit, len(rs))
+    lines += output_lines(t, kit, rs)
     n = commands.write_commands(path, lines)
     print(f"{path}: {n} lines, {len(rs)} runs")
 
