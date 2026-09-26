@@ -207,10 +207,9 @@ def read_run(root: Path, run: Run, rejected: set[str]) -> tuple[list[Flow], list
             tail = [ln for ln in log.splitlines() if "image-stage" in ln or "FAKEJNI" in ln][-1:]
             removed.append(f"exit code {conditions.rc if conditions.rc is not None else '?'}"
                            + (f": {tail[0][:200]}" if tail else ""))
-    # A changed cap does not remove a run here, thus the thermal status comes from the gate file itself.
-    after = gate.AFTER_RE.search(gate_text)
-    if after and after.group(1) not in ("", "0"):
-        removed.append(f"thermal {after.group(1)} after the run")
+    # A changed cap does not remove a run here, only a thermal status above 0 after the run
+    if conditions.thermal_mark:
+        removed.append(conditions.thermal_mark)
     if run.name in rejected:
         removed.append("the runner marked CAPS-CHANGED")
     flows, vision, index = [], [], 0

@@ -401,9 +401,8 @@ def table(root: Path) -> None:
     ab: dict[str, dict[str, dict[str, float]]] = {}
     for out in sorted(root.glob("[pt]-*-*.out")):
         name = out.stem
-        text = logs.read_text(root / f"{name}-gate.txt")
-        after = gate.AFTER_RE.search(text)
-        ok = gate.read(text).ok and after is not None and after.group(1) == "0"
+        cond = gate.read(logs.read_text(root / f"{name}-gate.txt"))
+        ok = cond.ok and cond.thermal_after == 0
         m = re.match(r"([pt])-(\d+)-(new|base)$", name)
         if not m or not ok:
             print(f"{name}: not counted (gate, exit code or thermal status)")

@@ -216,16 +216,14 @@ HOSTPROF_RE = re.compile(r"hostprof: HTP0 graphs \d+ ops (\d+) hits (\d+) replay
 def conditions(text: str) -> str:
     """The exit code, the caps before the run, and each flag of one run, in one line.
 
-    The stage names the caps after the run and the thermal status in its own words, thus the function
-    reads the two lines of the gate file again.
+    The stage names the caps after the run and the thermal status in its own words.
     """
     c = gate.read(text)
-    before, after = gate.GATE_RE.search(text), gate.AFTER_RE.search(text)
     flags = [] if "gate: OK" in text else ["gate stopped the run"]
-    if before and after and (before.group(3), before.group(4)) != (after.group(2), after.group(3)):
-        flags.append(f"caps changed to {after.group(2)}/{after.group(3)}")
-    if after and after.group(1) not in ("", "0"):
-        flags.append(f"thermal {after.group(1)}")
+    if c.caps_mark:
+        flags.append(f"caps changed to {c.caps_after}")
+    if c.thermal_after:
+        flags.append(f"thermal {c.thermal_after}")
     return f"rc={c.rc if c.rc is not None else '?'} caps {c.caps}" + (" " + ", ".join(flags) if flags else "")
 
 

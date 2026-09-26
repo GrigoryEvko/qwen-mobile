@@ -698,8 +698,8 @@ def read_result(root: Path, run: Run) -> RunData:
     text, out = logs.read_run(root, run.name, ("-gate.txt", ".out"))
     c = gate.read(text)
     # A thermal status above 0 after the run is a defect of the run. A change of the caps is a note only.
-    flags = c.faults + [m for m in c.marks if m.startswith("thermal ")]
-    notes = [m for m in c.marks if not m.startswith("thermal ")]
+    flags = c.faults + ([c.thermal_mark] if c.thermal_mark else [])
+    notes = [c.caps_mark] if c.caps_mark else []
     ok = c.ok
     events: tuple[int, ...] = ()
     graphs: list[GraphData] = []

@@ -38,7 +38,8 @@ class Conditions:
     each problem of the run itself, marks names each condition that makes the run not comparable, and
     removed names each condition that keeps the run out of the tables. caps is the pair of clock caps of
     cpu0 and cpu7 in kHz before the run, and nsp is the highest NPU zone temperature in C before and
-    after the run.
+    after the run. caps_after is the pair of caps after the run, and thermal_after is the thermal status
+    after the run. Each of the two is "?" or None when the gate file has no value.
     """
     ok: bool
     rc: int | None
@@ -48,11 +49,25 @@ class Conditions:
     faults: list[str] = field(default_factory=list)
     marks: list[str] = field(default_factory=list)
     removed: list[str] = field(default_factory=list)
+    caps_after: str = "?"
+    thermal_after: int | None = None
 
     @property
     def flags(self) -> list[str]:
         """The faults and the marks in one list, in the order of the gate file."""
         return self.faults + self.marks
+
+    @property
+    def caps_mark(self) -> str:
+        """The mark of a change of the caps during the run, or an empty text when the caps stayed the same
+        or the gate file does not give the two pairs."""
+        changed = "?" not in (self.caps, self.caps_after) and self.caps != self.caps_after
+        return f"caps {self.caps} -> {self.caps_after}" if changed else ""
+
+    @property
+    def thermal_mark(self) -> str:
+        """The mark of a thermal status above 0 after the run, or an empty text."""
+        return f"thermal {self.thermal_after} after the run" if self.thermal_after else ""
 
 
 def read(gate: str, *, ok_codes: tuple[int, ...] = (0,), cap_min: int | None = None) -> Conditions:
@@ -68,32 +83,33 @@ def read(gate: str, *, ok_codes: tuple[int, ...] = (0,), cap_min: int | None = N
     before, after = GATE_RE.search(gate), AFTER_RE.search(gate)
     m = RC_RE.search(gate)
     rc = int(m.group(1)) if m else None
-    ok = "gate: OK" in gate and rc in ok_codes
-    faults, marks, removed = [], [], []
+    nsp_before = BEFORE_RE.search(gate)
+    c = Conditions(
+        ok="gate: OK" in gate and rc in ok_codes, rc=rc,
+        caps=f"{before.group(3)}/{before.group(4)}" if before else "?",
+        battery=f"{before.group(5)}% {int(before.group(6)) / 10:.1f} C" if before and before.group(6) else "?",
+        nsp=(int(nsp_before.group(1)) / 1000 if nsp_before and nsp_before.group(1) else None,
+             int(after.group(6)) / 1000 if after and after.group(6) else None),
+        caps_after=f"{after.group(2)}/{after.group(3)}" if after else "?",
+        thermal_after=int(after.group(1)) if after and after.group(1) else None)
     if not gate:
-        faults.append("no gate file")
+        c.faults.append("no gate file")
     elif "gate: OK" not in gate:
-        faults.append("the gate stopped the run")
+        c.faults.append("the gate stopped the run")
     elif rc != 0:
-        faults.append(f"exit code {rc if rc is not None else '?'}")
-    caps = f"{before.group(3)}/{before.group(4)}" if before else "?"
-    if before and after and (before.group(3), before.group(4)) != (after.group(2), after.group(3)):
-        marks.append(f"caps {caps} -> {after.group(2)}/{after.group(3)}")
-    thermal = f"thermal {after.group(1)} after the run" if after and after.group(1) not in ("", "0") else ""
+        c.faults.append(f"exit code {rc if rc is not None else '?'}")
+    if c.caps_mark:
+        c.marks.append(c.caps_mark)
     if cap_min is not None:
         values = [int(v) for v in ((before.group(3), before.group(4)) if before else ())
                   + ((after.group(2), after.group(3)) if after else ()) if v]
         if values and min(values) < cap_min:
-            removed.append(f"a cap of {min(values)} kHz")
-        if thermal:
-            removed.append(thermal)
-    elif thermal:
-        marks.append(thermal)
-    battery = f"{before.group(5)}% {int(before.group(6)) / 10:.1f} C" if before and before.group(6) else "?"
-    nsp_before = BEFORE_RE.search(gate)
-    nsp = (int(nsp_before.group(1)) / 1000 if nsp_before and nsp_before.group(1) else None,
-           int(after.group(6)) / 1000 if after and after.group(6) else None)
-    return Conditions(ok, rc, caps, battery, nsp, faults, marks, removed)
+            c.removed.append(f"a cap of {min(values)} kHz")
+        if c.thermal_mark:
+            c.removed.append(c.thermal_mark)
+    elif c.thermal_mark:
+        c.marks.append(c.thermal_mark)
+    return c
 
 
 def nsp_range(items: list[Conditions], when: int) -> str:
