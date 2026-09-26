@@ -22,42 +22,13 @@
 # directory of the phone, and start "ADSP_LIBRARY_PATH=<dir> ./run_main_on_hexagon 3 <program>.so".
 # Refer to tools/README.md for the mask files.
 set -euo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/dsp-lib.sh"
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO="$(cd "${HERE}/../.." && pwd)"
-ARCH="${ARCH:-v79}"
-OUT_REL="${1:-build/hmx-bench/i8-${ARCH}}"
-IMAGE="ghcr.io/snapdragon-toolchain/arm64-android:v0.7"
-SKEL="${HERE}/build/librun_main_on_hexagon_skel.so"
-[ -f "${SKEL}" ] || { echo "error: ${SKEL} is missing. Make it from the SDK as the header of this script tells." >&2; exit 1; }
-mkdir -p "${REPO}/${OUT_REL}"
+out_rel=${1:-build/hmx-bench/i8-$HMX_ARCH}
 
-podman run --rm --userns=keep-id --security-opt label=disable -v "${REPO}:/repo" -w /repo "${IMAGE}" bash -euc '
-SDK=$HEXAGON_SDK_ROOT
-TOOLS=$HEXAGON_TOOLS_ROOT
-VAR=$DEFAULT_TOOLS_VARIANT
-ARCH='"${ARCH}"'
-OUT=/repo/'"${OUT_REL}"'
-INC="-I$SDK/rtos/qurt/compute${ARCH}/include -I$SDK/rtos/qurt/compute${ARCH}/include/qurt
-     -I$SDK/rtos/qurt/compute${ARCH}/include/posix -I$SDK/ipc/fastrpc/rtld/ship/hexagon_${VAR}_${ARCH}
-     -I$SDK/ipc/fastrpc/rpcmem/inc -I$SDK/rtos/qurt -I$SDK/utils/examples
-     -isystem $SDK/incs -isystem $SDK/incs/stddef -isystem $SDK/ipc/fastrpc/incs
-     -I/repo/tools/htp-lab/lab"
-CFLAGS="-m${ARCH} -G0 -Wall -Wno-unused-function -fno-zero-initialized-in-bss -fdata-sections
-        -fpic -fPIC -mhvx -mhvx-length=128B -mhmx -O2 -DLAB_DEVICE=1"
-LDFLAGS="-m${ARCH} -G0 -fpic -Wl,-Bsymbolic -Wl,-L$TOOLS/Tools/target/hexagon/lib/${ARCH}/G0/pic
-         -Wl,-L$TOOLS/Tools/target/hexagon/lib/ -Wl,--no-threads -Wl,--wrap=malloc -Wl,--wrap=calloc
-         -Wl,--wrap=free -Wl,--wrap=realloc -Wl,--wrap=memalign -shared"
-CC=$TOOLS/Tools/bin/hexagon-clang
-$CC $INC $CFLAGS -c /repo/tools/hmx-bench/src/dsp_lab.c -o $OUT/dsp_lab.o
-$CC $INC $CFLAGS -c /repo/tools/hmx-bench/src/i8read.c -o $OUT/i8read.o
-$CC $INC $CFLAGS -c /repo/tools/htp-lab/lab/target_i8probe.c -o $OUT/i8probe.o
-$CC $INC $CFLAGS -c /repo/tools/hmx-bench/src/i8hello.c -o $OUT/i8hello.o
-$CC $LDFLAGS -o $OUT/i8hello.so -Wl,-soname,i8hello.so -Wl,--start-group $OUT/i8hello.o $OUT/dsp_lab.o -Wl,--end-group -lc
-$CC $LDFLAGS -o $OUT/i8read.so -Wl,-soname,i8read.so -Wl,--start-group $OUT/i8read.o $OUT/dsp_lab.o -Wl,--end-group -lc
-$CC $LDFLAGS -o $OUT/i8probe.so -Wl,-soname,i8probe.so -Wl,--start-group $OUT/i8probe.o $OUT/dsp_lab.o -Wl,--end-group -lc
-rm -f $OUT/*.o
-install -m 755 $SDK/libs/run_main_on_hexagon/ship/android_aarch64/run_main_on_hexagon $OUT/run_main_on_hexagon
-'
-cp "${SKEL}" "${REPO}/${OUT_REL}/"
-ls -la "${REPO}/${OUT_REL}"
+build_dsp_programs "$out_rel" \
+    i8hello=tools/hmx-bench/src/i8hello.c \
+    i8read=tools/hmx-bench/src/i8read.c \
+    i8probe=tools/htp-lab/lab/target_i8probe.c
+copy_dsp_runner "$out_rel"
+ls -la "$REPO_ROOT/$out_rel"

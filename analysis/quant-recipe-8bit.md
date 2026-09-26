@@ -4,12 +4,24 @@ Target: Qwen3.5 2B and 4B, a hybrid of gated delta net layers and full attention
 layers, on the Hexagon v79 HMX matrix engine of a Snapdragon 8 Elite.
 
 Format: **per-channel int8 weights** (one scale for each output row) and
-**per-token u8 activations**. Written 2026-09-20.
+**per-token u8 activations**.
 
 This document is a procedure, not a survey. Every number in it is either a
 measurement of our own model, with the command that produces it, or a published
 number with a link. Where the two disagree, our measurement wins and the
 document says so.
+
+## The verdict on this format: the f16 GEMMs stay
+
+A later measurement rejected the format that this document builds. The best form
+of the W8A8 path, with the Hadamard rotation R1 and the online R4, gives a mean
+KL of 0.00304 against the naive oracle. That is 1.8 times the KL of the shipped
+Q8_0 file, and it buys at most 1.18 to 1.28 times of pp512. The f16 GEMMs stay,
+and the product format stays Q8_0.
+
+The rest of the document keeps its value as the record of the hardware contract,
+the error budget, the rotation table and the reason for each rejected item. Read
+the format sections as the design that the measurement rejected, not as the plan.
 
 ## How to read this
 
@@ -54,7 +66,7 @@ per-block weights.
 
 ### 1.2 What the engine gives back
 
-Measured on the device, in `tools/hmx-bench`: the int8 mode gives **2.05 times**
+Measured on the device, in `tools/hmx-bench/src/i8read.c`: the int8 mode gives **2.05 times**
 the throughput of the f16 mode. The block geometry is 64 x 32 x 32 for int8
 against 32 x 32 x 32 for f16, thus one int8 issue does 65536 multiply-accumulate
 operations where one f16 issue does 32768.
@@ -83,7 +95,7 @@ That is **1.63 times, not 2.05**. There is a worse case. Our own kernel reaches
 about 9 cycles for one f16 tile where the HexKL call costs 34, thus most of the
 per-issue figure is call overhead and not engine time. If the 711 cycles is
 mostly engine time, the true ratio falls toward 1.04. Do not plan on 2.05 until
-a device run settles it. `tools/hmx-bench` now times the read on its own.
+a device run settles it. `tools/hmx-bench/src/i8read.c` times the read on its own.
 
 **The instruction set is reachable without HexKL, and that matters because the
 HexKL archive cannot ship.** The macros are in the tree at
@@ -1865,4 +1877,5 @@ Grouped by the section that uses them.
 - `analysis/quant-results.md` — every row this recipe cites
 - `analysis/quant-attribution.md` — the per-class KL attribution
 - `tools/prof/bytes.py` — the byte budget
-- `tools/hmx-bench/src/hmx_rate.c` — the 2.05x measurement
+- `tools/hmx-bench/src/i8read.c` — the multiply rate of the two modes and the cost
+  of the int32 accumulator read, with no vendor library

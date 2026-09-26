@@ -101,9 +101,11 @@ device counters instead.
 
 `build-i8.sh` builds three DSP programs for `run_main_on_hexagon` with no vendor
 library: `i8hello.so`, `i8read.so` (the cost of the int32 read of the int8 path)
-and `i8probe.so`. The header of the script tells how to make the skel library and
-how to run a program. `build.sh` builds `hmx_rate.so`, which links the HexKL
-library, thus that program is for local use only.
+and `i8probe.so`. `build-sustain.sh` builds `hmx_sustain.so`, which holds the
+HMX engine at its rate for 800 ms and then measures the recovery after a pause.
+The header of each script tells how to make the skel library and how to run a
+program. No vendor library goes into these programs, thus a clone of this
+repository builds each one.
 
 **A DSP program in the unsigned protection domain writes no log line without a
 `.farf` mask file.** Put a file `<program>.farf` with the content `0x1f` next to
