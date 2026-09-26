@@ -205,8 +205,8 @@ build_oracle() {
     mkdir -p "$B_ORACLE"
     if [[ ! -f "$B_ORACLE/build.ninja" ]]; then
         CC=gcc CXX=g++ nice -n 10 cmake -S "$HERE" -B "$B_ORACLE" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DFUZZ_OPS_VARIANT=oracle -DFUZZ_SANITIZER=none -DFUZZ_OPS_GGML_SRC="$HOST_SRC" > "$B_ORACLE/cmake.log" 2>&1 \
-            || die "the configure of the oracle failed, refer to $B_ORACLE/cmake.log"
+            -DFUZZ_OPS_VARIANT=oracle -DFUZZ_SANITIZER=none -DFUZZ_OPS_GGML_SRC="$HOST_SRC" > "$B_ORACLE/configure.log" 2>&1 \
+            || die "the configure of the oracle failed, refer to $B_ORACLE/configure.log"
     fi
     nice -n 10 cmake --build "$B_ORACLE" -j"$BUILD_JOBS" --target ops_oracle > "$B_ORACLE/build.log" 2>&1 \
         || die "the build of the oracle failed, refer to $B_ORACLE/build.log"
@@ -229,8 +229,8 @@ build_oracle_x86() {
     done
     mkdir -p "$B_ORACLE_X86"
     CC=gcc CXX=g++ nice -n 10 cmake -S "$LLAMA_SUBMODULE" -B "$B_ORACLE_X86" -G Ninja "${opts[@]}" \
-        > "$B_ORACLE_X86/cmake.log" 2>&1 \
-        || die "the configure of the x86 oracle failed, refer to $B_ORACLE_X86/cmake.log"
+        > "$B_ORACLE_X86/configure.log" 2>&1 \
+        || die "the configure of the x86 oracle failed, refer to $B_ORACLE_X86/configure.log"
     nice -n 10 cmake --build "$B_ORACLE_X86" -j"$BUILD_JOBS" > "$B_ORACLE_X86/build.log" 2>&1 \
         || die "the build of the x86 oracle failed, refer to $B_ORACLE_X86/build.log"
     {
@@ -255,8 +255,8 @@ build_config() {
     mkdir -p "$dir"
     if [[ ! -f "$dir/build.ninja" ]]; then
         nice -n 10 cmake -S "$HERE" -B "$dir" -G Ninja -DFUZZ_OPS_VARIANT=fuzz -DFUZZ_OPS_GGML_SRC="$HOST_SRC" \
-            -C "$SHARED_SAN/profile-$profile.cmake" -C "$SHARED_SAN/$config.cmake" > "$dir/cmake.log" 2>&1 \
-            || die "the configure of $dir failed, refer to $dir/cmake.log"
+            -C "$SHARED_SAN/profile-$profile.cmake" -C "$SHARED_SAN/$config.cmake" > "$dir/configure.log" 2>&1 \
+            || die "the configure of $dir failed, refer to $dir/configure.log"
     fi
     nice -n 10 cmake --build "$dir" -j"$BUILD_JOBS" --target fuzz_ops ops_replay ops_f16_check > "$dir/build.log" 2>&1 \
         || die "the build of $dir failed, refer to $dir/build.log"

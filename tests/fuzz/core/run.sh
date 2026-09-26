@@ -181,14 +181,15 @@ build_tree() {
         || fuzz_die "the shared files $SHARED/profile-$profile.cmake and $SHARED/$san.cmake are necessary"
     local -a src=()
     [[ -n $LLAMA_DIR ]] && src=(-DFUZZ_LLAMA_DIR="$LLAMA_DIR")
+    mkdir -p "$dir"
     cmake -G Ninja -S "$HERE" -B "$dir" "${src[@]}" \
         -DFUZZ_TARGETS="${targets// /;}" \
         -DCMAKE_AR="$(command -v llvm-ar)" -DCMAKE_RANLIB="$(command -v llvm-ranlib)" \
-        -C "$SHARED/profile-$profile.cmake" -C "$SHARED/$san.cmake" > "$dir.configure.log" 2>&1 \
-        || fuzz_die "the configure of $dir failed. Read $dir.configure.log."
+        -C "$SHARED/profile-$profile.cmake" -C "$SHARED/$san.cmake" > "$dir/configure.log" 2>&1 \
+        || fuzz_die "the configure of $dir failed. Read $dir/configure.log."
     # shellcheck disable=SC2086
-    nice -n 10 cmake --build "$dir" -j"$BUILD_JOBS" --target $targets > "$dir.build.log" 2>&1 \
-        || fuzz_die "the build of $dir failed. Read $dir.build.log."
+    nice -n 10 cmake --build "$dir" -j"$BUILD_JOBS" --target $targets > "$dir/build.log" 2>&1 \
+        || fuzz_die "the build of $dir failed. Read $dir/build.log."
 }
 
 # Fuzz one target for the budget. $1 is the profile, $2 the configuration, $3 the target.

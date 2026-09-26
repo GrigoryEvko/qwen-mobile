@@ -396,7 +396,7 @@ rt='$(fuzz_phone_runtime "$cfg")'
 if [[ -n \$rt && \$rt != '$FUZZ_ASAN_RT_NAME' ]]; then
     cp -f \$(find \$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt -name \$rt | head -n 1) $rel/runtime/
 fi
-" > "$dir.build.log" 2>&1 || fuzz_die "the phone build failed. Read $dir.build.log."
+" > "$dir/build.log" 2>&1 || fuzz_die "the phone build failed. Read $dir/build.log."
     [[ -n $asan_rt ]] && cp -f "$asan_rt" "$dir/runtime/"
 
     rm -rf "$stage"

@@ -189,8 +189,8 @@ build() {
         -DCMAKE_C_FLAGS_"$opt_var"="$opt_flags" -DCMAKE_CXX_FLAGS_"$opt_var"="$opt_flags" \
         -DCMAKE_EXE_LINKER_FLAGS="$prof_link $link_extra" \
         "${native[@]}" -DGGML_OPENMP=OFF -DGGML_LLAMAFILE=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF \
-        -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TESTS=OFF -DBUILD_SHARED_LIBS=OFF > "$out/logs/cmake.log" 2>&1 \
-        || { echo "run.sh: the configure of $cm failed. Read $out/logs/cmake.log." >&2; return 1; }
+        -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TESTS=OFF -DBUILD_SHARED_LIBS=OFF > "$out/logs/configure.log" 2>&1 \
+        || { echo "run.sh: the configure of $cm failed. Read $out/logs/configure.log." >&2; return 1; }
     nice -n 10 cmake --build "$cm" --target llama-perplexity ggml-base -j "${BUILD_JOBS:-10}" \
         > "$out/logs/build.log" 2>&1 \
         || { echo "run.sh: the build of $cm failed. Read $out/logs/build.log." >&2; return 1; }
@@ -214,8 +214,8 @@ build_native() {
     cmake -S "$LLAMA_DIR" -B "$out/llama" -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DGGML_NATIVE=ON -DLLAMA_CURL=OFF \
         -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TESTS=OFF -DBUILD_SHARED_LIBS=OFF \
-        > "$out/logs/cmake.log" 2>&1 \
-        || { echo "run.sh: the configure of $out/llama failed. Read $out/logs/cmake.log." >&2; return 1; }
+        > "$out/logs/configure.log" 2>&1 \
+        || { echo "run.sh: the configure of $out/llama failed. Read $out/logs/configure.log." >&2; return 1; }
     nice -n 10 cmake --build "$out/llama" --target llama-perplexity -j "${BUILD_JOBS:-10}" > "$out/logs/build.log" 2>&1 \
         || { echo "run.sh: the build of $out/llama failed. Read $out/logs/build.log." >&2; return 1; }
     echo "run.sh: built $out/llama/bin/llama-perplexity"
