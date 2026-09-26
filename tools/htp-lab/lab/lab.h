@@ -26,8 +26,9 @@ static inline uint64_t lab_cycles(void) {
     return c;
 }
 
-// Maps the VTCM, enables the HMX for the main thread, seeds the random generator, records the
-// limits of the build and of the simulator, and prints those limits at the exit of the program.
+// Maps the VTCM, enables the HMX for the main thread, seeds the random generator, and records the
+// limits of the build and of the simulator. At the exit of the program it does the check of the
+// options (refer to lab_args_done) and prints the limits.
 void lab_init(void);
 
 // Returns the VTCM base and size that the core configuration reports
@@ -174,7 +175,7 @@ void lab_report(const char * target, const char * key, double value, const char 
 // life of the program, thus give a string literal.
 void lab_limit(const char * text);
 
-// Prints the limits block. lab_init registers this function with atexit, thus a program prints
+// Prints the limits block. The exit handler of lab_init calls this function, thus a program prints
 // its limits without a call of its own.
 void lab_limits_report(void);
 
@@ -190,15 +191,26 @@ void lab_hmx_enable(void);
 // ---- arguments ----
 
 // Parses "--name value" pairs. Returns the value of the option or the default. The function
-// records the name, thus lab_args_done finds an option that no call of the program reads.
+// records the name and the argument vector, thus the exit of the program finds an option that no
+// call of the program read.
 long        lab_arg_long(int argc, char ** argv, const char * name, long def);
 double      lab_arg_double(int argc, char ** argv, const char * name, double def);
 const char * lab_arg_str(int argc, char ** argv, const char * name, const char * def);
 
-// Stops the program with the status 2 when an argument that starts with "--" is not one of the
-// names that a lab_arg_* call read. Without this check a misspelled option name takes the default
-// value in silence, and the run then measures a case that the reader did not ask for. Call it
-// after the last lab_arg_* call. Complexity O(argc * names).
+// Returns true when argv holds the flag, an option with no value
+bool lab_arg_flag(int argc, char ** argv, const char * name);
+
+// The check of the options. An argument that starts with "--" and that no lab_arg_* call read is an
+// error: without the check a misspelled option name takes the preset value in silence, and the run
+// then measures a case that the reader did not ask for.
+//
+// The exit handler of lab_init does this check for every program that read an option with lab_arg_*.
+// It prints the unknown options and the limits block, and the program ends with the status 2. Thus an
+// option that a mode of the program does not read also fails, because the run did not use it.
+//
+// lab_args_done does the same check at once and stops the program with the status 2. Call it after
+// the last lab_arg_* call when the program must not start work with a wrong option.
+// Complexity O(argc * names).
 void lab_args_done(int argc, char ** argv);
 
 // ---- half floats ----

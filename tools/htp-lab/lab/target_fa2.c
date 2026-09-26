@@ -782,12 +782,7 @@ static int mode_full(int argc, char ** argv) {
 
 int main(int argc, char ** argv) {
     lab_init();
-    const char * mode = "exp";
-    for (int i = 1; i + 1 < argc; i++) {
-        if (strcmp(argv[i], "--mode") == 0) {
-            mode = argv[i + 1];
-        }
-    }
+    const char * mode = lab_arg_str(argc, argv, "--mode", "exp");
     if (strcmp(mode, "exp") == 0) {
         return mode_exp(argc, argv);
     }

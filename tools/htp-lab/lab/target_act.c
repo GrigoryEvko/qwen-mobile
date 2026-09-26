@@ -113,14 +113,8 @@ int main(int argc, char ** argv) {
     const uint32_t iters   = (uint32_t) lab_arg_long(argc, argv, "--iters", 3);
     const float    x_range = (float) lab_arg_long(argc, argv, "--range", 8);
 
-    // --only <name> keeps one kernel in the program. The argument parser of the lab reads
-    // numbers, thus the name comes from argv directly.
-    const char * only = NULL;
-    for (int i = 1; i + 1 < argc; i++) {
-        if (!strcmp(argv[i], "--only")) {
-            only = argv[i + 1];
-        }
-    }
+    // --only <name> keeps one kernel in the program
+    const char * only = lab_arg_str(argc, argv, "--only", NULL);
 
     lab_init();
 

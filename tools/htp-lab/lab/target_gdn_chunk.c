@@ -258,12 +258,7 @@ int main(int argc, char ** argv) {
     // 2^-11, with a margin of 2. The tight criterion of this phase is the NMSE.
     const double   rnd_abs   = 4.0 * (double) x_range * 2.0 / 2048.0;
 
-    const char * phase = "all";
-    for (int i = 1; i + 1 < argc; i++) {
-        if (strcmp(argv[i], "--phase") == 0) {
-            phase = argv[i + 1];
-        }
-    }
+    const char * phase = lab_arg_str(argc, argv, "--phase", "all");
     const bool do_random  = strcmp(phase, "all") == 0 || strcmp(phase, "random") == 0;
     const bool do_octaves = strcmp(phase, "all") == 0 || strcmp(phase, "octaves") == 0;
     const bool do_silu    = strcmp(phase, "all") == 0 || strcmp(phase, "silu") == 0;

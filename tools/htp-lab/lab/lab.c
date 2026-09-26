@@ -34,10 +34,16 @@ static struct lab_guarded g_guarded[LAB_MAX_GUARDED];
 static size_t             g_guarded_count;
 
 static const char * g_arg_names[LAB_MAX_ARG_NAMES];
+static bool         g_arg_flags[LAB_MAX_ARG_NAMES];
+static int          g_argc;
+static char **      g_argv;
+static bool         g_args_checked;
 static size_t       g_arg_name_count;
 
 static const char * g_limits[LAB_MAX_LIMITS];
 static size_t       g_limit_count;
+
+static void lab_at_exit(void);
 
 // The standalone runtime maps a page on the first access with the default attributes. The lab
 // maps the VTCM pages explicitly with the cacheable attribute (L1 write-back, L2), which is the
@@ -95,7 +101,7 @@ void lab_init(void) {
     printf("lab: build profile = %s\n", LAB_PROFILE_NAME);
 #endif
     lab_record_build_limits();
-    atexit(lab_limits_report);
+    atexit(lab_at_exit);
 }
 
 uint8_t * lab_vtcm_base(void) {
@@ -443,8 +449,13 @@ void lab_run_threads(lab_thread_fn fn, void * data, unsigned int n) {
     thread_join(mask);
 }
 
-// Records an option name, thus lab_args_done knows the names that the program reads.
-static void lab_arg_seen(const char * name) {
+// Records an option name and the argument vector, thus the check of the options knows the names that
+// the program reads. A flag is an option with no value.
+static void lab_arg_seen(int argc, char ** argv, const char * name, bool flag) {
+    if (g_argv == NULL) {
+        g_argc = argc;
+        g_argv = argv;
+    }
     for (size_t i = 0; i < g_arg_name_count; i++) {
         if (strcmp(g_arg_names[i], name) == 0) {
             return;
@@ -453,12 +464,13 @@ static void lab_arg_seen(const char * name) {
     if (g_arg_name_count == LAB_MAX_ARG_NAMES) {
         return;
     }
+    g_arg_flags[g_arg_name_count]   = flag;
     g_arg_names[g_arg_name_count++] = name;
 }
 
 // Returns the value of "--name value", or NULL when the option is not in argv
 static const char * lab_arg_find(int argc, char ** argv, const char * name) {
-    lab_arg_seen(name);
+    lab_arg_seen(argc, argv, name, false);
     for (int i = 1; i + 1 < argc; i++) {
         if (strcmp(argv[i], name) == 0) {
             return argv[i + 1];
@@ -482,32 +494,64 @@ const char * lab_arg_str(int argc, char ** argv, const char * name, const char *
     return v ? v : def;
 }
 
-void lab_args_done(int argc, char ** argv) {
+bool lab_arg_flag(int argc, char ** argv, const char * name) {
+    lab_arg_seen(argc, argv, name, true);
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Prints each argument that starts with "--" and that no lab_arg_* call read. Returns their number.
+// Complexity O(argc * names).
+static size_t lab_args_unknown(int argc, char ** argv) {
     size_t bad = 0;
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] != '-' || argv[i][1] != '-') {
             continue;
         }
-        bool known = false;
+        long known = -1;
         for (size_t k = 0; k < g_arg_name_count; k++) {
             if (strcmp(g_arg_names[k], argv[i]) == 0) {
-                known = true;
+                known = (long) k;
                 break;
             }
         }
-        if (!known) {
-            printf("lab: error: this program does not read the option %s\n", argv[i]);
+        if (known < 0) {
+            printf("lab: error: this program does not read the option %s, thus the run did not use it\n", argv[i]);
             bad++;
+        } else if (!g_arg_flags[known]) {
+            i++;  // the value of the option
         }
-        i++;  // the value of the option
     }
     if (bad != 0) {
-        printf("lab: the options of this program are:");
+        printf("lab: the options that this run of the program reads are:");
         for (size_t k = 0; k < g_arg_name_count; k++) {
             printf(" %s", g_arg_names[k]);
         }
         printf("\n");
+    }
+    return bad;
+}
+
+void lab_args_done(int argc, char ** argv) {
+    g_args_checked = true;
+    if (lab_args_unknown(argc, argv) != 0) {
         exit(2);
+    }
+}
+
+// The exit handler of every lab program: the check of the options, then the limits block. A program
+// that read its options with lab_arg_* and got one that it did not read ends with the status 2, thus
+// a misspelled option name cannot take the preset value in silence.
+static void lab_at_exit(void) {
+    const size_t bad = (g_argv != NULL && !g_args_checked) ? lab_args_unknown(g_argc, g_argv) : 0;
+    lab_limits_report();
+    if (bad != 0) {
+        fflush(stdout);
+        _Exit(2);
     }
 }
 

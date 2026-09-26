@@ -1347,13 +1347,8 @@ static void usr_report(void) {
 }
 
 int main(int argc, char ** argv) {
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--only") == 0 && i + 1 < argc) {
-            g.only = argv[++i];
-        } else if (strcmp(argv[i], "--list") == 0) {
-            g.list = true;
-        }
-    }
+    g.only = lab_arg_str(argc, argv, "--only", NULL);
+    g.list = lab_arg_flag(argc, argv, "--list");
     lab_init();
     crc_init();
     usr_report();
