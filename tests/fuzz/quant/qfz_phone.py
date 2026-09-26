@@ -178,7 +178,7 @@ def build_files(seed: int = 20260923) -> dict:
     (OUT / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
     if no_block:
         raise RuntimeError(f"{len(no_block)} host runs have no final KL statistics block: {', '.join(no_block)}. "
-                           f"Their logs are in {host_logs}. A build without patches/fuzz-quant/0002 can lose "
+                           f"Their logs are in {host_logs}. A build without patches/tools/0001 can lose "
                            "the block at the exit: rebuild it.")
     return manifest
 
@@ -210,7 +210,7 @@ def phone_commands() -> str:
         "",
         "# 2. The runs: before each run the charger state, the caps and the thermal status; the loop stops at a",
         "#    status other than 0 or on a charger. After each run the status and the llama processes. A run whose",
-        "#    log has no final KL statistics block fails: llama-perplexity without patches/fuzz-quant/0002 can lose",
+        "#    log has no final KL statistics block fails: llama-perplexity without patches/tools/0001 can lose",
         "#    the block at the exit with the status 0. The run is not done again.",
         "failed=0",
         f"for name in {' '.join(names)}; do",

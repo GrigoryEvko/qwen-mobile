@@ -131,7 +131,7 @@ Groups (the targets): matmul gdn attn norm elem data
 Flags and runtime options: the shared files tests/sanitizers/profile-<profile>.cmake,
 tests/sanitizers/<config>.cmake and tests/sanitizers/env.sh. Suppressions: only the shared files
 tests/sanitizers/<config>.supp. The area has no entry there: the fixes of its UBSan reports (the
-null pointer of ggml_graph_nbytes, the casts of the type traits) are patches/fuzz-ops/0001 and 0002.
+null pointer of ggml_graph_nbytes, the casts of the type traits) are patches/ggml/0001 and 0002.
 
 Special cases: a case is special (refer to src/case.h) when an input holds Inf, NaN, a subnormal
 or a huge value, or when a conversion of the op makes an input infinite. The known properties of

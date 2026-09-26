@@ -39,12 +39,12 @@
  *   REPRO-CONTROL: integer-divide-by-zero MODE: control_divide
  * The clean modes:
  *   graph_nbytes: ggml_graph_nbytes must compute the size of a graph with no
- *     arithmetic on a null pointer (patches/fuzz-ops/0001). The mode reaches
+ *     arithmetic on a null pointer (patches/ggml/0001). The mode reaches
  *     it through ggml_graph_overhead, and each other mode reaches it through
  *     ggml_new_graph.
  *   The "function" modes: the CPU backend must call each type trait function
  *     (to_float, from_float, vec_dot) through a pointer of its own type
- *     (patches/fuzz-ops/0002). Each mode runs one op that makes such a call.
+ *     (patches/ggml/0002). Each mode runs one op that makes such a call.
  */
 
 #include "ggml.h"

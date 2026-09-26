@@ -39,7 +39,7 @@
 //   P5  An intact state blob loads (returns non-zero) into any sequence.
 //   P6  A sequence load that fails (returns 0) leaves no part of the
 //       destination sequence, in the KV cache and in the recurrent memory.
-//       The loader of patches/fuzz-core/0026 writes the tensor data after it
+//       The loader of patches/context/0015 writes the tensor data after it
 //       reads the blob, and a NaN stops it after some parts are written: the
 //       load then removes the sequence.
 //
@@ -53,7 +53,7 @@
 // also the cells of the other sequences. A masked cell gets the weight 0
 // there, but 0 * NaN is NaN. The flash attention of the CPU skips a masked
 // cell. The loader rejects a blob with a NaN or an Inf
-// (patches/fuzz-core/0025), thus a blob cannot bring one in. A decode that
+// (patches/context/0015), thus a blob cannot bring one in. A decode that
 // overflows can still write one: then the other sequences of its KV stream,
 // and each later sequence in it, get NaN logits without flash attention,
 // until a clear with data. Thus a P2 failure with NaN logits, after a decode
