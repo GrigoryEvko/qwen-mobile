@@ -25,7 +25,11 @@
 //            --defer 0
 // --ver sets kernel_params[1], the version of the chunked kernel (2 selects version 2, another value
 // version 1). --defer 1 runs each HMX job of version 2 at its wait (refer to the shim below).
-// lab-run: mode=functional args=--vtcm_kb 1024
+// With the whole VTCM (--vtcm_kb 0) the HMX model of the simulator stops with the exception 0x26,
+// thus a run in the simulator gives --vtcm_kb 1024. The float64 reference of 32 heads and 256 tokens
+// runs for more than 20 minutes in the functional simulator, thus the registry runs 8 heads and 128
+// tokens. 128 tokens are two chunks of 64, thus the state goes from one chunk to the next.
+// lab-run: mode=functional args=--vtcm_kb 1024 --tokens 128 --h 8 --hk 4 --threads 2
 #include "lab.h"
 
 #include <stdatomic.h>

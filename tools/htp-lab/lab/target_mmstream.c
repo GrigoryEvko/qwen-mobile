@@ -25,11 +25,14 @@
 // the multirow path already computes.
 //
 // Arguments: --mb 16 --k 2560 --iters 3
+// A bandwidth number needs the DDR model of the timing mode (MODE=timing with "run.sh run"). The
+// timing run with the packet profile of 16 MB of weights takes more than 17 minutes, thus the
+// registry runs the functional mode, which does the check of the dot products and no more.
 #pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
 #pragma clang diagnostic ignored "-Wunused-function"
 #pragma clang diagnostic ignored "-Wunused-variable"
 #pragma clang diagnostic ignored "-Wunused-but-set-variable"
-// lab-run: mode=timing
+// lab-run: mode=functional
 
 #include "lab.h"
 
