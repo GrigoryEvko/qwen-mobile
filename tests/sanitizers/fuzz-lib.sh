@@ -134,15 +134,30 @@ fuzz_android_build_dir() {
 # tests/sanitizers/msan.cmake reads it.
 FUZZ_MSAN_PREFIX=${FUZZ_MSAN_PREFIX:-$FUZZ_REPO/build/fuzz/msan-libcxx/install}
 
-# Print the flags of one profile that each object of the build gets, as
-# tests/sanitizers/common.cmake and tests/sanitizers/profile-<profile>.cmake give them: the frame
-# pointer and the debug information of every configuration, then the flags of the profile.
-# A build that configures a project with the two -C files does not need this function. A build that
-# compiles one file with a direct compiler call does.
+# The flag functions below read the initial cache files of tests/sanitizers, which check-rules.sh
+# (rule R12) compares with the shipped flags. A build that configures a project with the two -C
+# files does not need them. A build that compiles one file with a direct compiler call does.
+
+# Print the text of the first group of the first match of a regular expression in a shared file,
+# and stop when the file has no match. The expression can span lines.
+# Arguments: the file name in tests/sanitizers, the regular expression.
+fuzz_read_shared() {
+    local text
+    text=$(rg -U -o -m 1 -r '$1' -e "$2" "$FUZZ_SHARED_DIR/$1" | head -n 1) \
+        || fuzz_die_code 2 "tests/sanitizers/$1 has no text that matches '$2': update the reader in tests/sanitizers/fuzz-lib.sh"
+    echo "$text"
+}
+
+# Print the flags of one profile that each object of the build gets: the flags that common.cmake
+# gives to each configuration (the debug information and the frame pointer), then
+# SANMATRIX_PROFILE_FLAGS of profile-<profile>.cmake.
 # Argument: the profile.
 fuzz_profile_flags() {
+    local common flags
     fuzz_check_profile "${1:-}"
-    echo "-g -fno-omit-frame-pointer $(rg -o -r '$1' 'SANMATRIX_PROFILE_FLAGS "([^"]*)"' "$FUZZ_SHARED_DIR/profile-$1.cmake")"
+    common=$(fuzz_read_shared common.cmake 'set\(common "([^"$]*)\$\{SANMATRIX_PROFILE_FLAGS\}"\)')
+    flags=$(fuzz_read_shared "profile-$1.cmake" 'SANMATRIX_PROFILE_FLAGS "([^"]*)"')
+    echo "${common% } $flags"
 }
 
 # Print the optimizer flags of one profile (CMAKE_<LANG>_FLAGS_<TYPE> of the profile file).
@@ -151,67 +166,62 @@ fuzz_profile_opt_flags() {
     local type=DEBUG
     fuzz_check_profile "${1:-}"
     [[ $1 == release ]] && type=RELEASE
-    rg -o -r '$1' "CMAKE_C_FLAGS_$type \"([^\"]*)\"" "$FUZZ_SHARED_DIR/profile-$1.cmake"
+    fuzz_read_shared "profile-$1.cmake" "CMAKE_C_FLAGS_$type \"([^\"]*)\""
 }
 
 # Print the link flags of one profile (SANMATRIX_PROFILE_LINK_FLAGS of the profile file).
 # Argument: the profile.
 fuzz_profile_link_flags() {
     fuzz_check_profile "${1:-}"
-    rg -o -r '$1' 'SANMATRIX_PROFILE_LINK_FLAGS "([^"]*)"' "$FUZZ_SHARED_DIR/profile-$1.cmake"
+    fuzz_read_shared "profile-$1.cmake" 'SANMATRIX_PROFILE_LINK_FLAGS "([^"]*)"'
 }
 
-# Print the flags that the debug profile adds to each C++ object: the library asserts. The release
-# profile adds none, because the shipped build has none. The msan configuration uses the MSan
-# libc++, thus it gets the hardening mode of that library.
+# Print the flags that the debug profile adds to each C++ object: the library asserts of
+# common.cmake. The release profile adds none, because the shipped build has none. The msan
+# configuration uses the MSan libc++, thus it gets the hardening mode of that library.
 # Arguments: the profile, the configuration.
 fuzz_profile_cxx_flags() {
     fuzz_check_profile "${1:-}"
     [[ $1 == debug ]] || return 0
     if [[ ${2:-} == msan ]]; then
-        echo "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE"
+        fuzz_read_shared common.cmake 'set\(asserts "(-D_LIBCPP[^"]*)"\)'
     else
-        echo "-D_GLIBCXX_ASSERTIONS"
+        fuzz_read_shared common.cmake 'set\(asserts "(-D_GLIBCXX[^"]*)"\)'
     fi
 }
 
-# Print the compile flags of one sanitizer. The rule SAN-FLAGS of
-# tests/sanitizers/check-rules.sh compares each list with the file
-# tests/sanitizers/<config>.cmake, thus the two cannot drift.
+# Print one argument of sanitizer_matrix_apply in tests/sanitizers/<config>.cmake, with the path of
+# the MSan libc++ in the place of the variable of that file.
+# Arguments: the configuration, the number of the argument after the name (1 compile, 2 link,
+# 3 C++).
+fuzz_matrix_argument() {
+    local skip="" value i token='${_msan_prefix}'
+    fuzz_check_config "${1:-}" host
+    for (( i = 1; i < $2; i++ )); do
+        skip+='\s+"[^"]*"'
+    done
+    value=$(fuzz_read_shared "$1.cmake" "sanitizer_matrix_apply\\($1$skip\\s+\"([^\"]*)\"")
+    echo "${value//"$token"/$FUZZ_MSAN_PREFIX}"
+}
+
+# Print the compile flags of one sanitizer (the first argument of sanitizer_matrix_apply).
 # Argument: the configuration.
 fuzz_sanitizer_flags() {
-    fuzz_check_config "${1:-}" host
-    case $1 in
-        none)  echo "" ;;
-        asan)  echo "-fsanitize=address -fno-optimize-sibling-calls" ;;
-        ubsan) echo "-fsanitize=undefined -fno-sanitize-recover=undefined" ;;
-        tsan)  echo "-fsanitize=thread" ;;
-        msan)  echo "-fsanitize=memory -fsanitize-memory-track-origins=2" ;;
-    esac
+    fuzz_matrix_argument "${1:-}" 1
 }
 
-# Print the link flags of one sanitizer.
+# Print the link flags of one sanitizer (the second argument of sanitizer_matrix_apply).
 # Argument: the configuration.
 fuzz_sanitizer_link_flags() {
-    fuzz_check_config "${1:-}" host
-    case $1 in
-        none)  echo "" ;;
-        asan)  echo "-fsanitize=address" ;;
-        ubsan) echo "-fsanitize=undefined" ;;
-        tsan)  echo "-fsanitize=thread" ;;
-        msan)  echo "-fsanitize=memory -stdlib=libc++ -L$FUZZ_MSAN_PREFIX/lib -Wl,-rpath,$FUZZ_MSAN_PREFIX/lib -lc++ -lc++abi" ;;
-    esac
+    fuzz_matrix_argument "${1:-}" 2
 }
 
-# Print the flags that one sanitizer adds to each C++ object. MSan must see each store, thus the C++
-# code uses the MSan libc++ and not libstdc++.
+# Print the flags that one sanitizer adds to each C++ object (the third argument of
+# sanitizer_matrix_apply). MSan must see each store, thus the C++ code of msan uses the MSan libc++
+# and not libstdc++.
 # Argument: the configuration.
 fuzz_sanitizer_cxx_flags() {
-    fuzz_check_config "${1:-}" host
-    case $1 in
-        msan) echo "-stdlib=libc++ -nostdinc++ -isystem $FUZZ_MSAN_PREFIX/include/c++/v1" ;;
-        *)    echo "" ;;
-    esac
+    fuzz_matrix_argument "${1:-}" 3
 }
 
 # Export the runtime options of one sanitizer, and clear the options of the
