@@ -22,6 +22,8 @@ from pathlib import Path
 
 import numpy as np
 
+import labcheck
+
 F32_NAN = 0x7FC00000
 F32_INF = 0x7F800000
 
@@ -183,16 +185,19 @@ def compare(name: str, got: np.ndarray, ref: np.ndarray, nan_class: np.ndarray, 
     return len(bad)
 
 
-def check_dir(d: Path) -> int:
+# The output files that the cross-version compare reads
+OUTPUTS = ["mul_out.bin", "add_out.bin", "hf2sf_out.bin", "sf2hf_out.bin"]
+
+
+def check_dir(d: Path) -> tuple[int, list[str]]:
     """Check all the routines of one run directory.
 
     Args:
         d: The run directory
 
     Returns:
-        The total number of differing lanes
+        The total number of differing lanes, and the output files of the cross-version compare
     """
-    print(f"{d}:")
     total = 0
 
     a, b, got = load_u32(d / "mul_a.bin"), load_u32(d / "mul_b.bin"), load_u32(d / "mul_out.bin")
@@ -213,7 +218,7 @@ def check_dir(d: Path) -> int:
         ref = x.view(np.float32).astype(np.float16).view(np.uint16).astype(np.uint32)
     nan16 = ((got & 0x7FFF) > 0x7C00) & ((ref & 0x7FFF) > 0x7C00)
     total += compare("sf_to_hf", got, ref, nan16, [x])
-    return total
+    return total, OUTPUTS
 
 
 def main() -> int:
@@ -222,19 +227,7 @@ def main() -> int:
     Returns:
         The exit code: 0 when every lane agrees with the reference and every directory agrees
     """
-    dirs = [Path(p) for p in sys.argv[1:]]
-    if not dirs:
-        print(__doc__)
-        return 2
-    bad = sum(check_dir(d) for d in dirs)
-    if len(dirs) > 1:
-        print("cross-version:")
-        for f in ("mul_out.bin", "add_out.bin", "hf2sf_out.bin", "sf2hf_out.bin"):
-            blobs = [(d / f).read_bytes() for d in dirs]
-            same = all(x == blobs[0] for x in blobs[1:])
-            print(f"  {f}: {'identical' if same else 'DIFFERENT'} in {len(dirs)} directories")
-            bad += 0 if same else 1
-    return 0 if bad == 0 else 1
+    return labcheck.main_for(__doc__, check_dir)
 
 
 if __name__ == "__main__":

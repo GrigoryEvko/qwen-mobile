@@ -20,6 +20,8 @@ from pathlib import Path
 
 import numpy as np
 
+import labcheck
+
 TILE = 1152
 F32_MIN_NORMAL = np.float32(2.0**-126)
 
@@ -147,35 +149,30 @@ def check_scales(d: Path) -> int:
     return len(bd) + len(bi)
 
 
+def check_dir(d: Path) -> tuple[int, list[str]]:
+    """Check one run directory: a scales run when it holds am.bin, else a run of rows.
+
+    Args:
+        d: The run directory
+
+    Returns:
+        The number of lanes or blocks that differ, and the output files of the cross-version compare
+    """
+    if (d / "am.bin").exists():
+        return check_scales(d), ["d.bin", "id.bin"]
+    bad = 0
+    for k in (4096, 2688, 128):
+        bad += check_rows(d, k)
+    return bad, [f"{p}_{k}.bin" for k in (4096, 2688, 128) for p in ("tiles", "compact", "sums", "scales")]
+
+
 def main() -> int:
     """Check each run directory, then compare the output files across the directories.
 
     Returns:
         The exit code: 0 when every block agrees with the reference and every directory agrees
     """
-    dirs = [Path(p) for p in sys.argv[1:]]
-    if not dirs:
-        print(__doc__)
-        return 2
-    bad = 0
-    names: list[str] = []
-    for d in dirs:
-        print(f"{d}:")
-        if (d / "am.bin").exists():
-            bad += check_scales(d)
-            names = ["d.bin", "id.bin"]
-        else:
-            for k in (4096, 2688, 128):
-                bad += check_rows(d, k)
-            names = [f"{p}_{k}.bin" for k in (4096, 2688, 128) for p in ("tiles", "compact", "sums", "scales")]
-    if len(dirs) > 1:
-        print("cross-version:")
-        for f in names:
-            blobs = [(d / f).read_bytes() for d in dirs]
-            same = all(b == blobs[0] for b in blobs[1:])
-            print(f"  {f}: {'identical' if same else 'DIFFERENT'} in {len(dirs)} directories")
-            bad += 0 if same else 1
-    return 0 if bad == 0 else 1
+    return labcheck.main_for(__doc__, check_dir)
 
 
 if __name__ == "__main__":
