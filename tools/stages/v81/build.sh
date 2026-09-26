@@ -69,7 +69,7 @@ echo "v81: SOURCE_DATE_EPOCH=$(source_date_epoch) JOBS=$JOBS"
     # shellcheck disable=SC2016
     stage_build --tests "$tree" "$bdir" "$LLAMA_LIBS htp-v79 htp-v81 llama-bench llama-perplexity test-backend-ops" '
 "$(ndk_cxx)" -O2 -std=c++17 $FLAGS_EXTRA -I"$TREE/ggml/include" tools/stages/v81/canarytime.cpp -o "$BDIR/bin/canarytime" \
-    -L"$BDIR/bin" -lggml -lggml-base -Wl,-rpath,"\$ORIGIN/../lib"'
+    -L"$BDIR/bin" -lggml -lggml-base -Wl,-rpath,"\$ORIGIN/../lib"' || exit
     stage_build --tests "$base" "$bbase" "htp-v79 htp-v81"
 ) 9> build/.container.lock > "$stage/build.log" 2>&1 || die "the build failed, refer to $stage/build.log"
 

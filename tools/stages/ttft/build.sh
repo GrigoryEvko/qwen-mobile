@@ -113,7 +113,7 @@ build_phone() {
     mkdir -p "$bdir"
     (
         flock 9
-        stage_build --no-remap "$tree" "$bdir" "$LLAMA_LIBS htp-v79"
+        stage_build --no-remap "$tree" "$bdir" "$LLAMA_LIBS htp-v79" || exit
         compile_memprobe
     ) 9> build/.container.lock > "$stage/build-phone.log" 2>&1 || die "the phone build failed, refer to $stage/build-phone.log"
     copy_phone_files

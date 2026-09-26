@@ -66,7 +66,7 @@ echo "gemv: SOURCE_DATE_EPOCH=$(source_date_epoch) JOBS=$JOBS"
     stage_build --tests "$stage/new" "$stage/android-new" \
         "$LLAMA_LIBS htp-v73 htp-v75 htp-v79 htp-v81 llama-bench test-backend-ops" '
 "$(ndk_cxx)" -O2 -std=c++17 -Wall -Wextra $FLAGS_EXTRA -static-libstdc++ -I"$TREE/ggml/include" tools/gemv/gemvcheck.cpp \
-    -o "$BDIR/bin/gemvcheck" -L"$BDIR/bin" -lggml -lggml-cpu -lggml-base -Wl,-rpath,"\$ORIGIN/../lib"'
+    -o "$BDIR/bin/gemvcheck" -L"$BDIR/bin" -lggml -lggml-cpu -lggml-base -Wl,-rpath,"\$ORIGIN/../lib"' || exit
     stage_build --tests "$stage/base" "$stage/android-base" "htp-v73 htp-v75 htp-v79"
 ) 9> build/.container.lock > "$stage/build.log" 2>&1 || die "the build failed, refer to $stage/build.log"
 

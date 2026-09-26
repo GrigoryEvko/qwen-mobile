@@ -88,9 +88,9 @@ echo "spf: SOURCE_DATE_EPOCH=$(source_date_epoch) JOBS=$JOBS"
     # The base build also compiles memprobe against its libraries
     # shellcheck disable=SC2016
     stage_build --tests "$stage/base" "$stage/android-base" "$LLAMA_LIBS htp-v79 test-backend-ops llama-bench llama-perplexity" '
-memprobe_build "$TREE" "$BDIR" "$BDIR/bin/memprobe" "-Wall -Wextra -Wno-unused-parameter $FLAGS_EXTRA"'
+memprobe_build "$TREE" "$BDIR" "$BDIR/bin/memprobe" "-Wall -Wextra -Wno-unused-parameter $FLAGS_EXTRA"' || exit
     for name in "${names[@]}"; do
-        stage_build --tests "$stage/$name" "$stage/android-$name" "$LLAMA_LIBS htp-v79 test-backend-ops"
+        stage_build --tests "$stage/$name" "$stage/android-$name" "$LLAMA_LIBS htp-v79 test-backend-ops" || exit
     done
 ) 9> build/.container.lock > "$stage/build.log" 2>&1 || die "the build failed, refer to $stage/build.log"
 

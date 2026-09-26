@@ -59,7 +59,7 @@ echo "unary-rows: SOURCE_DATE_EPOCH=$(source_date_epoch) JOBS=$JOBS"
     stage_build "$stage/base" "$stage/android-base" "$LLAMA_LIBS htp-v79 test-backend-ops" '
 memprobe_build "$TREE" "$BDIR" "$BDIR/bin/memprobe" "-Wall -Wextra -Wno-unused-parameter $FLAGS_EXTRA"
 "$(ndk_cxx)" -O2 -std=c++17 -Wall -Wextra $FLAGS_EXTRA -I"$TREE/ggml/include" tools/stages/unary-rows/unarycheck.cpp \
-    -o "$BDIR/bin/unarycheck" -static-libstdc++ -L"$BDIR/bin" -lggml -lggml-cpu -lggml-base -Wl,-rpath,"\$ORIGIN/../lib"'
+    -o "$BDIR/bin/unarycheck" -static-libstdc++ -L"$BDIR/bin" -lggml -lggml-cpu -lggml-base -Wl,-rpath,"\$ORIGIN/../lib"' || exit
     stage_build "$stage/src" "$stage/android-src" "$LLAMA_LIBS htp-v79"
 ) 9> build/.container.lock > "$stage/build.log" 2>&1 || die "the build failed, refer to $stage/build.log"
 

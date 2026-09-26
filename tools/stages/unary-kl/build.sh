@@ -57,7 +57,7 @@ echo "unary-kl: SOURCE_DATE_EPOCH=$(source_date_epoch) JOBS=$JOBS"
     # The base build also compiles memprobe against its libraries
     # shellcheck disable=SC2016
     stage_build "$stage/base" "$stage/android-base" "$LLAMA_LIBS htp-v79 llama-bench llama-perplexity" '
-memprobe_build "$TREE" "$BDIR" "$BDIR/bin/memprobe" "-Wall -Wextra -Wno-unused-parameter $FLAGS_EXTRA"'
+memprobe_build "$TREE" "$BDIR" "$BDIR/bin/memprobe" "-Wall -Wextra -Wno-unused-parameter $FLAGS_EXTRA"' || exit
     stage_build "$stage/src" "$stage/android-src" "$LLAMA_LIBS htp-v79"
 ) 9> build/.container.lock > "$stage/build.log" 2>&1 || die "the build failed, refer to $stage/build.log"
 
