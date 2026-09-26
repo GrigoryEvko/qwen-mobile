@@ -28,7 +28,8 @@ rm -rf "$out"
 mkdir -p "$out/bin" "$out/lib" "$out/tests"
 cp -f build/ddrbw/bin/ddrbw "$out/bin/"
 cp -f build/ddrbw/v79/libddrbw_skel.so "$out/lib/"
-cp -f build/bench-kv/phone/bin/gate.sh build/bench-kv/phone/bin/llama-bench build/bench-kv/phone/bin/memprobe "$out/bin/"
+cp -f tools/phone/gate.sh "$out/bin/"
+cp -f build/bench-kv/phone/bin/llama-bench build/bench-kv/phone/bin/memprobe "$out/bin/"
 cp -f build/bench-kv/phone/lib/*.so "$out/lib/"
 (
     flock 9

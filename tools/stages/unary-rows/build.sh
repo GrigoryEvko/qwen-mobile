@@ -66,14 +66,7 @@ echo "unary-rows: SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH JOBS=$JOBS"
         -e STAGE="$stage" \
         -e APP_SRC="$app_src" -e APP_FILES="$app_files" \
         "$SNAPDRAGON_IMAGE" bash -euo pipefail -c '
-preset_flag() {
-    python3 -c "
-import json, sys
-presets = json.load(open(sys.argv[1]))[\"configurePresets\"]
-preset = [p for p in presets if p[\"name\"] == \"arm64-android-snapdragon\"][0]
-print(preset[\"cacheVariables\"][sys.argv[2]])
-" "$1/CMakeUserPresets.json" "$2"
-}
+source tools/stages/common/buildlib.sh
 for name in base src; do
     tree=$STAGE/$name
     bdir=$STAGE/android-$name

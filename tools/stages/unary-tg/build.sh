@@ -53,21 +53,14 @@ echo "unary-tg: SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH JOBS=$JOBS"
         -e FLAGS_EXTRA="$repro $remap" \
         -e TREE="$tree" -e BDIR="$bdir" \
         "$SNAPDRAGON_IMAGE" bash -euo pipefail -c '
-preset_flag() {
-    python3 -c "
-import json, sys
-presets = json.load(open(sys.argv[1]))[\"configurePresets\"]
-preset = [p for p in presets if p[\"name\"] == \"arm64-android-snapdragon\"][0]
-print(preset[\"cacheVariables\"][sys.argv[2]])
-" "$TREE/CMakeUserPresets.json" "$1"
-}
+source tools/stages/common/buildlib.sh
 # The DSP library is an external project that the build step configures, thus it reads CFLAGS at that time
 export CFLAGS="$FLAGS_EXTRA" CXXFLAGS="$FLAGS_EXTRA"
 cmake -S "$TREE" --preset arm64-android-snapdragon-release -B "$BDIR" \
     -DLLAMA_BUILD_NUMBER="$LLAMA_BUILD_NUMBER" \
     -DLLAMA_BUILD_COMMIT="$LLAMA_BUILD_COMMIT_SHORT" \
-    -DCMAKE_C_FLAGS="$(preset_flag CMAKE_C_FLAGS) $FLAGS_EXTRA" \
-    -DCMAKE_CXX_FLAGS="$(preset_flag CMAKE_CXX_FLAGS) $FLAGS_EXTRA"
+    -DCMAKE_C_FLAGS="$(preset_flag "$TREE" CMAKE_C_FLAGS) $FLAGS_EXTRA" \
+    -DCMAKE_CXX_FLAGS="$(preset_flag "$TREE" CMAKE_CXX_FLAGS) $FLAGS_EXTRA"
 # shellcheck disable=SC2086
 cmake --build "$BDIR" -j"$JOBS" --target $TARGETS
 '

@@ -49,16 +49,9 @@ SOURCE_DATE_EPOCH=$(source_date_epoch)
         -e TREE="$tree" -e BDIR="$bdir" -e NAME="$name" \
         -e APP_SRC="$app_src" -e APP_FILES="$app_src/state_cache.cpp $app_src/cache_io.cpp $app_src/spec_policy.cpp $app_src/chat_prompt.cpp $app_src/engine_tasks.cpp" \
         "$SNAPDRAGON_IMAGE" bash -euo pipefail -c '
-preset_flag() {
-    python3 -c "
-import json, sys
-presets = json.load(open(sys.argv[1]))[\"configurePresets\"]
-preset = [p for p in presets if p[\"name\"] == \"arm64-android-snapdragon\"][0]
-print(preset[\"cacheVariables\"][sys.argv[2]])
-" "$TREE/CMakeUserPresets.json" "$1"
-}
-c_flags="$(preset_flag CMAKE_C_FLAGS) $FLAGS_EXTRA"
-cxx_flags="$(preset_flag CMAKE_CXX_FLAGS) $FLAGS_EXTRA"
+source tools/stages/common/buildlib.sh
+c_flags="$(preset_flag "$TREE" CMAKE_C_FLAGS) $FLAGS_EXTRA"
+cxx_flags="$(preset_flag "$TREE" CMAKE_CXX_FLAGS) $FLAGS_EXTRA"
 export CFLAGS="$FLAGS_EXTRA" CXXFLAGS="$FLAGS_EXTRA"
 cmake -S "$TREE" --preset arm64-android-snapdragon-release -B "$BDIR" \
     -DLLAMA_BUILD_NUMBER="$LLAMA_BUILD_NUMBER" \
@@ -86,7 +79,7 @@ done
 cp -f "$bdir/ggml/src/ggml-hexagon/libggml-htp-v79.so" "$out/lib-$name/"
 if [[ $name == base ]]; then
     cp -f "$bdir/bin/llama-bench" "$bdir/bin/test-backend-ops" "$bdir/bin/memprobe" "$out/bin/"
-    cp -f build/memory/tools/gate.sh "$out/bin/"
+    cp -f tools/phone/gate.sh "$out/bin/"
 else
     # lib-new keeps only the libraries that differ from lib-base: the runs put lib-new before lib-base
     for so in "$out/lib-new"/*.so; do

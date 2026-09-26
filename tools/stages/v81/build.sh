@@ -78,16 +78,9 @@ build_tree() {
         -e FLAGS_EXTRA="$repro $remap" \
         -e TREE="$t" -e BDIR="$b" \
         "$SNAPDRAGON_IMAGE" bash -euo pipefail -c '
-preset_flag() {
-    python3 -c "
-import json, sys
-presets = json.load(open(sys.argv[1]))[\"configurePresets\"]
-preset = [p for p in presets if p[\"name\"] == \"arm64-android-snapdragon\"][0]
-print(preset[\"cacheVariables\"][sys.argv[2]])
-" "$TREE/CMakeUserPresets.json" "$1"
-}
-c_flags="$(preset_flag CMAKE_C_FLAGS) $FLAGS_EXTRA"
-cxx_flags="$(preset_flag CMAKE_CXX_FLAGS) $FLAGS_EXTRA"
+source tools/stages/common/buildlib.sh
+c_flags="$(preset_flag "$TREE" CMAKE_C_FLAGS) $FLAGS_EXTRA"
+cxx_flags="$(preset_flag "$TREE" CMAKE_CXX_FLAGS) $FLAGS_EXTRA"
 export CFLAGS="$FLAGS_EXTRA" CXXFLAGS="$FLAGS_EXTRA"
 cmake -S "$TREE" --preset arm64-android-snapdragon-release -B "$BDIR" \
     -DLLAMA_BUILD_NUMBER="$LLAMA_BUILD_NUMBER" \
