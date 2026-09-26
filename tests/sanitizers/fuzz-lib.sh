@@ -190,6 +190,17 @@ fuzz_profile_cxx_flags() {
     fi
 }
 
+# Print the -D options that turn GGML_NATIVE and each x86 SIMD option of ggml off, as
+# tests/sanitizers/msan.cmake gives them (rule R7): MemorySanitizer does not see the stores of an
+# x86 SIMD intrinsic, thus an msan build has the scalar code of ggml.
+fuzz_scalar_x86_options() {
+    local opt out="-DGGML_NATIVE=OFF"
+    for opt in $(fuzz_read_shared msan.cmake 'foreach \(_opt ([A-Z0-9_ ]+)\)'); do
+        out+=" -DGGML_$opt=OFF"
+    done
+    echo "$out"
+}
+
 # Print one argument of sanitizer_matrix_apply in tests/sanitizers/<config>.cmake, with the path of
 # the MSan libc++ in the place of the variable of that file.
 # Arguments: the configuration, the number of the argument after the name (1 compile, 2 link,

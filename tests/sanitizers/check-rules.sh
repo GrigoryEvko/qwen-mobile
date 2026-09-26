@@ -380,15 +380,20 @@ check_results() {
     done
 }
 
-# R1, R7, R11 and R12 in one build directory.
+# R1, R7, R11 and R12 in one build directory. The CMake directory is the build
+# directory itself, or its subdirectory build/ when the area keeps its own
+# outputs next to it (quant: build/fuzz/quant-<profile>-<config>/build).
 check_build_dir() {
-    local dir="$1" name config profile cache cc fams flags area android=0
+    local dir="$1" name config profile cache cc fams flags area android=0 cmake_dir="$1"
     name="$(basename "$dir")"
     area="$(area_of "$dir")"
     config="$(config_of_dir "$name")"
     profile="$(profile_of_dir "$name")"
-    cache="$dir/CMakeCache.txt"
-    cc="$dir/compile_commands.json"
+    # Only a matrix build directory: a tool build (the Android ASan runtime) also holds build/.
+    [[ -n "$profile" && -n "$config" && ! -f "$dir/CMakeCache.txt" && -f "$dir/build/CMakeCache.txt" ]] \
+        && cmake_dir="$dir/build"
+    cache="$cmake_dir/CMakeCache.txt"
+    cc="$cmake_dir/compile_commands.json"
     [[ -f "$cache" || -f "$cc" ]] || return 0
     [[ -f "$cache" ]] && rg -q '^CMAKE_SYSTEM_NAME:[A-Z]*=Android' "$cache" && android=1
 
@@ -589,36 +594,47 @@ write_requests() {
     done
 }
 
-# L9 and the TSan hang: each libFuzzer command in the scripts of an area has
+# L9 and the TSan hang: each libFuzzer command in the scripts of an area and in
+# the shared scripts of tests/sanitizers (fuzz-lib.sh, the self-tests) has
 # -artifact_prefix, and each fuzz run (-max_total_time=) has an outer
 # "timeout -s KILL". A command can go on more than one line with "\".
 check_libfuzzer_commands() {
-    local file area n start line logical
+    local file area n start line logical entry
+    local -a scripts=()
     for area in $AREAS; do
         while IFS= read -r file; do
-            n=0
-            logical=""
-            start=0
-            while IFS= read -r line || [[ -n "$line" ]]; do
-                n=$((n + 1))
-                [[ -z "$logical" ]] && start=$n
-                if [[ "$line" == *'\' ]]; then
-                    logical+="${line%\\} "
-                    continue
-                fi
-                logical+="$line"
-                if [[ ! "$logical" =~ ^[[:space:]]*# ]] \
-                    && [[ "$logical" == *-max_total_time=* || "$logical" == *-runs=* || "$logical" == *-rss_limit_mb=* ]]; then
-                    [[ "$logical" == *-artifact_prefix* ]] \
-                        || violation L9 "$area" "$file:$start" "a libFuzzer command without -artifact_prefix (crash files go to the working directory)"
-                    if [[ "$logical" == *-max_total_time=* && "$logical" != *"timeout -s KILL"* \
-                          && "$logical" != *"timeout --signal=KILL"* && "$logical" != *"timeout -s 9"* ]]; then
-                        violation L9 "$area" "$file:$start" "a fuzz run without an outer 'timeout -s KILL' (a TSan hang then blocks the job)"
-                    fi
-                fi
-                logical=""
-            done < "$file"
+            scripts+=("$area"$'\t'"$file")
         done < <(find "$FUZZ_DIR/$area" -name '*.sh' -type f 2> /dev/null | sort)
+    done
+    # This file holds the patterns of the rule, not a command.
+    while IFS= read -r file; do
+        [[ "$file" == */check-rules.sh ]] || scripts+=("sanitizers"$'\t'"$file")
+    done < <(find "$SAN_DIR" -maxdepth 1 -name '*.sh' -type f 2> /dev/null | sort)
+    for entry in "${scripts[@]}"; do
+        area="${entry%%$'\t'*}"
+        file="${entry#*$'\t'}"
+        n=0
+        logical=""
+        start=0
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            n=$((n + 1))
+            [[ -z "$logical" ]] && start=$n
+            if [[ "$line" == *'\' ]]; then
+                logical+="${line%\\} "
+                continue
+            fi
+            logical+="$line"
+            if [[ ! "$logical" =~ ^[[:space:]]*# ]] \
+                && [[ "$logical" == *-max_total_time=* || "$logical" == *-runs=* || "$logical" == *-rss_limit_mb=* ]]; then
+                [[ "$logical" == *-artifact_prefix* ]] \
+                    || violation L9 "$area" "$file:$start" "a libFuzzer command without -artifact_prefix (crash files go to the working directory)"
+                if [[ "$logical" == *-max_total_time=* && "$logical" != *"timeout -s KILL"* \
+                      && "$logical" != *"timeout --signal=KILL"* && "$logical" != *"timeout -s 9"* ]]; then
+                    violation L9 "$area" "$file:$start" "a fuzz run without an outer 'timeout -s KILL' (a TSan hang then blocks the job)"
+                fi
+            fi
+            logical=""
+        done < "$file"
     done
     # Stray libFuzzer files in the root of the repository.
     local stray
@@ -1035,6 +1051,11 @@ main() {
                 \( -name CMakeLists.txt -o -name '*.cmake' -o -name '*.sh' \) -type f 2> /dev/null | sort)
         done
         while IFS= read -r f; do sources+=("$f"); done < <(find "$SAN_DIR" -maxdepth 1 -name '*.cmake' -type f | sort)
+        # The shared scripts (fuzz-lib.sh, the builds of the runtimes, the self-tests). This file
+        # holds the patterns of the rules, not a flag.
+        while IFS= read -r f; do
+            [[ "$f" == */check-rules.sh ]] || sources+=("$f")
+        done < <(find "$SAN_DIR" -maxdepth 1 -name '*.sh' -type f | sort)
     fi
     if [[ -n "$COMMIT_MSG" ]]; then
         :

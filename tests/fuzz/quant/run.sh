@@ -81,7 +81,9 @@ Sanitizers (one sanitizer for each build and each run, never two):
           only. The first report stops the run.
   tsan    -fsanitize=thread. The native targets only.
   msan    -fsanitize=memory with the MSan libc++ at FUZZ_MSAN_PREFIX
-          (preset: build/fuzz/msan-libcxx/install). The native targets only.
+          (preset: build/fuzz/msan-libcxx/install), and the scalar code of
+          ggml: GGML_NATIVE and the x86 SIMD options OFF (rule R7). The native
+          targets only.
   Suppressions: only the shared files tests/sanitizers/<sanitizer>.supp, when
   they exist. This area keeps no suppression of its own.
 
@@ -153,6 +155,7 @@ build() {
     local san="$1" profile="$2"
     local out="$ROOT/build/fuzz/quant-$profile-$san"
     local flags cxx_extra link_extra prof_flags opt_flags prof_link cxx_asserts build_type opt_var tools=()
+    local -a native=(-DGGML_NATIVE=ON)
     # The flags come from the shared files tests/sanitizers/profile-<profile>.cmake and
     # tests/sanitizers/<san>.cmake: this area compiles one file of its own (qfz_gguf_check.c) with a
     # direct compiler call, thus it reads the flags and does not give the files to cmake -C.
@@ -165,6 +168,9 @@ build() {
     cxx_asserts="$(fuzz_profile_cxx_flags "$profile" "$san")"
     if [[ "$san" == "msan" ]]; then
         [[ -d "$FUZZ_MSAN_PREFIX/lib" ]] || { echo "run.sh: the MSan libc++ is missing at $FUZZ_MSAN_PREFIX" >&2; return 3; }
+        # Rule R7: MemorySanitizer does not see the stores of an x86 SIMD intrinsic, thus the msan
+        # build has the scalar code of ggml. The cache records the MSan libc++ of the build.
+        read -r -a native <<< "$(fuzz_scalar_x86_options) -DFUZZ_MSAN_PREFIX=$FUZZ_MSAN_PREFIX"
     fi
     if [[ "$profile" == "release" ]]; then
         build_type=Release; opt_var=RELEASE
@@ -182,7 +188,7 @@ build() {
         -DCMAKE_C_FLAGS="$prof_flags $flags" -DCMAKE_CXX_FLAGS="$prof_flags $flags $cxx_extra $cxx_asserts" \
         -DCMAKE_C_FLAGS_"$opt_var"="$opt_flags" -DCMAKE_CXX_FLAGS_"$opt_var"="$opt_flags" \
         -DCMAKE_EXE_LINKER_FLAGS="$prof_link $link_extra" \
-        -DGGML_NATIVE=ON -DGGML_OPENMP=OFF -DGGML_LLAMAFILE=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF \
+        "${native[@]}" -DGGML_OPENMP=OFF -DGGML_LLAMAFILE=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF \
         -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TESTS=OFF -DBUILD_SHARED_LIBS=OFF > "$out/logs/cmake.log" 2>&1 \
         || { echo "run.sh: the configure of $cm failed. Read $out/logs/cmake.log." >&2; return 1; }
     nice -n 10 cmake --build "$cm" --target llama-perplexity ggml-base -j "${BUILD_JOBS:-10}" \

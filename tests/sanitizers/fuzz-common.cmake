@@ -176,10 +176,11 @@ endfunction()
 
 # Set GGML_NATIVE and each x86 SIMD option of ggml to OFF in the cache, with FORCE. The scalar code
 # of ggml is the code that MemorySanitizer handles, and it is also the code of the naive oracle
-# build (rule R7).
+# build (rule R7). The list of the options is the list of tests/sanitizers/msan.cmake.
 macro(fuzz_scalar_x86)
-    foreach (_fuzz_opt NATIVE AVX AVX2 AVX512 AVX512_VBMI AVX512_VNNI AVX512_BF16 AVX_VNNI FMA F16C
-                       SSE42 BMI2 AMX_TILE AMX_INT8 AMX_BF16)
+    _fuzz_read_shared(msan.cmake "foreach \\(_opt ([A-Z0-9_ ]+)\\)" _fuzz_simd_options)
+    separate_arguments(_fuzz_simd_options)
+    foreach (_fuzz_opt NATIVE ${_fuzz_simd_options})
         set(GGML_${_fuzz_opt} OFF CACHE BOOL "" FORCE)
     endforeach()
 endmacro()
